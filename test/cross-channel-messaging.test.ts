@@ -1066,33 +1066,44 @@ test("M4: send_to_channel rejects out-of-scope account key", async () => {
   });
 });
 
-// m3-minLength: empty context_note fails TypeBox validation
-test("minLength: empty context_note fails schema validation for send_dm", () => {
-  // The TypeBox schema on context_note has minLength: 1.
-  // We verify the schema constraint is present by inspecting the tool's parameter schema.
-  const ctx = {
-    provider: stubProvider("matrix"),
-    providers: new Map([["matrix", stubProvider("matrix")]]),
-    target: { provider: "matrix", timelineKey: "matrix:default:room:!r:s", accountId: "default" } as OutboundTarget,
-    inbound: stubInbound("@alice:example.org", "matrix:default:room:!r:s"),
-    sessionId: "sess",
-    timeline: null as unknown as TimelineStore,
-    storage: null as unknown as Storage,
-    visibilityResolver: new ChannelVisibilityResolver(undefined),
-    messagingEnabled: true,
-    dmInitiationEnabled: true,
-    triggerSenderId: "@alice:example.org",
-  };
-  const tools = createCrossChannelTools(ctx);
-  const sendDmTool = tools.find((t) => t.name === "send_dm")!;
-  const sendToTool = tools.find((t) => t.name === "send_to_channel")!;
+// N3: empty context_note is rejected by the execute path (not just schema inspection).
+test("N3: empty context_note is rejected at execute time for send_dm", async () => {
+  await withStorage(async (storage, timeline) => {
+    // Seed corpus so the test doesn't fail on eligibility instead of context_note.
+    await storage.upsertUserIdentity({
+      provider: "matrix",
+      userId: "@alice:example.org",
+      username: "alice",
+      displayName: "Alice",
+      observedAt: Date.now(),
+    });
 
-  // Inspect the schema directly — context_note should have minLength: 1.
-  const dmSchema = sendDmTool.parameters as { properties?: { context_note?: { minLength?: number } } };
-  assert.equal(dmSchema.properties?.context_note?.minLength, 1, "send_dm context_note has minLength: 1");
+    const ctx = makeCcCtx({ storage, timeline });
+    const tools = createCrossChannelTools(ctx);
+    const sendDmTool = tools.find((t) => t.name === "send_dm")!;
+    const sendToTool = tools.find((t) => t.name === "send_to_channel")!;
 
-  const toSchema = sendToTool.parameters as { properties?: { context_note?: { minLength?: number } } };
-  assert.equal(toSchema.properties?.context_note?.minLength, 1, "send_to_channel context_note has minLength: 1");
+    // Drive the actual tool call with an empty context_note — must be rejected.
+    const dmResult = await sendDmTool.execute(
+      "call1",
+      { user: "@alice:example.org", message: "hi", context_note: "" },
+      undefined as never,
+    );
+    assert.ok(
+      (dmResult.content[0]!.text as string).toLowerCase().includes("context_note"),
+      `send_dm should reject empty context_note, got: ${dmResult.content[0]!.text}`,
+    );
+
+    const toResult = await sendToTool.execute(
+      "call2",
+      { channel: "matrix:default:room:!r:s", message: "hi", context_note: "   " },
+      undefined as never,
+    );
+    assert.ok(
+      (toResult.content[0]!.text as string).toLowerCase().includes("context_note"),
+      `send_to_channel should reject whitespace-only context_note, got: ${toResult.content[0]!.text}`,
+    );
+  });
 });
 
 // m2: IRC userId canonicalization — lowercase before opt-out lookup
@@ -1160,5 +1171,292 @@ test("m5: fuzzy resolution annotates opted-out candidates", async () => {
       text.includes("opted out"),
       `should annotate opted-out candidate or give all-opted-out error, got: ${text}`,
     );
+  });
+});
+
+// ── N2: roster eligibility — silent lurker (no corpus, no DM history) ─────────
+
+test("N2: silent roster member is DMable via exact id (no corpus, no DM history)", async () => {
+  await withStorage(async (storage, timeline) => {
+    // @lurker is NOT in the identity corpus and has no DM timeline history.
+    // The provider knows them via live roster membership.
+    const dmKey = "matrix:default:dm:!lurkerdm:server";
+    const rosterProvider: IChatProvider = {
+      ...stubProvider("matrix"),
+      accountIds: () => ["default"],
+      openDm: async (_acct, _uid) => ({ timelineKey: dmKey, status: "delivered" }),
+      listJoinedChannels: (_acct, _opts) => ["matrix:default:room:!shared:s"],
+      channelClient: () => ({
+        ...stubChannelClient(),
+        memberInfo: async (uid: string) => {
+          if (uid === "@lurker:example.org") {
+            return { userId: "@lurker:example.org", isSelf: false, isDirect: false };
+          }
+          return undefined;
+        },
+      }),
+    };
+
+    const ctx = makeCcCtx({ storage, timeline, provider: rosterProvider });
+    const tools = createCrossChannelTools(ctx);
+    const tool = tools.find((t) => t.name === "send_dm")!;
+
+    const result = await tool.execute(
+      "call1",
+      { user: "@lurker:example.org", message: "hey", context_note: "lurker test" },
+      undefined as never,
+    );
+    const text = result.content[0]!.text as string;
+    assert.ok(
+      text.startsWith("sent:") || text.includes(dmKey),
+      `send_dm for silent roster member should succeed, got: ${text}`,
+    );
+  });
+});
+
+// ── Matrix openDm: pending_invite status ──────────────────────────────────────
+
+test("Matrix openDm: pending_invite status surfaces invite note in result", async () => {
+  await withStorage(async (storage, timeline) => {
+    await storage.upsertUserIdentity({
+      provider: "matrix",
+      userId: "@invited:example.org",
+      username: "invited",
+      displayName: "Invited User",
+      observedAt: Date.now(),
+    });
+
+    const dmKey = "matrix:default:dm:!invitedm:server";
+    const inviteProvider: IChatProvider = {
+      ...stubProvider("matrix"),
+      openDm: async () => ({ timelineKey: dmKey, status: "pending_invite" }),
+    };
+
+    const ctx = makeCcCtx({ storage, timeline, provider: inviteProvider });
+    const tools = createCrossChannelTools(ctx);
+    const tool = tools.find((t) => t.name === "send_dm")!;
+
+    const result = await tool.execute(
+      "call1",
+      { user: "@invited:example.org", message: "hello", context_note: "invite test" },
+      undefined as never,
+    );
+    const text = result.content[0]!.text as string;
+    assert.ok(
+      text.toLowerCase().includes("invite") || text.includes("pending_invite"),
+      `result should mention pending invite, got: ${text}`,
+    );
+  });
+});
+
+// ── Discord: closed-DM error surfaces with message_ref ───────────────────────
+
+test("Discord openDm: closed-DM error is surfaced with message_ref", async () => {
+  await withStorage(async (storage, timeline) => {
+    await storage.upsertUserIdentity({
+      provider: "discord",
+      userId: "123456789012345678",
+      username: "closeduser",
+      displayName: "Closed DM User",
+      observedAt: Date.now(),
+    });
+
+    const closedProvider: IChatProvider = {
+      ...stubProvider("discord"),
+      openDm: async () => {
+        throw new Error(
+          "Cannot open DM with 123456789012345678: their DMs are closed to bots (Discord error: Cannot send messages to this user).",
+        );
+      },
+    };
+
+    const ctx = makeCcCtx({
+      storage,
+      timeline,
+      provider: closedProvider,
+      target: { provider: "discord", timelineKey: "discord:default:room:!guild:s", accountId: "default" },
+    });
+    const tools = createCrossChannelTools(ctx);
+    const tool = tools.find((t) => t.name === "send_dm")!;
+
+    const result = await tool.execute(
+      "call1",
+      { user: "123456789012345678", message: "hi", context_note: "discord closed dm" },
+      undefined as never,
+    );
+    const text = result.content[0]!.text as string;
+    assert.ok(
+      text.toLowerCase().includes("closed") || text.toLowerCase().includes("cannot"),
+      `Discord closed-DM error should be surfaced, got: ${text}`,
+    );
+    assert.ok(text.includes("message_ref"), `should include message_ref for retry, got: ${text}`);
+  });
+});
+
+// ── IRC: offline nick WHOIS miss surfaces spec error text ─────────────────────
+
+test("IRC openDm: offline nick WHOIS miss surfaces spec error text", async () => {
+  await withStorage(async (storage, timeline) => {
+    await storage.upsertUserIdentity({
+      provider: "irc",
+      userId: "libera.chat/offlinenick",
+      username: "offlinenick",
+      displayName: "Offline Nick",
+      observedAt: Date.now(),
+    });
+
+    const ircProvider: IChatProvider = {
+      ...stubProvider("irc"),
+      openDm: async (_acct, uid) => {
+        const nick = uid.split("/").pop() ?? uid;
+        throw new Error(
+          `IRC openDm: nick "${nick}" is not currently online — they won't receive the message. ` +
+            "Try again when they are online, or use a network-scoped id if the nick changed.",
+        );
+      },
+    };
+
+    const ctx = makeCcCtx({
+      storage,
+      timeline,
+      provider: ircProvider,
+      target: { provider: "irc", timelineKey: "irc:default:room:#general", accountId: "default" },
+    });
+    const tools = createCrossChannelTools(ctx);
+    const tool = tools.find((t) => t.name === "send_dm")!;
+
+    const result = await tool.execute(
+      "call1",
+      { user: "libera.chat/offlinenick", message: "ping", context_note: "irc whois miss" },
+      undefined as never,
+    );
+    const text = result.content[0]!.text as string;
+    assert.ok(
+      text.toLowerCase().includes("online"),
+      `IRC WHOIS miss should surface "online" in error, got: ${text}`,
+    );
+    assert.ok(text.includes("message_ref"), `should include message_ref, got: ${text}`);
+  });
+});
+
+// ── IRC: dm_enabled=false rejection in openDm ────────────────────────────────
+
+test("IRC openDm: dm_enabled=false is rejected with actionable error", async () => {
+  await withStorage(async (storage, timeline) => {
+    await storage.upsertUserIdentity({
+      provider: "irc",
+      userId: "libera.chat/someuser",
+      username: "someuser",
+      displayName: "Some User",
+      observedAt: Date.now(),
+    });
+
+    const ircNoInitProvider: IChatProvider = {
+      ...stubProvider("irc"),
+      openDm: async (_acct, _uid) => {
+        throw new Error(`IRC openDm: DMs are disabled for account "default" (dm_enabled: false).`);
+      },
+    };
+
+    const ctx = makeCcCtx({
+      storage,
+      timeline,
+      provider: ircNoInitProvider,
+      target: { provider: "irc", timelineKey: "irc:default:room:#general", accountId: "default" },
+    });
+    const tools = createCrossChannelTools(ctx);
+    const tool = tools.find((t) => t.name === "send_dm")!;
+
+    const result = await tool.execute(
+      "call1",
+      { user: "libera.chat/someuser", message: "hi", context_note: "irc dm disabled" },
+      undefined as never,
+    );
+    const text = result.content[0]!.text as string;
+    assert.ok(
+      text.toLowerCase().includes("disabled") || text.toLowerCase().includes("dm_enabled"),
+      `IRC dm_enabled=false should be surfaced, got: ${text}`,
+    );
+    assert.ok(text.includes("message_ref"), `should include message_ref, got: ${text}`);
+  });
+});
+
+// ── Discord: dmEnabled=false rejection in openDm ─────────────────────────────
+
+test("Discord openDm: dmEnabled=false is rejected with actionable error", async () => {
+  await withStorage(async (storage, timeline) => {
+    await storage.upsertUserIdentity({
+      provider: "discord",
+      userId: "987654321098765432",
+      username: "discorduser",
+      displayName: "Discord User",
+      observedAt: Date.now(),
+    });
+
+    const discordNoInitProvider: IChatProvider = {
+      ...stubProvider("discord"),
+      openDm: async (_acct, _uid) => {
+        throw new Error(`Discord openDm: DMs are disabled for account "default" (dm_enabled: false).`);
+      },
+    };
+
+    const ctx = makeCcCtx({
+      storage,
+      timeline,
+      provider: discordNoInitProvider,
+      target: { provider: "discord", timelineKey: "discord:default:room:!guild:s", accountId: "default" },
+    });
+    const tools = createCrossChannelTools(ctx);
+    const tool = tools.find((t) => t.name === "send_dm")!;
+
+    const result = await tool.execute(
+      "call1",
+      { user: "987654321098765432", message: "hello", context_note: "discord dm disabled" },
+      undefined as never,
+    );
+    const text = result.content[0]!.text as string;
+    assert.ok(
+      text.toLowerCase().includes("disabled") || text.toLowerCase().includes("dm_enabled"),
+      `Discord dmEnabled=false should be surfaced, got: ${text}`,
+    );
+    assert.ok(text.includes("message_ref"), `should include message_ref, got: ${text}`);
+  });
+});
+
+// ── list_channels: isolated DM is filtered out ────────────────────────────────
+
+test("list_channels: isolated DM is excluded even when include_dms=true", async () => {
+  await withStorage(async (storage, timeline) => {
+    const dmKey = "matrix:default:dm:!isolateddm:server";
+    const roomKey = "matrix:default:room:!mainroom:server";
+
+    const listProvider: IChatProvider = {
+      ...stubProvider("matrix"),
+      accountIds: () => ["default"],
+      listJoinedChannels: (_acct, opts) =>
+        opts?.includeDms ? [roomKey, dmKey] : [roomKey],
+    };
+
+    // DMs are globally isolated; the current session is in a non-DM room.
+    const isolatedResolver = new ChannelVisibilityResolver({ dms: "isolated" });
+
+    const ctx = makeCcCtx({
+      storage,
+      timeline,
+      provider: listProvider,
+      target: { provider: "matrix", timelineKey: roomKey, accountId: "default" },
+      visibilityResolver: isolatedResolver,
+    });
+    const tools = createCrossChannelTools(ctx);
+    const tool = tools.find((t) => t.name === "list_channels")!;
+
+    const result = await tool.execute(
+      "call1",
+      { include_dms: true },
+      undefined as never,
+    );
+    const text = result.content[0]!.text as string;
+    assert.ok(!text.includes(dmKey), `isolated DM must not appear in list_channels, got: ${text}`);
+    assert.ok(text.includes(roomKey), `non-isolated room should appear, got: ${text}`);
   });
 });

@@ -13,9 +13,11 @@
  *   dm_optout        — Self-service opt-out/in for agent-initiated DMs (§4.5)
  */
 
+import { unlink } from "node:fs/promises";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type {
+  AttachmentMeta,
   CanonicalChatEvent,
   IChatProvider,
   InboundChatEvent,
@@ -30,6 +32,7 @@ import type { ChannelVisibilityResolver } from "../visibility/index.js";
 import { chunkMarkdownText } from "./chunk.js";
 import { MATRIX_TERMINOLOGY } from "./terminology.js";
 import { formatAgentTimestamp } from "../time/index.js";
+import { resolveMedia } from "./send-message.js";
 
 // ── Context ───────────────────────────────────────────────────────────────────
 
@@ -71,32 +74,55 @@ export interface CrossChannelToolContext {
    * outside the agent's scope. Absent (undefined) in legacy mode → no filtering.
    */
   sessionAgentAccountPrefixes?: string[];
+  /**
+   * Workspace root for resolving local media file paths (m4, spec §4.1/§4.2).
+   * Injected from the session's workspace entry. Absent in tests.
+   */
+  workspaceRoot?: string;
+  /**
+   * Maximum download size for URL media attachments, in bytes (m4).
+   * Mirrors the same field in SendMessageToolContext. Absent → 50 MB default.
+   */
+  mediaMaxBytes?: number;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**
- * Simple session-scoped message stash: short handles (m1, m2, …) → body text.
+ * Simple session-scoped message stash: short handles (m1, m2, …) → body + optional media refs.
  * Dies with the session as required by §5.2 — this Map is created once per
  * `createCrossChannelTools` call and captured by closure in all five tool factories.
+ * mediaRefs are the original path/URL strings (not resolved binaries), so a retry
+ * re-resolves them from the workspace (m4, spec §5.2).
  */
+interface StashEntry {
+  body: string;
+  mediaRefs?: string[];
+}
+
 function makeMessageStash(): {
-  store(body: string): string;
-  recall(ref: string): string | undefined;
+  store(body: string, mediaRefs?: string[]): string;
+  recall(ref: string): StashEntry | undefined;
 } {
-  const stash = new Map<string, string>();
+  const stash = new Map<string, StashEntry>();
   let counter = 0;
   return {
-    store(body: string): string {
+    store(body: string, mediaRefs?: string[]): string {
       counter += 1;
       const ref = `m${counter}`;
-      stash.set(ref, body);
+      stash.set(ref, { body, mediaRefs: mediaRefs?.length ? mediaRefs : undefined });
       return ref;
     },
-    recall(ref: string): string | undefined {
+    recall(ref: string): StashEntry | undefined {
       return stash.get(ref);
     },
   };
+}
+
+/** Normalize args.media (string | string[] | undefined) to a string[]. */
+function normalizeMediaRefs(media: string | string[] | undefined): string[] {
+  if (!media) return [];
+  return (Array.isArray(media) ? media : [media]).filter((s) => s.trim());
 }
 
 /** Format epoch-ms as a human timestamp (mirrors read-messages.ts). */
@@ -124,12 +150,14 @@ function resolveSelf(ctx: CrossChannelToolContext): SenderInfo {
  * Send a message to `destTarget` (which may be any channel or DM the bot is in),
  * store cross_channel metadata, and ingest into the timeline.
  * Returns the result text or throws on provider error.
+ * `attachments` are forwarded to the provider's send call (m4, spec §4.1/§4.2).
  */
 async function sendWithCrossChannelNote(
   ctx: CrossChannelToolContext,
   destTarget: OutboundTarget,
   body: string,
   note: string,
+  attachments?: AttachmentMeta[],
 ): Promise<{ text: string; eventId: string | null }> {
   const destProvider = ctx.providers.get(destTarget.provider);
   if (!destProvider) {
@@ -152,6 +180,8 @@ async function sendWithCrossChannelNote(
     const receipt = await destProvider.send(destTarget, {
       body: chunks[i],
       agentSessionId: ctx.sessionId,
+      // Attach media only on the first chunk (multi-chunk sends are text-only after the first).
+      attachments: i === 0 && attachments?.length ? attachments : undefined,
     });
     const event: CanonicalChatEvent = {
       id: `assistant:${ctx.sessionId}:${receipt.externalId ?? Date.now()}:${i}`,
@@ -166,6 +196,7 @@ async function sendWithCrossChannelNote(
       timestamp: receipt.deliveredAt,
       receivedAt: Date.now(),
       crossChannel: i === 0 ? crossChannel : undefined,
+      attachments: i === 0 && attachments?.length ? attachments : undefined,
     };
     await ctx.timeline.ingestAssistantSend(event);
     lastEventId = receipt.externalId ?? null;
@@ -226,38 +257,67 @@ function createSendDmTool(
       "Requires the user's exact stable id (@user:server / snowflake / network/nick). " +
       "Use `list_members` with a `query` first when you only know a name. " +
       "A `context_note` is required: 1–2 sentences on why you're DMing and whether a reply should be relayed back.",
-    parameters: Type.Object({
-      user: Type.String({
-        description:
-          "Exact stable user id (@user:server for Matrix, snowflake for Discord, network/nick for IRC). " +
-          "Any string is accepted; an inexact match returns resolution candidates instead of sending.",
-      }),
-      message: Type.Optional(Type.String({
-        description: "Message body. Required unless message_ref is given.",
-      })),
-      message_ref: Type.Optional(Type.String({
-        description:
-          "Handle from a prior send_dm or send_to_channel resolution error (e.g. \"m1\"). " +
-          "Re-sends the stashed body. `message` wins when both are given.",
-      })),
-      context_note: Type.String({
-        minLength: 1,
-        description:
-          "Required 1–2 sentence note: what prompted this DM and whether/where a reply should be relayed back. " +
-          "Never sent to the recipient — stored locally as context for the DM session.",
-      }),
-    }),
+    parameters: (() => {
+      const caps = ctx.provider.capabilities;
+      const maxAttachments = caps?.maxAttachmentsPerMessage ?? 1;
+      const mediaParam = maxAttachments > 1
+        ? Type.Optional(Type.Union(
+            [
+              Type.String({ description: "Path to local file (relative to workspace) or URL to send as media attachment." }),
+              Type.Array(Type.String(), {
+                minItems: 1,
+                maxItems: maxAttachments,
+                description: `Array of paths/URLs to send as attachments (up to ${maxAttachments}).`,
+              }),
+            ],
+            { description: "Media attachment(s): a single path/URL, or an array of paths/URLs." },
+          ))
+        : Type.Optional(Type.String({ description: "Path to local file (relative to workspace) or URL to send as media attachment." }));
+      return Type.Object({
+        user: Type.String({
+          description:
+            "Exact stable user id (@user:server for Matrix, snowflake for Discord, network/nick for IRC). " +
+            "Any string is accepted; an inexact match returns resolution candidates instead of sending.",
+        }),
+        message: Type.Optional(Type.String({
+          description: "Message body. Required unless message_ref is given.",
+        })),
+        message_ref: Type.Optional(Type.String({
+          description:
+            "Handle from a prior send_dm or send_to_channel resolution error (e.g. \"m1\"). " +
+            "Re-sends the stashed body and media. `message` wins when both are given.",
+        })),
+        context_note: Type.String({
+          minLength: 1,
+          description:
+            "Required 1–2 sentence note: what prompted this DM and whether/where a reply should be relayed back. " +
+            "Never sent to the recipient — stored locally as context for the DM session.",
+        }),
+        media: mediaParam,
+        ...(caps?.voiceMessages
+          ? { as_voice: Type.Optional(Type.Boolean({ description: "When true, sends the media attachment as a voice message (audio only). Requires media to be set to an audio file." })) }
+          : {}),
+      });
+    })(),
     execute: async (_toolCallId, params) => {
       const args = params as {
         user: string;
         message?: string;
         message_ref?: string;
         context_note: string;
+        media?: string | string[];
+        as_voice?: boolean;
       };
 
       const userId = args.user.trim();
       if (!userId) {
         return { content: [{ type: "text", text: "error: `user` must not be empty." }], details: null };
+      }
+
+      // N3: manual empty context_note guard (mirrors minLength: 1 in the schema for
+      // frameworks that don't enforce JSON Schema constraints at execute time).
+      if (!args.context_note?.trim()) {
+        return { content: [{ type: "text", text: "error: `context_note` is required and must not be empty." }], details: null };
       }
 
       // Master switch + DM initiation gate (§10).
@@ -274,11 +334,15 @@ function createSendDmTool(
         };
       }
 
+      // m4: normalize media refs early so all stash entries preserve them for retry.
+      const rawMediaRefs = normalizeMediaRefs(args.media);
+
       // Resolve body from message / message_ref.
       let body: string | undefined = args.message?.trim();
+      let mediaRefs: string[] = rawMediaRefs;
       if (!body && args.message_ref) {
-        body = stash.recall(args.message_ref.trim());
-        if (!body) {
+        const recalled = stash.recall(args.message_ref.trim());
+        if (!recalled) {
           return {
             content: [{
               type: "text",
@@ -287,6 +351,9 @@ function createSendDmTool(
             details: null,
           };
         }
+        body = recalled.body;
+        // On retry: prefer stashed media, allow args.media to override when provided.
+        mediaRefs = rawMediaRefs.length > 0 ? rawMediaRefs : (recalled.mediaRefs ?? []);
       }
       if (!body) {
         return {
@@ -304,7 +371,7 @@ function createSendDmTool(
       // We also run it after fuzzy resolution, but we check early for exact ids.
       const earlyOptout = ctx.storage.getDmOptout(ctx.target.provider, canonicalUserId);
       if (earlyOptout) {
-        const ref = stash.store(body);
+        const ref = stash.store(body, mediaRefs);
         return {
           content: [{
             type: "text",
@@ -335,7 +402,7 @@ function createSendDmTool(
           limit: 5,
         });
         if (candidates.length === 0) {
-          const ref = stash.store(body);
+          const ref = stash.store(body, mediaRefs);
           return {
             content: [{
               type: "text",
@@ -355,7 +422,7 @@ function createSendDmTool(
         // If every candidate has opted out, give a terminal error rather than a
         // resolution list the agent cannot act on.
         if (candidatesWithOptout.every((c) => c.optedOut)) {
-          const ref = stash.store(body);
+          const ref = stash.store(body, mediaRefs);
           return {
             content: [{
               type: "text",
@@ -366,7 +433,7 @@ function createSendDmTool(
             details: null,
           };
         }
-        const ref = stash.store(body);
+        const ref = stash.store(body, mediaRefs);
         const lines = candidatesWithOptout.map((c) => formatCandidate(c, c.optedOut)).join("\n");
         return {
           content: [{
@@ -384,7 +451,7 @@ function createSendDmTool(
       // to a blocked user — in this branch we already have the exact id).
       const optout = ctx.storage.getDmOptout(ctx.target.provider, canonicalUserId);
       if (optout) {
-        const ref = stash.store(body);
+        const ref = stash.store(body, mediaRefs);
         return {
           content: [{ type: "text", text: buildOptoutError(canonicalUserId, optout.createdAt, optout.originTimelineKey, ref) }],
           details: null,
@@ -402,27 +469,81 @@ function createSendDmTool(
         };
       }
 
-      // M3: Eligibility — the user must have been seen in at least one channel
-      // this account has been in, OR an existing DM timeline must be on record.
-      // This prevents cold-contact spam to users the agent has never shared a
-      // space with. We check corpus presence first (fast), then fall back to the
-      // dm timeline index for users who only appeared via prior DMs.
+      // M3 + N2: Eligibility — user must satisfy at least one of:
+      //   (a) identity corpus presence (has posted in a shared channel)
+      //   (b) existing DM timeline on record
+      //   (c) live roster membership in a shared channel (N2: lurkers who never posted)
+      // Checks run in ascending cost order; short-circuit on first hit.
       const inCorpus = ctx.storage.searchUserIdentities(userId, {
         provider: ctx.target.provider,
         limit: 1,
       }).some((r) => r.userId === userId);
+
       if (!inCorpus) {
         const existingDm = ctx.storage.findDmTimelineKeysForUser(userId, { limit: 1 });
-        if (existingDm.length === 0) {
-          const ref = stash.store(body);
+        const hasDmHistory = existingDm.length > 0;
+
+        let eligible = hasDmHistory;
+        let rosterNote = "";
+        if (!hasDmHistory && ctx.provider.listJoinedChannels) {
+          // N2: roster check — scan shared channels for the user via memberInfo.
+          // Bound: check at most MAX_ROSTER_CHANNELS to avoid excessive IPC.
+          const MAX_ROSTER_CHANNELS = 20;
+          const joined = await ctx.provider.listJoinedChannels(accountId, { includeDms: false });
+          const channels = (joined ?? []).slice(0, MAX_ROSTER_CHANNELS);
+          for (const key of channels) {
+            const parsed = parseTimelineKey(key);
+            if (!parsed) continue;
+            const client = ctx.provider.channelClient({
+              provider: parsed.provider,
+              timelineKey: key,
+              accountId: parsed.accountId,
+            });
+            if (!client) continue;
+            try {
+              const info = await client.memberInfo(userId);
+              if (info) { eligible = true; break; }
+            } catch { /* skip this channel */ }
+          }
+          if (!eligible && joined && joined.length > MAX_ROSTER_CHANNELS) {
+            rosterNote = ` (roster check limited to ${MAX_ROSTER_CHANNELS}/${joined.length} channels)`;
+          }
+        }
+
+        if (!eligible) {
+          const ref = stash.store(body, mediaRefs);
           return {
             content: [{
               type: "text",
               text:
-                `User "${userId}" is not known — they have not appeared in any channel ` +
-                "this account has been in and no prior DM exists. " +
+                `User "${userId}" is not known — not in the identity corpus, no prior DM, ` +
+                `and not found in any shared channel roster${rosterNote}. ` +
                 `(message_ref: "${ref}")`,
             }],
+            details: null,
+          };
+        }
+      }
+
+      // m4: resolve media attachments (local paths or URLs).
+      const resolvedAttachments: AttachmentMeta[] = [];
+      const tempPaths: string[] = [];
+      if (mediaRefs.length > 0) {
+        try {
+          for (let i = 0; i < mediaRefs.length; i++) {
+            const { attachment, tempPath } = await resolveMedia(mediaRefs[i]!, {
+              workspaceRoot: ctx.workspaceRoot,
+              mediaMaxBytes: ctx.mediaMaxBytes,
+            });
+            if (i === 0 && args.as_voice) attachment.asVoice = true;
+            resolvedAttachments.push(attachment);
+            if (tempPath) tempPaths.push(tempPath);
+          }
+        } catch (err) {
+          const ref = stash.store(body, mediaRefs);
+          const msg = err instanceof Error ? err.message : String(err);
+          return {
+            content: [{ type: "text", text: `Failed to resolve media: ${msg}\n(message_ref: "${ref}" to retry)` }],
             details: null,
           };
         }
@@ -433,7 +554,8 @@ function createSendDmTool(
       try {
         dmResult = await ctx.provider.openDm(accountId, userId);
       } catch (err) {
-        const ref = stash.store(body);
+        for (const p of tempPaths) void unlink(p).catch(() => {});
+        const ref = stash.store(body, mediaRefs);
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{
@@ -471,9 +593,9 @@ function createSendDmTool(
       // Send message with context note.
       let sendResult: { text: string; eventId: string | null };
       try {
-        sendResult = await sendWithCrossChannelNote(ctx, dmTarget, body, args.context_note);
+        sendResult = await sendWithCrossChannelNote(ctx, dmTarget, body, args.context_note, resolvedAttachments.length ? resolvedAttachments : undefined);
       } catch (err) {
-        const ref = stash.store(body);
+        const ref = stash.store(body, mediaRefs);
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{
@@ -482,6 +604,9 @@ function createSendDmTool(
           }],
           details: null,
         };
+      } finally {
+        // m4: clean up any downloaded temp files regardless of success or failure.
+        for (const p of tempPaths) void unlink(p).catch(() => {});
       }
 
       const statusNote =
@@ -517,32 +642,61 @@ function createSendToChannelTool(
       "Send a message to another channel the bot is joined to (spec CROSS-CHANNEL-MESSAGING §4.2). " +
       "`channel` must be a full timeline key (use `list_channels` to enumerate joined channels). " +
       "A `context_note` is required: why this message is going there.",
-    parameters: Type.Object({
-      channel: Type.String({
-        description:
-          "Full timeline key of the destination channel (e.g. \"matrix:myaccount:room:!abc:example.org\"). " +
-          "Unknown or unjoined channels return an error listing valid targets.",
-      }),
-      message: Type.Optional(Type.String({ description: "Message body. Required unless message_ref is given." })),
-      message_ref: Type.Optional(Type.String({
-        description: "Handle from a prior resolution error (e.g. \"m1\"). Re-sends stashed body.",
-      })),
-      context_note: Type.String({
-        minLength: 1,
-        description:
-          "Required 1–2 sentence note: what prompted this message and any relay expectations. " +
-          "Stored locally on the event — not sent to the channel.",
-      }),
-    }),
+    parameters: (() => {
+      const caps = ctx.provider.capabilities;
+      const maxAttachments = caps?.maxAttachmentsPerMessage ?? 1;
+      const mediaParam = maxAttachments > 1
+        ? Type.Optional(Type.Union(
+            [
+              Type.String({ description: "Path to local file (relative to workspace) or URL to send as media attachment." }),
+              Type.Array(Type.String(), {
+                minItems: 1,
+                maxItems: maxAttachments,
+                description: `Array of paths/URLs to send as attachments (up to ${maxAttachments}).`,
+              }),
+            ],
+            { description: "Media attachment(s): a single path/URL, or an array of paths/URLs." },
+          ))
+        : Type.Optional(Type.String({ description: "Path to local file (relative to workspace) or URL to send as media attachment." }));
+      return Type.Object({
+        channel: Type.String({
+          description:
+            "Full timeline key of the destination channel (e.g. \"matrix:myaccount:room:!abc:example.org\"). " +
+            "Unknown or unjoined channels return an error listing valid targets. " +
+            "DM-kind keys are rejected — use send_dm instead.",
+        }),
+        message: Type.Optional(Type.String({ description: "Message body. Required unless message_ref is given." })),
+        message_ref: Type.Optional(Type.String({
+          description: "Handle from a prior resolution error (e.g. \"m1\"). Re-sends stashed body and media.",
+        })),
+        context_note: Type.String({
+          minLength: 1,
+          description:
+            "Required 1–2 sentence note: what prompted this message and any relay expectations. " +
+            "Stored locally on the event — not sent to the channel.",
+        }),
+        media: mediaParam,
+        ...(caps?.voiceMessages
+          ? { as_voice: Type.Optional(Type.Boolean({ description: "When true, sends the media attachment as a voice message (audio only). Requires media to be set to an audio file." })) }
+          : {}),
+      });
+    })(),
     execute: async (_toolCallId, params) => {
       const args = params as {
         channel: string;
         message?: string;
         message_ref?: string;
         context_note: string;
+        media?: string | string[];
+        as_voice?: boolean;
       };
 
       const channelKey = args.channel.trim();
+
+      // N3: manual empty context_note guard.
+      if (!args.context_note?.trim()) {
+        return { content: [{ type: "text", text: "error: `context_note` is required and must not be empty." }], details: null };
+      }
 
       if (!ctx.messagingEnabled) {
         return {
@@ -551,11 +705,15 @@ function createSendToChannelTool(
         };
       }
 
+      // m4: normalize media refs early so all stash entries preserve them for retry.
+      const rawMediaRefs = normalizeMediaRefs(args.media);
+
       // Resolve body.
       let body: string | undefined = args.message?.trim();
+      let mediaRefs: string[] = rawMediaRefs;
       if (!body && args.message_ref) {
-        body = stash.recall(args.message_ref.trim());
-        if (!body) {
+        const recalled = stash.recall(args.message_ref.trim());
+        if (!recalled) {
           return {
             content: [{
               type: "text",
@@ -564,6 +722,8 @@ function createSendToChannelTool(
             details: null,
           };
         }
+        body = recalled.body;
+        mediaRefs = rawMediaRefs.length > 0 ? rawMediaRefs : (recalled.mediaRefs ?? []);
       }
       if (!body) {
         return {
@@ -575,7 +735,7 @@ function createSendToChannelTool(
       // Parse and validate the target timeline key.
       const parsed = parseTimelineKey(channelKey);
       if (!parsed) {
-        const ref = stash.store(body);
+        const ref = stash.store(body, mediaRefs);
         return {
           content: [{
             type: "text",
@@ -590,7 +750,7 @@ function createSendToChannelTool(
       // C1 guard: dm-kind keys must go through send_dm where consent and
       // eligibility checks apply. Accepting them here would bypass opt-out.
       if (parsed.kind === "dm") {
-        const ref = stash.store(body);
+        const ref = stash.store(body, mediaRefs);
         return {
           content: [{
             type: "text",
@@ -606,7 +766,7 @@ function createSendToChannelTool(
       if (ctx.sessionAgentAccountPrefixes !== undefined) {
         const prefix = `${parsed.provider}:${parsed.accountId}`;
         if (!ctx.sessionAgentAccountPrefixes.includes(prefix)) {
-          const ref = stash.store(body);
+          const ref = stash.store(body, mediaRefs);
           return {
             content: [{
               type: "text",
@@ -622,7 +782,7 @@ function createSendToChannelTool(
       // Find the provider for this channel.
       const destProvider = ctx.providers.get(parsed.provider);
       if (!destProvider) {
-        const ref = stash.store(body);
+        const ref = stash.store(body, mediaRefs);
         return {
           content: [{
             type: "text",
@@ -638,18 +798,19 @@ function createSendToChannelTool(
       // should not SUGGEST them in error paths. For a valid explicit timeline key,
       // send proceeds regardless of visibility mode.
 
-      // Verify the account is joined by attempting to find the channel in the
-      // provider's joined list (best-effort — providers that don't implement
-      // listJoinedChannels skip this check).
+      // N1: Verify the account is currently joined by checking the provider's join
+      // registry (listJoinedChannels). Providers without the registry skip this
+      // check (best-effort). The Matrix implementation is async and also filters
+      // left rooms via channelInfo so this catches the "bot was removed" case.
       const accountId = parsed.accountId;
       if (destProvider.listJoinedChannels) {
-        const joined = destProvider.listJoinedChannels(accountId, { includeDms: true });
+        const joined = await destProvider.listJoinedChannels(accountId, { includeDms: true });
         if (joined && !joined.some((k) => k === channelKey)) {
           // Build visible (non-isolated) channel suggestions.
-          const visibleJoined = (joined ?? []).filter(
+          const visibleJoined = joined.filter(
             (k) => ctx.visibilityResolver.modeFor(k) !== "isolated" || k === ctx.target.timelineKey,
           );
-          const ref = stash.store(body);
+          const ref = stash.store(body, mediaRefs);
           const suggestions = visibleJoined.slice(0, 8).map((k) => `  ${k}`).join("\n");
           return {
             content: [{
@@ -659,6 +820,30 @@ function createSendToChannelTool(
                 `Valid channels include:\n${suggestions || "  (none visible)"}\n` +
                 `(message_ref: "${ref}")`,
             }],
+            details: null,
+          };
+        }
+      }
+
+      // m4: resolve media attachments (local paths or URLs).
+      const resolvedAttachments: AttachmentMeta[] = [];
+      const tempPaths: string[] = [];
+      if (mediaRefs.length > 0) {
+        try {
+          for (let i = 0; i < mediaRefs.length; i++) {
+            const { attachment, tempPath } = await resolveMedia(mediaRefs[i]!, {
+              workspaceRoot: ctx.workspaceRoot,
+              mediaMaxBytes: ctx.mediaMaxBytes,
+            });
+            if (i === 0 && args.as_voice) attachment.asVoice = true;
+            resolvedAttachments.push(attachment);
+            if (tempPath) tempPaths.push(tempPath);
+          }
+        } catch (err) {
+          const ref = stash.store(body, mediaRefs);
+          const msg = err instanceof Error ? err.message : String(err);
+          return {
+            content: [{ type: "text", text: `Failed to resolve media: ${msg}\n(message_ref: "${ref}" to retry)` }],
             details: null,
           };
         }
@@ -675,17 +860,25 @@ function createSendToChannelTool(
       // Send with context note.
       let sendResult: { text: string; eventId: string | null };
       try {
-        sendResult = await sendWithCrossChannelNote(ctx, destTarget, body, args.context_note);
+        sendResult = await sendWithCrossChannelNote(ctx, destTarget, body, args.context_note, resolvedAttachments.length ? resolvedAttachments : undefined);
       } catch (err) {
-        const ref = stash.store(body);
+        const ref = stash.store(body, mediaRefs);
         const msg = err instanceof Error ? err.message : String(err);
+        // N1(b): translate "not in room" send failures into an actionable error.
+        const isUnjoinedError = /not a member|forbidden|not joined|M_FORBIDDEN|not in the room|left the room/i.test(msg);
+        const friendlyMsg = isUnjoinedError
+          ? `Failed to send to ${channelKey}: the bot may no longer be in that room — use list_channels for current valid targets. (${msg})`
+          : `Failed to send to ${channelKey}: ${msg}`;
         return {
           content: [{
             type: "text",
-            text: `Failed to send to ${channelKey}: ${msg}\n(message_ref: "${ref}")`,
+            text: `${friendlyMsg}\n(message_ref: "${ref}")`,
           }],
           details: null,
         };
+      } finally {
+        // m4: clean up any downloaded temp files.
+        for (const p of tempPaths) void unlink(p).catch(() => {});
       }
 
       return {
@@ -903,7 +1096,7 @@ function createListChannelsTool(ctx: CrossChannelToolContext): AgentTool {
             const prefix = `${provider.id}:${accountId}`;
             if (!ctx.sessionAgentAccountPrefixes.includes(prefix)) continue;
           }
-          const joined = provider.listJoinedChannels(accountId, { includeDms });
+          const joined = await provider.listJoinedChannels(accountId, { includeDms });
           if (!joined) continue;
           for (const key of joined) {
             const parsed = parseTimelineKey(key);

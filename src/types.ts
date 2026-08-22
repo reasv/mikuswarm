@@ -691,7 +691,7 @@ export interface IChatProvider {
    * enumerate joined rooms efficiently. Matrix: not yet implemented (returns
    * undefined); Discord/IRC: available from in-memory state. (spec §4.4)
    */
-  listJoinedChannels?(accountId: string, opts?: { includeDms?: boolean }): string[] | undefined;
+  listJoinedChannels?(accountId: string, opts?: { includeDms?: boolean }): string[] | undefined | Promise<string[] | undefined>;
 }
 
 /**

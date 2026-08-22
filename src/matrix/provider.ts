@@ -93,7 +93,7 @@ export class MatrixProvider implements IChatProvider {
    * degradation: list_channels omits Matrix channels from the listing rather
    * than crashing).
    */
-  listJoinedChannelsSource?: (accountId: string, includeDms: boolean) => string[];
+  listJoinedChannelsSource?: (accountId: string, includeDms: boolean) => Promise<string[]>;
 
   /**
    * Self-ids of all in-process bot accounts across all agents (spec
@@ -501,7 +501,7 @@ export class MatrixProvider implements IChatProvider {
    * callback injected at app startup; returns undefined when the callback
    * is absent so list_channels degrades gracefully.
    */
-  listJoinedChannels(accountId: string, opts?: { includeDms?: boolean }): string[] | undefined {
+  async listJoinedChannels(accountId: string, opts?: { includeDms?: boolean }): Promise<string[] | undefined> {
     if (!this.listJoinedChannelsSource) return undefined;
     return this.listJoinedChannelsSource(accountId, opts?.includeDms ?? false);
   }

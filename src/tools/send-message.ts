@@ -323,9 +323,18 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
   };
 }
 
-async function resolveMedia(
+/**
+ * Minimal context needed for media resolution — a subset of SendMessageToolContext.
+ * Exported so cross-channel tools can resolve media without importing the full context type.
+ */
+export interface MediaResolveOpts {
+  workspaceRoot?: string;
+  mediaMaxBytes?: number;
+}
+
+export async function resolveMedia(
   mediaRef: string,
-  context: SendMessageToolContext,
+  context: MediaResolveOpts,
 ): Promise<{ attachment: AttachmentMeta; tempPath?: string }> {
   const maxBytes = context.mediaMaxBytes ?? 50 * 1024 * 1024;
 

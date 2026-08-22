@@ -1509,14 +1509,27 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   if (matrixProvider) {
     matrixProvider.siblingUserIds = botSelfIdsForLimits;
     matrixProvider.siblingRepliesMode = siblingRepliesMode;
-    // M2: storage-backed listJoinedChannels callback. Returns timeline keys from
-    // chat_index with the matching "matrix:<accountId>:" prefix, filtered by kind.
-    matrixProvider.listJoinedChannelsSource = (accountId: string, includeDms: boolean): string[] => {
+    // M2+N1(a): storage-backed listJoinedChannels callback. Returns timeline keys from
+    // chat_index with the matching "matrix:<accountId>:" prefix, filtered by kind, then
+    // further filtered by current join state (channelInfo — local state-store call, no
+    // network I/O) so left rooms are excluded from list_channels and send_to_channel checks.
+    matrixProvider.listJoinedChannelsSource = async (accountId: string, includeDms: boolean): Promise<string[]> => {
       const prefix = `matrix:${accountId}:`;
       const keys = storage.getDistinctTimelineKeysForAccountPrefixes([prefix]);
-      if (includeDms) return keys;
-      // Exclude dm-kind keys (contain ":dm:") when includeDms is false.
-      return keys.filter((k) => !k.includes(":dm:"));
+      const kindFiltered = includeDms ? keys : keys.filter((k) => !k.includes(":dm:"));
+      // N1(a): drop rooms the bot has left by checking the local matrix-sdk state.
+      const joined: string[] = [];
+      for (const key of kindFiltered) {
+        try {
+          const client = matrixProvider.channelClient({ provider: "matrix", timelineKey: key, accountId });
+          if (!client) { joined.push(key); continue; }  // no client → include (fail-open)
+          const info = await client.channelInfo();
+          if (info.joined !== false) joined.push(key);
+        } catch {
+          joined.push(key);  // channelInfo error → include (fail-open for listing)
+        }
+      }
+      return joined;
     };
   }
   const _discordProviderRef = providers.get("discord");
@@ -4548,6 +4561,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         terminology,
         // M4: agent-scoped account prefixes (multi-agent mode only).
         sessionAgentAccountPrefixes,
+        // m4: workspace and media config for attachment resolution.
+        workspaceRoot: sessionWsRoot,
+        mediaMaxBytes: downloadSizeLimit,
       }),
       // Chat-history search + recap (§9e) — DB-backed, not tied to the live room
       // client, so available regardless of roomId and able to span all rooms.
