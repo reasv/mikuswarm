@@ -98,19 +98,20 @@ export interface CrossChannelToolContext {
 interface StashEntry {
   body: string;
   mediaRefs?: string[];
+  asVoice?: boolean;
 }
 
 function makeMessageStash(): {
-  store(body: string, mediaRefs?: string[]): string;
+  store(body: string, mediaRefs?: string[], asVoice?: boolean): string;
   recall(ref: string): StashEntry | undefined;
 } {
   const stash = new Map<string, StashEntry>();
   let counter = 0;
   return {
-    store(body: string, mediaRefs?: string[]): string {
+    store(body: string, mediaRefs?: string[], asVoice?: boolean): string {
       counter += 1;
       const ref = `m${counter}`;
-      stash.set(ref, { body, mediaRefs: mediaRefs?.length ? mediaRefs : undefined });
+      stash.set(ref, { body, mediaRefs: mediaRefs?.length ? mediaRefs : undefined, asVoice: asVoice || undefined });
       return ref;
     },
     recall(ref: string): StashEntry | undefined {
@@ -340,6 +341,7 @@ function createSendDmTool(
       // Resolve body from message / message_ref.
       let body: string | undefined = args.message?.trim();
       let mediaRefs: string[] = rawMediaRefs;
+      let asVoice = args.as_voice === true;
       if (!body && args.message_ref) {
         const recalled = stash.recall(args.message_ref.trim());
         if (!recalled) {
@@ -354,6 +356,8 @@ function createSendDmTool(
         body = recalled.body;
         // On retry: prefer stashed media, allow args.media to override when provided.
         mediaRefs = rawMediaRefs.length > 0 ? rawMediaRefs : (recalled.mediaRefs ?? []);
+        // N4: restore the voice-message modality unless the retry overrides it.
+        if (args.as_voice === undefined && recalled.asVoice) asVoice = true;
       }
       if (!body) {
         return {
@@ -371,7 +375,7 @@ function createSendDmTool(
       // We also run it after fuzzy resolution, but we check early for exact ids.
       const earlyOptout = ctx.storage.getDmOptout(ctx.target.provider, canonicalUserId);
       if (earlyOptout) {
-        const ref = stash.store(body, mediaRefs);
+        const ref = stash.store(body, mediaRefs, asVoice);
         return {
           content: [{
             type: "text",
@@ -402,7 +406,7 @@ function createSendDmTool(
           limit: 5,
         });
         if (candidates.length === 0) {
-          const ref = stash.store(body, mediaRefs);
+          const ref = stash.store(body, mediaRefs, asVoice);
           return {
             content: [{
               type: "text",
@@ -422,7 +426,7 @@ function createSendDmTool(
         // If every candidate has opted out, give a terminal error rather than a
         // resolution list the agent cannot act on.
         if (candidatesWithOptout.every((c) => c.optedOut)) {
-          const ref = stash.store(body, mediaRefs);
+          const ref = stash.store(body, mediaRefs, asVoice);
           return {
             content: [{
               type: "text",
@@ -433,7 +437,7 @@ function createSendDmTool(
             details: null,
           };
         }
-        const ref = stash.store(body, mediaRefs);
+        const ref = stash.store(body, mediaRefs, asVoice);
         const lines = candidatesWithOptout.map((c) => formatCandidate(c, c.optedOut)).join("\n");
         return {
           content: [{
@@ -451,7 +455,7 @@ function createSendDmTool(
       // to a blocked user — in this branch we already have the exact id).
       const optout = ctx.storage.getDmOptout(ctx.target.provider, canonicalUserId);
       if (optout) {
-        const ref = stash.store(body, mediaRefs);
+        const ref = stash.store(body, mediaRefs, asVoice);
         return {
           content: [{ type: "text", text: buildOptoutError(canonicalUserId, optout.createdAt, optout.originTimelineKey, ref) }],
           details: null,
@@ -511,7 +515,7 @@ function createSendDmTool(
         }
 
         if (!eligible) {
-          const ref = stash.store(body, mediaRefs);
+          const ref = stash.store(body, mediaRefs, asVoice);
           return {
             content: [{
               type: "text",
@@ -535,12 +539,12 @@ function createSendDmTool(
               workspaceRoot: ctx.workspaceRoot,
               mediaMaxBytes: ctx.mediaMaxBytes,
             });
-            if (i === 0 && args.as_voice) attachment.asVoice = true;
+            if (i === 0 && asVoice) attachment.asVoice = true;
             resolvedAttachments.push(attachment);
             if (tempPath) tempPaths.push(tempPath);
           }
         } catch (err) {
-          const ref = stash.store(body, mediaRefs);
+          const ref = stash.store(body, mediaRefs, asVoice);
           const msg = err instanceof Error ? err.message : String(err);
           return {
             content: [{ type: "text", text: `Failed to resolve media: ${msg}\n(message_ref: "${ref}" to retry)` }],
@@ -555,7 +559,7 @@ function createSendDmTool(
         dmResult = await ctx.provider.openDm(accountId, userId);
       } catch (err) {
         for (const p of tempPaths) void unlink(p).catch(() => {});
-        const ref = stash.store(body, mediaRefs);
+        const ref = stash.store(body, mediaRefs, asVoice);
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{
@@ -595,7 +599,7 @@ function createSendDmTool(
       try {
         sendResult = await sendWithCrossChannelNote(ctx, dmTarget, body, args.context_note, resolvedAttachments.length ? resolvedAttachments : undefined);
       } catch (err) {
-        const ref = stash.store(body, mediaRefs);
+        const ref = stash.store(body, mediaRefs, asVoice);
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{
@@ -711,6 +715,7 @@ function createSendToChannelTool(
       // Resolve body.
       let body: string | undefined = args.message?.trim();
       let mediaRefs: string[] = rawMediaRefs;
+      let asVoice = args.as_voice === true;
       if (!body && args.message_ref) {
         const recalled = stash.recall(args.message_ref.trim());
         if (!recalled) {
@@ -724,6 +729,8 @@ function createSendToChannelTool(
         }
         body = recalled.body;
         mediaRefs = rawMediaRefs.length > 0 ? rawMediaRefs : (recalled.mediaRefs ?? []);
+        // N4: restore the voice-message modality unless the retry overrides it.
+        if (args.as_voice === undefined && recalled.asVoice) asVoice = true;
       }
       if (!body) {
         return {
@@ -735,7 +742,7 @@ function createSendToChannelTool(
       // Parse and validate the target timeline key.
       const parsed = parseTimelineKey(channelKey);
       if (!parsed) {
-        const ref = stash.store(body, mediaRefs);
+        const ref = stash.store(body, mediaRefs, asVoice);
         return {
           content: [{
             type: "text",
@@ -750,7 +757,7 @@ function createSendToChannelTool(
       // C1 guard: dm-kind keys must go through send_dm where consent and
       // eligibility checks apply. Accepting them here would bypass opt-out.
       if (parsed.kind === "dm") {
-        const ref = stash.store(body, mediaRefs);
+        const ref = stash.store(body, mediaRefs, asVoice);
         return {
           content: [{
             type: "text",
@@ -766,7 +773,7 @@ function createSendToChannelTool(
       if (ctx.sessionAgentAccountPrefixes !== undefined) {
         const prefix = `${parsed.provider}:${parsed.accountId}`;
         if (!ctx.sessionAgentAccountPrefixes.includes(prefix)) {
-          const ref = stash.store(body, mediaRefs);
+          const ref = stash.store(body, mediaRefs, asVoice);
           return {
             content: [{
               type: "text",
@@ -782,7 +789,7 @@ function createSendToChannelTool(
       // Find the provider for this channel.
       const destProvider = ctx.providers.get(parsed.provider);
       if (!destProvider) {
-        const ref = stash.store(body, mediaRefs);
+        const ref = stash.store(body, mediaRefs, asVoice);
         return {
           content: [{
             type: "text",
@@ -810,7 +817,7 @@ function createSendToChannelTool(
           const visibleJoined = joined.filter(
             (k) => ctx.visibilityResolver.modeFor(k) !== "isolated" || k === ctx.target.timelineKey,
           );
-          const ref = stash.store(body, mediaRefs);
+          const ref = stash.store(body, mediaRefs, asVoice);
           const suggestions = visibleJoined.slice(0, 8).map((k) => `  ${k}`).join("\n");
           return {
             content: [{
@@ -835,12 +842,12 @@ function createSendToChannelTool(
               workspaceRoot: ctx.workspaceRoot,
               mediaMaxBytes: ctx.mediaMaxBytes,
             });
-            if (i === 0 && args.as_voice) attachment.asVoice = true;
+            if (i === 0 && asVoice) attachment.asVoice = true;
             resolvedAttachments.push(attachment);
             if (tempPath) tempPaths.push(tempPath);
           }
         } catch (err) {
-          const ref = stash.store(body, mediaRefs);
+          const ref = stash.store(body, mediaRefs, asVoice);
           const msg = err instanceof Error ? err.message : String(err);
           return {
             content: [{ type: "text", text: `Failed to resolve media: ${msg}\n(message_ref: "${ref}" to retry)` }],
@@ -862,7 +869,7 @@ function createSendToChannelTool(
       try {
         sendResult = await sendWithCrossChannelNote(ctx, destTarget, body, args.context_note, resolvedAttachments.length ? resolvedAttachments : undefined);
       } catch (err) {
-        const ref = stash.store(body, mediaRefs);
+        const ref = stash.store(body, mediaRefs, asVoice);
         const msg = err instanceof Error ? err.message : String(err);
         // N1(b): translate "not in room" send failures into an actionable error.
         const isUnjoinedError = /not a member|forbidden|not joined|M_FORBIDDEN|not in the room|left the room/i.test(msg);
