@@ -2705,27 +2705,33 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     const enrichmentStatus = needsEnrichment(inbound.event) ? "pending" : "skipped";
     const routed = await router.route(inbound, enrichmentStatus);
 
-    // Identity upsert (§6.5): data-presence-driven, no config knob. Only called
-    // when the sender carries a `username` field — Discord does, Matrix never does.
-    // With an empty `user_identities` table the Matrix path is GUARANTEED to be
-    // byte-identical: this branch is dead for every Matrix event (no username set).
+    // Identity upsert (§6.5 + §8.4 cross-channel prerequisite): data-presence-driven.
+    // Discord/IRC carry a distinct `username`; Matrix uses the MXID (localpart) as
+    // the username so the resolution corpus is populated for all three providers.
     // isSelf senders are included so operator-side bot renames are absorbed. Fires
     // for both new and duplicate events (a rename may happen between two copies of
-    // the same external_id arriving on different gateways). Fire-and-forget through
-    // the single-writer queue — a failure here must never stall the ingest path.
-    if (inbound.event.sender.username) {
+    // the same external_id). Fire-and-forget — failure must never stall ingest.
+    {
+      const senderId = inbound.event.sender.id;
+      // Derive a "username" for providers that lack a separate username field.
+      // Matrix: extract the localpart from the MXID ("@alice:example.org" → "alice").
+      // Fallback: use the full id so the corpus row is always written.
+      const username = inbound.event.sender.username
+        ?? (inbound.provider === "matrix" && senderId.startsWith("@")
+            ? (senderId.slice(1).split(":")[0] ?? senderId)
+            : senderId);
       void storage
         .upsertUserIdentity({
           provider: inbound.provider,
-          userId: inbound.event.sender.id,
-          username: inbound.event.sender.username,
+          userId: senderId,
+          username,
           displayName: inbound.event.sender.displayName,
           observedAt: inbound.event.timestamp,
         })
         .catch((error) =>
           logger.warn("identity_upsert_failed", {
             provider: inbound.provider,
-            userId: inbound.event.sender.id,
+            userId: senderId,
             error: error instanceof Error ? error.message : String(error),
           }),
         );
