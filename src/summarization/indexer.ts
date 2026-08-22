@@ -362,6 +362,7 @@ export class SummarizationIndexer {
         newestLatestTs,
         layerTokens,
         summaryTarget,
+        allSummaries,
       );
       if (enqueued) return; // one job per pass
     }
@@ -382,15 +383,15 @@ export class SummarizationIndexer {
     newestLatestTs: number,
     layerTokens: number,
     summaryTarget: number,
+    selectionSummaries: Summary[],
   ): Promise<boolean> {
     const { storage, config, logger } = this.options;
 
-    // Get uncondensed summaries at this level (same exclusion as evaluateCondensation).
-    const allAtLevel = storage.getSummariesByLevel(timelineKey, level);
-    const covered = storage.getCondensedSummaryIds(timelineKey, level);
-    const summaries = covered.size === 0
-      ? allAtLevel
-      : allAtLevel.filter((s) => !covered.has(s.id));
+    // Candidates are the current selection at this level. selectSummaryCoverage
+    // already masks pre-lineage-era phantoms that sit within a higher-level
+    // summary's timestamp span, so they never appear here and cannot stall
+    // discovery or produce over-large condense requests.
+    const summaries = selectionSummaries.filter((s) => s.level === level);
     if (summaries.length === 0) return false;
 
     // Build failed ranges for levels 1..level (same logic as evaluateCondensation).
@@ -429,7 +430,12 @@ export class SummarizationIndexer {
       }
       const prev = current[current.length - 1]!;
       const interrupted =
-        storage.hasSummaryBetween(timelineKey, level, prev.latestTimestamp, summary.earliestTimestamp) ||
+        selectionSummaries.some(
+          (other) =>
+            other.level > level &&
+            other.latestTimestamp > prev.latestTimestamp &&
+            other.earliestTimestamp < summary.earliestTimestamp,
+        ) ||
         failedRangeInGap(prev, summary);
       if (interrupted) {
         runs.push(current);
@@ -466,15 +472,11 @@ export class SummarizationIndexer {
       // Find adjacent level-(level+1) parents.
       const prevRunEnd = ri > 0 ? runs[ri - 1]![runs[ri - 1]!.length - 1]!.latestTimestamp : 0;
       const nextRunStart = ri < runs.length - 1 ? runs[ri + 1]![0]!.earliestTimestamp : Infinity;
-      // Only consider parents that are resident in the summary layer — i.e. not already
-      // condensed into a level-(level+2) summary. A condensed parent contributes zero tokens
-      // to the rendered layer; absorbing into it reduces cost by nothing, wastes inference,
-      // and can orphan the replacement outside the grandparent's child list (spec §5).
-      const allParents = storage.getSummariesByLevel(timelineKey, level + 1);
-      const condensedParentIds = storage.getCondensedSummaryIds(timelineKey, level + 1);
-      const parents = condensedParentIds.size === 0
-        ? allParents
-        : allParents.filter((p) => !condensedParentIds.has(p.id));
+      // Candidate parents are the selection's entries at level+1. A condensed
+      // parent is absent from the selection (pruned by selectSummaryCoverage),
+      // so absorbing into it would reduce rendered-layer cost by nothing — the
+      // same resident-layer invariant enforced via the selection.
+      const parents = selectionSummaries.filter((s) => s.level === level + 1);
 
       // Left-adjacent: parent's coverage ends in the gap before this run.
       const leftCandidates = parents.filter(

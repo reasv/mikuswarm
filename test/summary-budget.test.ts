@@ -166,7 +166,10 @@ async function addSentinel(storage: Storage): Promise<void> {
       eventIds: ["ev0"],
     });
   }
-  await insertSummary(storage, "se_P_full", "sentinel", 2, 2000, 2010, "j_se_P_full", {
+  // earliestTs=1999 (strictly before the L1 children at 2000+) so se_P_full sorts
+  // first in selectSummaryCoverage and is added to the selection before any L1 child
+  // is processed. All se_l1_* (latestTs ≤ 2010) are then skipped as covered.
+  await insertSummary(storage, "se_P_full", "sentinel", 2, 1999, 2010, "j_se_P_full", {
     parentIds,
   });
 }
@@ -822,7 +825,11 @@ test("budget: condensed parent excluded from absorption — run falls through to
     await insertSummary(storage, "P", "parent condensed", 2, 1000, 1003, "j_P", {
       parentIds: ["s1", "s2"],
     });
-    await insertSummary(storage, "G", "grandparent", 3, 1000, 1003, "j_G", {
+    // earliestTs=999 (strictly before P.earliestTs=1000) ensures G is processed first
+    // in selectSummaryCoverage and covers P (latestTs=1003 ≤ G's coverageEnd=1003).
+    // If G and P share earliestTs=1000, SQLite's unstable sort may process P first,
+    // putting P into the selection where it becomes an absorb candidate for [s3,s4].
+    await insertSummary(storage, "G", "grandparent", 3, 999, 1003, "j_G", {
       parentIds: ["P"],
     });
     // Uncondensed L1 run [s3, s4] adjacent to P (which is condensed).
@@ -839,7 +846,8 @@ test("budget: condensed parent excluded from absorption — run falls through to
         eventIds: ["ev0"],
       });
     }
-    await insertSummary(storage, "se2_P_full", "sentinel", 2, 5000, 5010, "j_se2_P_full", {
+    // earliestTs=4999 (before the L1 children at 5000+) so se2_P_full sorts first.
+    await insertSummary(storage, "se2_P_full", "sentinel", 2, 4999, 5010, "j_se2_P_full", {
       parentIds: sentinelParentIds,
     });
 
@@ -1781,59 +1789,58 @@ test("budget: worker pool resolves L2 job from explicit inputChildIds, not span 
 });
 
 // ---------------------------------------------------------------------------
-// Pre-lineage-era phantom eligible run: span-integrity guard skips candidate.
+// §9b selection-based discovery: phantom masking, skip-continue, reproduction.
 // ---------------------------------------------------------------------------
 
-test("budget: span-integrity guard skips absorb candidate when span returns phantom interlopers", async () => {
-  // Scenario:
-  //   a1(100-150), a2(200-249): ancient L1 phantoms with NO summary_parents rows
-  //     → appear uncondensed → form eligible run [a1, a2]
-  //   cond1(101-150), cond2(201-249): L1 summaries properly condensed by old_L2
-  //     → have summary_parents rows → EXCLUDED from uncondensed set
-  //     → BUT still returned by getSummariesBetween(a1..c2) as phantom interlopers
-  //   old_L2(101-249, L2): earliest=101 < rk.latestTs=249, so NOT in rightCandidates
-  //   c1(500-550), c2(600-650): L1 summaries condensed by P
-  //   P(500-650, L2): right-adjacent candidate for run [a1, a2]; children=[c1, c2]
+test("budget: pre-lineage phantom L1 masked by higher-level selection — not a candidate, resident band processed", async () => {
+  // With selection-based discovery, a phantom L1 that falls within the timestamp
+  // span of an already-selected higher-level summary is skipped by selectSummaryCoverage
+  // and never becomes a run candidate.
   //
-  //   Absorb into P: allChildren sorted=[a1(100), a2(200), c1(500), c2(600)]
-  //   Span [a1..c2] at level=1 also contains cond1(101) and cond2(201)
-  //   → 6 materialized ≠ 4 declared → span-integrity skip → no job enqueued
-
+  // old_L2 (L2, 100-501) has earliestTs=100 < phantom1.earliestTs=500. In the sorted
+  // candidate list old_L2 is processed first and added with coverageEnd=501. When
+  // phantom1 (latestTs=501) is processed, latestTs ≤ coverageEnd → skipped.
+  //
+  // The genuine over-budget band [s1, s2] IS selected at level 1 and bootstrapped.
+  // No span-integrity event fires because phantom1 never forms a run candidate.
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     const bigContent = "word ".repeat(100);
 
-    // Phantom L1s: no summary_parents rows (pre-lineage era). They appear as
-    // uncondensed and form the eligible run [a1, a2].
-    await insertSummary(storage, "a1", bigContent, 1, 100, 150, "j_a1", { eventIds: ["ev0"] });
-    await insertSummary(storage, "a2", bigContent, 1, 200, 249, "j_a2", { eventIds: ["ev0"] });
-
-    // L1 summaries properly condensed by old_L2 — have summary_parents rows so
-    // EXCLUDED from the uncondensed set. Timestamps interleave with the phantoms
-    // so they appear as phantom interlopers in getSummariesBetween(a1..c2).
-    // old_L2.earliestTimestamp=101 < rk.latestTimestamp=249 → old_L2 is NOT a
-    // rightCandidates absorb target for run [a1, a2].
-    await insertSummary(storage, "cond1", bigContent, 1, 101, 150, "j_cond1", { eventIds: ["ev0"] });
-    await insertSummary(storage, "cond2", bigContent, 1, 201, 249, "j_cond2", { eventIds: ["ev0"] });
-    await insertSummary(storage, "old_L2", "old parent", 2, 101, 249, "j_old_L2", {
-      parentIds: ["cond1", "cond2"],
+    // old_L2 covers [100, 501]; real L1 children give it lineage.
+    await insertSummary(storage, "real1", bigContent, 1, 100, 200, "j_real1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "real2", bigContent, 1, 201, 300, "j_real2", { eventIds: ["ev0"] });
+    await insertSummary(storage, "old_L2", "old parent summary", 2, 100, 501, "j_old_L2", {
+      parentIds: ["real1", "real2"],
     });
 
-    // P with children c1, c2 — the intended absorb target.
-    await insertSummary(storage, "c1", bigContent, 1, 500, 550, "j_c1", { eventIds: ["ev0"] });
-    await insertSummary(storage, "c2", bigContent, 1, 600, 650, "j_c2", { eventIds: ["ev0"] });
-    await insertSummary(storage, "P", "parent words here", 2, 500, 650, "j_P", {
-      parentIds: ["c1", "c2"],
+    // Phantom L1: no summary_parents rows. latestTs=501 ≤ old_L2.coverageEnd=501 → masked.
+    await insertSummary(storage, "phantom1", bigContent, 1, 500, 501, "j_phantom1", {
+      eventIds: ["ev0"],
     });
+
+    // Over-budget resident band — genuinely uncondensed, in the selection.
+    await insertSummary(storage, "s1", bigContent, 1, 1000, 1001, "j_s1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "s2", bigContent, 1, 1002, 1003, "j_s2", { eventIds: ["ev0"] });
+
+    // Sentinel pushes newestLatestTs >> 1003 and old_L2 has 2 children (absorbMax=2
+    // → capacity=0) so the run [s1, s2] falls through to bootstrap without hitting
+    // span-integrity (no absorb attempt touches the phantom's timestamp range).
+    await addSentinel(storage);
 
     const warnLogs: Array<Record<string, unknown>> = [];
     const infoLogs: Array<Record<string, unknown>> = [];
     const indexer = makeIndexer(
       storage, store,
       { summary_target_tokens: 100, summary_max_tokens: 150 },
-      { condense_fanout: 5, condense_target_tokens: 5, eager_absorb_max_children: 10, max_retries: 2 },
+      {
+        condense_fanout: 5,
+        condense_target_tokens: 5,
+        eager_absorb_max_children: 2, // old_L2 at capacity → no absorb → no span-integrity check
+        max_retries: 2,
+      },
       {
         logger: {
           info: (event: string, data?: unknown) => infoLogs.push({ event, ...(data as any) }),
@@ -1845,22 +1852,217 @@ test("budget: span-integrity guard skips absorb candidate when span returns phan
     indexer.enqueueReconcileTimeline(TK);
     await indexer.stop();
 
-    // Span-integrity guard must have fired (declared 4, materialized 6).
+    // Phantom was masked by the selection — no span-integrity guard needed or fired.
     assert.ok(
-      warnLogs.some((l) => l.event === "summary_budget_span_integrity_skip"),
-      "summary_budget_span_integrity_skip emitted",
+      !warnLogs.some((l) => l.event === "summary_budget_span_integrity_skip"),
+      "no span-integrity skip — phantom1 never became a run candidate",
     );
 
-    // No budget condense job enqueued (guard blocked all candidates).
+    // The legitimate resident band [s1, s2] was discovered and bootstrapped.
+    const enq = infoLogs.find((l) => l.event === "summary_budget_condense_enqueued");
+    assert.ok(enq, "a job was enqueued for the resident band");
+    assert.equal(enq!.shape, "bootstrap", "bootstrap — no absorb parent with capacity");
+    assert.equal(enq!.childCount, 2, "only s1 and s2; phantom1 excluded");
+  } finally {
+    storage.close();
+  }
+});
+
+test("budget: span-integrity skip-continue — first run's absorb fails span check, second run's bootstrap succeeds", async () => {
+  // Verifies that a span-integrity failure on a run's absorb does not abort the
+  // entire pass: the indexer continues to the next run and enqueues for that.
+  //
+  // A phantom L1 (phantom_in_P) lives inside P's historical child span. It is
+  // masked from the selection by P (P.earliestTs=999 < phantom_in_P.earliestTs=1200,
+  // so P is added to selection first with coverageEnd=1999; phantom_in_P.latestTs=1300
+  // ≤ 1999 → skipped). phantom_in_P is NOT a run candidate. But it IS in the DB
+  // at level 1, so getSummariesBetween(cond1..s_a2, 1) returns it as an extra —
+  // span-integrity fires on the absorb into P → `continue`.
+  //
+  // inter_L2 (L2, 2999-3209) in the selection creates the run-A / run-B split
+  // (latestTs=3209 > s_a2.latestTs=2999, earliestTs=2999 < s_b1.earliestTs=4000).
+  // inter_L2 is at absorbMax capacity (4 children, absorbMax=4) → no absorb into it.
+  // Run B [s_b1, s_b2] has no adjacent parent with capacity → bootstrap succeeds.
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const store = new TimelineStore(storage);
+    await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
+    const bigContent = "word ".repeat(100);
+
+    // P (L2, 999-1999): earliestTs=999 ensures P precedes phantom_in_P in the sort.
+    await insertSummary(storage, "cond1", bigContent, 1, 1000, 1499, "j_cond1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "cond2", bigContent, 1, 1500, 1999, "j_cond2", { eventIds: ["ev0"] });
+    await insertSummary(storage, "P", "parent summary words", 2, 999, 1999, "j_P", {
+      parentIds: ["cond1", "cond2"],
+    });
+
+    // Phantom inside P's span: masked from selection, but present in DB at level 1.
+    await insertSummary(storage, "phantom_in_P", bigContent, 1, 1200, 1300, "j_phantom", {
+      eventIds: ["ev0"],
+    });
+
+    // Run A: left-adjacent to P. Absorb into P fires span-integrity (phantom_in_P
+    // sits between cond1 and s_a2 in the DB → 5 materialized vs 4 declared).
+    await insertSummary(storage, "s_a1", bigContent, 1, 2000, 2499, "j_sa1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "s_a2", bigContent, 1, 2500, 2999, "j_sa2", { eventIds: ["ev0"] });
+
+    // inter_L2 (L2, 2999-3209): splits run A from run B in the selection.
+    // 4 children → at absorbMax=4 capacity → cannot absorb run-B members.
+    await insertSummary(storage, "ic1", "x", 1, 3010, 3059, "j_ic1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "ic2", "x", 1, 3060, 3109, "j_ic2", { eventIds: ["ev0"] });
+    await insertSummary(storage, "ic3", "x", 1, 3110, 3159, "j_ic3", { eventIds: ["ev0"] });
+    await insertSummary(storage, "ic4", "x", 1, 3160, 3209, "j_ic4", { eventIds: ["ev0"] });
+    await insertSummary(storage, "inter_L2", "inter parent", 2, 2999, 3209, "j_inter", {
+      parentIds: ["ic1", "ic2", "ic3", "ic4"],
+    });
+
+    // Run B: bootstrap target. No adjacent parent with spare capacity.
+    await insertSummary(storage, "s_b1", bigContent, 1, 4000, 4499, "j_sb1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "s_b2", bigContent, 1, 4500, 4999, "j_sb2", { eventIds: ["ev0"] });
+
+    // Sentinel at L3 to push newestLatestTs >> 5000 and maxLevel=3.
+    const sIds: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const id = `sl1_${i}`;
+      sIds.push(id);
+      await insertSummary(storage, id, "x", 1, 8000 + i, 8001 + i, `j_sl1_${i}`, { eventIds: ["ev0"] });
+    }
+    // sl2.earliestTs=7999 < sl1_0.earliestTs=8000, sl3.earliestTs=7998 < sl2.earliestTs=7999.
+    // This ensures sl3 sorts first in selectSummaryCoverage (coverageEnd=8005), masking
+    // sl2 and all sl1_* so they don't appear as stray candidates.
+    await insertSummary(storage, "sl2", "x", 2, 7999, 8005, "j_sl2", { parentIds: sIds });
+    await insertSummary(storage, "sl3", "x", 3, 7998, 8005, "j_sl3", { parentIds: ["sl2"] });
+
+    const warnLogs: Array<Record<string, unknown>> = [];
+    const infoLogs: Array<Record<string, unknown>> = [];
+    const indexer = makeIndexer(
+      storage, store,
+      { summary_target_tokens: 100, summary_max_tokens: 150 },
+      {
+        condense_fanout: 5,
+        condense_target_tokens: 5,
+        eager_absorb_max_children: 4, // P (2 children): capacity=2; inter_L2 (4): capacity=0
+        eager_condense_min_children: 2,
+        max_retries: 2,
+      },
+      {
+        logger: {
+          info: (event: string, data?: unknown) => infoLogs.push({ event, ...(data as any) }),
+          warn: (event: string, data?: unknown) => warnLogs.push({ event, ...(data as any) }),
+          error: () => {}, debug: () => {},
+        } as any,
+      },
+    );
+    indexer.enqueueReconcileTimeline(TK);
+    await indexer.stop();
+
+    // Run A's absorb into P fires span-integrity (phantom_in_P is an interloper).
     assert.ok(
-      !infoLogs.some((l) => l.event === "summary_budget_condense_enqueued"),
-      "no condense job enqueued when span-integrity fails",
+      warnLogs.some((l) => l.event === "summary_budget_span_integrity_skip"),
+      "span-integrity skip emitted for run A's absorb into P",
     );
-    assert.equal(
-      storage.getActiveSummarizationJobs(TK, 2).length,
-      0,
-      "no active L2 condensation jobs",
+
+    // The pass continued to run B and enqueued a bootstrap.
+    const enq = infoLogs.find((l) => l.event === "summary_budget_condense_enqueued");
+    assert.ok(enq, "a job was enqueued for run B (skip-continue worked)");
+    assert.equal(enq!.shape, "bootstrap", "run B falls back to bootstrap");
+    assert.equal(enq!.summaryLevel, 2, "bootstrap at level 2 (L1→L2)");
+    assert.equal(enq!.childCount, 2, "run B: s_b1 and s_b2");
+  } finally {
+    storage.close();
+  }
+});
+
+test("budget: reproduction fixture — pre-lineage phantoms masked by L3, over-budget L2 band absorbed", async () => {
+  // Mirrors the production stall that triggered this fix. The timeline had:
+  //   - Pre-lineage L1 phantoms (no summary_parents rows) at old timestamps
+  //   - A wide old_L3 (earliestTs=50) covering those timestamps in the selection
+  //   - 4 uncondensed L2 summaries forming the over-budget resident band
+  //   - Live-edge L1s not eligible
+  //
+  // Raw-pool discovery always found the phantoms first (declared 7 inputs vs 682
+  // materialized → span-integrity fired every pass → stall). With selection-based
+  // discovery old_L3 (earliestTs=50 < phantom timestamps) is added to the selection
+  // first (coverageEnd=500); the phantoms (latestTs ≤ 500) are skipped. The L2 band
+  // IS in the selection and gets absorbed into old_L3 on the first eligible pass.
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const store = new TimelineStore(storage);
+    await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
+    const bigContent = "word ".repeat(100);
+
+    // Historical L1→L2→L3 chain. old_L3.earliestTs=1 ensures it sorts first in
+    // selectSummaryCoverage (coverageEnd=500); the phantoms (latestTs ≤ 500) are
+    // then skipped as covered. old_l2 and old_l1_* (latestTs ≤ 49) are also skipped.
+    await insertSummary(storage, "old_l1_a", bigContent, 1, 1, 24, "j_old_l1_a", { eventIds: ["ev0"] });
+    await insertSummary(storage, "old_l1_b", bigContent, 1, 25, 49, "j_old_l1_b", { eventIds: ["ev0"] });
+    await insertSummary(storage, "old_l2", "old l2", 2, 1, 49, "j_old_l2", {
+      parentIds: ["old_l1_a", "old_l1_b"],
+    });
+    await insertSummary(storage, "old_L3", "old top-level summary", 3, 1, 500, "j_old_L3", {
+      parentIds: ["old_l2"],
+    });
+
+    // Phantom L1s: no parents; timestamps within old_L3's span → masked.
+    await insertSummary(storage, "phantom1", bigContent, 1, 100, 150, "j_ph1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "phantom2", bigContent, 1, 200, 250, "j_ph2", { eventIds: ["ev0"] });
+
+    // Over-budget resident L2 band: 4 uncondensed L2 summaries (no L3 parent).
+    // Each L2 needs a real L1 child to satisfy insertSummaryWithLineage's constraint.
+    // Each l2_i.earliestTs = base-1 (one tick before its L1 child at base) so l2_i
+    // sorts before lc_i in selectSummaryCoverage and is added to the selection first;
+    // lc_i (latestTs=base+99 ≤ l2_i.latestTs=base+99) is then skipped as covered.
+    for (let i = 1; i <= 4; i++) {
+      const base = 600 + (i - 1) * 100;
+      const lc_id = `lc_${i}`;
+      const l2_id = `l2_${i}`;
+      await insertSummary(storage, lc_id, bigContent, 1, base, base + 99, `j_lc_${i}`, { eventIds: ["ev0"] });
+      await insertSummary(storage, l2_id, bigContent, 2, base - 1, base + 99, `j_l2_${i}`, {
+        parentIds: [lc_id],
+      });
+    }
+
+    // Live-edge L1s (live-edge guard fires — newestLatestTs = live2.latestTs = 5003).
+    await insertSummary(storage, "live1", bigContent, 1, 5000, 5001, "j_live1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "live2", bigContent, 1, 5002, 5003, "j_live2", { eventIds: ["ev0"] });
+
+    const warnLogs: Array<Record<string, unknown>> = [];
+    const infoLogs: Array<Record<string, unknown>> = [];
+    const indexer = makeIndexer(
+      storage, store,
+      { summary_target_tokens: 100, summary_max_tokens: 150 },
+      {
+        condense_fanout: 5,
+        condense_target_tokens: 5,
+        eager_absorb_max_children: 10,
+        eager_condense_min_children: 2,
+        max_retries: 2,
+      },
+      {
+        logger: {
+          info: (event: string, data?: unknown) => infoLogs.push({ event, ...(data as any) }),
+          warn: (event: string, data?: unknown) => warnLogs.push({ event, ...(data as any) }),
+          error: () => {}, debug: () => {},
+        } as any,
+      },
     );
+    indexer.enqueueReconcileTimeline(TK);
+    await indexer.stop();
+
+    // Phantoms were masked — no span-integrity event fired.
+    assert.ok(
+      !warnLogs.some((l) => l.event === "summary_budget_span_integrity_skip"),
+      "no span-integrity skip — phantoms masked by old_L3 in selection",
+    );
+
+    // L2 band discovered and absorbed into old_L3.
+    const enq = infoLogs.find((l) => l.event === "summary_budget_condense_enqueued");
+    assert.ok(enq, "a job was enqueued for the over-budget L2 band");
+    assert.equal(enq!.shape, "absorb", "L2 band absorbed into old_L3");
+    assert.equal(enq!.parentId, "old_L3", "absorption target is old_L3");
+    // runLength = the 4 new run members; childCount includes old_L3's existing child (old_l2).
+    assert.equal(enq!.runLength, 4, "4 L2 summaries in the absorb run (no phantoms included)");
+    assert.equal(enq!.summaryLevel, 3, "new summary at level 3");
   } finally {
     storage.close();
   }
