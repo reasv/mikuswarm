@@ -556,6 +556,7 @@ export class SummarizationWorkerPool {
         eventIds: input.eventIds,
         parentIds: input.parentIds,
         jobId: job.id,
+        absorbedParentId: job.absorbedParentId ?? undefined,
       });
       logger.info("summarization_complete", {
         jobId: job.id,
@@ -680,6 +681,7 @@ export class SummarizationWorkerPool {
       eventIds: input.eventIds,
       parentIds: input.parentIds,
       jobId: job.id,
+      absorbedParentId: job.absorbedParentId ?? undefined,
     });
     logger.warn("summarization_truncated", {
       jobId: job.id,

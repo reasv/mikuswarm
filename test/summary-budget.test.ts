@@ -1612,7 +1612,7 @@ test("migration v13→v14: input_child_ids column added; poisoned eager rows del
     const storage = await Storage.open({ databasePath: dbPath });
     try {
       const version = storage.read((db) => Number(db.pragma("user_version", { simple: true })));
-      assert.equal(version, 15, "migrations stamp v15");
+      assert.equal(version, 16, "migrations stamp v16");
 
       // Column must now exist.
       const cols = storage.read((db) =>
@@ -1632,7 +1632,7 @@ test("migration v13→v14: input_child_ids column added; poisoned eager rows del
     const storage2 = await Storage.open({ databasePath: dbPath });
     try {
       const version2 = storage2.read((db) => Number(db.pragma("user_version", { simple: true })));
-      assert.equal(version2, 15, "idempotent re-open: version still 15");
+      assert.equal(version2, 16, "idempotent re-open: version still 16");
       assert.equal(storage2.getSummarizationJobById("poisoned_job"), undefined, "idempotent re-open: row still absent");
     } finally {
       await storage2.waitForIdle();
@@ -1782,6 +1782,168 @@ test("budget: worker pool resolves L2 job from explicit inputChildIds, not span 
 
     assert.deepEqual(capturedSummaryIds.sort(), ["c1", "c2"], "factory received exactly c1, c2");
     assert.equal(storage.getSummarizationJobById("l2_job")?.status, "complete");
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// §9b absorb job — same-level supersession via worker pool (seam test).
+// Storage-layer tests pass absorbedParentId directly; these tests exercise the
+// worker→storage seam to catch the class of bug where the worker omits the
+// field and supersession silently no-ops.
+// ---------------------------------------------------------------------------
+
+test("budget: absorb job — worker pool supersedes old parent and run members on success path", async () => {
+  // P (L2) has original children c1, c2.  Run members r1, r2 are absorbed into
+  // P on the success path.  After completion P and {r1, r2} are superseded;
+  // {c1, c2} — P's own recorded children — remain complete.
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await storage.appendTimelineEvent(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
+
+    await insertSummary(storage, "c1", "child 1 words", 1, 1000, 1001, "j_c1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "c2", "child 2 words", 1, 1002, 1003, "j_c2", { eventIds: ["ev0"] });
+    await insertSummary(storage, "P", "parent summary", 2, 1000, 1003, "j_P", {
+      parentIds: ["c1", "c2"],
+    });
+    await insertSummary(storage, "r1", "run member 1", 1, 1004, 1005, "j_r1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "r2", "run member 2", 1, 1006, 1007, "j_r2", { eventIds: ["ev0"] });
+
+    // Absorb job: P' = condense([c1, c2, r1, r2]), superseding P and {r1, r2}.
+    await storage.insertSummarizationJob({
+      id: "absorb_job",
+      timelineKey: TK,
+      level: 2,
+      inputStartId: "c1",
+      inputEndId: "r2",
+      inputTokenCount: 50,
+      targetTokenCount: 800,
+      maxRetries: 0,
+      absorbedParentId: "P",
+      inputChildIds: ["c1", "c2", "r1", "r2"],
+    });
+
+    const factory = {
+      resolveModelId: () => "test-model",
+      resolveSessionCostCeiling: () => 0.5,
+      create: async (_session: unknown, tools: AgentTool[], opts: any) => {
+        const summaries: Array<{ id: string }> = opts?.condenseInputs?.summaries ?? [];
+        const ids = summaries.map((s) => s.id);
+        await tools[0]!.execute("t", { command: "create", file_text: "Combined summary." });
+        return {
+          agent: {
+            prompt: async () => {},
+            waitForIdle: async () => {},
+            subscribe: () => () => {},
+            state: { messages: [] },
+          },
+          renderedInputIds: ids,
+        };
+      },
+    } as any;
+
+    const pool = new SummarizationWorkerPool({
+      storage,
+      factory,
+      config: { worker_count: 1, max_retries: 0 } as any,
+      onComplete: () => {},
+      onError: () => {},
+      logger: silentLogger as any,
+    });
+    await pool.start();
+    pool.notifyNewWork();
+    await waitFor(() => storage.getSummarizationJobById("absorb_job")?.status === "complete");
+    await pool.stop();
+
+    // Old parent and run members superseded; P's original children untouched.
+    assert.equal(storage.getSummaryById("P")?.status, "superseded", "P superseded");
+    assert.equal(storage.getSummaryById("r1")?.status, "superseded", "run member r1 superseded");
+    assert.equal(storage.getSummaryById("r2")?.status, "superseded", "run member r2 superseded");
+    assert.equal(storage.getSummaryById("c1")?.status, "complete", "P's child c1 untouched");
+    assert.equal(storage.getSummaryById("c2")?.status, "complete", "P's child c2 untouched");
+
+    // Replacement P' exists and is complete.
+    const job = storage.getSummarizationJobById("absorb_job")!;
+    const pPrime = storage.getSummaryById(job.resultSummaryId!)!;
+    assert.equal(pPrime.level, 2, "P' at L2");
+    assert.equal(pPrime.status, "complete", "P' complete");
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+  }
+});
+
+test("budget: absorb job — worker pool supersedes old parent and run members on truncation path", async () => {
+  // Same setup as above, but the factory forces agent failure so the truncation
+  // (best-effort draft) path is exercised.  Supersession must fire there too.
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await storage.appendTimelineEvent(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
+
+    await insertSummary(storage, "c1", "child 1 words", 1, 1000, 1001, "j_c1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "c2", "child 2 words", 1, 1002, 1003, "j_c2", { eventIds: ["ev0"] });
+    await insertSummary(storage, "P", "parent summary", 2, 1000, 1003, "j_P", {
+      parentIds: ["c1", "c2"],
+    });
+    await insertSummary(storage, "r1", "run member 1", 1, 1004, 1005, "j_r1", { eventIds: ["ev0"] });
+    await insertSummary(storage, "r2", "run member 2", 1, 1006, 1007, "j_r2", { eventIds: ["ev0"] });
+
+    await storage.insertSummarizationJob({
+      id: "absorb_trunc",
+      timelineKey: TK,
+      level: 2,
+      inputStartId: "c1",
+      inputEndId: "r2",
+      inputTokenCount: 50,
+      targetTokenCount: 800,
+      maxRetries: 0,
+      absorbedParentId: "P",
+      inputChildIds: ["c1", "c2", "r1", "r2"],
+    });
+
+    // Writes a draft then throws — triggers the truncation fallback.
+    const factory = {
+      resolveModelId: () => "test-model",
+      resolveSessionCostCeiling: () => 0.5,
+      create: async (_session: unknown, tools: AgentTool[]) => {
+        await tools[0]!.execute("t", { command: "create", file_text: "Best-effort combined summary." });
+        return {
+          agent: {
+            prompt: async () => {},
+            waitForIdle: async () => { throw new Error("forced failure"); },
+            subscribe: () => () => {},
+            state: { messages: [] },
+          },
+          renderedInputIds: [],
+        };
+      },
+    } as any;
+
+    const pool = new SummarizationWorkerPool({
+      storage,
+      factory,
+      config: { worker_count: 1, max_retries: 0, summary_max_overage_factor: 2.5 } as any,
+      onComplete: () => {},
+      onError: () => {},
+      logger: silentLogger as any,
+    });
+    await pool.start();
+    pool.notifyNewWork();
+    await waitFor(() => storage.getSummarizationJobById("absorb_trunc")?.status === "complete");
+    await pool.stop();
+
+    assert.equal(storage.getSummaryById("P")?.status, "superseded", "P superseded via truncation path");
+    assert.equal(storage.getSummaryById("r1")?.status, "superseded", "r1 superseded via truncation path");
+    assert.equal(storage.getSummaryById("r2")?.status, "superseded", "r2 superseded via truncation path");
+    assert.equal(storage.getSummaryById("c1")?.status, "complete", "c1 untouched");
+    assert.equal(storage.getSummaryById("c2")?.status, "complete", "c2 untouched");
+
+    const job = storage.getSummarizationJobById("absorb_trunc")!;
+    const pPrime = storage.getSummaryById(job.resultSummaryId!)!;
+    assert.equal(pPrime.level, 2, "P' at L2");
+    assert.equal(pPrime.status, "truncated", "P' truncated (best-effort path)");
   } finally {
     await storage.waitForIdle();
     storage.close();
@@ -2164,8 +2326,89 @@ test("migration v14→v15: rows cancelled-to-failed by the original v14 are dele
     const storage = await Storage.open({ databasePath: dbPath });
     try {
       const version = storage.read((db) => Number(db.pragma("user_version", { simple: true })));
-      assert.equal(version, 15, "v14→v15 runs");
+      assert.equal(version, 16, "v14→v15 runs (chain continues to v16)");
       assert.equal(storage.getSummarizationJobById("old_cancelled_job"), undefined, "previously cancelled row deleted");
+    } finally {
+      await storage.waitForIdle();
+      storage.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("migration v15→v16: missed supersessions from completed absorb jobs are backfilled", async () => {
+  // Simulates a production DB that ran through one or more absorb jobs while the
+  // worker pool was omitting absorbedParentId from insertSummaryWithLineage.
+  // The v15→v16 migration (supersedeOrphanedAbsorbedParents) must retroactively
+  // supersede P and the run members, leaving P's original children untouched.
+  const dir = await mkdtemp(path.join(os.tmpdir(), "miku-budget-migrate16-"));
+  const dbPath = path.join(dir, "test.db");
+  try {
+    {
+      const storage = await Storage.open({ databasePath: dbPath });
+      const TK16 = "matrix:test:room:!migrate16";
+      await storage.appendTimelineEvent(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
+
+      // P (L2, children c1+c2) and run members r1, r2 all still 'complete'
+      // because the worker never fired the supersession.
+      await insertSummary(storage, "c1", "child 1", 1, 1000, 1001, "j_c1_16", { eventIds: ["ev0"] });
+      await insertSummary(storage, "c2", "child 2", 1, 1002, 1003, "j_c2_16", { eventIds: ["ev0"] });
+      await insertSummary(storage, "P16", "old parent", 2, 1000, 1003, "j_P16", {
+        parentIds: ["c1", "c2"],
+      });
+      await insertSummary(storage, "r1_16", "run member 1", 1, 1004, 1005, "j_r1_16", { eventIds: ["ev0"] });
+      await insertSummary(storage, "r2_16", "run member 2", 1, 1006, 1007, "j_r2_16", { eventIds: ["ev0"] });
+
+      // Insert P_prime and its absorb job directly, bypassing supersession,
+      // to faithfully represent what the buggy worker path produced.
+      await storage.write((db) => {
+        const now = Date.now();
+        // P_prime summary (no supersession triggered — no absorbedParentId in the call).
+        db.prepare(`
+          insert into summaries
+            (id, timeline_key, level, content, earliest_timestamp, latest_timestamp,
+             latest_event_id, event_count, token_count, model_id, status, generated_at, created_at)
+          values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run("P_prime_16", TK16, 2, "replacement summary", 1000, 1007, "r2_16", 4, 5,
+               "test-model", "complete", now, now);
+        const insertPar = db.prepare(
+          `insert into summary_parents (summary_id, parent_id, ordinal) values (?, ?, ?)`,
+        );
+        ["c1", "c2", "r1_16", "r2_16"].forEach((pid, i) => insertPar.run("P_prime_16", pid, i));
+
+        // Absorb job completed without firing supersession (the bug).
+        db.prepare(`
+          insert into summarization_jobs
+            (id, timeline_key, level, status, priority,
+             input_start_id, input_end_id, input_token_count, target_token_count,
+             attempts, max_retries, result_summary_id,
+             absorbed_parent_id, input_child_ids, created_at, updated_at)
+          values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          "absorb_job_16", TK16, 2, "complete", "background",
+          "c1", "r2_16", 50, 800, 1, 0, "P_prime_16",
+          "P16", JSON.stringify(["c1", "c2", "r1_16", "r2_16"]), now, now,
+        );
+
+        db.pragma("user_version = 15");
+      });
+      await storage.waitForIdle();
+      storage.close();
+    }
+
+    // Reopen — v15→v16 migration runs supersedeOrphanedAbsorbedParents.
+    const storage = await Storage.open({ databasePath: dbPath });
+    try {
+      const version = storage.read((db) => Number(db.pragma("user_version", { simple: true })));
+      assert.equal(version, 16, "v15→v16 ran");
+
+      assert.equal(storage.getSummaryById("P16")?.status, "superseded", "P retroactively superseded");
+      assert.equal(storage.getSummaryById("r1_16")?.status, "superseded", "r1 retroactively superseded");
+      assert.equal(storage.getSummaryById("r2_16")?.status, "superseded", "r2 retroactively superseded");
+      assert.equal(storage.getSummaryById("c1")?.status, "complete", "c1 (P's original child) untouched");
+      assert.equal(storage.getSummaryById("c2")?.status, "complete", "c2 (P's original child) untouched");
+      assert.equal(storage.getSummaryById("P_prime_16")?.status, "complete", "P' untouched");
     } finally {
       await storage.waitForIdle();
       storage.close();

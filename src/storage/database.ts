@@ -9827,7 +9827,7 @@ ${USER_IDENTITIES_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 15;
+export const LATEST_SCHEMA_VERSION = 16;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -10503,6 +10503,63 @@ function deleteCancelledPoisonedJobs(db: Database.Database): void {
   `);
 }
 
+/**
+ * v15→v16: backfill same-level supersessions that were missed because the
+ * worker pool omitted `absorbedParentId` from its `insertSummaryWithLineage`
+ * calls (both success and truncation paths). The supersession block inside
+ * that function never fired, leaving the old parent P and the absorbed run
+ * members still status='complete' even after the replacement P' was written.
+ *
+ * For every completed absorb job whose result summary is present and
+ * complete/truncated, retroactively supersede P and the run members
+ * (input_child_ids − P's original children from summary_parents). Idempotent:
+ * already-superseded rows are unaffected by the status filter.
+ */
+function supersedeOrphanedAbsorbedParents(db: Database.Database): void {
+  const jobs = db
+    .prepare(
+      `select j.absorbed_parent_id as parentId, j.input_child_ids as childIdsJson
+       from summarization_jobs j
+       join summaries rs on rs.id = j.result_summary_id
+         and rs.status in ('complete', 'truncated')
+       where j.status = 'complete'
+         and j.absorbed_parent_id is not null
+         and j.input_child_ids is not null
+         and j.result_summary_id is not null`,
+    )
+    .all() as Array<{ parentId: string; childIdsJson: string }>;
+
+  for (const { parentId, childIdsJson } of jobs) {
+    let allChildIds: unknown;
+    try {
+      allChildIds = JSON.parse(childIdsJson);
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(allChildIds)) continue;
+
+    const originalChildren = new Set<string>(
+      (
+        db
+          .prepare(`select parent_id from summary_parents where summary_id = ?`)
+          .all(parentId) as Array<{ parent_id: string }>
+      ).map((r) => r.parent_id),
+    );
+    const runMembers = (allChildIds as string[]).filter((id) => !originalChildren.has(id));
+
+    db.prepare(
+      `update summaries set status = 'superseded' where id = ? and status in ('complete', 'truncated')`,
+    ).run(parentId);
+
+    if (runMembers.length > 0) {
+      const placeholders = runMembers.map(() => "?").join(", ");
+      db.prepare(
+        `update summaries set status = 'superseded' where id in (${placeholders}) and status in ('complete', 'truncated')`,
+      ).run(...runMembers);
+    }
+  }
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -10522,7 +10579,8 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   addAbsorbedParentIdColumn,
   widenDiaryStatusConstraint,
   addInputChildIdsColumn,
-  deleteCancelledPoisonedJobs, // v14→v15
+  deleteCancelledPoisonedJobs,          // v14→v15
+  supersedeOrphanedAbsorbedParents,     // v15→v16
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write
