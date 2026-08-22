@@ -1568,10 +1568,10 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void
 }
 
 // ---------------------------------------------------------------------------
-// Migration v13→v14: column added (idempotent DDL), poisoned rows cancelled.
+// Migrations v13→v14 (column added, poisoned rows deleted) and v14→v15 (cleanup).
 // ---------------------------------------------------------------------------
 
-test("migration v13→v14: input_child_ids column added; poisoned eager rows cancelled; idempotent re-open", async () => {
+test("migration v13→v14: input_child_ids column added; poisoned eager rows deleted; idempotent re-open", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "miku-budget-migrate-"));
   const dbPath = path.join(dir, "test.db");
   try {
@@ -1604,7 +1604,7 @@ test("migration v13→v14: input_child_ids column added; poisoned eager rows can
     const storage = await Storage.open({ databasePath: dbPath });
     try {
       const version = storage.read((db) => Number(db.pragma("user_version", { simple: true })));
-      assert.equal(version, 14, "migration stamps v14");
+      assert.equal(version, 15, "migrations stamp v15");
 
       // Column must now exist.
       const cols = storage.read((db) =>
@@ -1612,12 +1612,9 @@ test("migration v13→v14: input_child_ids column added; poisoned eager rows can
       );
       assert.ok(cols.includes("input_child_ids"), "input_child_ids column added by migration");
 
-      // Poisoned row must be cancelled.
+      // Poisoned row must be deleted outright — never a lingering failed row.
       const job = storage.getSummarizationJobById("poisoned_job");
-      assert.ok(job, "job row still exists");
-      assert.equal(job!.status, "failed", "poisoned eager job cancelled to failed");
-      assert.match(job!.error ?? "", /cancelled by v13.*migration/i, "error message identifies migration source");
-      assert.equal(job!.inputChildIds, null, "inputChildIds is null (legacy row)");
+      assert.equal(job, undefined, "poisoned eager job deleted by migration");
     } finally {
       await storage.waitForIdle();
       storage.close();
@@ -1627,9 +1624,8 @@ test("migration v13→v14: input_child_ids column added; poisoned eager rows can
     const storage2 = await Storage.open({ databasePath: dbPath });
     try {
       const version2 = storage2.read((db) => Number(db.pragma("user_version", { simple: true })));
-      assert.equal(version2, 14, "idempotent re-open: version still 14");
-      const job2 = storage2.getSummarizationJobById("poisoned_job");
-      assert.equal(job2!.status, "failed", "idempotent re-open: row unchanged");
+      assert.equal(version2, 15, "idempotent re-open: version still 15");
+      assert.equal(storage2.getSummarizationJobById("poisoned_job"), undefined, "idempotent re-open: row still absent");
     } finally {
       await storage2.waitForIdle();
       storage2.close();
@@ -1875,7 +1871,7 @@ test("budget: span-integrity guard skips absorb candidate when span returns phan
 // → terminated by worker pool; no failed-range marker; timeline proceeds.
 // ---------------------------------------------------------------------------
 
-test("budget: legacy eager job (absorbed_parent_id set, no inputChildIds) fails terminally; reconcile re-enqueues fresh job", async () => {
+test("budget: legacy eager job (absorbed_parent_id set, no inputChildIds) is deleted; reconcile re-enqueues fresh job", async () => {
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
@@ -1916,38 +1912,64 @@ test("budget: legacy eager job (absorbed_parent_id set, no inputChildIds) fails 
 
     await pool.start();
     pool.notifyNewWork();
-    await waitFor(() => storage.getSummarizationJobById("legacy_eager_job")?.status === "failed");
+    await waitFor(() => storage.getSummarizationJobById("legacy_eager_job") === undefined);
     await pool.stop();
 
-    const job = storage.getSummarizationJobById("legacy_eager_job")!;
-    assert.equal(job.status, "failed", "legacy eager job terminally failed");
+    assert.equal(storage.getSummarizationJobById("legacy_eager_job"), undefined, "legacy eager job row deleted");
     assert.deepEqual(errors, ["legacy_eager_job"]);
 
-    // No failed-range marker: the failed L2 job is not a run-interrupting marker for L1.
-    // c1 and c2 are still eligible for a fresh L2 condensation job.
-    // The failed L2 job does block level-3 condensation (chunk-skip guard),
-    // but for the test, the reconcile at level 1 should still be able to
-    // enqueue a new L2 job (because getFailedSummarizationJobs(TK, 2) would
-    // block the SAME range — but c1,c2 are L1 and their run has no L2 active/failed job).
-    // After the failed legacy job, getActiveSummarizationJobs(TK,2) = [] and
-    // getFailedSummarizationJobs(TK,2) = [legacy_eager_job] with inputStartId=c1, inputEndId=c2.
-    // evaluateCondensation would see the failed L2 job and skip that chunk.
-    // However, the indexer uses a different path (tryEagerJobAtLevel) which checks
-    // activeJobsAbove (pending/processing), not failed jobs, for the overlap check.
-    // Confirm c1, c2 are still selectable (not superseded).
+    // Deletion (not terminal failure) means nothing lingers to block anything:
+    // no failed-range marker, no failed L2 row for the evaluator's chunk-skip
+    // guard, no red badge in the pipeline monitor. c1 and c2 remain complete
+    // and re-eligible for a fresh, well-formed L2 job on the next reconcile.
     assert.equal(storage.getSummaryById("c1")?.status, "complete");
     assert.equal(storage.getSummaryById("c2")?.status, "complete");
 
-    // The failed L2 job does NOT supersede the L1 summaries.
-    // getFailedSummarizationJobs returns the legacy job, so evaluateCondensation
-    // would block re-enqueueing. But tryEagerJobAtLevel uses getActiveSummarizationJobs
-    // for its overlap check (not failed jobs) — so a fresh reconcile CAN enqueue.
-    // This confirms "timeline reconcile proceeds" by checking no L1 content is lost.
+    // No L1 content is lost — the timeline reconcile can proceed cleanly.
     const l1s = storage.getSummariesByLevel(TK, 1);
     assert.equal(l1s.length, 2, "both L1 summaries still visible");
   } finally {
     await storage.waitForIdle();
     storage.close();
+  }
+});
+
+test("migration v14→v15: rows cancelled-to-failed by the original v14 are deleted", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "miku-budget-migrate15-"));
+  const dbPath = path.join(dir, "test.db");
+  try {
+    {
+      const storage = await Storage.open({ databasePath: dbPath });
+      await storage.insertSummarizationJob({
+        id: "old_cancelled_job",
+        timelineKey: TK,
+        level: 2,
+        inputStartId: "c1",
+        inputEndId: "c2",
+        inputTokenCount: 100,
+        targetTokenCount: 800,
+        maxRetries: 2,
+        absorbedParentId: "P_old",
+      });
+      // Simulate a DB migrated by the ORIGINAL v13→v14 (row marked failed, v14 stamp).
+      await storage.write((db) => {
+        db.prepare("update summarization_jobs set status = 'failed', error = 'cancelled by v13→v14 migration: poisoned eager job (absorbed_parent_id set, no input_child_ids)' where id = 'old_cancelled_job'").run();
+        db.pragma("user_version = 14");
+      });
+      await storage.waitForIdle();
+      storage.close();
+    }
+    const storage = await Storage.open({ databasePath: dbPath });
+    try {
+      const version = storage.read((db) => Number(db.pragma("user_version", { simple: true })));
+      assert.equal(version, 15, "v14→v15 runs");
+      assert.equal(storage.getSummarizationJobById("old_cancelled_job"), undefined, "previously cancelled row deleted");
+    } finally {
+      await storage.waitForIdle();
+      storage.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 });
 
@@ -2099,7 +2121,7 @@ test("budget: declared-vs-rendered mismatch on L2 job fails terminally and commi
 // Missing/superseded declared child → resolveInputFromChildIds terminal failure.
 // ---------------------------------------------------------------------------
 
-test("budget: declared child missing at build time fails terminally, no failed-range marker", async () => {
+test("budget: declared child missing at build time deletes the job, no failed-range marker", async () => {
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     await storage.appendTimelineEvent(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
@@ -2134,13 +2156,10 @@ test("budget: declared child missing at build time fails terminally, no failed-r
 
     await pool.start();
     pool.notifyNewWork();
-    await waitFor(() => storage.getSummarizationJobById("missing_child_job")?.status === "failed");
+    await waitFor(() => storage.getSummarizationJobById("missing_child_job") === undefined);
     await pool.stop();
 
-    const job = storage.getSummarizationJobById("missing_child_job")!;
-    assert.equal(job.status, "failed", "missing declared child fails job terminally");
-    // Error comes from resolveInput returning undefined → "input material not found".
-    assert.match(job.error ?? "", /input material not found/i);
+    assert.equal(storage.getSummarizationJobById("missing_child_job"), undefined, "missing declared child deletes the job row");
     assert.deepEqual(errors, ["missing_child_job"]);
 
     // No L2 summary committed.
@@ -2154,7 +2173,7 @@ test("budget: declared child missing at build time fails terminally, no failed-r
   }
 });
 
-test("budget: superseded declared child at build time fails terminally", async () => {
+test("budget: superseded declared child at build time deletes the job", async () => {
   // c3_runmember is superseded by an absorption (P_base → P_prime absorbs c3).
   // A subsequent job that declares c3_runmember as a child fails terminally
   // because resolveInputFromChildIds rejects superseded summaries.
@@ -2256,12 +2275,10 @@ test("budget: superseded declared child at build time fails terminally", async (
 
     await pool.start();
     pool.notifyNewWork();
-    await waitFor(() => storage.getSummarizationJobById("superseded_child_job")?.status === "failed");
+    await waitFor(() => storage.getSummarizationJobById("superseded_child_job") === undefined);
     await pool.stop();
 
-    const job = storage.getSummarizationJobById("superseded_child_job")!;
-    assert.equal(job.status, "failed", "superseded declared child fails job terminally");
-    assert.match(job.error ?? "", /input material not found/i);
+    assert.equal(storage.getSummarizationJobById("superseded_child_job"), undefined, "superseded declared child deletes the job row");
     assert.deepEqual(errors, ["superseded_child_job"]);
   } finally {
     await storage.waitForIdle();

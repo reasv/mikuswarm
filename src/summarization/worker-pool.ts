@@ -288,6 +288,23 @@ export class SummarizationWorkerPool {
 
     const input = this.resolveInput(job);
     if (!input) {
+      if (job.level >= 2) {
+        // Obsolete or unbuildable condense job: a legacy eager row (no
+        // input_child_ids) or a declared child that vanished/was superseded
+        // since enqueue. Jobs never linger as terminal 'failed' rows — delete
+        // the row; the next reconcile enqueues a fresh, well-formed
+        // replacement if the work is still needed.
+        await storage.deleteSummarizationJob(job.id);
+        logger.warn("summarization_job_deleted", {
+          jobId: job.id,
+          timelineKey: job.timelineKey,
+          summaryLevel: job.level,
+          reason: "input material not resolvable",
+        });
+        this.options.onError(job.id, new Error("input material not found"));
+        this.emit(job, "failed", "failed");
+        return;
+      }
       // Input material no longer resolvable (e.g. events dropped). Nothing to do.
       await storage.failSummarizationJob(job.id, "input material not found");
       this.options.onError(job.id, new Error("input material not found"));

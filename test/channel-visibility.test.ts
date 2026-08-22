@@ -866,7 +866,7 @@ test("migration v12→v13: rowids, FTS, summary_events, summary_parents all pres
       try {
         // Version is now 14 (v13 channel-visibility + v14 input_child_ids).
         const version = storage.read((db) => Number(db.pragma("user_version", { simple: true })));
-        assert.equal(version, 14, "migration stamped version 14");
+        assert.equal(version, 15, "migration stamped version 15");
 
         // Rowid preserved across the table rebuild.
         const postRowid = storage.read((db) => {

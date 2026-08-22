@@ -5873,6 +5873,18 @@ export class Storage {
     });
   }
 
+  /**
+   * Remove a job row entirely. Used for obsolete/unbuildable level-2+ condense
+   * jobs (legacy eager rows, vanished/superseded declared children): jobs must
+   * never linger as terminal 'failed' rows — the reconciler enqueues a fresh,
+   * well-formed replacement when the work is still needed.
+   */
+  deleteSummarizationJob(jobId: string): Promise<void> {
+    return this.write((db) => {
+      db.prepare(`delete from summarization_jobs where id = ?`).run(jobId);
+    });
+  }
+
   saveBestEffortDraft(jobId: string, draft: string): Promise<void> {
     return this.write((db) => {
       db.prepare(
@@ -9808,7 +9820,7 @@ ${USER_IDENTITIES_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 14;
+export const LATEST_SCHEMA_VERSION = 15;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -10441,37 +10453,46 @@ function widenDiaryStatusConstraint(db: Database.Database): void {
  * post-deployment fix). Purely additive DDL; uses PRAGMA table_info idempotency
  * guard (same pattern as v5→v6, v7→v8, v9→v10, v11→v12 migrations).
  *
- * After adding the column, cancel any non-terminal row that has
+ * After adding the column, DELETE any non-complete row that has
  * `absorbed_parent_id` set and `input_child_ids` null — these are the live
  * poisoned eager jobs from the pre-fix deployment that used span-based input
- * re-derivation and could expand to 600+ summaries. Cancelling terminally
- * (status='failed') without creating a failed-range marker lets the next
- * reconcile re-evaluate the timeline from scratch, enqueuing a fresh job that
- * will carry the explicit child id list and pass the span-integrity guard.
+ * re-derivation and could expand to 600+ summaries. Deletion (not a terminal
+ * 'failed' status) is deliberate: every summarization job must eventually
+ * complete, failed level-2+ rows block the evaluator's chunk-skip guard from
+ * re-condensing the range, and the pipeline monitor treats lingering failed
+ * rows as actionable. The next reconcile re-evaluates the timeline from
+ * scratch and enqueues a fresh job that carries the explicit child id list
+ * and passes the span-integrity guard.
  */
 function addInputChildIdsColumn(db: Database.Database): void {
   const cols = db.prepare("PRAGMA table_info(summarization_jobs)").all() as Array<{ name: string }>;
   if (!cols.some((c) => c.name === "input_child_ids")) {
     db.exec("ALTER TABLE summarization_jobs ADD COLUMN input_child_ids TEXT");
   }
-  // Cancel poisoned legacy eager rows — absorbed_parent_id set, input_child_ids
-  // null, status not yet terminal. Terminal-fail WITHOUT creating a failed-range
-  // marker: the job row flips to 'failed', which is terminal but does NOT appear
-  // in getFailedSummarizationJobs(level-1) or block the evaluator for level-2+
-  // (failed level-N+1 rows are consulted by the evaluator's chunk-skip guard, not
-  // run-split guard — and these jobs are at level≥2 so their failure is a chunk-
-  // level termination, not a run-interruption; the run members remain uncondensed
-  // and re-eligible after the next reconcile enqueues a fresh job with an
-  // explicit child list). The error message is set so operators can identify
-  // these rows in the pipeline monitor.
+  // Delete poisoned legacy eager rows outright (see doc comment above). The
+  // deletion is logged by the migration runner's structured event; the run
+  // members remain uncondensed and re-eligible, and the next reconcile
+  // enqueues a fresh job with an explicit child list.
   db.exec(`
-    update summarization_jobs
-    set status = 'failed',
-        error  = 'cancelled by v13→v14 migration: poisoned eager job (absorbed_parent_id set, no input_child_ids)',
-        updated_at = ${Date.now()}
+    delete from summarization_jobs
     where absorbed_parent_id is not null
       and input_child_ids is null
-      and status not in ('complete', 'failed')
+      and status != 'complete'
+  `);
+}
+
+/**
+ * v14→v15: cleanup for deployments that ran the original v13→v14, which marked
+ * poisoned eager rows status='failed' instead of deleting them. Failed rows
+ * must not linger (jobs either complete or are removed), so delete any row the
+ * old migration cancelled. No-op on databases migrated by the current v13→v14.
+ */
+function deleteCancelledPoisonedJobs(db: Database.Database): void {
+  db.exec(`
+    delete from summarization_jobs
+    where absorbed_parent_id is not null
+      and input_child_ids is null
+      and status = 'failed'
   `);
 }
 
@@ -10494,6 +10515,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   addAbsorbedParentIdColumn,
   widenDiaryStatusConstraint,
   addInputChildIdsColumn,
+  deleteCancelledPoisonedJobs, // v14→v15
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write
