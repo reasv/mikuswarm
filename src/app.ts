@@ -84,6 +84,7 @@ import {
   createImageGenTool,
   createListReactionsTool,
   createReadMessagesTool,
+  createCrossChannelTools,
   createSearchMessagesTool,
   createExpandSummaryTool,
   createRecapTool,
@@ -4475,10 +4476,53 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         ...(caps.edits ? [createEditMessageTool({ channelClient, terminology })] : []),
         ...(caps.deletes ? [createDeleteMessageTool({ channelClient, terminology })] : []),
         ...(caps.pins ? [createPinsTool({ channelClient, terminology })] : []),
-        ...(caps.history ? [createReadMessagesTool({ channelClient, terminology })] : []),
+        ...(caps.history
+          ? [
+              createReadMessagesTool({
+                channelClient,
+                terminology,
+                // Cross-channel extension (spec CROSS-CHANNEL-MESSAGING §4.6):
+                // pass storage + visibility resolver so `room` + `anchor` params work.
+                storage,
+                currentTimelineKey: inbound.timelineKey,
+                visibilityResolver,
+                // Resolve a foreign timeline key to its ChannelClient — mirrors the
+                // channel_info channelClientFor pattern but for arbitrary keys.
+                resolveChannelClient: (key) => {
+                  const parsedKey = parseTimelineKey(key);
+                  if (!parsedKey) return undefined;
+                  const p = providers.get(parsedKey.provider);
+                  if (!p) return undefined;
+                  return p.channelClient({ provider: parsedKey.provider, timelineKey: key, accountId: parsedKey.accountId }) ?? undefined;
+                },
+              }),
+            ]
+          : []),
         ...(caps.pollCreate ? [createCreatePollTool({ channelClient, terminology })] : []),
         ...(caps.pollVote ? [createPollVoteTool({ channelClient, terminology })] : []),
       ] : []),
+      // Cross-channel messaging tools (spec CROSS-CHANNEL-MESSAGING §4). Deferred
+      // (activated via the `contacts` skill); always present in the catalog so
+      // tool_search / load_skill can find and activate them. The [messaging] config
+      // flags are enforced inside each tool's execute handler at call time.
+      ...createCrossChannelTools({
+        provider: sessionProvider,
+        providers,
+        target,
+        inbound,
+        sessionId,
+        timeline,
+        storage,
+        visibilityResolver,
+        // config.messaging?.enabled is `true | undefined` per TypeBox Static inference
+        // (default-on; only false when explicitly set to false). `!== false` checks
+        // are done inside each tool's execute rather than at catalog-build time.
+        messagingEnabled: config.messaging?.enabled !== false,
+        dmInitiationEnabled: config.messaging?.dm_initiation !== false,
+        triggerSenderId: (inbound.trigger?.triggeredBy ?? inbound.event.sender).id,
+        agentSessionGeneration: resumeGeneration,
+        terminology,
+      }),
       // Chat-history search + recap (§9e) — DB-backed, not tied to the live room
       // client, so available regardless of roomId and able to span all rooms.
       createSearchMessagesTool({

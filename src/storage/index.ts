@@ -68,7 +68,7 @@ export {
   type UserIdentityAliasRow,
   USER_IDENTITY_ALIAS_BOUND,
 } from "./database.js";
-// Re-export DmOptout type implicitly — getDmOptout returns an inline type;
-// callers destructure from the Storage method directly.
+// Re-export DmOptout + cross-channel helper return types implicitly — callers
+// destructure from the Storage methods directly.
 export { MemoryFileWriter } from "./memory-writer.js";
 export type { TimelineState } from "../types.js";

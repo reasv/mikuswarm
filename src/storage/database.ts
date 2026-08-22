@@ -8691,6 +8691,113 @@ export class Storage {
     });
   }
 
+  /**
+   * Fuzzy-search the user_identities corpus for candidate users matching `query`
+   * (spec CROSS-CHANNEL-MESSAGING §5.1 / §4.3). Matches against user_id,
+   * username, and display_name using LIKE substring search.
+   *
+   * Returns at most `limit` rows (default 10), ordered by recency of last
+   * observed activity. Optionally scoped to one `provider`.
+   */
+  searchUserIdentities(
+    query: string,
+    opts?: { provider?: string; limit?: number },
+  ): Array<{
+    provider: string;
+    userId: string;
+    username: string;
+    displayName: string | null;
+    lastSeen: number | null;
+  }> {
+    return this.read((db) => {
+      const pattern = `%${query}%`;
+      const limit = opts?.limit ?? 10;
+      const rows = opts?.provider
+        ? db
+            .prepare(
+              `select provider, user_id, username, display_name, last_seen
+               from user_identities
+               where provider = ?
+                 and (user_id like ? or username like ? or display_name like ?)
+               order by coalesce(last_seen, updated_at) desc
+               limit ?`,
+            )
+            .all(opts.provider, pattern, pattern, pattern, limit) as Array<{
+            provider: string;
+            user_id: string;
+            username: string;
+            display_name: string | null;
+            last_seen: number | null;
+          }>
+        : db
+            .prepare(
+              `select provider, user_id, username, display_name, last_seen
+               from user_identities
+               where user_id like ? or username like ? or display_name like ?
+               order by coalesce(last_seen, updated_at) desc
+               limit ?`,
+            )
+            .all(pattern, pattern, pattern, limit) as Array<{
+            provider: string;
+            user_id: string;
+            username: string;
+            display_name: string | null;
+            last_seen: number | null;
+          }>;
+      return rows.map((r) => ({
+        provider: r.provider,
+        userId: r.user_id,
+        username: r.username,
+        displayName: r.display_name,
+        lastSeen: r.last_seen,
+      }));
+    });
+  }
+
+  /**
+   * Find DM timeline keys where a given user_id has posted, for user-id sugar in
+   * `read_messages(room: userId)` (spec CROSS-CHANNEL-MESSAGING §4.6). Returns
+   * up to `limit` distinct keys (default 5), most recent first.
+   */
+  findDmTimelineKeysForUser(
+    userId: string,
+    opts?: { limit?: number },
+  ): string[] {
+    return this.read((db) => {
+      const rows = db
+        .prepare(
+          `select distinct timeline_key
+           from timeline_events
+           where sender_id = ? and instr(timeline_key, ':dm:') > 0
+           order by max(timestamp) over (partition by timeline_key) desc
+           limit ?`,
+        )
+        .all(userId, opts?.limit ?? 5) as Array<{ timeline_key: string }>;
+      return rows.map((r) => r.timeline_key);
+    });
+  }
+
+  /**
+   * Retrieve the most recent assistant (self-sent) event in a given timeline.
+   * Used by `read_messages(anchor: "last_self")` to find the starting point.
+   * Returns undefined when no assistant event is stored for that timeline.
+   */
+  getLastAssistantEvent(timelineKey: string): import("../types.js").CanonicalChatEvent | undefined {
+    return this.read((db) => {
+      const row = db
+        .prepare(
+          `select event_json
+           from timeline_events
+           where timeline_key = ? and role = 'assistant'
+           order by timestamp desc, received_at desc, id desc
+           limit 1`,
+        )
+        .get(timelineKey) as { event_json: string } | undefined;
+      if (!row) return undefined;
+      return JSON.parse(row.event_json) as import("../types.js").CanonicalChatEvent;
+    });
+  }
+
   close(): void {
     this.closed = true;
     this.rejectPendingWrites();

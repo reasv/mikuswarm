@@ -76,3 +76,4 @@ export { createBashTool, type BashToolContext } from "./bash.js";
 export { MATRIX_TERMINOLOGY, DISCORD_TERMINOLOGY, IRC_TERMINOLOGY } from "./terminology.js";
 export { createLoadSkillTool, loadSkillToolDefinition, type LoadSkillContext } from "./load-skill.js";
 export { createToolSearchTool, toolSearchToolDefinition, type ToolSearchContext } from "./tool-search.js";
+export { createCrossChannelTools, type CrossChannelToolContext } from "./cross-channel.js";

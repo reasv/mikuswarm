@@ -250,6 +250,24 @@ export interface CanonicalChatEvent {
    * `body`/`attachments` carry the decrypted content.
    */
   undecryptable?: { sessionId?: string; reason?: string };
+  /**
+   * Cross-channel context note (spec CROSS-CHANNEL-MESSAGING §6). Stored locally
+   * in `event_json` only — never transmitted over the wire. Set on
+   * `send_dm` / `send_to_channel` assistant events; absent on all inbound events
+   * and on ordinary `send_message` events. Rendered as an annotation in context
+   * assembly for the *destination* timeline so the fresh session spawned there
+   * can see intent and relay instructions without any session bridging.
+   */
+  crossChannel?: {
+    /** Timeline key of the channel where the agent was triggered. Auto-stamped. */
+    originTimelineKey: string;
+    /** Stable user id of the trigger sender. Auto-stamped. */
+    originSenderId: string;
+    /** Session id of the originating agent session. Auto-stamped. */
+    originSessionId: string;
+    /** The agent's free-text note: why this message was sent, relay expectations. */
+    note: string;
+  };
 }
 
 export interface InboundChatEvent {
