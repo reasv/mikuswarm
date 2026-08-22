@@ -183,6 +183,23 @@ export class RosterTracker {
   }
 
   /**
+   * Return true if `nick` appears in the roster of ANY currently-tracked
+   * channel, false otherwise.
+   *
+   * Used by the IRC openDm WHOIS pre-flight (spec CROSS-CHANNEL-MESSAGING §8.3
+   * M5) to check whether a nick is online before attempting WHOIS. A negative
+   * result here triggers an actual WHOIS query for nicks not visible in any
+   * shared channel (the user is in channels the bot is not in, or is offline).
+   */
+  isNickOnline(nick: string, casemapping: string): boolean {
+    const nickKey = casefold(nick, casemapping);
+    for (const members of this.channels.values()) {
+      if (members.has(nickKey)) return true;
+    }
+    return false;
+  }
+
+  /**
    * Find the nick(s) in a channel whose account (from AccountTracker) matches
    * the given account name. Used by memberInfo() to resolve an account-name id
    * to a nick for WHOIS. Returns the first match (there should be at most one).

@@ -1413,6 +1413,12 @@ export class DiscordProvider implements IChatProvider {
   }> {
     const runtime = this.accounts.get(accountId);
     if (!runtime) throw new Error(`Discord openDm: account "${accountId}" is not running`);
+    // m3: honour the per-account dm_enabled flag.
+    if (!runtime.dmEnabled) {
+      throw new Error(
+        `Discord openDm: DMs are disabled for account "${accountId}" (dm_enabled: false).`,
+      );
+    }
     let dmChannel: import("discord.js").DMChannel;
     try {
       const user = await runtime.client.users.fetch(userId);

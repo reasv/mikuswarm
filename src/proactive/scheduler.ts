@@ -460,21 +460,34 @@ export class ProactiveScheduler {
     // DM opt-out gate (spec CROSS-CHANNEL-MESSAGING §7, enforcement point 2):
     // skip proactive runs on dm-kind timelines whose peer has opted out.
     // Checked after the eligibility gate so the cheap dead/sparse short-circuits
-    // fire first; an opt-out row is present only for known users, so a missing
-    // peer (no events yet) is treated as non-opted-out (nothing to block).
+    // fire first. The gate is fail-closed: if the peer cannot be identified (no
+    // events and no dm_peers row), we skip rather than risk posting without
+    // consent verification.
     const parsedForOptout = parseTimelineKey(eff.timelineKey);
     if (parsedForOptout?.kind === "dm") {
-      // Identify the DM peer from recent timeline events: the most recent
-      // non-assistant sender who is not the bot itself.
+      // Identify the DM peer. First try: scan recent events for the most recent
+      // non-self user sender. Second try: the dm_peers table (populated on inbound
+      // and on successful openDm). Fail closed if neither yields a peer id.
       const selfId = this.options.getSelf?.(parsedForOptout.provider, parsedForOptout.accountId)?.id;
       const peerEvent = events.slice().reverse().find(
         (e) => e.role === "user" && e.sender?.id && e.sender.id !== selfId,
       );
-      if (peerEvent?.sender?.id) {
-        const optout = this.options.storage.getDmOptout(parsedForOptout.provider, peerEvent.sender.id);
-        if (optout) {
-          return { decision: "skip_dm_optout", ...base };
-        }
+      const peerId =
+        peerEvent?.sender?.id ??
+        this.options.storage.getDmPeer(
+          parsedForOptout.provider,
+          parsedForOptout.accountId,
+          parsedForOptout.channelId,
+        );
+      if (!peerId) {
+        // Peer is unknown — fail closed rather than risk posting without
+        // consent verification (the dm_peers row will be written on the next
+        // inbound message, at which point the scheduler can proceed).
+        return { decision: "skip_dm_unknown_peer", ...base };
+      }
+      const optout = this.options.storage.getDmOptout(parsedForOptout.provider, peerId);
+      if (optout) {
+        return { decision: "skip_dm_optout", ...base };
       }
     }
 

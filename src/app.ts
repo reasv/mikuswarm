@@ -1509,6 +1509,15 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   if (matrixProvider) {
     matrixProvider.siblingUserIds = botSelfIdsForLimits;
     matrixProvider.siblingRepliesMode = siblingRepliesMode;
+    // M2: storage-backed listJoinedChannels callback. Returns timeline keys from
+    // chat_index with the matching "matrix:<accountId>:" prefix, filtered by kind.
+    matrixProvider.listJoinedChannelsSource = (accountId: string, includeDms: boolean): string[] => {
+      const prefix = `matrix:${accountId}:`;
+      const keys = storage.getDistinctTimelineKeysForAccountPrefixes([prefix]);
+      if (includeDms) return keys;
+      // Exclude dm-kind keys (contain ":dm:") when includeDms is false.
+      return keys.filter((k) => !k.includes(":dm:"));
+    };
   }
   const _discordProviderRef = providers.get("discord");
   if (_discordProviderRef instanceof DiscordProvider) {
@@ -2736,6 +2745,21 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             error: error instanceof Error ? error.message : String(error),
           }),
         );
+    }
+
+    // M1 (dm_peers): record the non-self peer on every inbound DM event so the
+    // proactive scheduler can identify the peer without scanning message history
+    // (fail-closed gate, spec CROSS-CHANNEL-MESSAGING §6.1). Fire-and-forget.
+    {
+      const parsedDmKey = parseTimelineKey(inbound.timelineKey);
+      if (parsedDmKey?.kind === "dm" && !inbound.event.sender.isSelf && inbound.event.sender.id) {
+        void storage.setDmPeer(
+          parsedDmKey.provider,
+          parsedDmKey.accountId,
+          parsedDmKey.channelId,
+          inbound.event.sender.id,
+        ).catch(() => {});
+      }
     }
 
     // Eager summarization (spec §7.1): events just persisted — recompute the
@@ -4522,6 +4546,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         triggerSenderId: (inbound.trigger?.triggeredBy ?? inbound.event.sender).id,
         agentSessionGeneration: resumeGeneration,
         terminology,
+        // M4: agent-scoped account prefixes (multi-agent mode only).
+        sessionAgentAccountPrefixes,
       }),
       // Chat-history search + recap (§9e) — DB-backed, not tied to the live room
       // client, so available regardless of roomId and able to span all rooms.

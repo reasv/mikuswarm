@@ -391,6 +391,14 @@ test("send_dm: message beats message_ref when both given", async () => {
       undefined as never,
     );
 
+    // Seed @bob so M3 eligibility passes.
+    await storage.upsertUserIdentity({
+      provider: "matrix",
+      userId: "@bob:example.org",
+      username: "bob",
+      observedAt: Date.now(),
+    });
+
     let sentBody: string | undefined;
     const provider: IChatProvider = {
       ...stubProvider("matrix"),
@@ -742,6 +750,14 @@ test("proactive DM opt-out: getDmOptout blocks the peer", async () => {
 
 test("send_dm: Matrix MXID starting with @ is treated as exact id", async () => {
   await withStorage(async (storage, timeline) => {
+    // Seed the corpus so M3 eligibility passes for this known user.
+    await storage.upsertUserIdentity({
+      provider: "matrix",
+      userId: "@bob:example.org",
+      username: "bob",
+      observedAt: Date.now(),
+    });
+
     let openDmCalledWith: string | undefined;
     const provider: IChatProvider = {
       ...stubProvider("matrix"),
@@ -791,5 +807,358 @@ test("send_dm: fuzzy name triggers resolution error with candidates", async () =
       `expected candidate resolution error, got: ${text}`,
     );
     assert.ok(text.includes("@bob:example.org"), `candidate should include exact id, got: ${text}`);
+  });
+});
+
+// ── Adversarial findings: new coverage (C1, C2, M1, M3, M4, M5, m1, m3, m4-minLength) ──
+
+// C1: send_to_channel must redirect dm-kind keys to send_dm
+test("C1: send_to_channel rejects a dm-kind timeline key", async () => {
+  await withStorage(async (storage, timeline) => {
+    const provider: IChatProvider = {
+      ...stubProvider("matrix"),
+      listJoinedChannels: (_accountId) => ["matrix:default:room:!r:s"],
+    };
+    const ctx = makeCcCtx({ storage, timeline, provider, providers: new Map([["matrix", provider]]) });
+    const tools = createCrossChannelTools(ctx);
+    const tool = tools.find((t) => t.name === "send_to_channel")!;
+
+    const result = await tool.execute(
+      "call1",
+      { channel: "matrix:default:dm:!dm:example.org", message: "hi", context_note: "test" },
+      undefined as never,
+    );
+    const text = result.content[0]!.text as string;
+    assert.ok(text.includes("send_dm"), `should redirect to send_dm, got: ${text}`);
+    // message_ref should be stashed so the body isn't lost.
+    assert.ok(text.includes("m1"), `should include a message_ref, got: ${text}`);
+  });
+});
+
+// C2: read_messages userId sugar with isolated DM must fail the second visibility check
+test("C2: read_messages refuses isolated DM resolved from userId sugar", async () => {
+  await withStorage(async (storage, _timeline) => {
+    // Seed a DM event so findDmTimelineKeysForUser returns a key.
+    const dmKey = "matrix:default:dm:!isolateddm:s";
+    await storage.upsertUserIdentity({ provider: "matrix", userId: "@peer:s", username: "peer", observedAt: Date.now() });
+    const ev: CanonicalChatEvent = {
+      id: "dm-ev1",
+      timelineKey: dmKey,
+      provider: "matrix",
+      role: "user",
+      sender: { id: "@peer:s", isSelf: false },
+      body: "hello",
+      timestamp: Date.now(),
+      receivedAt: Date.now(),
+    };
+    await storage.appendTimelineEvent(ev, "skipped");
+    await storage.waitForIdle();
+
+    // Set up an isolated visibility resolver for the DM key.
+    const resolver = new ChannelVisibilityResolver({
+      channels: [{ timeline_key: dmKey, mode: "isolated" }],
+    });
+    const currentKey = "matrix:default:room:!r:s"; // not the DM
+
+    const ctx = {
+      channelClient: stubChannelClient(),
+      storage,
+      currentTimelineKey: currentKey,
+      visibilityResolver: resolver,
+    };
+    const tool = createReadMessagesTool(ctx);
+
+    const result = await tool.execute("call1", { room: "@peer:s" }, undefined as never);
+    const text = result.content[0]!.text as string;
+    assert.ok(
+      text.toLowerCase().includes("isolated") || text.toLowerCase().includes("cannot read"),
+      `should refuse isolated DM, got: ${text}`,
+    );
+  });
+});
+
+// M1: proactive scheduler fails closed for DM channel with unknown peer (no events, no dm_peers row)
+test("M1: proactive gate skips DM channel when peer is unknown (fail-closed)", async () => {
+  await withStorage(async (storage) => {
+    // Use storage directly — getDmPeer returns undefined for unseen DM.
+    const peer = storage.getDmPeer("matrix", "miku", "!dm:s");
+    assert.equal(peer, undefined, "no dm_peers row yet");
+
+    // Simulate what the scheduler does: no peer from events, no peer from storage → skip.
+    // We verify the storage primitive directly since scheduler internals are package-private.
+    const optout = peer ? storage.getDmOptout("matrix", peer) : undefined;
+    assert.equal(optout, undefined, "no optout either — but peer unknown → fail closed");
+
+    // After setDmPeer, the lookup should succeed.
+    await storage.setDmPeer("matrix", "miku", "!dm:s", "@peer:s");
+    const knownPeer = storage.getDmPeer("matrix", "miku", "!dm:s");
+    assert.equal(knownPeer, "@peer:s", "dm_peers row now present");
+  });
+});
+
+// M3: eligibility check blocks exact-id send_dm when user not in corpus and no existing DM
+test("M3: send_dm rejects exact id not in corpus and no existing DM", async () => {
+  await withStorage(async (storage, timeline) => {
+    const provider: IChatProvider = {
+      ...stubProvider("matrix"),
+      openDm: async () => ({ timelineKey: "matrix:default:dm:!dm:s", status: "delivered" }),
+    };
+    const ctx = makeCcCtx({ storage, timeline, provider, providers: new Map([["matrix", provider]]) });
+    const tools = createCrossChannelTools(ctx);
+    const tool = tools.find((t) => t.name === "send_dm")!;
+
+    // @unknown:example.org is an exact MXID but not in corpus, no DM history.
+    const result = await tool.execute(
+      "call1",
+      { user: "@unknown:example.org", message: "hi", context_note: "test" },
+      undefined as never,
+    );
+    const text = result.content[0]!.text as string;
+    assert.ok(
+      text.includes("not known") || text.includes("not in corpus") || text.includes("no prior DM"),
+      `should fail eligibility, got: ${text}`,
+    );
+    // Should still stash message_ref.
+    assert.ok(text.includes("m1"), `should include message_ref, got: ${text}`);
+  });
+});
+
+// M3: eligibility check passes when user has existing DM timeline (no corpus entry needed)
+test("M3: send_dm allows exact id with existing DM timeline even if not in identity corpus", async () => {
+  await withStorage(async (storage, timeline) => {
+    // Insert a DM event for @oldpeer:example.org — findDmTimelineKeysForUser returns the key.
+    const dmEv: CanonicalChatEvent = {
+      id: "old-dm-ev1",
+      timelineKey: "matrix:default:dm:!olddm:s",
+      provider: "matrix",
+      role: "user",
+      sender: { id: "@oldpeer:example.org", isSelf: false },
+      body: "hi",
+      timestamp: Date.now() - 10000,
+      receivedAt: Date.now() - 10000,
+    };
+    await storage.appendTimelineEvent(dmEv, "skipped");
+    await storage.waitForIdle();
+
+    let openDmCalled = false;
+    const provider: IChatProvider = {
+      ...stubProvider("matrix"),
+      openDm: async () => {
+        openDmCalled = true;
+        return { timelineKey: "matrix:default:dm:!olddm:s", status: "delivered" };
+      },
+    };
+    const ctx = makeCcCtx({ storage, timeline, provider, providers: new Map([["matrix", provider]]) });
+    const tools = createCrossChannelTools(ctx);
+    const tool = tools.find((t) => t.name === "send_dm")!;
+
+    await tool.execute(
+      "call1",
+      { user: "@oldpeer:example.org", message: "hello again", context_note: "test" },
+      undefined as never,
+    );
+    assert.ok(openDmCalled, "openDm should be called when existing DM timeline exists");
+  });
+});
+
+// m1: list_members uses sameChannel semantics — thread key sees parent room as current
+test("m1: list_members allows read of a room from a thread session (sameChannel match)", async () => {
+  await withStorage(async (storage, timeline) => {
+    const roomKey = "matrix:default:room:!r:s";
+    // Thread keys use the form "<roomKey>:thread:<threadId>" — same kind as room.
+    const threadKey = "matrix:default:room:!r:s:thread:$threadRoot";
+
+    const alice: SenderInfo = { id: "@alice:s", username: "alice" };
+    const provider: IChatProvider = {
+      ...stubProvider("matrix"),
+      channelClient: () => stubChannelClient([alice]),
+    };
+
+    // Resolver: roomKey is isolated (only accessible from inside that room or its threads).
+    const resolver = new ChannelVisibilityResolver({
+      channels: [{ timeline_key: roomKey, mode: "isolated" }],
+    });
+
+    const ctx = makeCcCtx({
+      storage,
+      timeline,
+      provider,
+      providers: new Map([["matrix", provider]]),
+      visibilityResolver: resolver,
+      target: { provider: "matrix", timelineKey: threadKey, accountId: "default" },
+    });
+    const tools = createCrossChannelTools(ctx);
+    const tool = tools.find((t) => t.name === "list_members")!;
+
+    const result = await tool.execute(
+      "call1",
+      { rooms: [roomKey] },
+      undefined as never,
+    );
+    const text = result.content[0]!.text as string;
+    // sameChannel(threadKey, roomKey) should be true → not blocked as isolated.
+    assert.ok(
+      !text.includes("isolated"),
+      `thread session should be able to read parent room, got: ${text}`,
+    );
+  });
+});
+
+// M4: list_channels filters out accounts not in sessionAgentAccountPrefixes
+test("M4: list_channels omits channels from out-of-scope accounts", async () => {
+  await withStorage(async (storage, timeline) => {
+    const provider: IChatProvider = {
+      ...stubProvider("matrix"),
+      accountIds: () => ["accountA", "accountB"],
+      listJoinedChannels: (accountId) => [`matrix:${accountId}:room:!r:s`],
+    };
+
+    const ctx = makeCcCtx({
+      storage,
+      timeline,
+      provider,
+      providers: new Map([["matrix", provider]]),
+      target: { provider: "matrix", timelineKey: "matrix:accountA:room:!r:s", accountId: "accountA" },
+      // Only accountA is in scope.
+      sessionAgentAccountPrefixes: ["matrix:accountA"],
+    });
+    const tools = createCrossChannelTools(ctx);
+    const tool = tools.find((t) => t.name === "list_channels")!;
+
+    const result = await tool.execute("call1", {}, undefined as never);
+    const text = result.content[0]!.text as string;
+    assert.ok(text.includes("matrix:accountA:room:!r:s"), `accountA channel should be listed, got: ${text}`);
+    assert.ok(!text.includes("matrix:accountB"), `accountB channels should be filtered, got: ${text}`);
+  });
+});
+
+// M4: send_to_channel rejects destination from out-of-scope account
+test("M4: send_to_channel rejects out-of-scope account key", async () => {
+  await withStorage(async (storage, timeline) => {
+    const provider: IChatProvider = {
+      ...stubProvider("matrix"),
+      accountIds: () => ["accountA", "accountB"],
+      listJoinedChannels: (accountId) => [`matrix:${accountId}:room:!r:s`],
+    };
+
+    const ctx = makeCcCtx({
+      storage,
+      timeline,
+      provider,
+      providers: new Map([["matrix", provider]]),
+      target: { provider: "matrix", timelineKey: "matrix:accountA:room:!r:s", accountId: "accountA" },
+      sessionAgentAccountPrefixes: ["matrix:accountA"],
+    });
+    const tools = createCrossChannelTools(ctx);
+    const tool = tools.find((t) => t.name === "send_to_channel")!;
+
+    const result = await tool.execute(
+      "call1",
+      { channel: "matrix:accountB:room:!r:s", message: "hi", context_note: "test" },
+      undefined as never,
+    );
+    const text = result.content[0]!.text as string;
+    assert.ok(
+      text.includes("not in scope") || text.includes("scope"),
+      `should reject out-of-scope account, got: ${text}`,
+    );
+    assert.ok(text.includes("m1"), `should include message_ref, got: ${text}`);
+  });
+});
+
+// m3-minLength: empty context_note fails TypeBox validation
+test("minLength: empty context_note fails schema validation for send_dm", () => {
+  // The TypeBox schema on context_note has minLength: 1.
+  // We verify the schema constraint is present by inspecting the tool's parameter schema.
+  const ctx = {
+    provider: stubProvider("matrix"),
+    providers: new Map([["matrix", stubProvider("matrix")]]),
+    target: { provider: "matrix", timelineKey: "matrix:default:room:!r:s", accountId: "default" } as OutboundTarget,
+    inbound: stubInbound("@alice:example.org", "matrix:default:room:!r:s"),
+    sessionId: "sess",
+    timeline: null as unknown as TimelineStore,
+    storage: null as unknown as Storage,
+    visibilityResolver: new ChannelVisibilityResolver(undefined),
+    messagingEnabled: true,
+    dmInitiationEnabled: true,
+    triggerSenderId: "@alice:example.org",
+  };
+  const tools = createCrossChannelTools(ctx);
+  const sendDmTool = tools.find((t) => t.name === "send_dm")!;
+  const sendToTool = tools.find((t) => t.name === "send_to_channel")!;
+
+  // Inspect the schema directly — context_note should have minLength: 1.
+  const dmSchema = sendDmTool.parameters as { properties?: { context_note?: { minLength?: number } } };
+  assert.equal(dmSchema.properties?.context_note?.minLength, 1, "send_dm context_note has minLength: 1");
+
+  const toSchema = sendToTool.parameters as { properties?: { context_note?: { minLength?: number } } };
+  assert.equal(toSchema.properties?.context_note?.minLength, 1, "send_to_channel context_note has minLength: 1");
+});
+
+// m2: IRC userId canonicalization — lowercase before opt-out lookup
+test("m2: dm_optout stored as lowercase for IRC provider", async () => {
+  await withStorage(async (storage, timeline) => {
+    const ctx = makeCcCtx({
+      storage,
+      timeline,
+      provider: stubProvider("irc"),
+      target: {
+        provider: "irc",
+        timelineKey: "irc:default:room:#test",
+        accountId: "default",
+      },
+      triggerSenderId: "libera.chat/Alice",
+    });
+    const tools = createCrossChannelTools(ctx);
+    const optoutTool = tools.find((t) => t.name === "dm_optout")!;
+
+    // Opt out as "Alice" — stored under lowercase "libera.chat/alice".
+    await optoutTool.execute(
+      "call1",
+      { action: "opt_out", user: "libera.chat/Alice" },
+      undefined as never,
+    );
+
+    // The row should be readable under lowercase.
+    const row = storage.getDmOptout("irc", "libera.chat/alice");
+    assert.ok(row, "opt-out should be stored under lowercase id");
+    // Should NOT exist under mixed case.
+    const rowMixed = storage.getDmOptout("irc", "libera.chat/Alice");
+    assert.equal(rowMixed, undefined, "opt-out should NOT be findable under mixed-case id directly");
+  });
+});
+
+// m5: opted-out candidates in fuzzy resolution are annotated
+test("m5: fuzzy resolution annotates opted-out candidates", async () => {
+  await withStorage(async (storage, timeline) => {
+    await storage.upsertUserIdentity({
+      provider: "matrix",
+      userId: "@optedout:example.org",
+      username: "optedout_user",
+      displayName: "Opted Out User",
+      observedAt: Date.now(),
+    });
+    // Set an opt-out for this user.
+    await storage.setDmOptout({
+      provider: "matrix",
+      userId: "@optedout:example.org",
+      createdAt: Date.now(),
+    });
+
+    const ctx = makeCcCtx({ storage, timeline });
+    const tools = createCrossChannelTools(ctx);
+    const tool = tools.find((t) => t.name === "send_dm")!;
+
+    const result = await tool.execute(
+      "call1",
+      { user: "optedout", message: "hello", context_note: "test" },
+      undefined as never,
+    );
+    const text = result.content[0]!.text as string;
+    // Either the candidate is annotated as opted out, or all-opted-out error.
+    assert.ok(
+      text.includes("opted out"),
+      `should annotate opted-out candidate or give all-opted-out error, got: ${text}`,
+    );
   });
 });

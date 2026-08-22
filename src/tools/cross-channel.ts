@@ -64,6 +64,13 @@ export interface CrossChannelToolContext {
    */
   agentSessionGeneration?: number;
   terminology?: ProviderTerminology;
+  /**
+   * Account prefixes (e.g. "matrix:myaccount") for the session's agent in
+   * agents-mode (spec MULTI-AGENT-SUPPORT §7.2). When set, list_channels only
+   * shows channels on these accounts, and send_to_channel rejects destinations
+   * outside the agent's scope. Absent (undefined) in legacy mode → no filtering.
+   */
+  sessionAgentAccountPrefixes?: string[];
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -173,15 +180,22 @@ async function sendWithCrossChannelNote(
  * Format a resolution-error candidate line (§5.1):
  * `  <id>  "<DisplayName>" (username) — shares <channels>; last seen <time>`
  */
-function formatCandidate(c: {
-  userId: string;
-  username: string;
-  displayName: string | null;
-  lastSeen: number | null;
-}): string {
+function formatCandidate(
+  c: { userId: string; username: string; displayName: string | null; lastSeen: number | null },
+  optedOut?: boolean,
+): string {
   const name = c.displayName ? `"${c.displayName}" (${c.username})` : `"${c.username}"`;
   const seen = c.lastSeen ? `; last seen ${fmtTs(c.lastSeen)}` : "";
-  return `  ${c.userId}  ${name}${seen}`;
+  const optoutTag = optedOut ? " [opted out of agent DMs]" : "";
+  return `  ${c.userId}  ${name}${seen}${optoutTag}`;
+}
+
+/**
+ * Canonicalize a user id for opt-out storage.
+ * IRC nicks are case-insensitive; lowercase before any storage key read/write.
+ */
+function canonicalizeUserId(provider: string, userId: string): string {
+  return provider === "irc" ? userId.toLowerCase() : userId;
 }
 
 // ── Tool factories ────────────────────────────────────────────────────────────
@@ -227,6 +241,7 @@ function createSendDmTool(
           "Re-sends the stashed body. `message` wins when both are given.",
       })),
       context_note: Type.String({
+        minLength: 1,
         description:
           "Required 1–2 sentence note: what prompted this DM and whether/where a reply should be relayed back. " +
           "Never sent to the recipient — stored locally as context for the DM session.",
@@ -280,16 +295,20 @@ function createSendDmTool(
         };
       }
 
+      // m2: canonicalize provider-specific ids before any opt-out key read/write
+      // (IRC nicks are case-insensitive; lowercase before storage lookups).
+      const canonicalUserId = canonicalizeUserId(ctx.target.provider, userId);
+
       // Opt-out check fires before resolution (§4.1, §7 enforcement point 1).
       // Exact-id check: does this userId have an opt-out?
       // We also run it after fuzzy resolution, but we check early for exact ids.
-      const earlyOptout = ctx.storage.getDmOptout(ctx.target.provider, userId);
+      const earlyOptout = ctx.storage.getDmOptout(ctx.target.provider, canonicalUserId);
       if (earlyOptout) {
         const ref = stash.store(body);
         return {
           content: [{
             type: "text",
-            text: buildOptoutError(userId, earlyOptout.createdAt, earlyOptout.originTimelineKey, ref),
+            text: buildOptoutError(canonicalUserId, earlyOptout.createdAt, earlyOptout.originTimelineKey, ref),
           }],
           details: null,
         };
@@ -328,8 +347,27 @@ function createSendDmTool(
             details: null,
           };
         }
+        // m5: annotate opted-out candidates so the agent knows not to pick them.
+        const candidatesWithOptout = candidates.map((c) => ({
+          ...c,
+          optedOut: !!ctx.storage.getDmOptout(ctx.target.provider, canonicalizeUserId(ctx.target.provider, c.userId)),
+        }));
+        // If every candidate has opted out, give a terminal error rather than a
+        // resolution list the agent cannot act on.
+        if (candidatesWithOptout.every((c) => c.optedOut)) {
+          const ref = stash.store(body);
+          return {
+            content: [{
+              type: "text",
+              text:
+                `All candidates matching "${userId}" have opted out of agent-initiated DMs. ` +
+                `(message_ref: "${ref}")`,
+            }],
+            details: null,
+          };
+        }
         const ref = stash.store(body);
-        const lines = candidates.map(formatCandidate).join("\n");
+        const lines = candidatesWithOptout.map((c) => formatCandidate(c, c.optedOut)).join("\n");
         return {
           content: [{
             type: "text",
@@ -344,11 +382,11 @@ function createSendDmTool(
 
       // Post-resolution opt-out check (catches fuzzy input that resolves uniquely
       // to a blocked user — in this branch we already have the exact id).
-      const optout = ctx.storage.getDmOptout(ctx.target.provider, userId);
+      const optout = ctx.storage.getDmOptout(ctx.target.provider, canonicalUserId);
       if (optout) {
         const ref = stash.store(body);
         return {
-          content: [{ type: "text", text: buildOptoutError(userId, optout.createdAt, optout.originTimelineKey, ref) }],
+          content: [{ type: "text", text: buildOptoutError(canonicalUserId, optout.createdAt, optout.originTimelineKey, ref) }],
           details: null,
         };
       }
@@ -364,16 +402,31 @@ function createSendDmTool(
         };
       }
 
-      // Eligibility: user must share ≥1 visible channel with the sending account.
-      // An existing DM timeline counts. We check by corpus presence (heuristic:
-      // if they're in user_identities for this provider, they've been seen).
-      const corpusEntry = ctx.storage.searchUserIdentities(userId, {
+      // M3: Eligibility — the user must have been seen in at least one channel
+      // this account has been in, OR an existing DM timeline must be on record.
+      // This prevents cold-contact spam to users the agent has never shared a
+      // space with. We check corpus presence first (fast), then fall back to the
+      // dm timeline index for users who only appeared via prior DMs.
+      const inCorpus = ctx.storage.searchUserIdentities(userId, {
         provider: ctx.target.provider,
         limit: 1,
-      }).find((r) => r.userId === userId);
-      // If not in corpus, still allow exact-id sends (the operator configured this user)
-      // but note the eligibility check passed — the spec says "users outside the corpus simply
-      // never resolve by name" which we've already enforced above; exact-id allows the send.
+      }).some((r) => r.userId === userId);
+      if (!inCorpus) {
+        const existingDm = ctx.storage.findDmTimelineKeysForUser(userId, { limit: 1 });
+        if (existingDm.length === 0) {
+          const ref = stash.store(body);
+          return {
+            content: [{
+              type: "text",
+              text:
+                `User "${userId}" is not known — they have not appeared in any channel ` +
+                "this account has been in and no prior DM exists. " +
+                `(message_ref: "${ref}")`,
+            }],
+            details: null,
+          };
+        }
+      }
 
       // Open DM channel.
       let dmResult: { timelineKey: string; status: "delivered" | "pending_invite" };
@@ -389,6 +442,18 @@ function createSendDmTool(
           }],
           details: null,
         };
+      }
+
+      // M1: Record the peer in dm_peers so the proactive scheduler can identify
+      // the DM peer without scanning message history (fail-closed gate §6.1).
+      const dmParsedForPeer = parseTimelineKey(dmResult.timelineKey);
+      if (dmParsedForPeer) {
+        void ctx.storage.setDmPeer(
+          dmParsedForPeer.provider,
+          dmParsedForPeer.accountId,
+          dmParsedForPeer.channelId,
+          canonicalUserId,
+        ).catch(() => {});
       }
 
       // Visibility: sending into a DM is never isolation-blocked (§3.3 principle).
@@ -463,6 +528,7 @@ function createSendToChannelTool(
         description: "Handle from a prior resolution error (e.g. \"m1\"). Re-sends stashed body.",
       })),
       context_note: Type.String({
+        minLength: 1,
         description:
           "Required 1–2 sentence note: what prompted this message and any relay expectations. " +
           "Stored locally on the event — not sent to the channel.",
@@ -519,6 +585,38 @@ function createSendToChannelTool(
           }],
           details: null,
         };
+      }
+
+      // C1 guard: dm-kind keys must go through send_dm where consent and
+      // eligibility checks apply. Accepting them here would bypass opt-out.
+      if (parsed.kind === "dm") {
+        const ref = stash.store(body);
+        return {
+          content: [{
+            type: "text",
+            text:
+              `"${channelKey}" is a DM channel — use send_dm with the user's id ` +
+              `so consent and eligibility checks apply. (message_ref: "${ref}")`,
+          }],
+          details: null,
+        };
+      }
+
+      // M4: reject channels outside this session agent's account scope.
+      if (ctx.sessionAgentAccountPrefixes !== undefined) {
+        const prefix = `${parsed.provider}:${parsed.accountId}`;
+        if (!ctx.sessionAgentAccountPrefixes.includes(prefix)) {
+          const ref = stash.store(body);
+          return {
+            content: [{
+              type: "text",
+              text:
+                `Cannot send to "${channelKey}": that account ("${prefix}") is not in scope for this session. ` +
+                `Use list_channels to see the channels available to this session. (message_ref: "${ref}")`,
+            }],
+            details: null,
+          };
+        }
       }
 
       // Find the provider for this channel.
@@ -687,8 +785,10 @@ function createListMembersTool(ctx: CrossChannelToolContext): AgentTool {
 
       for (const key of roomKeys) {
         // Visibility check: report isolated channels (reads blocked).
+        // m1: use sameChannel() rather than string equality so that thread
+        // sessions in the same room see the parent as "current".
         const mode = ctx.visibilityResolver.modeFor(key);
-        if (mode === "isolated" && key !== ctx.target.timelineKey) {
+        if (mode === "isolated" && !ctx.visibilityResolver.sameChannel(key, ctx.target.timelineKey)) {
           notes.push(`  ${key}: isolated — cannot enumerate members from outside this channel.`);
           continue;
         }
@@ -798,6 +898,11 @@ function createListChannelsTool(ctx: CrossChannelToolContext): AgentTool {
       for (const [, provider] of ctx.providers) {
         if (!provider.listJoinedChannels) continue;
         for (const accountId of provider.accountIds()) {
+          // M4: skip accounts outside this session agent's scope.
+          if (ctx.sessionAgentAccountPrefixes !== undefined) {
+            const prefix = `${provider.id}:${accountId}`;
+            if (!ctx.sessionAgentAccountPrefixes.includes(prefix)) continue;
+          }
           const joined = provider.listJoinedChannels(accountId, { includeDms });
           if (!joined) continue;
           for (const key of joined) {
@@ -806,8 +911,9 @@ function createListChannelsTool(ctx: CrossChannelToolContext): AgentTool {
             // Filter DMs when not requested.
             if (parsed.kind === "dm" && !includeDms) continue;
             // Visibility gate: isolated channels outside the current session are omitted.
+            // m1: use sameChannel() so thread sessions see the parent room as "current".
             const mode = ctx.visibilityResolver.modeFor(key);
-            if (mode === "isolated" && key !== ctx.target.timelineKey) continue;
+            if (mode === "isolated" && !ctx.visibilityResolver.sameChannel(key, ctx.target.timelineKey)) continue;
             rows.push({
               timelineKey: key,
               kind: parsed.kind,
@@ -870,11 +976,15 @@ function createDmOptoutTool(ctx: CrossChannelToolContext): AgentTool {
     execute: async (_toolCallId, params) => {
       const args = params as { action: "opt_out" | "opt_in"; user?: string };
 
-      // Resolve target user.
-      const targetUserId = args.user?.trim() || ctx.triggerSenderId;
+      // Resolve target user and normalize for storage.
+      const rawTargetUserId = args.user?.trim() || ctx.triggerSenderId;
+      // m2: canonicalize before authorization comparison and storage ops so IRC
+      // case variants ("Alice" vs "alice") resolve to the same opt-out row.
+      const targetUserId = canonicalizeUserId(ctx.target.provider, rawTargetUserId);
+      const canonicalTrigger = canonicalizeUserId(ctx.target.provider, ctx.triggerSenderId);
 
       // Structural authorization: only the trigger sender can flip their own bit.
-      if (targetUserId !== ctx.triggerSenderId) {
+      if (targetUserId !== canonicalTrigger) {
         return {
           content: [{
             type: "text",

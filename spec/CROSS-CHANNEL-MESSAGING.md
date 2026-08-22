@@ -148,7 +148,7 @@ Send a message to another channel the account is in.
 
 | Param | Type | Req | Notes |
 |---|---|---|---|
-| `channel` | string | yes | Full timeline key. Unknown/unjoined → error listing nearest valid targets inline (no follow-up `list_channels` call needed). |
+| `channel` | string | yes | Full timeline key. Unknown/unjoined → error listing nearest valid targets inline (no follow-up `list_channels` call needed). DM-kind keys are rejected with a redirect to `send_dm`. |
 | `message` / `message_ref` | string | yes* | As §4.1. |
 | `context_note` | string | yes | As §4.1. Canonical use: the relay-back leg of a DM errand. |
 | `media` | per caps | no | As §4.1. |

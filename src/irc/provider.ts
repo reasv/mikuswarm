@@ -624,19 +624,48 @@ export class IrcProvider implements IChatProvider {
    * `userId` must be a network-scoped id of the form `<networkId>/<nick>`.
    * If the account is not running, an error is thrown so the tool surface can
    * report it cleanly to the agent.
+   *
+   * Pre-flight checks (m3, M5):
+   * - m3: rejects when `dm_enabled: false` is set on this account's config.
+   * - M5: verifies the nick is currently reachable via roster membership or
+   *   WHOIS before returning the DM key, so the agent gets an early actionable
+   *   error rather than sending into the void.
    */
-  openDm(accountId: string, userId: string): Promise<{
+  async openDm(accountId: string, userId: string): Promise<{
     timelineKey: string;
     status: "delivered" | "pending_invite";
   }> {
     const rt = this.accounts.get(accountId);
     if (!rt) {
-      return Promise.reject(new Error(`IRC openDm: account "${accountId}" is not running`));
+      throw new Error(`IRC openDm: account "${accountId}" is not running`);
     }
+
+    // m3: honour the per-account dm_enabled flag.
+    if (rt.config.dm_enabled === false) {
+      throw new Error(
+        `IRC openDm: DMs are disabled for account "${accountId}" (dm_enabled: false).`,
+      );
+    }
+
+    // M5: pre-flight online check for the target nick.
+    // unscopeIrcId strips the "<networkId>/" prefix to get the bare nick.
+    const nick = unscopeIrcId(userId);
+    const isOnline = rt.rosterTracker.isNickOnline(nick, rt.casemapping);
+    if (!isOnline) {
+      // Nick not in any shared channel — do a WHOIS to confirm they're on-network.
+      const whoisResult = await this.doWhois(rt, nick);
+      if (!whoisResult || (whoisResult as { error?: string }).error === "not_found") {
+        throw new Error(
+          `IRC openDm: nick "${nick}" is not currently online — they won't receive the message. ` +
+            "Try again when they are online, or use a network-scoped id if the nick changed.",
+        );
+      }
+    }
+
     // userId is already the scoped id; use it as the channelId segment of the
     // timeline key so that send() / unscopeIrcId() can recover the bare nick.
     const timelineKey = `irc:${accountId}:dm:${userId}`;
-    return Promise.resolve({ timelineKey, status: "delivered" });
+    return { timelineKey, status: "delivered" };
   }
 
   /**

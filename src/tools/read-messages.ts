@@ -158,6 +158,24 @@ export function createReadMessagesTool(context: ReadMessagesToolContext): AgentT
           }
           // Use the most recent DM (first in list, most-recent ordering from DB).
           const dmKey = dmKeys[0];
+          // C2 guard: run a second visibility check on the resolved DM key itself.
+          // The earlier check on roomArg used the raw (non-parseable) input which
+          // resolves to "shared" for all unknown keys — the isolated DM would slip
+          // through. We must check the actual timeline key.
+          if (context.visibilityResolver && context.currentTimelineKey) {
+            const dmMode = context.visibilityResolver.modeFor(dmKey);
+            if (dmMode === "isolated" && !context.visibilityResolver.sameChannel(dmKey, context.currentTimelineKey)) {
+              return {
+                content: [{
+                  type: "text",
+                  text:
+                    `Cannot read DM with "${roomArg}": that conversation is isolated ` +
+                    "and this session is not in it.",
+                }],
+                details: null,
+              };
+            }
+          }
           if (!context.resolveChannelClient) {
             // Fall back to storage-only mode for DM keys when no channel resolver.
             const events = context.storage.getTimelineEvents(dmKey, args.limit ?? 20);

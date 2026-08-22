@@ -86,6 +86,16 @@ export class MatrixProvider implements IChatProvider {
   private readonly activePolls = new Set<Promise<void>>();
 
   /**
+   * Storage-backed callback for listJoinedChannels (M2, spec CROSS-CHANNEL-MESSAGING §8.1).
+   * Injected by app.ts after construction. Returns the timeline keys seen in
+   * the chat_index for this account, filtered by kind when includeDms is false.
+   * Without this injection, listJoinedChannels returns undefined (graceful
+   * degradation: list_channels omits Matrix channels from the listing rather
+   * than crashing).
+   */
+  listJoinedChannelsSource?: (accountId: string, includeDms: boolean) => string[];
+
+  /**
    * Self-ids of all in-process bot accounts across all agents (spec
    * MULTI-AGENT-SUPPORT §9). Injected by app.ts after construction. When set,
    * sibling messages in the "never" mode (Phase 1 default) never trigger a
@@ -483,6 +493,17 @@ export class MatrixProvider implements IChatProvider {
     const status: "delivered" | "pending_invite" = result.isDirect ? "delivered" : "pending_invite";
     const timelineKey = `matrix:${accountId}:dm:${roomId}`;
     return { timelineKey, status };
+  }
+
+  /**
+   * Return timeline keys of all Matrix channels this account has seen
+   * (spec CROSS-CHANNEL-MESSAGING §8.1, M2 fix). Backed by the storage
+   * callback injected at app startup; returns undefined when the callback
+   * is absent so list_channels degrades gracefully.
+   */
+  listJoinedChannels(accountId: string, opts?: { includeDms?: boolean }): string[] | undefined {
+    if (!this.listJoinedChannelsSource) return undefined;
+    return this.listJoinedChannelsSource(accountId, opts?.includeDms ?? false);
   }
 
   /**

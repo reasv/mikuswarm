@@ -8692,6 +8692,44 @@ export class Storage {
   }
 
   /**
+   * Record the known peer user-id for a DM channel (spec CROSS-CHANNEL-MESSAGING §6.1).
+   * Called on every inbound non-self message in a dm-kind timeline and after
+   * openDm() succeeds, so the proactive scheduler can look up the peer without
+   * scanning message history. Upsert — last writer wins (peer ids are stable).
+   */
+  async setDmPeer(
+    provider: string,
+    accountId: string,
+    dmChannelId: string,
+    peerUserId: string,
+  ): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `insert into dm_peers (provider, account_id, dm_channel_id, peer_user_id)
+         values (?, ?, ?, ?)
+         on conflict(provider, account_id, dm_channel_id)
+         do update set peer_user_id = excluded.peer_user_id`,
+      ).run(provider, accountId, dmChannelId, peerUserId);
+    });
+  }
+
+  /**
+   * Look up the peer user-id for a DM channel.
+   * Returns undefined when no row has been recorded yet.
+   */
+  getDmPeer(provider: string, accountId: string, dmChannelId: string): string | undefined {
+    return this.read((db) => {
+      const row = db
+        .prepare(
+          `select peer_user_id from dm_peers
+           where provider = ? and account_id = ? and dm_channel_id = ?`,
+        )
+        .get(provider, accountId, dmChannelId) as { peer_user_id: string } | undefined;
+      return row?.peer_user_id;
+    });
+  }
+
+  /**
    * Fuzzy-search the user_identities corpus for candidate users matching `query`
    * (spec CROSS-CHANNEL-MESSAGING §5.1 / §4.3). Matches against user_id,
    * username, and display_name using LIKE substring search.
@@ -9517,6 +9555,22 @@ create table if not exists dm_optouts (
 ) without rowid;
 `;
 
+/**
+ * Records the known peer user-id for each DM channel (v14→v15).
+ * Written on every inbound message from a non-self sender in a dm-kind timeline,
+ * and on successful send_dm openDm(). Used by the proactive scheduler's opt-out
+ * gate to fail closed when no message history is available to derive the peer.
+ */
+const DM_PEERS_SCHEMA = `
+create table if not exists dm_peers (
+  provider       text not null,
+  account_id     text not null,
+  dm_channel_id  text not null,
+  peer_user_id   text not null,
+  primary key (provider, account_id, dm_channel_id)
+) without rowid;
+`;
+
 // Canonical schema. This is the COMPLETE current schema with every constraint
 // baked in from the start, expressed entirely with idempotent
 // `create … if not exists` DDL: a fresh database executes this block, is built
@@ -10007,7 +10061,8 @@ ${SUMMARY_SEARCH_SCHEMA}
 ${REACTIONS_SCHEMA}
 ${BACKFETCH_JOBS_SCHEMA}
 ${USER_IDENTITIES_SCHEMA}
-${DM_OPTOUTS_SCHEMA}`;
+${DM_OPTOUTS_SCHEMA}
+${DM_PEERS_SCHEMA}`;
 
 // SCHEMA above defines the complete current shape with idempotent
 // `create … if not exists` DDL, so a fresh database is built directly at the
@@ -10015,7 +10070,7 @@ ${DM_OPTOUTS_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 17;
+export const LATEST_SCHEMA_VERSION = 18;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -10753,6 +10808,11 @@ function addDmOptoutsTable(db: Database.Database): void {
   db.exec(DM_OPTOUTS_SCHEMA);
 }
 
+/** v17→v18: create dm_peers table (spec CROSS-CHANNEL-MESSAGING §6.1). Purely additive DDL. */
+function addDmPeersTable(db: Database.Database): void {
+  db.exec(DM_PEERS_SCHEMA);
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -10775,6 +10835,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   deleteCancelledPoisonedJobs,          // v14→v15
   supersedeOrphanedAbsorbedParents,     // v15→v16
   addDmOptoutsTable,                    // v16→v17
+  addDmPeersTable,                      // v17→v18
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write
