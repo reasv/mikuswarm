@@ -67,6 +67,7 @@ export {
   type CurrentIdentity,
   type UserIdentityAliasRow,
   USER_IDENTITY_ALIAS_BOUND,
+  type SeedLedgerRow,
 } from "./database.js";
 // Re-export DmOptout + cross-channel helper return types implicitly — callers
 // destructure from the Storage methods directly.

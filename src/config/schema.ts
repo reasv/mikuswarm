@@ -1729,6 +1729,26 @@ const VisibilitySchema = StrictObject({
   channels: Type.Optional(Type.Array(VisibilityChannelSchema)),
 });
 
+// Workspace seeding policy (spec WORKSPACE-TEMPLATE-RECONCILIATION §4).
+// Global — seeding policy is deployment-wide; the reconcile itself runs per agent.
+// All fields optional with code-level defaults so an absent [seeding] block is valid.
+const SeedingSchema = StrictObject({
+  // "reconcile"  — ledger-driven per-file reconcile (default).
+  // "first-run"  — exact pre-reconcile behavior: emptiness-gated seedWorkspace +
+  //                ungated copy-missing seedFeatureSkills; ledger not consulted.
+  // "off"        — no workspace/feature seeding at all (config seeding unaffected).
+  mode: Type.Optional(Type.Union([
+    Type.Literal("reconcile"),
+    Type.Literal("first-run"),
+    Type.Literal("off"),
+  ])),
+  // When true (default), a template file that changed upstream AND whose local copy
+  // is still byte-identical to the ledger-recorded template version (provably never
+  // locally edited) is automatically overwritten with the new template content.
+  // Set false to restrict the mechanism to creating new files only.
+  update_unmodified: Type.Optional(Type.Boolean()),
+});
+
 export const AppConfigSchema = StrictObject({
   app: StrictObject({
     name: Type.String(),
@@ -1969,9 +1989,14 @@ export const AppConfigSchema = StrictObject({
     enabled: Type.Optional(Type.Boolean()),
     dm_initiation: Type.Optional(Type.Boolean()),
   })),
+  // Workspace seeding policy (spec WORKSPACE-TEMPLATE-RECONCILIATION §4). Global.
+  // Default mode: "reconcile". Default update_unmodified: true. Absent block behaves
+  // as mode="reconcile", update_unmodified=true (the safe, full-feature default).
+  seeding: Type.Optional(SeedingSchema),
 });
 
 export type AppConfig = Static<typeof AppConfigSchema>;
+export type SeedingConfig = Static<typeof SeedingSchema>;
 export type SummarizationConfig = Static<typeof SummarizationSchema>;
 export type DiaryConfig = Static<typeof DiarySchema>;
 export type RetrievalConfig = Static<typeof RetrievalSchema>;

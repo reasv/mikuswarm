@@ -3,7 +3,7 @@ import { accessSync, constants as fsConstants } from "node:fs";
 import { mkdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AppConfig } from "./config/index.js";
-import { seedWorkspace, seedFeatureSkills } from "./bootstrap/seed.js";
+import { seedWorkspace, seedFeatureSkills, reconcileWorkspace, resolveTemplatesDir, type SeedLedgerOps, type ReconcileSource } from "./bootstrap/seed.js";
 import { createLogger, createObservabilityServer, PipelineActivityBus, SessionLiveEventBus, type ConsoleServer, type Logger } from "./observability/index.js";
 import { MatrixProvider, RoomLabelCache, makeBackfillReadClient } from "./matrix/index.js";
 import { DiscordProvider } from "./discord/index.js";
@@ -458,12 +458,27 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       resolved: path.resolve(block.workspace_root),
     }));
     // Build per-agent entries and seed each workspace independently.
-    // Seeding is a no-op on an established workspace (never overwrites persona files).
+    // In reconcile mode (default): ledger-driven per-file reconcile (spec §4b).
+    // In first-run mode: emptiness-gated seedWorkspace + ungated seedFeatureSkills (legacy behavior).
+    // In off mode: no workspace/feature seeding.
     const agentEntries = new Map<string, AgentWorkspaceEntry>();
+    const seedingMode = config.seeding?.mode ?? "reconcile";
+    const updateUnmodified = config.seeding?.update_unmodified ?? true;
+    const templatesDir = resolveTemplatesDir();
     for (const { name, resolved } of agentRoots) {
       await mkdir(resolved, { recursive: true });
-      await seedWorkspace(resolved, logger);
-      await seedFeatureSkills(resolved, enabledFeatureNames(config.features), logger);
+      if (seedingMode === "reconcile") {
+        const ledger = makeSeedLedger(storage, name);
+        const sources = buildReconcileSources(templatesDir, resolved, enabledFeatureNames(config.features));
+        const counts = await reconcileWorkspace(name, sources, ledger, { updateUnmodified, logger });
+        if (counts.seeded > 0 || counts.updated > 0 || counts.driftNotices > 0 || counts.tombstonesSkipped > 0) {
+          logger.info("workspace reconcile summary", { agent: name, ...counts });
+        }
+      } else if (seedingMode === "first-run") {
+        await seedWorkspace(resolved, logger);
+        await seedFeatureSkills(resolved, enabledFeatureNames(config.features), logger);
+      }
+      // "off": no workspace/feature seeding.
       agentEntries.set(name, {
         agentName: name,
         workspaceRoot: resolved,
@@ -540,13 +555,28 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     workspaceRoot = path.resolve(config.workspace?.root_dir ?? "./workspaces/miku");
     await mkdir(workspaceRoot, { recursive: true });
 
-    // First-run workspace seeding (ARCHITECTURE.md §4 "First-run seeding"). Runs
-    // POST-config-load now that workspaceRoot is known. Copy-missing/never-overwrite:
-    // seeds templates/workspace/ only when the workspace is empty (no AGENTS.md AND
-    // no SOUL.md), then seeds skill files for every ON feature gate. A strict no-op
-    // on an established workspace (the live case) — never clobbers SOUL.md et al.
-    await seedWorkspace(workspaceRoot, logger);
-    await seedFeatureSkills(workspaceRoot, enabledFeatureNames(config.features), logger);
+    // Workspace seeding (ARCHITECTURE.md §4b): mode from [seeding] config (default "reconcile").
+    // "reconcile": ledger-driven per-file reconcile — delivers new template files to established
+    //   workspaces, never overwrites locally-modified content, tombstones deliberate deletions.
+    // "first-run": exact pre-reconcile behavior — emptiness-gated seedWorkspace + ungated seedFeatureSkills.
+    // "off": no workspace/feature seeding at all.
+    {
+      const legacyMode = config.seeding?.mode ?? "reconcile";
+      const legacyUpdateUnmodified = config.seeding?.update_unmodified ?? true;
+      const legacyTemplatesDir = resolveTemplatesDir();
+      if (legacyMode === "reconcile") {
+        const ledger = makeSeedLedger(storage, "__legacy__");
+        const sources = buildReconcileSources(legacyTemplatesDir, workspaceRoot, enabledFeatureNames(config.features));
+        const counts = await reconcileWorkspace("__legacy__", sources, ledger, { updateUnmodified: legacyUpdateUnmodified, logger });
+        if (counts.seeded > 0 || counts.updated > 0 || counts.driftNotices > 0 || counts.tombstonesSkipped > 0) {
+          logger.info("workspace reconcile summary", { agent: "__legacy__", ...counts });
+        }
+      } else if (legacyMode === "first-run") {
+        await seedWorkspace(workspaceRoot, logger);
+        await seedFeatureSkills(workspaceRoot, enabledFeatureNames(config.features), logger);
+      }
+      // "off": no workspace/feature seeding at all.
+    }
 
     // Single-writer FIFO for all memory/*.md mutations (ARCHITECTURE.md §9b): the
     // diary worker's appends and `write_memory`'s edits serialize through it so a
@@ -7123,6 +7153,62 @@ export function enabledFeatureNames(features: AppConfig["features"]): string[] {
   return (Object.keys(FEATURE_TOOLS) as (keyof typeof FEATURE_TOOLS)[]).filter(
     (key) => features?.[key] === true,
   );
+}
+
+/**
+ * Build a SeedLedgerOps adapter for a given agent from the Storage instance.
+ * app.ts is the only place that wires Storage to seed.ts (seed.ts never imports Storage).
+ */
+function makeSeedLedger(storage: Storage, agentName: string): SeedLedgerOps {
+  return {
+    get(relPath: string) {
+      const row = storage.getSeedLedgerRow(agentName, relPath);
+      return row as import("./bootstrap/seed.js").SeedLedgerRow | undefined;
+    },
+    list() {
+      return storage.listSeedLedgerRows(agentName) as import("./bootstrap/seed.js").SeedLedgerRow[];
+    },
+    async upsert(patch) {
+      const now = Date.now();
+      await storage.upsertSeedLedgerRow({
+        agent_name: agentName,
+        rel_path: patch.rel_path,
+        source: patch.source,
+        origin: patch.origin,
+        template_hash: patch.template_hash,
+        created_at: now,
+        updated_at: now,
+      });
+    },
+  };
+}
+
+/**
+ * Build the list of ReconcileSource entries for a single workspace.
+ * Source "workspace" maps templates/workspace/ → workspaceRoot.
+ * Source "feature:<name>" maps templates/features/<name>/skills/ → workspaceRoot/skills/.
+ * Missing source directories are handled gracefully by reconcileWorkspace.
+ */
+function buildReconcileSources(
+  templatesDir: string,
+  workspaceRoot: string,
+  enabledFeatures: string[],
+): ReconcileSource[] {
+  const sources: ReconcileSource[] = [
+    {
+      source: "workspace",
+      srcDir: path.join(templatesDir, "workspace"),
+      destDir: workspaceRoot,
+    },
+  ];
+  for (const feature of enabledFeatures) {
+    sources.push({
+      source: `feature:${feature}`,
+      srcDir: path.join(templatesDir, "features", feature, "skills"),
+      destDir: path.join(workspaceRoot, "skills"),
+    });
+  }
+  return sources;
 }
 
 /**

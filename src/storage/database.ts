@@ -1473,6 +1473,23 @@ export interface RoomSummaryRow {
 }
 
 /**
+ * One row of the workspace seed ledger (spec WORKSPACE-TEMPLATE-RECONCILIATION §6).
+ * Tombstone: row present + local file absent. `origin` is 'seeded' (mechanism
+ * created it), 'adopted' (pre-ledger file observed), or 'updated' (hash-gated
+ * safe overwrite). `template_hash` is the SHA-256 hex of the last-seen template
+ * content. Primary key (agent_name, rel_path).
+ */
+export interface SeedLedgerRow {
+  agent_name: string;
+  rel_path: string;
+  source: string;
+  origin: "seeded" | "adopted" | "updated";
+  template_hash: string;
+  created_at: number;
+  updated_at: number;
+}
+
+/**
  * Backing data for a summary in the console detail column (spec §12): the raw
  * timeline events it covers (level-1, via `summary_events`) and/or the child
  * summaries it condenses (level-2+, via `summary_parents`). Both are returned;
@@ -8836,6 +8853,59 @@ export class Storage {
     });
   }
 
+  // ── Workspace seed ledger (spec WORKSPACE-TEMPLATE-RECONCILIATION §6) ────────
+
+  /** Read one ledger row synchronously (outside the write queue). */
+  getSeedLedgerRow(agentName: string, relPath: string): SeedLedgerRow | undefined {
+    return this.read((db) => {
+      return db
+        .prepare(
+          `select agent_name, rel_path, source, origin, template_hash, created_at, updated_at
+           from workspace_seed_ledger
+           where agent_name = ? and rel_path = ?`,
+        )
+        .get(agentName, relPath) as SeedLedgerRow | undefined;
+    });
+  }
+
+  /** List all ledger rows for one agent synchronously (outside the write queue). */
+  listSeedLedgerRows(agentName: string): SeedLedgerRow[] {
+    return this.read((db) => {
+      return db
+        .prepare(
+          `select agent_name, rel_path, source, origin, template_hash, created_at, updated_at
+           from workspace_seed_ledger
+           where agent_name = ?`,
+        )
+        .all(agentName) as SeedLedgerRow[];
+    });
+  }
+
+  /** Upsert (insert-or-replace) a ledger row through the single-writer queue. */
+  upsertSeedLedgerRow(row: SeedLedgerRow): Promise<void> {
+    return this.write((db) => {
+      const now = Date.now();
+      db.prepare(
+        `insert into workspace_seed_ledger
+           (agent_name, rel_path, source, origin, template_hash, created_at, updated_at)
+         values (@agentName, @relPath, @source, @origin, @templateHash, @createdAt, @updatedAt)
+         on conflict(agent_name, rel_path) do update set
+           source = excluded.source,
+           origin = excluded.origin,
+           template_hash = excluded.template_hash,
+           updated_at = excluded.updated_at`,
+      ).run({
+        agentName: row.agent_name,
+        relPath: row.rel_path,
+        source: row.source,
+        origin: row.origin,
+        templateHash: row.template_hash,
+        createdAt: row.created_at ?? now,
+        updatedAt: row.updated_at ?? now,
+      });
+    });
+  }
+
   close(): void {
     this.closed = true;
     this.rejectPendingWrites();
@@ -9571,6 +9641,27 @@ create table if not exists dm_peers (
 ) without rowid;
 `;
 
+/**
+ * Workspace seed ledger (§6, spec WORKSPACE-TEMPLATE-RECONCILIATION). Tracks,
+ * per agent and per template-relative path, that the reconcile mechanism placed
+ * or observed a file and which template content hash (SHA-256 hex) it last saw.
+ * Tombstone is row-present + file-absent (no flag column). Keyed by agent name
+ * so a relocated workspace retains its history; '__legacy__' is used in legacy
+ * mode (matching agentWorkspaceMap). WITHOUT ROWID keeps membership rows compact.
+ */
+const WORKSPACE_SEED_LEDGER_SCHEMA = `
+create table if not exists workspace_seed_ledger (
+  agent_name    text not null,
+  rel_path      text not null,
+  source        text not null,
+  origin        text not null,
+  template_hash text not null,
+  created_at    integer not null,
+  updated_at    integer not null,
+  primary key (agent_name, rel_path)
+) without rowid;
+`;
+
 // Canonical schema. This is the COMPLETE current schema with every constraint
 // baked in from the start, expressed entirely with idempotent
 // `create … if not exists` DDL: a fresh database executes this block, is built
@@ -10062,7 +10153,8 @@ ${REACTIONS_SCHEMA}
 ${BACKFETCH_JOBS_SCHEMA}
 ${USER_IDENTITIES_SCHEMA}
 ${DM_OPTOUTS_SCHEMA}
-${DM_PEERS_SCHEMA}`;
+${DM_PEERS_SCHEMA}
+${WORKSPACE_SEED_LEDGER_SCHEMA}`;
 
 // SCHEMA above defines the complete current shape with idempotent
 // `create … if not exists` DDL, so a fresh database is built directly at the
@@ -10070,7 +10162,7 @@ ${DM_PEERS_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 18;
+export const LATEST_SCHEMA_VERSION = 19;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -10813,6 +10905,11 @@ function addDmPeersTable(db: Database.Database): void {
   db.exec(DM_PEERS_SCHEMA);
 }
 
+/** v18→v19: create workspace_seed_ledger table (spec WORKSPACE-TEMPLATE-RECONCILIATION §6). Purely additive DDL. */
+function addWorkspaceSeedLedger(db: Database.Database): void {
+  db.exec(WORKSPACE_SEED_LEDGER_SCHEMA);
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -10836,6 +10933,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   supersedeOrphanedAbsorbedParents,     // v15→v16
   addDmOptoutsTable,                    // v16→v17
   addDmPeersTable,                      // v17→v18
+  addWorkspaceSeedLedger,               // v18→v19
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write

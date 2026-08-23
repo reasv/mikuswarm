@@ -1,7 +1,6 @@
 # Workspace Template Reconciliation — rolling out template additions to established workspaces
 
-**Status**: APPROVED FOR IMPLEMENTATION — owner reviewed 2026-08-23, §12
-resolved (see owner decisions below). Flip to IMPLEMENTED in the landing commit.
+**Status**: IMPLEMENTED — superseded by ARCHITECTURE.md §4b; retained for review.
 
 **Owner decisions (2026-08-23)**: implement now. `update_unmodified` defaults
 **on** in v1 — an owner override of the draft's off recommendation: the hash
