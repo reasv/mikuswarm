@@ -47,6 +47,7 @@ something is gone. Entries marked with a skill live behind it; load it first.
 | You want… | Use |
 |---|---|
 | A specific message, link, image, or quote | `search_messages` (filters: `from`, `mentions`, `has_link`, `attachment_type`, `after`/`before`/`last`; `rooms:"all"` to span channels) |
+| A topic in the rolling conversation summaries | `search_summaries` (each hit cites an `id` for `expand_summary`) |
 | Messages that pinged a user while they were gone | `search_messages` with `mentions:[id]` + `since_user_absence:[id]` |
 | Your own past thoughts/decisions (meaning-based) | `recall_memory` |
 | An exact string in your diary (a URL, exact phrase) | `search_memory` (ripgrep) |

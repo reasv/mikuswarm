@@ -23,9 +23,13 @@ fresh, empty Unreleased section above it. Keep this guidance comment in the
 Unreleased section; it is not part of any release's notes.
 -->
 
+### Changed
+
+- Summary keyword search is now its own tool, **`search_summaries`**, instead of a `corpus:"summaries"` flag on `search_messages` — the union schema invited cross-corpus mis-fills, and dynamic tool loading removed the tool-count pressure behind the flag. The two tools have disjoint schemas sharing the common search facets (`query`, `rooms`, time window, pagination, order); `search_summaries` carries `level`/`min_level`/`status` and joins the shipped dynamic-loading immediate core.
+
 ### Fixed
 
-- `search_messages` no longer fails a call over corpus-inapplicable filters. Semantically-empty argument values (`""`, `[]`, `null`, and `0` for `level`/`min_level`) are stripped before interpretation — models that pad every optional schema field instead of omitting unused ones no longer trip errors or phantom filters (`mentions: []` matching nothing, `level: 0` matching no summaries). A meaningful filter that belongs to the other corpus (e.g. `level: 2` under `corpus:"messages"`) now runs the search without it and appends a note naming the ignored field and the corpus that accepts it, instead of erroring the whole round trip.
+- The chat-search tools no longer fail a call over filters that belong to the other search tool. Semantically-empty argument values (`""`, `[]`, `null`, and `0` for `level`/`min_level`) are stripped before interpretation — models that pad every optional schema field instead of omitting unused ones no longer trip errors or phantom filters (`mentions: []` matching nothing, `level: 0` matching no summaries). A meaningful filter that belongs to the other tool (e.g. `level: 2` on `search_messages`) runs the search without it and appends a note naming the ignored field and the tool that accepts it, instead of erroring the whole round trip.
 
 ### Added
 

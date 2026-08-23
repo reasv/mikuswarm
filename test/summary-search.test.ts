@@ -6,7 +6,7 @@ import test from "node:test";
 import { Storage } from "../src/storage/index.js";
 import type { SummaryStatus } from "../src/storage/index.js";
 import { ChatSearchIndexer } from "../src/search/index.js";
-import { createSearchMessagesTool } from "../src/tools/index.js";
+import { createSearchMessagesTool, createSearchSummariesTool } from "../src/tools/index.js";
 
 const TK = "matrix:test:room:!room";
 const TK2 = "matrix:test:room:!other";
@@ -273,14 +273,13 @@ test("metadata-only summary search (no query) filters by level and time without 
   });
 });
 
-test("search_messages(corpus:summaries) returns summary hits and notes ignored message-only filters", async () => {
+test("search_summaries returns summary hits and notes ignored message-only filters", async () => {
   await withStorage(async (storage) => {
     await insertSummary(storage, { id: "sum_abc", content: "release planning discussion", earliest: 1000, latest: 2000 });
-    const indexer = new ChatSearchIndexer({ storage });
-    const tool = createSearchMessagesTool({ storage, indexer, currentTimelineKey: TK, now: () => 10_000 });
+    const tool = createSearchSummariesTool({ storage, currentTimelineKey: TK, now: () => 10_000 });
 
     // Happy path: a summary hit, citing its id, in the visible text.
-    const ok = await tool.execute("c1", { corpus: "summaries", query: "release", rooms: "all" });
+    const ok = await tool.execute("c1", { query: "release", rooms: "all" });
     const okText = (ok.content[0] as { text: string }).text;
     assert.match(okText, /id: sum_abc/);
     assert.match(okText, /expand_summary/);
@@ -290,10 +289,10 @@ test("search_messages(corpus:summaries) returns summary hits and notes ignored m
 
     // A message-only filter under corpus:summaries is ignored with a note naming
     // it and the corpus that accepts it — the search still runs and returns hits.
-    const noted = await tool.execute("c2", { corpus: "summaries", query: "release", rooms: "all", from: ["@u:test"] });
+    const noted = await tool.execute("c2", { query: "release", rooms: "all", from: ["@u:test"] });
     const notedText = (noted.content[0] as { text: string }).text;
-    assert.match(notedText, /ignored from — message-only filter/);
-    assert.match(notedText, /corpus:"messages"/);
+    assert.match(notedText, /ignored from — message filter/);
+    assert.match(notedText, /use search_messages/);
     assert.match(notedText, /id: sum_abc/); // results delivered despite the padded filter
     const notedDetails = noted.details as { error?: string; ignoredFilters: string[] };
     assert.equal(notedDetails.error, undefined);
@@ -301,7 +300,7 @@ test("search_messages(corpus:summaries) returns summary hits and notes ignored m
   });
 });
 
-test("search_messages(corpus:messages) ignores summary-only filters with a note, pointing at corpus:summaries", async () => {
+test("search_messages ignores summary-only filters with a note, pointing at search_summaries", async () => {
   await withStorage(async (storage) => {
     const indexer = new ChatSearchIndexer({ storage });
     const tool = createSearchMessagesTool({ storage, indexer, currentTimelineKey: TK, now: () => 10_000 });
@@ -310,8 +309,8 @@ test("search_messages(corpus:messages) ignores summary-only filters with a note,
     // round trip — and the note names the fields and the exact recourse.
     const noted = await tool.execute("c1", { query: "release", level: 2, status: ["complete"] });
     const notedText = (noted.content[0] as { text: string }).text;
-    assert.match(notedText, /ignored level, status — summaries-only filter/);
-    assert.match(notedText, /set corpus:"summaries"/);
+    assert.match(notedText, /ignored level, status — summary filter/);
+    assert.match(notedText, /search_summaries/);
     const notedDetails = noted.details as { error?: string; ignoredFilters: string[] };
     assert.equal(notedDetails.error, undefined);
     assert.deepEqual(notedDetails.ignoredFilters, ["level", "status"]);
@@ -361,15 +360,16 @@ test("search_messages treats padded semantically-empty args exactly like omitted
     assert.deepEqual(details.ignoredBounds, []);
     assert.doesNotMatch((res.content[0] as { text: string }).text, /ignored/);
 
-    // Same tolerance on the summaries corpus: padded empties vanish, real
-    // summary-only values still apply.
-    const sum = await tool.execute("c2", { corpus: "summaries", query: "release", rooms: "all", from: [], status: [], min_level: 0 });
+    // Same tolerance on search_summaries: padded empties vanish, real values apply.
+    const sumTool = createSearchSummariesTool({ storage, currentTimelineKey: TK, now: () => 10_000 });
+    const sum = await sumTool.execute("c2", { query: "release", rooms: "all", from: [], status: [], min_level: 0 });
     const sumDetails = sum.details as { error?: string; ignoredFilters: string[] };
     assert.equal(sumDetails.error, undefined);
     assert.deepEqual(sumDetails.ignoredFilters, []);
 
     // A padded level:[0] array collapses to unset rather than matching nothing.
-    const lvl = await tool.execute("c3", { corpus: "summaries", query: "release", rooms: "all", level: [0] });
+    const lvl = await sumTool.execute("c3", { query: "release", rooms: "all", level: [0] });
     assert.equal((lvl.details as { error?: string }).error, undefined);
   });
 });
+

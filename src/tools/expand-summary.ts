@@ -61,7 +61,7 @@ export function createExpandSummaryTool(context: ExpandSummaryToolContext): Agen
       "approximations that grow coarser with age — one can compress weeks of chat. Whenever your " +
       "answer rests on a period you hold only as a summary, expand it BEFORE answering instead of " +
       "answering from the approximation. Pass a summary id (the id=... shown on summaries in your " +
-      "context, in recap, or in search_messages corpus:\"summaries\" results). A level-1 summary " +
+      "context, in recap, or in search_summaries results). A level-1 summary " +
       "expands to its raw source messages (hydrated with caption/reply/link context, same as " +
       "search_messages); a higher-level summary expands to the finer summaries underneath it, each " +
       "with its own id you can expand again. Prefer expanding the one relevant summary over paging " +

@@ -532,7 +532,7 @@ export interface ChatSearchResult {
 
 /**
  * Query over the summary-content FTS index (`summaries_fts`), backing
- * `search_messages(corpus:"summaries")` (ARCHITECTURE.md §9e). Orthogonal to
+ * `search_summaries` (ARCHITECTURE.md §9e). Orthogonal to
  * `ChatSearchQuery` — only the corpus-agnostic axes (text, rooms, time, order,
  * pagination) overlap; summaries add `levels`/`minLevel`/`statuses`. `superseded`
  * summaries are NEVER returned regardless of `statuses` (filtered in SQL).
@@ -6651,7 +6651,7 @@ export class Storage {
 
   /**
    * Keyword search over `summaries_fts` (ARCHITECTURE.md §9e), backing
-   * `search_messages(corpus:"summaries")`. Mirrors {@link searchChatIndex}: optional
+   * `search_summaries`. Mirrors {@link searchChatIndex}: optional
    * FTS join when `match` is set (else a metadata-only scan), keyset pagination on
    * `(latest_timestamp, rowid)` for newest/oldest, and bm25 ordering for relevance.
    * `superseded` is always excluded — it is dropped from the requested `statuses` set

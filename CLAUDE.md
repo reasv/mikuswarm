@@ -65,7 +65,7 @@ src/
   summarization/    Hierarchical summarization worker pool + eager-enqueue reconciliation indexer (see ARCHITECTURE.md §9b)
   diary/            Diary memory worker pool: first-person journal (see ARCHITECTURE.md §9c)
   retrieval/        Memory retrieval: reconciliation indexer, chunker, embedding providers, sqlite-vec store, embed worker, hybrid search (see ARCHITECTURE.md §9d)
-  search/           Chat-history search: chat_index reconciliation indexer, FTS5 query builder, summary-content FTS search (corpus:"summaries"), absence-gap resolver, summary coverage selection (see ARCHITECTURE.md §9e)
+  search/           Chat-history search: chat_index reconciliation indexer, FTS5 query builder, summary-content FTS search (search_summaries), absence-gap resolver, summary coverage selection (see ARCHITECTURE.md §9e)
   proactive/        Proactive posting: per-channel self-rescheduling scheduler, eligibility gate, cadence math, synthetic-inbound builder (see ARCHITECTURE.md §9g)
   saucenao/         SauceNAO reverse-image lookup: shared per-account short-window rate limiter backing the find_source tool (see ARCHITECTURE.md §10)
   youtube/          YouTube video understanding: URL parser (url.ts), yt-dlp subprocess wrapper (ytdlp.ts), config resolution (config.ts), payload types and format helpers (payload.ts) (see ARCHITECTURE.md §7e)
@@ -73,7 +73,7 @@ src/
   agent/            Session factory, runner, manager; LLM request scheduler + retry/resume recovery (ARCHITECTURE.md §8/§8a)
   context/          Context builder, renderer, compaction
   matrix/           Matrix provider, inbound normalization, native client
-  tools/            Agent tool implementations (48 tools: the 46 default-session tools of §10 plus the background-session summary_tool and diary_tool)
+  tools/            Agent tool implementations (49 tools: the 47 default-session tools of §10 plus the background-session summary_tool and diary_tool)
   sandbox/          Docker sandbox: ExecBackend + SandboxManager (bash & search_files run in-container; see ARCHITECTURE.md §11a)
   browser/          Browser-use control layer: Manager REST client + BrowserSession (connectOverCDP) + snapshot/act over one persistent stealth identity (see ARCHITECTURE.md §11b)
   storage/          SQLite persistence (single-writer queue) + MemoryFileWriter (memory/*.md single-writer)

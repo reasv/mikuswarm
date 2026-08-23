@@ -1,21 +1,19 @@
-import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
-import type { Storage, ChatSearchHit, SummaryStatus } from "../storage/index.js";
+import type { Storage, ChatSearchHit } from "../storage/index.js";
 import type { ChatSearchIndexer } from "../search/index.js";
 import {
   sanitizeFtsMatch,
-  sanitizeSummaryFtsMatch,
   buildSnippet,
-  buildSummarySnippet,
   resolveRoomsForAgent,
   applyVisibilityToRooms,
   decodeCursor,
   encodeCursor,
-  encodeSummaryCursor,
   queryTerms,
   runChatSearch,
-  runSummarySearch,
   resolveAbsence,
+  normalizeSearchArgs,
+  inapplicableFilters,
   type SearchScope,
 } from "../search/index.js";
 import { resolveTimeWindow } from "../search/time.js";
@@ -75,7 +73,6 @@ const RICH_BODY_MAX = 6000;
 const RICH_AGGREGATE_MAX = 200_000;
 
 interface SearchMessagesArgs {
-  corpus?: "messages" | "summaries";
   query?: string;
   rooms?: string[] | "current" | "all";
   scope?: SearchScope;
@@ -94,78 +91,15 @@ interface SearchMessagesArgs {
   cursor?: string;
   order?: "newest" | "oldest" | "relevance";
   format?: "compact" | "snippet" | "rich";
-  // corpus:"summaries" only
-  level?: number | number[];
-  min_level?: number;
-  status?: SummaryStatus[];
 }
 
 /**
- * Message-only / corpus-inapplicable params, keyed by the public arg name. When
- * `corpus:"summaries"` these have no meaning, so the search runs without them and
- * the result carries a note naming the ignored field(s) and the corpus that accepts
- * them. Never a failed call: the note preserves the mis-corpus signal (a silent
- * ignore would mask a malformed query) without costing the agent a round trip.
+ * Summary-search params this tool has no meaning for, keyed by the public arg name.
+ * A caller that sends one with a real value (meant `search_summaries`) still gets
+ * its message results — the filter is ignored with a note naming it and the tool
+ * that accepts it, instead of a dead round trip.
  */
-const SUMMARY_INAPPLICABLE_FIELDS = [
-  "scope",
-  "from",
-  "mentions",
-  "quoted_user",
-  "is_reply",
-  "has_attachment",
-  "attachment_type",
-  "has_link",
-  "since_user_absence",
-  "format",
-] as const;
-
-/**
- * Summary-only params, keyed by the public arg name. The mirror of
- * `SUMMARY_INAPPLICABLE_FIELDS`: under the default `corpus:"messages"` these have no
- * meaning, so the search runs without them and the result notes them by name — a
- * model that meant to search summaries but forgot `corpus:"summaries"` still gets
- * its message results plus the exact recourse, instead of a dead round trip.
- */
-const MESSAGE_INAPPLICABLE_FIELDS = ["level", "min_level", "status"] as const;
-
-/**
- * Strip semantically-empty values from a call before interpreting it. Key presence
- * carries no intent: some models pad every optional schema field with "", [], null,
- * or 0 instead of omitting the ones they don't mean, so a value that expresses no
- * constraint must behave exactly like an omitted field. "" / [] / null are dropped
- * for every field; 0 is additionally dropped from level/min_level (levels start at
- * 1, so 0 cannot name a real level and a literal read would silently match nothing).
- */
-function normalizeArgs(raw: Record<string, unknown>): SearchMessagesArgs {
-  const args: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(raw)) {
-    if (v === undefined || v === null) continue;
-    if (v === "") continue;
-    if (Array.isArray(v)) {
-      const items = k === "level" ? v.filter((x) => x !== 0) : v;
-      if (items.length === 0) continue;
-      args[k] = items;
-      continue;
-    }
-    if ((k === "level" || k === "min_level") && v === 0) continue;
-    args[k] = v;
-  }
-  return args as SearchMessagesArgs;
-}
-
-/**
- * The corpus-inapplicable fields still present after normalization (i.e. carrying a
- * real value), plus the note to surface. Empty note when nothing was ignored.
- */
-function inapplicableFilters(
-  args: SearchMessagesArgs,
-  fields: readonly string[],
-  note: (names: string) => string,
-): { ignored: string[]; note: string } {
-  const ignored = fields.filter((f) => (args as Record<string, unknown>)[f] !== undefined);
-  return { ignored, note: ignored.length > 0 ? note(ignored.join(", ")) : "" };
-}
+const SUMMARY_ONLY_FIELDS = ["level", "min_level", "status"] as const;
 
 function fmtTs(ms: number): string {
   try {
@@ -199,22 +133,9 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
       "its event_id — pass it to read_messages to see the surrounding thread. By default each match is " +
       "returned as the FULL message (compact form); set format:snippet to scan many results as short " +
       "excerpts. Newest-first by default; use order:relevance for best-match ranking with a text query. " +
-      'Set corpus:"summaries" to instead search the rolling conversation summaries by keyword (each hit ' +
-      "cites a summary id you can pass to expand_summary) — useful when you only hold a coarse summary " +
-      "and need the finer detail underneath a topic. For your own past notes (not chat), use recall_memory instead.",
+      "To search the rolling conversation summaries by keyword instead, use search_summaries. For your " +
+      "own past notes (not chat), use recall_memory instead.",
     parameters: Type.Object({
-      corpus: Type.Optional(
-        Type.Union([Type.Literal("messages"), Type.Literal("summaries")], {
-          description:
-            'Which corpus to search. "messages" (default) = the raw chat transcript. ' +
-            '"summaries" = the rolling conversation summaries (§9b) by keyword, when you ' +
-            "hold only a coarse summary and want to find the right one to expand_summary on. " +
-            "A call returns EITHER message hits OR summary hits, never both. With " +
-            'corpus:"summaries", the message-only filters (from, mentions, quoted_user, ' +
-            "is_reply, has_attachment, attachment_type, has_link, scope, since_user_absence, " +
-            "format) do not apply and are ignored; level/min_level/status apply instead.",
-        }),
-      ),
       query: Type.Optional(
         Type.String({
           description:
@@ -282,29 +203,9 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
             'scanning many results). "rich" = the full XML message envelope. (messages corpus only.)',
         }),
       ),
-      // ── corpus:"summaries" only ───────────────────────────────────────────────
-      level: Type.Optional(
-        Type.Union([Type.Number(), Type.Array(Type.Number())], {
-          description:
-            "corpus:\"summaries\" only. Restrict to summaries at this level (or any of these " +
-            "levels). Level 1 = finest (covers raw events); higher = coarser.",
-        }),
-      ),
-      min_level: Type.Optional(
-        Type.Number({
-          description: 'corpus:"summaries" only. Restrict to summaries at level >= this (e.g. only coarse summaries).',
-        }),
-      ),
-      status: Type.Optional(
-        Type.Array(Type.Union([Type.Literal("complete"), Type.Literal("truncated")]), {
-          description:
-            'corpus:"summaries" only. Which summary statuses to include (default both). ' +
-            '"truncated" summaries are lossy but still expandable; superseded summaries are never returned.',
-        }),
-      ),
     }),
     execute: async (_toolCallId, params) => {
-      const args = normalizeArgs(params as Record<string, unknown>);
+      const args = normalizeSearchArgs<SearchMessagesArgs>(params as Record<string, unknown>);
       const rawKeys = resolveRoomsForAgent(
         args.rooms,
         context.currentTimelineKey,
@@ -335,16 +236,13 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
           details: { hits: 0, total: 0, rooms: 0, excluded: excludedCount },
         };
       }
-      if ((args.corpus ?? "messages") === "summaries") {
-        return runSummaryCorpus(context, args, timelineKeys, now, visibilityNote);
-      }
-      // A summary-only filter under corpus:"messages" (post-normalization, so a real
-      // value like level: 2) is ignored with a note naming the recourse — the search
-      // still runs (mirror of the summaries-branch handling).
+      // A summary-search filter here (post-normalization, so a real value like
+      // level: 2) is ignored with a note naming the recourse — the search still runs
+      // (mirror of search_summaries' handling of message filters).
       const { ignored: ignoredFilters, note: inapplicableNote } = inapplicableFilters(
-        args,
-        MESSAGE_INAPPLICABLE_FIELDS,
-        (names) => ` (ignored ${names} — summaries-only filter(s); set corpus:"summaries" to use them)`,
+        args as Record<string, unknown>,
+        SUMMARY_ONLY_FIELDS,
+        (names) => ` (ignored ${names} — summary filter(s); use the search_summaries tool for them)`,
       );
       const scope: SearchScope = args.scope ?? "text";
       const window = resolveTimeWindow(args, now());
@@ -508,118 +406,6 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
           })),
         },
       };
-    },
-  };
-}
-
-/**
- * The `corpus:"summaries"` branch of `search_messages` (§9e): keyword search over the
- * rolling summaries (`summaries_fts`) instead of the raw transcript. Returns summary
- * hits — each citing its `id` for `expand_summary` — never message hits, so the two
- * corpora never interleave. Message-only filters are ignored with a naming note.
- */
-function runSummaryCorpus(
-  context: SearchMessagesToolContext,
-  args: SearchMessagesArgs,
-  timelineKeys: string[] | undefined,
-  now: () => number,
-  visibilityNote = "",
-): AgentToolResult<unknown> {
-  // A message-only filter here (post-normalization, so a real value) is ignored with
-  // a note naming it and the corpus that accepts it — the search still runs.
-  const { ignored: ignoredFilters, note: inapplicableNote } = inapplicableFilters(
-    args,
-    SUMMARY_INAPPLICABLE_FIELDS,
-    (names) => ` (ignored ${names} — message-only filter(s); use corpus:"messages" for them)`,
-  );
-
-  const window = resolveTimeWindow(args, now());
-  const match = args.query ? sanitizeSummaryFtsMatch(args.query) : undefined;
-
-  let order = args.order ?? "newest";
-  let orderNote = "";
-  if (order === "relevance" && !match) {
-    order = "newest";
-    orderNote = " (relevance needs a query — ordered newest instead)";
-  }
-  const limit = args.limit ?? 30;
-  const cursor = order === "relevance" ? undefined : decodeCursor(args.cursor);
-  const levels =
-    args.level === undefined ? undefined : Array.isArray(args.level) ? args.level : [args.level];
-
-  const outcome = runSummarySearch(context.storage, {
-    match,
-    timelineKeys,
-    levels,
-    minLevel: args.min_level,
-    statuses: args.status,
-    afterTs: window.afterTs,
-    beforeTs: window.beforeTs,
-    limit,
-    cursor,
-    order,
-  });
-
-  const terms = queryTerms(args.query);
-  const showRoom = outcome.roomCount !== 1;
-  const lines = outcome.hits.map((h) => {
-    const statusTag = h.status === "truncated" ? " · truncated" : "";
-    const header = `[L${h.level} · ${fmtTs(h.earliestTimestamp)} → ${fmtTs(h.latestTimestamp)} · ${h.eventCount} msgs${statusTag}]`;
-    const ref = `   ↳ id: ${h.id}${showRoom ? ` · {${h.timelineKey}}` : ""}`;
-    return `${header} ${buildSummarySnippet(h.content, terms)}\n${ref}`;
-  });
-
-  const nextCursor =
-    order !== "relevance" && outcome.hits.length === limit
-      ? encodeSummaryCursor(outcome.hits[outcome.hits.length - 1])
-      : undefined;
-
-  const dateNote =
-    window.ignored.length > 0
-      ? ` (ignored unparseable ${window.ignored.join(", ")} bound — use ISO or YYYY-MM-DD / a duration like 3d)`
-      : "";
-  const trailer =
-    `searched ${outcome.roomCount === -1 ? "all rooms" : `${outcome.roomCount} room(s)`}, ` +
-    `${outcome.total} summary match(es) in ${outcome.elapsedMs} ms`;
-  const visNote = visibilityNote ? `\n${visibilityNote}` : "";
-
-  let text: string;
-  if (outcome.hits.length === 0 && visibilityNote && !timelineKeys?.length) {
-    text = visibilityNote;
-  } else if (outcome.hits.length === 0) {
-    text = `No matching summaries${orderNote}${dateNote}${inapplicableNote}.\n(${trailer})${visNote}`;
-  } else {
-    const more =
-      outcome.total > outcome.hits.length
-        ? `\nShowing ${outcome.hits.length} of ${outcome.total}.` +
-          (nextCursor ? ` Pass cursor: ${nextCursor} for the next page.` : "")
-        : "";
-    text =
-      `${outcome.total} summary match(es)${orderNote}${dateNote}${inapplicableNote} ` +
-      `(pass any id to expand_summary to drill into it):\n\n${lines.join("\n\n")}${more}\n\n(${trailer})${visNote}`;
-  }
-
-  return {
-    content: [{ type: "text", text }],
-    details: {
-      corpus: "summaries",
-      total: outcome.total,
-      returned: outcome.hits.length,
-      elapsedMs: outcome.elapsedMs,
-      order,
-      nextCursor: nextCursor ?? null,
-      ignoredBounds: window.ignored,
-      ignoredFilters,
-      hits: outcome.hits.map((h) => ({
-        id: h.id,
-        timelineKey: h.timelineKey,
-        level: h.level,
-        earliestTimestamp: h.earliestTimestamp,
-        latestTimestamp: h.latestTimestamp,
-        eventCount: h.eventCount,
-        tokenCount: h.tokenCount,
-        status: h.status,
-      })),
     },
   };
 }

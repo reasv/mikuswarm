@@ -1,6 +1,6 @@
 ---
 name: chat-history
-description: "Catch up on a period you (or someone) were away (`recap`) or profile a user's activity over time (`user_activity`). Also loads channel roster and overlap tools (`list_members`, `list_channels`). Load whenever someone asks \"what did I miss?\", about a user's presence/habits, who's in a channel, or for membership comparisons. Keyword search (`search_messages`) and summary expansion (`expand_summary`) are always loaded and need no skill."
+description: "Catch up on a period you (or someone) were away (`recap`) or profile a user's activity over time (`user_activity`). Also loads channel roster and overlap tools (`list_members`, `list_channels`). Load whenever someone asks \"what did I miss?\", about a user's presence/habits, who's in a channel, or for membership comparisons. Keyword search (`search_messages`, `search_summaries`) and summary expansion (`expand_summary`) are always loaded and need no skill."
 tools:
   - recap
   - user_activity
@@ -11,7 +11,8 @@ tools:
 # Chat History Deep-Dive
 
 Tools for time-shaped history, user activity, and channel rosters. For keyword
-lookups use the always-loaded `search_messages`; to recover detail beneath a
+lookups use the always-loaded `search_messages` (raw transcript) or
+`search_summaries` (rolling summaries); to recover detail beneath a
 `<summary>` block, the always-loaded `expand_summary`.
 
 ## `recap`
@@ -41,7 +42,8 @@ Useful before `send_to_channel` (contacts skill) or to audit which channels
 are configured.
 
 ## Choosing
-- Exact keyword/phrase → `search_messages` (always loaded).
+- Exact keyword/phrase in messages → `search_messages` (always loaded).
+- A topic somewhere in the rolling summaries → `search_summaries` (always loaded).
 - A summary says it, you need the details → `expand_summary` (always loaded).
 - A time window's story → `recap`.
 - One user's story → `user_activity`.

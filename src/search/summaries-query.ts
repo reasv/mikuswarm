@@ -6,7 +6,7 @@ export interface RunSummarySearchResult extends SummarySearchResult {
 }
 
 /**
- * Run a summary-content search (`search_messages(corpus:"summaries")`, §9e), timing it
+ * Run a summary-content search (`search_summaries`, §9e), timing it
  * for the agent-facing latency trailer. Unlike `runChatSearch` there is NO lazy index
  * catch-up: `summaries_fts` is kept live by SQL triggers on `summaries` insert/delete
  * (and summaries are written synchronously through `insertSummaryWithLineage`), so the

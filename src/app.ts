@@ -86,6 +86,7 @@ import {
   createReadMessagesTool,
   createCrossChannelTools,
   createSearchMessagesTool,
+  createSearchSummariesTool,
   createExpandSummaryTool,
   createRecapTool,
   createUserActivityTool,
@@ -4572,6 +4573,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         indexer: chatSearchIndexer,
         currentTimelineKey: inbound.timelineKey,
         absenceDefaults: chatSearchDefaults.absence,
+        agentAccountPrefixes: sessionAgentAccountPrefixes,
+        visibilityResolver,
+        logger: logger.child("search"),
+      }),
+      // Summary keyword search (§9e) — the other entry to the drill-down ladder.
+      createSearchSummariesTool({
+        storage,
+        currentTimelineKey: inbound.timelineKey,
         agentAccountPrefixes: sessionAgentAccountPrefixes,
         visibilityResolver,
         logger: logger.child("search"),

@@ -186,4 +186,4 @@ cache_write = 0
 # feature entirely to keep every tool always loaded:
 # [agent.tools.dynamic]
 # enabled = false
-# immediate = ["send_message", "react", "read_messages", "search_messages", "mcp_yourserver_*"]
+# immediate = ["send_message", "react", "read_messages", "search_messages", "search_summaries", "mcp_yourserver_*"]

@@ -468,6 +468,7 @@ import { DiaryWorkerPool } from "../src/diary/index.js";
 import { MemoryFileWriter } from "../src/storage/index.js";
 import {
   createSearchMessagesTool,
+  createSearchSummariesTool,
   createRecapTool,
   createUserActivityTool,
 } from "../src/tools/index.js";
@@ -1084,8 +1085,8 @@ test("search_messages: no isolation configured — undefined no-filter path pres
   });
 });
 
-test("search_messages (corpus:summaries): isolated room excluded", async () => {
-  await withE2eSetup(async ({ storage, indexer }) => {
+test("search_summaries: isolated room excluded", async () => {
+  await withE2eSetup(async ({ storage }) => {
     // Insert a summary in the isolated DM.
     await insertL1Summary(storage, {
       id: "s-dm-1",
@@ -1094,12 +1095,12 @@ test("search_messages (corpus:summaries): isolated room excluded", async () => {
     });
 
     const resolver = makeResolver({ dms: "isolated" });
-    const tool = createSearchMessagesTool({
-      storage, indexer, currentTimelineKey: VIEWER_TK, visibilityResolver: resolver,
+    const tool = createSearchSummariesTool({
+      storage, currentTimelineKey: VIEWER_TK, visibilityResolver: resolver,
     });
 
     // Explicit request for the isolated DM summary.
-    const res = await tool.execute("t1", { corpus: "summaries", rooms: [ISOLATED_TK] }, {} as any);
+    const res = await tool.execute("t1", { rooms: [ISOLATED_TK] }, {} as any);
     const text = (res.content[0] as { type: "text"; text: string }).text;
     assert.match(text, /1 room\(s\) excluded by operator visibility config/);
     const details = res.details as { excluded?: number };

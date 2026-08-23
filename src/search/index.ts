@@ -20,6 +20,7 @@ export {
   encodeSummaryCursor,
   type RunSummarySearchResult,
 } from "./summaries-query.js";
+export { normalizeSearchArgs, inapplicableFilters } from "./args.js";
 export {
   parseDuration,
   parseInstant,

@@ -21,7 +21,7 @@ export function sanitizeFtsMatch(query: string, scope: SearchScope): string | un
 
 /**
  * Column-scoped MATCH expression over `summaries_fts`'s single `content` column, for
- * `search_messages(corpus:"summaries")` (§9e). Same tokenization/quoting as
+ * `search_summaries` (§9e). Same tokenization/quoting as
  * `sanitizeFtsMatch` — only the column set differs. Returns undefined for a no-token
  * query (→ metadata-only summary search).
  */
@@ -94,7 +94,7 @@ export function buildSnippet(hit: ChatSearchHit, terms: string[]): string {
 }
 
 /**
- * Snippet for a summary hit (`search_messages(corpus:"summaries")`, §9e): a window
+ * Snippet for a summary hit (`search_summaries`, §9e): a window
  * around the first query match in the summary `content`, or its head when there is no
  * text query. Same windowing/escaping as message snippets — one haystack, the content.
  */
