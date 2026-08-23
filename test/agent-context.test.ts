@@ -965,6 +965,134 @@ test("commit reconciles the running estimate to the provider-reported actual", a
   }
 });
 
+// === spec PER-USER-LIMITS §5.3: cache baseline is scoped to the upstream domain ==
+// The prompt-cache baseline established by a committed request exists only at the
+// (endpoint, wire-model) domain that served it. A later candidate whose chain would
+// be served from a DIFFERENT domain has no cached prefix upstream, so its estimate
+// must be priced as a cache miss (withinCacheTtl=false) even inside the TTL window
+// — otherwise a cross-provider selection step is under-priced at the cache-read
+// rate and admitted past the user's caps, then bills at full cache-miss price.
+test("cache-read credit is denied to a candidate on a different upstream domain", async () => {
+  // SSE stub serving any path: one assistant turn with fixed usage.
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      const chunk = (obj: unknown) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
+      chunk({
+        id: "c1", object: "chat.completion.chunk", created: 1, model: "stub-model",
+        choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: null }],
+      });
+      chunk({
+        id: "c1", object: "chat.completion.chunk", created: 1, model: "stub-model",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      });
+      chunk({
+        id: "c1", object: "chat.completion.chunk", created: 1, model: "stub-model",
+        choices: [],
+        usage: { prompt_tokens: 1_000, completion_tokens: 50, total_tokens: 1_050 },
+      });
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as { port: number }).port;
+
+  try {
+    const seen: Array<{ model: string; withinCacheTtl?: boolean; cachedTokens?: number }> = [];
+    let denyPreferred = false;
+    const resolution = {
+      matched: true,
+      active: true,
+      banned: false,
+      models: ["default", "cheap"],
+      constraints: [],
+      ledgerPartitionKeys: [],
+    } as unknown as UserLimitResolution;
+    const ctx = { userId: "@alice:hs", roomId: "!room:hs" } as UserLimitContext;
+    const engine = {
+      affordable(
+        _r: unknown,
+        m: string,
+        estimate: { cachedTokens?: number; newTokens?: number; withinCacheTtl?: boolean },
+      ) {
+        seen.push({ model: m, ...estimate });
+        if (denyPreferred && m === "default") return { ok: false, maxOutput: 0, remainingUsd: 0 };
+        return { ok: true, maxOutput: 4096, remainingUsd: Infinity };
+      },
+      bindingConstraint: () => undefined,
+      noteSelection: () => {},
+    } as never;
+
+    // Two single-member chains on DISTINCT upstream domains (different endpoints
+    // AND wire ids) — a cache established at one cannot exist at the other.
+    const factory = new AgentSessionFactory({
+      config: minimalConfig({
+        app: { name: "t", data_dir: "/tmp", log_level: "error", context_dump_dir: "/tmp" },
+        models: {
+          default: {
+            id: "model-a",
+            provider: "prov-a",
+            api: "openai-completions",
+            endpoint: `http://127.0.0.1:${port}/a/v1`,
+            api_key: "key",
+            input_modalities: ["text"],
+            max_tokens: 4096,
+            context_window: 128_000,
+          },
+          cheap: {
+            id: "model-b",
+            provider: "prov-b",
+            api: "openai-completions",
+            endpoint: `http://127.0.0.1:${port}/b/v1`,
+            api_key: "key",
+            input_modalities: ["text"],
+            max_tokens: 4096,
+            context_window: 128_000,
+          },
+        },
+      } as any),
+      contextBuilder: stubContextBuilder(triggerBuilt()),
+      getActiveSessions: () => [],
+    });
+
+    const { agent } = await factory.create(chatSession(), [], {
+      resume: { snapshot: [] },
+      usage: new SessionUsageTracker(),
+      userLimit: { engine, resolution, ctx },
+    });
+
+    // Request 1 commits on "default" → baseline domain = default's endpoint::wire-id.
+    await agent.prompt({ role: "user", content: "first", timestamp: 2 } as any);
+
+    // Request 2: "default" is now unaffordable, so the selector also evaluates the
+    // cross-domain "cheap" candidate — well inside the 5-minute cache TTL.
+    denyPreferred = true;
+    const before = seen.length;
+    await agent.prompt({ role: "user", content: "second", timestamp: 4 } as any);
+
+    const preflight2 = seen.slice(before);
+    const defaultEst = preflight2.find((e) => e.model === "default");
+    const cheapEst = preflight2.find((e) => e.model === "cheap");
+    assert.ok(defaultEst && cheapEst, "request 2's pre-flight evaluated both candidates");
+    // Same domain as the committed baseline → the cache-read discount applies…
+    assert.equal(
+      defaultEst!.withinCacheTtl,
+      true,
+      "the candidate on the SAME domain keeps the within-TTL cache-read credit",
+    );
+    // …but the cross-domain candidate has no cached prefix upstream: full price.
+    assert.equal(
+      cheapEst!.withinCacheTtl,
+      false,
+      "the candidate on a DIFFERENT domain must be priced as a cache miss",
+    );
+  } finally {
+    server.close();
+  }
+});
+
 test("convertToLlm filters accidental system transcript messages", () => {
   const messages = convertToLlm([{ role: "system", content: "duplicate system", timestamp: 1 } as any]);
   assert.deepEqual(messages, []);

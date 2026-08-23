@@ -779,8 +779,11 @@ export class AgentSessionFactory {
     // `initialContextEstimate`), so we seed from the built size and add the EXACT
     // tokenization of each new live message ONCE. `cachedTokensAtLastRequest` is the
     // prior request's prompt size (cache-read within the TTL); `lastRequestAtMs` dates
-    // the prior request for the cache-TTL test. O(delta) per request, not O(context).
-    const ctxCounter = { running: 0, seenMsgs: -1, cachedAtLast: 0, lastRequestAtMs: 0 };
+    // the prior request for the cache-TTL test; `cacheDomainAtLast` is the served
+    // member's health key (endpoint::wire-model) — the upstream identity the prompt
+    // cache is scoped to, so the cache-read discount is credited only to a candidate
+    // served from the SAME domain ("" = no baseline). O(delta) per request.
+    const ctxCounter = { running: 0, seenMsgs: -1, cachedAtLast: 0, lastRequestAtMs: 0, cacheDomainAtLast: "" };
     // Dynamic-tool-loading charge parking (spec DYNAMIC-TOOL-LOADING §9): a load
     // event that fires BEFORE the counter's first observation (load_skill as the
     // session's first tool call) parks its definition-token charge here; the
@@ -873,9 +876,8 @@ export class AgentSessionFactory {
       refreshRunningContext();
       const observed = ctxCounter.running;
       const newTokens = Math.max(0, observed - ctxCounter.cachedAtLast);
-      const withinCacheTtl =
+      const withinTtl =
         ctxCounter.lastRequestAtMs > 0 && Date.now() - ctxCounter.lastRequestAtMs < PROMPT_CACHE_TTL_MS;
-      const estimate = { cachedTokens: ctxCounter.cachedAtLast, newTokens, withinCacheTtl };
       let sawHealthyFit = false; // found a fits+healthy selectable (unaffordable) → budget cause
       let sawFit = false;        // found a selectable whose chain can fit the context at all
       for (const s of selectables) {
@@ -890,6 +892,18 @@ export class AgentSessionFactory {
           observedContextTokens: observed,
         });
         const viable = probe.reason !== "all-unhealthy";
+        // Prompt caches do not cross upstreams: the credited prefix exists only at
+        // the (endpoint, wire-model) domain that served the prior committed request.
+        // Credit the cache-read discount only when THIS candidate's predicted serving
+        // member is that same domain; otherwise price the whole input at cache-write,
+        // exactly as if the TTL had lapsed (the §5.3 conservative default — a
+        // cross-domain candidate's first request re-establishes the cache upstream).
+        const servingDomain = s.fallback.survivorMembers[probe.index]?.healthKey;
+        const withinCacheTtl =
+          withinTtl &&
+          ctxCounter.cacheDomainAtLast !== "" &&
+          servingDomain === ctxCounter.cacheDomainAtLast;
+        const estimate = { cachedTokens: ctxCounter.cachedAtLast, newTokens, withinCacheTtl };
         const aff = userLimit!.engine.affordable(
           userLimit!.resolution,
           s.requestedLogicalId,
@@ -1030,6 +1044,17 @@ export class AgentSessionFactory {
             if (actual !== null) ctxCounter.running = actual;
             ctxCounter.cachedAtLast = ctxCounter.running;
             ctxCounter.lastRequestAtMs = Date.now();
+            // Stamp the cache domain this commit established: the served chain
+            // member's health key (endpoint::wire-model — the upstream identity a
+            // prompt cache is scoped to). The next pre-flight credits the cache-read
+            // discount only to candidates predicted to be served from this same
+            // domain; any other candidate is priced as a cache miss. The logical-id
+            // fallback (member not found in the dispatched composite — shouldn't
+            // happen) can only mismatch, i.e. deny credit: conservative.
+            ctxCounter.cacheDomainAtLast =
+              activeSelection.fallback.survivorMembers.find(
+                (m) => m.logicalId === resolvedMember.logicalId,
+              )?.healthKey ?? resolvedMember.logicalId;
           }
           const budget = this.options.budget;
           if (budget?.record) {
