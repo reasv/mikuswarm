@@ -23,24 +23,76 @@ fresh, empty Unreleased section above it. Keep this guidance comment in the
 Unreleased section; it is not part of any release's notes.
 -->
 
-### Changed
-
-- Summary keyword search is now its own tool, **`search_summaries`**, instead of a `corpus:"summaries"` flag on `search_messages` — the union schema invited cross-corpus mis-fills, and dynamic tool loading removed the tool-count pressure behind the flag. The two tools have disjoint schemas sharing the common search facets (`query`, `rooms`, time window, pagination, order); `search_summaries` carries `level`/`min_level`/`status` and joins the shipped dynamic-loading immediate core.
-
-### Fixed
-
-- The chat-search tools no longer fail a call over filters that belong to the other search tool. Semantically-empty argument values (`""`, `[]`, `null`, and `0` for `level`/`min_level`) are stripped before interpretation — models that pad every optional schema field instead of omitting unused ones no longer trip errors or phantom filters (`mentions: []` matching nothing, `level: 0` matching no summaries). A meaningful filter that belongs to the other tool (e.g. `level: 2` on `search_messages`) runs the search without it and appends a note naming the ignored field and the tool that accepts it, instead of erroring the whole round trip.
+## [v0.4.0] - 2026-08-23
 
 ### Added
 
+- **Cross-channel messaging**: the agent can now act beyond the channel that
+  triggered it. New tools `send_dm` (open or reuse a direct-message timeline
+  with a user), `send_to_channel` (post into any joined channel),
+  `list_channels`, `list_members`, and `dm_optout`, plus `room`/`anchor`
+  arguments on `read_messages` for reading other timelines. Every
+  cross-channel send stores an internal context note bridging the originating
+  conversation; DMs can only be initiated with users who share a visible
+  channel with the agent (an existing DM counts); and a user can ask the agent
+  to stop DMing them — the opt-out is honored by `send_dm` and by the
+  proactive scheduler. A new seeded `contacts` workspace skill covers
+  discovery and usage. Configured under `[messaging]` (`enabled`,
+  `dm_initiation`), on by default; channel-visibility policy gates reads and
+  enumeration, never sends.
 - Dynamic session-time tool loading (`[agent.tools.dynamic]`): sessions start with a configurable immediate tool core; all other tools are deferred and loadable mid-session via the new `load_skill` and `tool_search` tools (or by viewing a tools-declaring markdown file), cache-safely per provider through pi-ai's `addedToolNames` contract. Skills gain a frontmatter `tools` list; under dynamic loading the skills index hides file paths and a `<deferred_tools>` discovery index is rendered (`index = "orphans" | "names" | "descriptions" | "none"`).
 - Six new seeded default skills grouping the built-in tools for dynamic loading: `chat-history`, `channel-ops`, `media`, `x-twitter`, `shell`, and `sessions`; all seeded skills (new and existing) now declare their tools in frontmatter.
 - **Channel visibility** (`[visibility]`): operators can assign each timeline (DM or channel) one of three modes — `shared` (default, full cross-channel search and diary access), `no_diary` (search remains cross-channel but diary is suppressed for that timeline), or `isolated` (diary suppressed and search is scoped so the timeline cannot be seen or queried from other timelines). Configure per-channel via `[[visibility.channels]]` entries (each with `timeline_key` and `mode`) and/or a blanket `dms = "…"` applied to every DM. The `expand_summary` tool refuses to surface a summary from an isolated channel when called from a different timeline. Diary rows from suppressed timelines are set to a new terminal status `excluded` (visible in the console pipeline view) rather than being retried or written. The `search_messages`, `recap`, and `user_activity` tools emit a note when operator policy silently removes rooms from a requested scope. No cross-channel access changes occur unless `[visibility]` is explicitly configured; all existing deployments behave identically on upgrade.
+- **Summary-layer token budget**: the in-context summary layer — previously
+  the only context segment with no size knob — can now be bounded. When the
+  layer's rendered size exceeds `summary_max_tokens`, eager condensation
+  absorbs the finest-grained resident summaries into higher-level ones until
+  the layer fits under `summary_target_tokens` (a target/max split, so
+  condensation runs in occasional bursts rather than continuously). Coverage
+  is never elided or replaced with pointers; the budget only moves the
+  coarsening boundary. Both knobs live in `[summarization]` and default to 0
+  (off) — existing deployments behave identically until they opt in.
+- **Workspace template reconciliation** (`[seeding]`): established workspaces
+  now receive new and updated template files on upgrade. A per-file seed
+  ledger records what was seeded and with what content hash; on boot, each
+  template file is created if absent, and an existing file is updated only
+  when it is still byte-identical to what was originally seeded — a file the
+  agent or an operator has modified is never touched. Previously only empty
+  workspaces were seeded, so template additions (such as new skills) never
+  reached existing deployments. `mode = "reconcile"` is the default;
+  `"first-run"` restores the old empty-workspace-only behavior and `"off"`
+  disables workspace seeding entirely; `update_unmodified = false` limits the
+  reconcile to creating missing files.
+- MCP servers that fail to connect at startup are now retried in the
+  background with exponential backoff instead of being dropped for the
+  process lifetime; on a late success their tools are registered and reach
+  every session created afterwards. Tunable via `[mcp]`
+  `startup_retry_max_attempts` (default 5), `startup_retry_initial_delay_ms`,
+  and `startup_retry_max_delay_ms`.
 
 ### Changed
 
 - **Dynamic tool loading ships ON in `00-defaults.toml`** with a lean always-loaded core (messaging, reactions, history read/search, native web, file tools, memory). On upgrade, sessions no longer carry every tool definition on every request — deferred tools remain reachable through skills, the `<deferred_tools>` index, and `tool_search`. Set `[agent.tools.dynamic] enabled = false` to restore the previous everything-always-loaded behavior, or override `immediate` to choose your own core.
+- Summary keyword search is now its own tool, **`search_summaries`**, instead of a `corpus:"summaries"` flag on `search_messages` — the union schema invited cross-corpus mis-fills, and dynamic tool loading removed the tool-count pressure behind the flag. The two tools have disjoint schemas sharing the common search facets (`query`, `rooms`, time window, pagination, order); `search_summaries` carries `level`/`min_level`/`status` and joins the shipped dynamic-loading immediate core.
+- **Database schema v19 (one-way migrations).** The schema advances from v11
+  through v19: the `dm_optouts` table and cross-channel event metadata, user
+  identity upserts for Matrix inbound events, summary supersession backfill
+  and stale-job cleanup for the budget work, and the workspace seed ledger.
+  Migration is automatic on first boot; a migrated database refuses to open
+  on an older build, so rolling back past this release requires a
+  pre-migration backup.
 - Updated `@earendil-works/pi-ai` and `@earendil-works/pi-agent-core` to 0.84.2.
+
+### Fixed
+
+- Per-user limits no longer under-price a request served by a different
+  upstream than the one holding the prompt cache. The within-TTL cache-read
+  discount is now credited only to a candidate whose predicted serving
+  upstream (endpoint + wire model) matches the one that served the prior
+  request; any other candidate is priced as a cache miss, so a request can no
+  longer slip past a user's spending cap at the discounted estimate and then
+  bill at full cache-miss price.
+- The chat-search tools no longer fail a call over filters that belong to the other search tool. Semantically-empty argument values (`""`, `[]`, `null`, and `0` for `level`/`min_level`) are stripped before interpretation — models that pad every optional schema field instead of omitting unused ones no longer trip errors or phantom filters (`mentions: []` matching nothing, `level: 0` matching no summaries). A meaningful filter that belongs to the other tool (e.g. `level: 2` on `search_messages`) runs the search without it and appends a note naming the ignored field and the tool that accepts it, instead of erroring the whole round trip.
 
 ## [v0.3.0] - 2026-08-20
 
