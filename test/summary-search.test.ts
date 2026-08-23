@@ -273,7 +273,7 @@ test("metadata-only summary search (no query) filters by level and time without 
   });
 });
 
-test("search_messages(corpus:summaries) returns summary hits and rejects message-only filters", async () => {
+test("search_messages(corpus:summaries) returns summary hits and notes ignored message-only filters", async () => {
   await withStorage(async (storage) => {
     await insertSummary(storage, { id: "sum_abc", content: "release planning discussion", earliest: 1000, latest: 2000 });
     const indexer = new ChatSearchIndexer({ storage });
@@ -288,42 +288,88 @@ test("search_messages(corpus:summaries) returns summary hits and rejects message
     assert.equal(okDetails.corpus, "summaries");
     assert.equal(okDetails.hits[0]?.id, "sum_abc");
 
-    // Rejection: a message-only filter under corpus:summaries fails fast, naming the field.
-    const bad = await tool.execute("c2", { corpus: "summaries", query: "release", from: ["@u:test"] });
-    const badText = (bad.content[0] as { text: string }).text;
-    assert.match(badText, /do not apply to corpus:"summaries"/);
-    assert.match(badText, /from/);
-    const badDetails = bad.details as { error: string; rejected: string[] };
-    assert.equal(badDetails.error, "inapplicable_filters");
-    assert.deepEqual(badDetails.rejected, ["from"]);
+    // A message-only filter under corpus:summaries is ignored with a note naming
+    // it and the corpus that accepts it — the search still runs and returns hits.
+    const noted = await tool.execute("c2", { corpus: "summaries", query: "release", rooms: "all", from: ["@u:test"] });
+    const notedText = (noted.content[0] as { text: string }).text;
+    assert.match(notedText, /ignored from — message-only filter/);
+    assert.match(notedText, /corpus:"messages"/);
+    assert.match(notedText, /id: sum_abc/); // results delivered despite the padded filter
+    const notedDetails = noted.details as { error?: string; ignoredFilters: string[] };
+    assert.equal(notedDetails.error, undefined);
+    assert.deepEqual(notedDetails.ignoredFilters, ["from"]);
   });
 });
 
-test("search_messages(corpus:messages) rejects summary-only filters, pointing at corpus:summaries", async () => {
+test("search_messages(corpus:messages) ignores summary-only filters with a note, pointing at corpus:summaries", async () => {
   await withStorage(async (storage) => {
     const indexer = new ChatSearchIndexer({ storage });
     const tool = createSearchMessagesTool({ storage, indexer, currentTimelineKey: TK, now: () => 10_000 });
 
-    // Default corpus is "messages": a summary-only filter must fail fast, not be ignored.
-    const bad = await tool.execute("c1", { query: "release", level: 2, status: ["complete"] });
-    const badText = (bad.content[0] as { text: string }).text;
-    assert.match(badText, /only apply to corpus:"summaries"/);
-    assert.match(badText, /level/);
-    assert.match(badText, /status/);
-    assert.match(badText, /set corpus:"summaries"/);
-    const badDetails = bad.details as { corpus: string; error: string; rejected: string[] };
-    assert.equal(badDetails.corpus, "messages");
-    assert.equal(badDetails.error, "inapplicable_filters");
-    assert.deepEqual(badDetails.rejected, ["level", "status"]);
+    // Default corpus is "messages": a summary-only filter is ignored — never a dead
+    // round trip — and the note names the fields and the exact recourse.
+    const noted = await tool.execute("c1", { query: "release", level: 2, status: ["complete"] });
+    const notedText = (noted.content[0] as { text: string }).text;
+    assert.match(notedText, /ignored level, status — summaries-only filter/);
+    assert.match(notedText, /set corpus:"summaries"/);
+    const notedDetails = noted.details as { error?: string; ignoredFilters: string[] };
+    assert.equal(notedDetails.error, undefined);
+    assert.deepEqual(notedDetails.ignoredFilters, ["level", "status"]);
 
-    // min_level is likewise rejected under the default corpus.
-    const bad2 = await tool.execute("c2", { query: "release", min_level: 3 });
-    const bad2Details = bad2.details as { rejected: string[] };
-    assert.deepEqual(bad2Details.rejected, ["min_level"]);
+    // min_level is likewise noted under the default corpus.
+    const noted2 = await tool.execute("c2", { query: "release", min_level: 3 });
+    const noted2Details = noted2.details as { ignoredFilters: string[] };
+    assert.deepEqual(noted2Details.ignoredFilters, ["min_level"]);
 
-    // A plain message search (no summary-only filters) is NOT rejected.
+    // A plain message search (no summary-only filters) carries no note.
     const ok = await tool.execute("c3", { query: "release" });
-    const okDetails = ok.details as { error?: string };
+    const okDetails = ok.details as { error?: string; ignoredFilters: string[] };
     assert.equal(okDetails.error, undefined);
+    assert.deepEqual(okDetails.ignoredFilters, []);
+  });
+});
+
+test("search_messages treats padded semantically-empty args exactly like omitted ones", async () => {
+  await withStorage(async (storage) => {
+    const indexer = new ChatSearchIndexer({ storage });
+    const tool = createSearchMessagesTool({ storage, indexer, currentTimelineKey: TK, now: () => 10_000 });
+
+    // Models that pad every optional field send "", [], 0 for the ones they don't
+    // mean. None of that may error or filter: level:0/min_level:0/status:[] are not
+    // summary intent, mentions:[]/quoted_user:[] are not filters, last:""/cursor:""
+    // are not bounds. (Real-world shape observed from a padding caller.)
+    const res = await tool.execute("c1", {
+      corpus: "messages",
+      query: "release",
+      rooms: "all",
+      scope: "text",
+      from: [],
+      mentions: [],
+      quoted_user: [],
+      last: "",
+      since_user_absence: "",
+      cursor: "",
+      order: "newest",
+      format: "compact",
+      level: 0,
+      min_level: 0,
+      status: [],
+    });
+    const details = res.details as { error?: string; ignoredFilters: string[]; ignoredBounds: string[] };
+    assert.equal(details.error, undefined);
+    assert.deepEqual(details.ignoredFilters, []); // normalized away, not "ignored with note"
+    assert.deepEqual(details.ignoredBounds, []);
+    assert.doesNotMatch((res.content[0] as { text: string }).text, /ignored/);
+
+    // Same tolerance on the summaries corpus: padded empties vanish, real
+    // summary-only values still apply.
+    const sum = await tool.execute("c2", { corpus: "summaries", query: "release", rooms: "all", from: [], status: [], min_level: 0 });
+    const sumDetails = sum.details as { error?: string; ignoredFilters: string[] };
+    assert.equal(sumDetails.error, undefined);
+    assert.deepEqual(sumDetails.ignoredFilters, []);
+
+    // A padded level:[0] array collapses to unset rather than matching nothing.
+    const lvl = await tool.execute("c3", { corpus: "summaries", query: "release", rooms: "all", level: [0] });
+    assert.equal((lvl.details as { error?: string }).error, undefined);
   });
 });

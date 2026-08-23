@@ -23,6 +23,10 @@ fresh, empty Unreleased section above it. Keep this guidance comment in the
 Unreleased section; it is not part of any release's notes.
 -->
 
+### Fixed
+
+- `search_messages` no longer fails a call over corpus-inapplicable filters. Semantically-empty argument values (`""`, `[]`, `null`, and `0` for `level`/`min_level`) are stripped before interpretation — models that pad every optional schema field instead of omitting unused ones no longer trip errors or phantom filters (`mentions: []` matching nothing, `level: 0` matching no summaries). A meaningful filter that belongs to the other corpus (e.g. `level: 2` under `corpus:"messages"`) now runs the search without it and appends a note naming the ignored field and the corpus that accepts it, instead of erroring the whole round trip.
+
 ### Added
 
 - Dynamic session-time tool loading (`[agent.tools.dynamic]`): sessions start with a configurable immediate tool core; all other tools are deferred and loadable mid-session via the new `load_skill` and `tool_search` tools (or by viewing a tools-declaring markdown file), cache-safely per provider through pi-ai's `addedToolNames` contract. Skills gain a frontmatter `tools` list; under dynamic loading the skills index hides file paths and a `<deferred_tools>` discovery index is rendered (`index = "orphans" | "names" | "descriptions" | "none"`).

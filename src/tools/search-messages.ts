@@ -102,9 +102,10 @@ interface SearchMessagesArgs {
 
 /**
  * Message-only / corpus-inapplicable params, keyed by the public arg name. When
- * `corpus:"summaries"` these are rejected (fail-fast, naming the field) rather than
- * silently ignored — they have no meaning for a summary, and a silent ignore would
- * mask a malformed query. See §5.1.
+ * `corpus:"summaries"` these have no meaning, so the search runs without them and
+ * the result carries a note naming the ignored field(s) and the corpus that accepts
+ * them. Never a failed call: the note preserves the mis-corpus signal (a silent
+ * ignore would mask a malformed query) without costing the agent a round trip.
  */
 const SUMMARY_INAPPLICABLE_FIELDS = [
   "scope",
@@ -122,12 +123,49 @@ const SUMMARY_INAPPLICABLE_FIELDS = [
 /**
  * Summary-only params, keyed by the public arg name. The mirror of
  * `SUMMARY_INAPPLICABLE_FIELDS`: under the default `corpus:"messages"` these have no
- * meaning, so they are rejected (fail-fast, naming the field) rather than silently
- * dropped — a model that meant to search summaries but forgot `corpus:"summaries"`
- * would otherwise get a plain message search with its level filter doing nothing and
- * no signal. See §5.1.
+ * meaning, so the search runs without them and the result notes them by name — a
+ * model that meant to search summaries but forgot `corpus:"summaries"` still gets
+ * its message results plus the exact recourse, instead of a dead round trip.
  */
 const MESSAGE_INAPPLICABLE_FIELDS = ["level", "min_level", "status"] as const;
+
+/**
+ * Strip semantically-empty values from a call before interpreting it. Key presence
+ * carries no intent: some models pad every optional schema field with "", [], null,
+ * or 0 instead of omitting the ones they don't mean, so a value that expresses no
+ * constraint must behave exactly like an omitted field. "" / [] / null are dropped
+ * for every field; 0 is additionally dropped from level/min_level (levels start at
+ * 1, so 0 cannot name a real level and a literal read would silently match nothing).
+ */
+function normalizeArgs(raw: Record<string, unknown>): SearchMessagesArgs {
+  const args: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (v === undefined || v === null) continue;
+    if (v === "") continue;
+    if (Array.isArray(v)) {
+      const items = k === "level" ? v.filter((x) => x !== 0) : v;
+      if (items.length === 0) continue;
+      args[k] = items;
+      continue;
+    }
+    if ((k === "level" || k === "min_level") && v === 0) continue;
+    args[k] = v;
+  }
+  return args as SearchMessagesArgs;
+}
+
+/**
+ * The corpus-inapplicable fields still present after normalization (i.e. carrying a
+ * real value), plus the note to surface. Empty note when nothing was ignored.
+ */
+function inapplicableFilters(
+  args: SearchMessagesArgs,
+  fields: readonly string[],
+  note: (names: string) => string,
+): { ignored: string[]; note: string } {
+  const ignored = fields.filter((f) => (args as Record<string, unknown>)[f] !== undefined);
+  return { ignored, note: ignored.length > 0 ? note(ignored.join(", ")) : "" };
+}
 
 function fmtTs(ms: number): string {
   try {
@@ -174,7 +212,7 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
             "A call returns EITHER message hits OR summary hits, never both. With " +
             'corpus:"summaries", the message-only filters (from, mentions, quoted_user, ' +
             "is_reply, has_attachment, attachment_type, has_link, scope, since_user_absence, " +
-            "format) do not apply and are rejected; level/min_level/status apply instead.",
+            "format) do not apply and are ignored; level/min_level/status apply instead.",
         }),
       ),
       query: Type.Optional(
@@ -266,7 +304,7 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
       ),
     }),
     execute: async (_toolCallId, params) => {
-      const args = params as SearchMessagesArgs;
+      const args = normalizeArgs(params as Record<string, unknown>);
       const rawKeys = resolveRoomsForAgent(
         args.rooms,
         context.currentTimelineKey,
@@ -300,24 +338,14 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
       if ((args.corpus ?? "messages") === "summaries") {
         return runSummaryCorpus(context, args, timelineKeys, now, visibilityNote);
       }
-      // Fail-fast: reject summary-only filters under corpus:"messages" rather than
-      // silently ignoring them (mirror of the summaries-branch rejection). See §5.1.
-      const rejectedSummaryOnly = MESSAGE_INAPPLICABLE_FIELDS.filter(
-        (f) => (args as Record<string, unknown>)[f] !== undefined,
+      // A summary-only filter under corpus:"messages" (post-normalization, so a real
+      // value like level: 2) is ignored with a note naming the recourse — the search
+      // still runs (mirror of the summaries-branch handling).
+      const { ignored: ignoredFilters, note: inapplicableNote } = inapplicableFilters(
+        args,
+        MESSAGE_INAPPLICABLE_FIELDS,
+        (names) => ` (ignored ${names} — summaries-only filter(s); set corpus:"summaries" to use them)`,
       );
-      if (rejectedSummaryOnly.length > 0) {
-        const text =
-          `error: these filters only apply to corpus:"summaries": ${rejectedSummaryOnly.join(", ")}. ` +
-          'To search the rolling conversation summaries by keyword, set corpus:"summaries".';
-        return {
-          content: [{ type: "text", text }],
-          details: {
-            corpus: "messages",
-            error: "inapplicable_filters",
-            rejected: rejectedSummaryOnly,
-          },
-        };
-      }
       const scope: SearchScope = args.scope ?? "text";
       const window = resolveTimeWindow(args, now());
       // since_user_absence overrides the lower bound with the gap-detected boundary.
@@ -442,7 +470,7 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
         // Every requested room was excluded and nothing was searched.
         text = visibilityNote;
       } else if (outcome.hits.length === 0) {
-        text = `No matching messages${orderNote}${dateNote}${absenceNote}.\n(${trailer})${visNote}`;
+        text = `No matching messages${orderNote}${dateNote}${absenceNote}${inapplicableNote}.\n(${trailer})${visNote}`;
       } else {
         const more =
           outcome.total > outcome.hits.length
@@ -450,7 +478,7 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
               (nextCursor ? ` Pass cursor: ${nextCursor} for the next page.` : "")
             : "";
         text =
-          `${outcome.total} match(es)${orderNote}${dateNote}${absenceNote}:\n\n${lines.join(lineSep)}${more}${truncationNote}\n\n(${trailer})${visNote}`;
+          `${outcome.total} match(es)${orderNote}${dateNote}${absenceNote}${inapplicableNote}:\n\n${lines.join(lineSep)}${more}${truncationNote}\n\n(${trailer})${visNote}`;
       }
 
       return {
@@ -465,6 +493,7 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
           aggregateTruncated,
           nextCursor: nextCursor ?? null,
           ignoredBounds: window.ignored,
+          ignoredFilters,
           hits: outcome.hits.map((h) => ({
             eventId: h.eventId,
             timelineKey: h.timelineKey,
@@ -487,7 +516,7 @@ export function createSearchMessagesTool(context: SearchMessagesToolContext): Ag
  * The `corpus:"summaries"` branch of `search_messages` (§9e): keyword search over the
  * rolling summaries (`summaries_fts`) instead of the raw transcript. Returns summary
  * hits — each citing its `id` for `expand_summary` — never message hits, so the two
- * corpora never interleave. Message-only filters are rejected up front (fail-fast).
+ * corpora never interleave. Message-only filters are ignored with a naming note.
  */
 function runSummaryCorpus(
   context: SearchMessagesToolContext,
@@ -496,21 +525,13 @@ function runSummaryCorpus(
   now: () => number,
   visibilityNote = "",
 ): AgentToolResult<unknown> {
-  // Fail-fast: reject any message-only / inapplicable filter rather than ignoring it.
-  const rejected = SUMMARY_INAPPLICABLE_FIELDS.filter(
-    (f) => (args as Record<string, unknown>)[f] !== undefined,
+  // A message-only filter here (post-normalization, so a real value) is ignored with
+  // a note naming it and the corpus that accepts it — the search still runs.
+  const { ignored: ignoredFilters, note: inapplicableNote } = inapplicableFilters(
+    args,
+    SUMMARY_INAPPLICABLE_FIELDS,
+    (names) => ` (ignored ${names} — message-only filter(s); use corpus:"messages" for them)`,
   );
-  if (rejected.length > 0) {
-    const text =
-      `error: these filters do not apply to corpus:"summaries": ${rejected.join(", ")}. ` +
-      "Applicable parameters are: query, rooms, after/before/last, limit, cursor, order, " +
-      "level, min_level, status. (To filter by sender/mentions/attachments, search the raw " +
-      "transcript with corpus:\"messages\".)";
-    return {
-      content: [{ type: "text", text }],
-      details: { corpus: "summaries", error: "inapplicable_filters", rejected },
-    };
-  }
 
   const window = resolveTimeWindow(args, now());
   const match = args.query ? sanitizeSummaryFtsMatch(args.query) : undefined;
@@ -566,7 +587,7 @@ function runSummaryCorpus(
   if (outcome.hits.length === 0 && visibilityNote && !timelineKeys?.length) {
     text = visibilityNote;
   } else if (outcome.hits.length === 0) {
-    text = `No matching summaries${orderNote}${dateNote}.\n(${trailer})${visNote}`;
+    text = `No matching summaries${orderNote}${dateNote}${inapplicableNote}.\n(${trailer})${visNote}`;
   } else {
     const more =
       outcome.total > outcome.hits.length
@@ -574,7 +595,7 @@ function runSummaryCorpus(
           (nextCursor ? ` Pass cursor: ${nextCursor} for the next page.` : "")
         : "";
     text =
-      `${outcome.total} summary match(es)${orderNote}${dateNote} ` +
+      `${outcome.total} summary match(es)${orderNote}${dateNote}${inapplicableNote} ` +
       `(pass any id to expand_summary to drill into it):\n\n${lines.join("\n\n")}${more}\n\n(${trailer})${visNote}`;
   }
 
@@ -588,6 +609,7 @@ function runSummaryCorpus(
       order,
       nextCursor: nextCursor ?? null,
       ignoredBounds: window.ignored,
+      ignoredFilters,
       hits: outcome.hits.map((h) => ({
         id: h.id,
         timelineKey: h.timelineKey,
