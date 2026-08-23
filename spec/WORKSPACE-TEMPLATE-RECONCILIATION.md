@@ -1,7 +1,14 @@
 # Workspace Template Reconciliation — rolling out template additions to established workspaces
 
-**Status**: PROPOSED — design for owner review; NOT implemented. Do not build
-without sign-off on the open questions in §12.
+**Status**: APPROVED FOR IMPLEMENTATION — owner reviewed 2026-08-23, §12
+resolved (see owner decisions below). Flip to IMPLEMENTED in the landing commit.
+
+**Owner decisions (2026-08-23)**: implement now. `update_unmodified` defaults
+**on** in v1 — an owner override of the draft's off recommendation: the hash
+gate itself, not the knob, is the safety contract (§5.4). The remaining §12
+questions resolve per the draft's recommendations: default mode `reconcile`;
+adoption-boot absences seed loudly; drift notices are logs-only in v1; no
+persona-file special case.
 
 **Author**: design session 2026-08-23.
 
@@ -71,8 +78,9 @@ Goals:
 Non-goals:
 
 - **No automatic merging** of upstream changes into modified files. Merge
-  remains a documented manual convention (§8). v1 does not even auto-copy
-  into *unmodified* files unless the operator opts in (§5.4).
+  remains a documented manual convention (§8). Auto-copy happens only for
+  files provably unedited since the mechanism wrote them (§5.4); anything
+  with local edits gets a notice, never a write.
 - **Config seeding is out of scope.** `seedConfigDir` stays first-run-only:
   config files are operator-owned from the moment they exist, and shipped
   defaults already roll out via the baked `00-defaults.toml` merge layer.
@@ -118,11 +126,13 @@ per-agent; the reconcile itself runs per agent workspace):
 # "off"        — no workspace/feature seeding at all (config seeding unaffected)
 mode = "reconcile"
 
-# Opt-in third tier (§5.3/§5.4): when a template file changed upstream AND the
-# local copy is still byte-identical to the template version last recorded in
-# the ledger (provably never locally edited), copy the new version over it.
-# Default off: the default posture modifies nothing that exists.
-update_unmodified = false
+# Third tier (§5.3/§5.4): when a template file changed upstream AND the local
+# copy is still byte-identical to the template version last recorded in the
+# ledger (provably never locally edited), copy the new version over it.
+# Default ON (owner decision 2026-08-23): provably non-destructive, and it is
+# what lets pure-doc template fixes roll out with zero manual steps. Set to
+# false to restrict the mechanism to creating new files only.
+update_unmodified = true
 ```
 
 Schema: TypeBox `StrictObject`, both fields optional with the defaults above;
@@ -191,9 +201,10 @@ not-per-boot).
 **Invariant (restates and strengthens the §4b invariant):** the mechanism
 never deletes anything, and never writes to an existing path unless
 `update_unmodified` is on *and* the current local bytes hash-match the
-template version the ledger itself recorded. Under default config it only
-ever creates files at paths that neither exist locally nor appear in the
-ledger. Failure posture is unchanged: every step fails safe — errors logged
+template version the ledger itself recorded. With `update_unmodified = false`
+it only ever creates files at paths that neither exist locally nor appear in
+the ledger; the default (on) additionally performs that hash-gated update of
+provably-unedited files and nothing else. Failure posture is unchanged: every step fails safe — errors logged
 and swallowed, startup continues; ledger writes go through the storage
 single-writer queue; a row is written only after its copy succeeds.
 
@@ -229,10 +240,11 @@ never satisfy it and can never be auto-updated, by construction.
 
 Provably non-destructive (it only replaces bytes identical to a template
 version it shipped), and it is what makes pure-doc template fixes (typo in a
-SKILL.md the agent never touched) roll out automatically. Still default-off
-in this proposal because "the mechanism modifies nothing that exists" is a
-simpler contract to trust on first landing; recommend revisiting the default
-one release later. §12 Q3.
+SKILL.md the agent never touched) roll out automatically. The draft proposed
+default-off for v1; the owner decided (2026-08-23) it ships **on**: the
+safety contract is the hash gate itself, and shipping it off would strand
+doc updates on every deployment that never finds the knob. `false` remains
+available to restrict the mechanism to file creation only.
 
 ### 5.5 Files removed from templates upstream
 
@@ -358,18 +370,14 @@ should skim the seed/drift log lines after that boot, per §8's documentation.
 No data transformation, no config required (defaults apply), `mode =
 "first-run"` is the escape hatch to exact pre-change behavior.
 
-## 12. Open questions for the owner
+## 12. Open questions — resolved (owner, 2026-08-23)
 
-1. **Default mode**: `reconcile` (recommended — the mechanism is inert
-   destruction-wise and the whole point is that every deployment benefits) or
-   ship default `first-run` and let deployments opt in?
-2. **Adoption-boot absences** (§5.1): seed loudly (recommended) or tombstone
-   conservatively?
-3. **`update_unmodified` default**: off in v1 (recommended) — revisit later,
-   or on from the start given it is provably non-destructive?
-4. **Drift-notice surface**: logs-only v1 (recommended) or also persist for
-   the console now?
-5. **`SOUL.md` exemption**: under §5.1 an established workspace missing
-   `SOUL.md` would receive the placeholder template. Special-case persona
-   files out of adoption-boot seeding, or accept (placeholder is harmless and
-   individually logged)?
+1. **Default mode**: `reconcile`.
+2. **Adoption-boot absences** (§5.1): seed them, loudly (one info line per
+   file); a re-deletion is then tombstoned permanently.
+3. **`update_unmodified` default**: **on** in v1 — owner override of the
+   draft's off recommendation (see §5.4).
+4. **Drift-notice surface**: logs-only in v1; the console drift panel stays
+   future work.
+5. **`SOUL.md` exemption**: none — adoption-boot seeding of the placeholder
+   is accepted (individually logged, harmless).
