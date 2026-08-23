@@ -6,6 +6,7 @@ import * as path from "node:path";
 
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Storage } from "../src/storage/index.js";
+import { LATEST_SCHEMA_VERSION } from "../src/storage/database.js";
 import { TimelineStore } from "../src/timeline/index.js";
 import { SummarizationIndexer, SummarizationWorkerPool, evaluateCondensation } from "../src/summarization/index.js";
 import { estimateTokens } from "../src/context/index.js";
@@ -1612,7 +1613,7 @@ test("migration v13→v14: input_child_ids column added; poisoned eager rows del
     const storage = await Storage.open({ databasePath: dbPath });
     try {
       const version = storage.read((db) => Number(db.pragma("user_version", { simple: true })));
-      assert.equal(version, 16, "migrations stamp v16");
+      assert.equal(version, LATEST_SCHEMA_VERSION, "migrations stamp the latest version");
 
       // Column must now exist.
       const cols = storage.read((db) =>
@@ -1632,7 +1633,7 @@ test("migration v13→v14: input_child_ids column added; poisoned eager rows del
     const storage2 = await Storage.open({ databasePath: dbPath });
     try {
       const version2 = storage2.read((db) => Number(db.pragma("user_version", { simple: true })));
-      assert.equal(version2, 16, "idempotent re-open: version still 16");
+      assert.equal(version2, LATEST_SCHEMA_VERSION, "idempotent re-open: version unchanged");
       assert.equal(storage2.getSummarizationJobById("poisoned_job"), undefined, "idempotent re-open: row still absent");
     } finally {
       await storage2.waitForIdle();
@@ -2326,7 +2327,7 @@ test("migration v14→v15: rows cancelled-to-failed by the original v14 are dele
     const storage = await Storage.open({ databasePath: dbPath });
     try {
       const version = storage.read((db) => Number(db.pragma("user_version", { simple: true })));
-      assert.equal(version, 16, "v14→v15 runs (chain continues to v16)");
+      assert.equal(version, LATEST_SCHEMA_VERSION, "v14→v15 runs (chain continues to latest)");
       assert.equal(storage.getSummarizationJobById("old_cancelled_job"), undefined, "previously cancelled row deleted");
     } finally {
       await storage.waitForIdle();
@@ -2401,7 +2402,7 @@ test("migration v15→v16: missed supersessions from completed absorb jobs are b
     const storage = await Storage.open({ databasePath: dbPath });
     try {
       const version = storage.read((db) => Number(db.pragma("user_version", { simple: true })));
-      assert.equal(version, 16, "v15→v16 ran");
+      assert.equal(version, LATEST_SCHEMA_VERSION, "v15→v16 ran (chain continues to latest)");
 
       assert.equal(storage.getSummaryById("P16")?.status, "superseded", "P retroactively superseded");
       assert.equal(storage.getSummaryById("r1_16")?.status, "superseded", "r1 retroactively superseded");
