@@ -1,5 +1,5 @@
 import { constants as fsConstants } from "node:fs";
-import { access, copyFile, mkdir, open as fsOpen, readdir, readFile, rename, stat } from "node:fs/promises";
+import { access, copyFile, mkdir, open as fsOpen, readdir, readFile, rename } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
 
@@ -220,6 +220,8 @@ export async function seedFeatureSkills(
  * Minimal ledger interface. seed.ts never imports Storage directly; app.ts wires
  * a concrete implementation from Storage.get/upsertSeedLedgerRow.
  */
+// Structurally identical to storage/database.ts SeedLedgerRow; kept separate so
+// seed.ts stays storage-free. app.ts wires them together without casts.
 export interface SeedLedgerRow {
   agent_name: string;
   rel_path: string;
@@ -284,7 +286,8 @@ async function atomicWrite(destPath: string, content: Buffer): Promise<void> {
   const base = path.basename(destPath);
   // Create a temp file in the same directory with a random suffix.
   const tmpPath = path.join(dir, `.${base}.tmp.${Math.random().toString(36).slice(2)}`);
-  let fh: ReturnType<typeof fsOpen> extends Promise<infer T> ? T : never;
+  let fh: Awaited<ReturnType<typeof fsOpen>> | undefined;
+  let wrote = false;
   try {
     await mkdir(dir, { recursive: true });
     // O_WRONLY | O_CREAT | O_EXCL — exclusive create so we never clobber an
@@ -293,15 +296,21 @@ async function atomicWrite(destPath: string, content: Buffer): Promise<void> {
     fh = await fsOpen(tmpPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL);
     await fh.writeFile(content);
     await fh.close();
+    fh = undefined; // successfully closed
+    wrote = true;
     await rename(tmpPath, destPath);
-  } catch (err) {
-    // Best-effort cleanup of the temp file on any failure.
-    try { await (await fsOpen(tmpPath, "r")).close(); } catch { /* ignore */ }
-    try {
-      const { unlink } = await import("node:fs/promises");
-      await unlink(tmpPath);
-    } catch { /* ignore */ }
-    throw err;
+  } finally {
+    // Close the handle if it is still open (write or close threw).
+    if (fh !== undefined) {
+      try { await fh.close(); } catch { /* ignore double-close */ }
+    }
+    // Best-effort unlink of the temp file on any failure.
+    if (!wrote) {
+      try {
+        const { unlink } = await import("node:fs/promises");
+        await unlink(tmpPath);
+      } catch { /* ignore */ }
+    }
   }
 }
 
@@ -330,15 +339,22 @@ export async function reconcileWorkspace(
   sources: ReconcileSource[],
   ledger: SeedLedgerOps,
   opts: ReconcileOptions,
-): Promise<{ seeded: number; updated: number; driftNotices: number; tombstonesSkipped: number }> {
+): Promise<{ seeded: number; updated: number; driftNotices: number; tombstonesSkipped: number; collisionsSkipped: number }> {
   const { updateUnmodified, logger } = opts;
   let seeded = 0;
   let updated = 0;
   let driftNotices = 0;
   let tombstonesSkipped = 0;
+  let collisionsSkipped = 0;
 
   // Track all rel_paths walked in this run (for §5.5 un-walked ledger row detection).
   const walkedRelPaths = new Set<string>();
+  // Cross-source collision guard: track resolved absolute destination paths claimed by
+  // earlier sources. When a later source's file resolves to an already-claimed physical
+  // path, skip it entirely — "first source wins". This prevents two sources from
+  // claiming the same file under different ledger keys (which could cause spurious
+  // drift notices or overwrites with update_unmodified=true).
+  const claimedDestPaths = new Map<string, string>(); // absDestPath → source id that owns it
 
   for (const src of sources) {
     if (!(await pathExists(src.srcDir))) continue; // missing source tree → skip silently
@@ -369,6 +385,22 @@ export async function reconcileWorkspace(
     await walkSource(src.srcDir);
 
     for (const { srcPath, relPath, destPath } of files) {
+      // Cross-source collision guard: skip if a prior source already claimed this physical path.
+      const absDestPath = path.resolve(destPath);
+      const ownerSource = claimedDestPaths.get(absDestPath);
+      if (ownerSource !== undefined) {
+        collisionsSkipped++;
+        logger?.warn?.("workspace reconcile: template source collision, first source wins", {
+          agent: agentName,
+          path: relPath,
+          dest: absDestPath,
+          owner: ownerSource,
+          skipped: src.source,
+        });
+        continue;
+      }
+      claimedDestPaths.set(absDestPath, src.source);
+
       walkedRelPaths.add(relPath);
       try {
         await reconcileFile({
@@ -402,7 +434,7 @@ export async function reconcileWorkspace(
     }
   }
 
-  return { seeded, updated, driftNotices, tombstonesSkipped };
+  return { seeded, updated, driftNotices, tombstonesSkipped, collisionsSkipped };
 }
 
 interface ReconcileFileArgs {

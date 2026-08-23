@@ -1,6 +1,6 @@
 # Workspace Template Reconciliation — rolling out template additions to established workspaces
 
-**Status**: IMPLEMENTED — superseded by ARCHITECTURE.md §4b; retained for review.
+**Status**: IMPLEMENTED — superseded by ARCHITECTURE.md §4b; retained for review. Post-design addition: cross-source collision guard (first-source-wins on physical path overlap, warn+skip); not in this spec but implemented in the landing commit.
 
 **Owner decisions (2026-08-23)**: implement now. `update_unmodified` defaults
 **on** in v1 — an owner override of the draft's off recommendation: the hash

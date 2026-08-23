@@ -1478,6 +1478,8 @@ export interface RoomSummaryRow {
  * created it), 'adopted' (pre-ledger file observed), or 'updated' (hash-gated
  * safe overwrite). `template_hash` is the SHA-256 hex of the last-seen template
  * content. Primary key (agent_name, rel_path).
+ * Structurally identical to bootstrap/seed.ts SeedLedgerRow; kept separate so
+ * seed.ts stays storage-free. app.ts wires them together without casts.
  */
 export interface SeedLedgerRow {
   agent_name: string;

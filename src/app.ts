@@ -471,7 +471,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         const ledger = makeSeedLedger(storage, name);
         const sources = buildReconcileSources(templatesDir, resolved, enabledFeatureNames(config.features));
         const counts = await reconcileWorkspace(name, sources, ledger, { updateUnmodified, logger });
-        if (counts.seeded > 0 || counts.updated > 0 || counts.driftNotices > 0 || counts.tombstonesSkipped > 0) {
+        if (counts.seeded > 0 || counts.updated > 0 || counts.driftNotices > 0 || counts.tombstonesSkipped > 0 || counts.collisionsSkipped > 0) {
           logger.info("workspace reconcile summary", { agent: name, ...counts });
         }
       } else if (seedingMode === "first-run") {
@@ -568,7 +568,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         const ledger = makeSeedLedger(storage, "__legacy__");
         const sources = buildReconcileSources(legacyTemplatesDir, workspaceRoot, enabledFeatureNames(config.features));
         const counts = await reconcileWorkspace("__legacy__", sources, ledger, { updateUnmodified: legacyUpdateUnmodified, logger });
-        if (counts.seeded > 0 || counts.updated > 0 || counts.driftNotices > 0 || counts.tombstonesSkipped > 0) {
+        if (counts.seeded > 0 || counts.updated > 0 || counts.driftNotices > 0 || counts.tombstonesSkipped > 0 || counts.collisionsSkipped > 0) {
           logger.info("workspace reconcile summary", { agent: "__legacy__", ...counts });
         }
       } else if (legacyMode === "first-run") {
@@ -7162,11 +7162,12 @@ export function enabledFeatureNames(features: AppConfig["features"]): string[] {
 function makeSeedLedger(storage: Storage, agentName: string): SeedLedgerOps {
   return {
     get(relPath: string) {
-      const row = storage.getSeedLedgerRow(agentName, relPath);
-      return row as import("./bootstrap/seed.js").SeedLedgerRow | undefined;
+      // storage.SeedLedgerRow and seed.SeedLedgerRow are structurally identical; no cast needed.
+      return storage.getSeedLedgerRow(agentName, relPath);
     },
     list() {
-      return storage.listSeedLedgerRows(agentName) as import("./bootstrap/seed.js").SeedLedgerRow[];
+      // Same structural identity — no cast needed.
+      return storage.listSeedLedgerRows(agentName);
     },
     async upsert(patch) {
       const now = Date.now();

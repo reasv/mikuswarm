@@ -243,7 +243,10 @@ test("seed-reconcile/tombstone: deleted local not recreated on next reconcile", 
       "file must still be absent",
     );
 
-    // Template hash update on tombstoned path stays silent (no seeding).
+    // Template hash update on tombstoned path: stays silent (no seeding), but
+    // the ledger row's template_hash MUST be updated to the new template hash.
+    const oldHash = ledger.rows.get("skill.md")?.template_hash;
+    assert.ok(oldHash, "row has a template_hash before template update");
     await writeFile(path.join(tmplDir, "skill.md"), "updated content\n");
     const r3 = await reconcileWorkspace("agent", sources, ledger, { updateUnmodified: true });
     assert.equal(r3.tombstonesSkipped, 1, "tombstone still skipped after template update");
@@ -252,6 +255,10 @@ test("seed-reconcile/tombstone: deleted local not recreated on next reconcile", 
       () => access(path.join(ws, "skill.md"), constants.F_OK),
       "file must still be absent after template update",
     );
+    // Ledger hash must have been silently updated to the new template hash.
+    const newHash = ledger.rows.get("skill.md")?.template_hash;
+    assert.notEqual(newHash, oldHash, "ledger hash updated to new template hash");
+    assert.ok(newHash, "new hash is non-empty");
   });
 });
 
@@ -541,6 +548,57 @@ test("seed-reconcile/mode-off: empty sources seeds nothing", async () => {
     assert.equal(ledger.rows.size, 0, "no rows created");
     const tree = await readTree(ws);
     assert.equal(tree.size, 0, "workspace remains empty");
+  });
+});
+
+test("seed-reconcile/collision-guard: second source claiming same physical path is skipped", async () => {
+  await withTmpDir(async (dir) => {
+    // Source A: templates/ws-source/ → destDir/
+    //   file: skills/shared.md  → destDir/skills/shared.md
+    // Source B: templates/feature-source/ → destDir/skills/
+    //   file: shared.md         → destDir/skills/shared.md  (SAME physical path)
+    const srcA = path.join(dir, "ws-source");
+    const srcB = path.join(dir, "feature-source");
+    const destDir = path.join(dir, "ws");
+
+    await mkdir(path.join(srcA, "skills"), { recursive: true });
+    await writeFile(path.join(srcA, "skills", "shared.md"), "from-workspace\n");
+    await mkdir(srcB, { recursive: true });
+    await writeFile(path.join(srcB, "shared.md"), "from-feature\n");
+    await mkdir(destDir, { recursive: true });
+
+    const ledger = new MemLedger("agent");
+    const { logger, entries } = makeCapturingLogger();
+    const sources: ReconcileSource[] = [
+      { source: "workspace", srcDir: srcA, destDir: destDir },
+      { source: "feature:x", srcDir: srcB, destDir: path.join(destDir, "skills") },
+    ];
+
+    const counts = await reconcileWorkspace("agent", sources, ledger, { updateUnmodified: true, logger });
+
+    // Collision detected and skipped.
+    assert.equal(counts.collisionsSkipped, 1, "one collision skipped");
+    assert.equal(counts.seeded, 1, "only first source's file seeded");
+
+    // Physical file has first source's content.
+    assert.equal(
+      await readFile(path.join(destDir, "skills", "shared.md"), "utf8"),
+      "from-workspace\n",
+      "first source content wins",
+    );
+
+    // No second ledger row for the colliding path.
+    const rowsForShared = [...ledger.rows.entries()].filter(([, r]) => r.source === "feature:x");
+    assert.equal(rowsForShared.length, 0, "no ledger row written for colliding second source");
+
+    // Warn logged.
+    const warnLog = entries.find((e) => e.level === "warn" && e.message.includes("collision"));
+    assert.ok(warnLog, "collision warn logged");
+    assert.equal(warnLog?.fields?.["owner"], "workspace", "owner source named correctly");
+    assert.equal(warnLog?.fields?.["skipped"], "feature:x", "skipped source named correctly");
+
+    // No drift notice.
+    assert.equal(counts.driftNotices, 0, "no drift notice from collision");
   });
 });
 
