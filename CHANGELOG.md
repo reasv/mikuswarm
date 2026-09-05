@@ -23,6 +23,20 @@ fresh, empty Unreleased section above it. Keep this guidance comment in the
 Unreleased section; it is not part of any release's notes.
 -->
 
+### Fixed
+
+- **Inactive channels were being summarized.** The eager summarization indexer
+  had no channel-lifecycle check, and two of its entry points bypass the inbound
+  activation gate: an applied message edit (applied for any timeline state so
+  edits work uniformly) and the worker pool's completion callback. A single edit
+  in a never-engaged channel with a large stored backlog therefore enqueued a
+  level-1 summary job, and each completion cascaded into the next chunk until the
+  whole backlog (and its condensations) had been sent to the LLM provider —
+  against the §7b lifecycle rule that inactive channels incur no upstream
+  traffic (a cost and privacy boundary). The indexer now skips any timeline whose
+  state is not `active` before counting anything, on every path.
+
+
 ## [v0.4.0] - 2026-08-23
 
 ### Added

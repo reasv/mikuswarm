@@ -75,6 +75,9 @@ function minimalConfig(overrides?: Partial<AppConfig>): AppConfig {
 
 async function seedTimeline(storage: Storage, count = 20, spacingMs = 1): Promise<TimelineStore> {
   const timeline = new TimelineStore(storage);
+  // Every indexer path is lifecycle-gated (§7b): only an `active` timeline is
+  // ever summarized. Seed the state the production paths would have reached.
+  await storage.setTimelineState(TK, "active");
   for (let i = 0; i < count; i++) {
     await timeline.append(
       testEvent({
@@ -213,6 +216,55 @@ test("indexer does not enqueue a duplicate when a pending job covers the same ra
     assert.equal(jobs[0]!.id, "existing_job");
   } finally {
     storage.close();
+  }
+});
+
+test("lifecycle gate (§7b): an inactive / never-engaged timeline over threshold is never summarized, on any path", async () => {
+  // Regression: an applied edit (and the pool's completion callback) reach the
+  // indexer without passing handleInbound's activation gate. Without a gate in
+  // the indexer itself, one edit in a never-engaged channel with a large stored
+  // backlog enqueued a level-1 job and cascaded through the whole backlog.
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const timeline = new TimelineStore(storage);
+    for (let i = 0; i < 20; i++) {
+      await timeline.append(
+        testEvent({ id: `ev${String(i).padStart(4, "0")}`, body: `message content with some words ${i}`, timestamp: 1000 + i }),
+      );
+    }
+    assert.equal(storage.getTimelineState(TK), "inactive", "no state row reads as inactive (never engaged)");
+    let jobEnqueued = false;
+    const indexer = makeIndexer(
+      storage,
+      timeline,
+      { generation_threshold_tokens: 1, leaf_input_tokens: 10, leaf_target_tokens: 5 },
+      () => { jobEnqueued = true; },
+    );
+
+    // Fire-and-forget path (persist seam / applied edit / pool completion).
+    indexer.enqueueReconcileTimeline(TK);
+    // Awaited path (builder wait-or-omit re-check).
+    await indexer.reconcileTimeline(TK);
+    await drainTail(indexer);
+    assert.equal(jobEnqueued, false, "inactive timeline: no job on the fire-and-forget or awaited path");
+    assert.equal(storage.getActiveSummarizationJobs(TK, 1).length, 0);
+
+    // An explicit non-active row is gated the same way.
+    await storage.setTimelineState(TK, "activating");
+    const indexer2 = makeIndexer(storage, timeline, { generation_threshold_tokens: 1, leaf_input_tokens: 10, leaf_target_tokens: 5 }, () => { jobEnqueued = true; });
+    indexer2.enqueueReconcileTimeline(TK);
+    await drainTail(indexer2);
+    assert.equal(jobEnqueued, false, "activating timeline: still no job");
+
+    // Activation opens the gate: the same backlog is now summarized.
+    await storage.setTimelineState(TK, "active");
+    const indexer3 = makeIndexer(storage, timeline, { generation_threshold_tokens: 1, leaf_input_tokens: 10, leaf_target_tokens: 5 }, () => { jobEnqueued = true; });
+    indexer3.enqueueReconcileTimeline(TK);
+    await drainTail(indexer3);
+    assert.equal(jobEnqueued, true, "active timeline: job enqueued");
+    assert.equal(storage.getActiveSummarizationJobs(TK, 1).length, 1);
+  } finally {
+    await storage.close();
   }
 });
 
@@ -634,6 +686,7 @@ test("issue #3: deep multi-chunk backlog — the build reconciles, waits each ch
   try {
     const count = 36;
     const timeline = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b)
     for (let i = 0; i < count; i++) {
       await timeline.append(
         testEvent({

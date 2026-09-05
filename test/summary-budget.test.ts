@@ -183,6 +183,7 @@ test("budget: feature is off when summary_target_tokens = 0; no eager jobs enque
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
 
     const bigContent = "word ".repeat(200);
@@ -214,6 +215,7 @@ test("budget: latch enters when layer > max (episode start event emitted)", asyn
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
 
     // Big summary (~200 tokens) → layer > max (150).
@@ -258,6 +260,7 @@ test("budget: max=0 degenerates to single threshold (no hysteresis)", async () =
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     const bigContent = "word ".repeat(200);
     await insertSummary(storage, "s1", bigContent, 1, 1000, 1000, "j1", { eventIds: ["ev0"] });
@@ -299,6 +302,7 @@ test("budget: absorb shape — adjacent under-capacity parent absorbs run member
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     const content = "word ".repeat(100); // ~100 tokens each
 
@@ -349,6 +353,7 @@ test("budget: absorb — declared children = P's original children ∪ run membe
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     const content = "word ".repeat(100);
     await insertSummary(storage, "s1", content, 1, 1000, 1001, "j_s1", { eventIds: ["ev0"] });
@@ -407,6 +412,7 @@ test("budget: bootstrap — when all adjacent parents are at capacity", async ()
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     const content = "word ".repeat(100);
     // P_full has 5 children (= fanout) — fully occupied.
@@ -464,6 +470,7 @@ test("budget: bootstrap — when no adjacent parent exists at all", async () => 
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     const content = "word ".repeat(100);
     // Just L1 summaries, no L2 parent.
@@ -516,6 +523,7 @@ test("budget: absorption marks P and run members as superseded", async () => {
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
 
     await insertSummary(storage, "s1", "child1 words", 1, 1000, 1001, "j1", { eventIds: ["ev0"] });
@@ -573,6 +581,7 @@ test("budget: superseded P excluded from getSummaryCandidates", async () => {
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     await insertSummary(storage, "s1", "c1", 1, 1000, 1001, "j1", { eventIds: ["ev0"] });
     await insertSummary(storage, "s2", "c2", 1, 1002, 1003, "j2", { eventIds: ["ev0"] });
@@ -624,6 +633,7 @@ test("budget: superseded rows excluded from summary search", async () => {
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     await insertSummary(storage, "s1", "child1 words", 1, 1000, 1001, "j1", { eventIds: ["ev0"] });
     await insertSummary(storage, "s2", "child2 words", 1, 1002, 1003, "j2", { eventIds: ["ev0"] });
@@ -699,6 +709,7 @@ test("budget: expand superseded P by id works after absorption (no error, return
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     await insertSummary(storage, "s1", "child1", 1, 1000, 1001, "j1", { eventIds: ["ev0"] });
     await insertSummary(storage, "s2", "child2", 1, 1002, 1003, "j2", { eventIds: ["ev0"] });
@@ -758,6 +769,7 @@ test("budget: expand P_prime includes absorbed run members (superseded children 
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     await insertSummary(storage, "s1", "child1", 1, 1000, 1001, "j1", { eventIds: ["ev0"] });
     await insertSummary(storage, "s2", "child2", 1, 1002, 1003, "j2", { eventIds: ["ev0"] });
@@ -816,6 +828,7 @@ test("budget: condensed parent excluded from absorption — run falls through to
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     const content = "word ".repeat(100);
 
@@ -896,6 +909,7 @@ test("budget: lowest level wins — L1 run processed before L2 run", async () =>
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     const content = "word ".repeat(100);
 
@@ -952,6 +966,7 @@ test("budget: capacity-truncated absorption takes oldest run members", async () 
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     const content = "word ".repeat(50);
 
@@ -1015,6 +1030,7 @@ test("budget: live-edge guard — sole run containing newest summary never selec
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     const content = "word ".repeat(100);
     // s1 and s2 are in one run; s2 is the newest (live edge).
@@ -1043,6 +1059,7 @@ test("budget: live-edge guard — older non-live-edge run IS eligible when newer
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     const content = "word ".repeat(100);
 
@@ -1106,6 +1123,7 @@ test("budget: top-level guard — no bootstrap at timeline's max level", async (
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     const content = "word ".repeat(200);
 
@@ -1156,6 +1174,7 @@ test("budget: bootstrap saving guard — run too small → no job", async () => 
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     // Very small summaries (1-3 tokens each) well below 2 × condenseTarget.
     const tinyContent = "short";
@@ -1197,6 +1216,7 @@ test("budget: soft threshold — over budget, no eligible run → no job, no loo
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     // ONE big L1 summary at the live edge (no sentinel). The only run IS the live edge.
     const bigContent = "word ".repeat(200);
@@ -1229,6 +1249,7 @@ test("budget: convergence — manual job completion drives layer to ≤ target",
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     const bigContent = "word ".repeat(100); // ~100 tokens each
 
@@ -1329,6 +1350,7 @@ test("budget: mirrored timeline — no eager jobs regardless of budget pressure"
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     const bigContent = "word ".repeat(200);
     await insertSummary(storage, "s1", bigContent, 1, 1000, 1001, "j_s1", { eventIds: ["ev0"] });
@@ -1518,6 +1540,7 @@ test("budget: P4 idempotency — active job prevents re-enqueue on repeated reco
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     const content = "word ".repeat(100);
     await insertSummary(storage, "s1", content, 1, 1000, 1001, "j_s1", { eventIds: ["ev0"] });
@@ -1653,6 +1676,7 @@ test("budget: eager absorb job carries inputChildIds = P's children ∪ run memb
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     const content = "word ".repeat(100);
     await insertSummary(storage, "s1", content, 1, 1000, 1001, "j_s1", { eventIds: ["ev0"] });
@@ -1969,6 +1993,7 @@ test("budget: pre-lineage phantom L1 masked by higher-level selection — not a 
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     const bigContent = "word ".repeat(100);
 
@@ -2049,6 +2074,7 @@ test("budget: span-integrity skip-continue — first run's absorb fails span che
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     const bigContent = "word ".repeat(100);
 
@@ -2151,6 +2177,7 @@ test("budget: reproduction fixture — pre-lineage phantoms masked by L3, over-b
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     const bigContent = "word ".repeat(100);
 
@@ -2240,6 +2267,7 @@ test("budget: legacy eager job (absorbed_parent_id set, no inputChildIds) is del
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const store = new TimelineStore(storage);
+    await storage.setTimelineState(TK, "active"); // lifecycle gate (§7b): only active timelines are summarized
     await store.append(testEvent({ id: "ev0", body: "x", timestamp: 1000 }));
     const bigContent = "word ".repeat(100);
 

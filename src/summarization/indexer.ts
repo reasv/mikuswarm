@@ -156,6 +156,19 @@ export class SummarizationIndexer {
     const { storage, store, config } = this.options;
     if (config.enabled === false) return;
 
+    // Channel lifecycle gate (ARCHITECTURE §7b "States"): only an `active`
+    // timeline is ever summarized. Inactive / never-engaged channels store
+    // events cheaply and must incur no upstream LLM traffic — a cost AND privacy
+    // boundary: their content is never sent to a provider until the channel is
+    // deliberately engaged. `handleInbound`'s activation gate keeps live appends
+    // out, but this indexer is also reached from paths that run before or
+    // outside that gate (an applied edit — applied for any timeline state so
+    // edits work uniformly — and the worker pool's completion callback, which
+    // would otherwise cascade a leaked first job through the whole backlog), so
+    // the gate lives here, where every entry point converges. `reconcileAll`'s
+    // active-only sweep is the same rule applied to the startup path.
+    if (storage.getTimelineState(timelineKey) !== "active") return;
+
     // §10b: skip mirrored timelines — the mirror worker provides summaries.
     if (this.options.isMirroredTimeline?.(timelineKey)) return;
 
