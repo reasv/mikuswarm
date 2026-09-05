@@ -9766,6 +9766,24 @@ end;
 
 -- captioning: media_assets(caption_status, caption_attempts) x parent eligibility bits,
 -- scope media_type in (image, video, audio)
+--
+-- REPLACE-conflict fix: "insert or replace into media_assets" uses SQLite REPLACE
+-- conflict resolution, which deletes the conflicting row without firing DELETE
+-- triggers (recursive_triggers is off; turning it on is a global semantic change).
+-- pc_ma_bi (BEFORE INSERT) reads the old row while it is still present and settles
+-- its captioning bucket; pc_ma_ai (AFTER INSERT) then adds the new row's bucket,
+-- keeping counts exact. For a plain INSERT with no conflict the WHEN subquery
+-- returns NULL (no row), so the trigger body is skipped.
+create trigger if not exists pc_ma_bi before insert on media_assets
+  when (select ${captionTrackSql("")} from media_assets where id = new.id) begin
+  update pipeline_counts set n = n - 1
+    where (pool, status, retrying, elig) in (
+      select 'captioning', ma.caption_status, ma.caption_attempts > 0,
+        ${captionEligBitsSql("te")}
+      from media_assets ma join timeline_events te on te.id = ma.event_id
+      where ma.id = new.id and ma.${captionTrackSql("")}
+    );
+end;
 create trigger if not exists pc_ma_ai after insert on media_assets
   when new.${captionTrackSql("")} begin
   insert into pipeline_counts (pool, status, retrying, elig, n)

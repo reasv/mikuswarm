@@ -43,6 +43,11 @@ Unreleased section; it is not part of any release's notes.
   session probe and the caption usage sums are index-backed, and the captioning list
   walks its keyset index — every request on the page now answers in single-digit
   milliseconds on the same data, and no longer blocks message handling while it runs.
+  The `pipeline_counts` captioning buckets could drift upward across bot restarts:
+  `insert or replace into media_assets` uses SQLite REPLACE conflict resolution,
+  which skips DELETE triggers without `recursive_triggers`, so re-inserting a tracked
+  asset incremented its bucket without decrementing the old one; a new BEFORE INSERT
+  trigger settles the replaced row's bucket first, keeping the counts exact.
 - **Inactive channels were being summarized.** The eager summarization indexer
   had no channel-lifecycle check, and two of its entry points bypass the inbound
   activation gate: an applied message edit (applied for any timeline state so

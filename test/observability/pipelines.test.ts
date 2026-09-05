@@ -1689,3 +1689,162 @@ test("pipeline monitor read paths are index-backed (session probe, usage sums)",
     assert.ok(!names.includes("idx_media_assets_caption_cost"), "superseded index should be dropped");
   });
 });
+
+test("pipeline_counts stays exact through insert-or-replace re-inserts of media_assets", async () => {
+  await withStorage(async (storage) => {
+    // Set up two parent events with distinct eligibility bits:
+    // evt-a: plain user message (elig = 0)
+    // evt-b: trigger-bearing (elig bit 1 set)
+    await enrichEvent(storage, "evt-a", "pending");
+    await enrichEvent(storage, "evt-b", "pending");
+    await storage.write((db) =>
+      db.prepare(`update timeline_events set trigger_group_id = 'g1' where id = 'evt-b'`).run(),
+    );
+
+    // Insert the initial asset: image, pending, no retries, under evt-a
+    await storage.insertMediaAsset({
+      id: "asset-1",
+      event_id: "evt-a",
+      role: "attachment",
+      media_type: "image",
+      caption_status: "pending",
+      caption_attempts: 0,
+      download_status: "complete",
+      created_at: 1_000,
+      updated_at: 1_000,
+    });
+    await assertCountsParity(storage);
+    const e0 = storage.getPipelineCounts("captioning", { captionAll: true, captionAssistant: true });
+    assert.equal(e0.pending, 1, "baseline: 1 pending");
+    assert.equal(e0.done, 0, "baseline: 0 done");
+
+    // (a) Re-insert same id with a changed caption_status
+    await storage.insertMediaAsset({
+      id: "asset-1",
+      event_id: "evt-a",
+      role: "attachment",
+      media_type: "image",
+      caption_status: "complete",
+      caption_attempts: 0,
+      download_status: "complete",
+      created_at: 1_000,
+      updated_at: 2_000,
+    });
+    await assertCountsParity(storage);
+    const e1 = storage.getPipelineCounts("captioning", { captionAll: true, captionAssistant: true });
+    assert.equal(e1.pending, 0, "after status change: pending = 0");
+    assert.equal(e1.done, 1, "after status change: done = 1");
+
+    // (b) Re-insert same id with a changed event_id (different elig bits: 0 → 1)
+    await storage.insertMediaAsset({
+      id: "asset-1",
+      event_id: "evt-b",
+      role: "attachment",
+      media_type: "image",
+      caption_status: "complete",
+      caption_attempts: 0,
+      download_status: "complete",
+      created_at: 1_000,
+      updated_at: 3_000,
+    });
+    await assertCountsParity(storage);
+    const e2 = storage.getPipelineCounts("captioning", { captionAll: true, captionAssistant: true });
+    assert.equal(e2.done, 1, "after event_id change: still 1 done (moved elig bucket)");
+    assert.equal(e2.pending, 0, "after event_id change: 0 pending");
+
+    // (c) Re-insert same id with a changed media_type that leaves the captioning track
+    await storage.insertMediaAsset({
+      id: "asset-1",
+      event_id: "evt-b",
+      role: "attachment",
+      media_type: "file",
+      caption_status: "complete",
+      caption_attempts: 0,
+      download_status: "complete",
+      created_at: 1_000,
+      updated_at: 4_000,
+    });
+    await assertCountsParity(storage);
+    const e3 = storage.getPipelineCounts("captioning", { captionAll: true, captionAssistant: true });
+    assert.equal(e3.done, 0, "after leaving track: done = 0");
+    assert.equal(e3.pending, 0, "after leaving track: pending = 0");
+
+    // (d) Idempotent re-insert of an off-track row: counts must not change
+    await storage.insertMediaAsset({
+      id: "asset-1",
+      event_id: "evt-b",
+      role: "attachment",
+      media_type: "file",
+      caption_status: "complete",
+      caption_attempts: 0,
+      download_status: "complete",
+      created_at: 1_000,
+      updated_at: 4_000,
+    });
+    await assertCountsParity(storage);
+    const e4 = storage.getPipelineCounts("captioning", { captionAll: true, captionAssistant: true });
+    assert.equal(e4.done, 0, "idempotent off-track: still 0");
+  });
+});
+
+test("pipeline_counts stays exact through resetStaleCaptions, resetStaleDiary, promoteBackfetchedCaptions", async () => {
+  await withStorage(async (storage) => {
+    // ── resetStaleCaptions: processing → pending, attempts preserved ──
+    await enrichEvent(storage, "evt-cap", "complete");
+    await storage.insertMediaAsset({
+      id: "asset-cap",
+      event_id: "evt-cap",
+      role: "attachment",
+      media_type: "image",
+      caption_status: "processing",
+      caption_attempts: 1,
+      download_status: "complete",
+      created_at: 1_000,
+      updated_at: 1_000,
+    });
+    await assertCountsParity(storage);
+    assert.equal(
+      storage.getPipelineCounts("captioning", { captionAll: true, captionAssistant: true }).processing,
+      1,
+      "before resetStaleCaptions: 1 processing",
+    );
+    await storage.resetStaleCaptions();
+    await assertCountsParity(storage);
+    const afterReset = storage.getPipelineCounts("captioning", { captionAll: true, captionAssistant: true });
+    assert.equal(afterReset.processing, 0, "after resetStaleCaptions: 0 processing");
+    assert.equal(afterReset.retrying, 1, "after resetStaleCaptions: 1 retrying (attempts=1 preserved)");
+
+    // ── resetStaleDiary: processing → pending ──
+    await diarySummary(storage, "sum-stale", "processing", { attempts: 1 });
+    await assertCountsParity(storage);
+    assert.equal(storage.getPipelineCounts("diary").processing, 1, "before resetStaleDiary: 1 processing");
+    await storage.resetStaleDiary();
+    await assertCountsParity(storage);
+    const afterDiary = storage.getPipelineCounts("diary");
+    assert.equal(afterDiary.processing, 0, "after resetStaleDiary: 0 processing");
+    assert.equal(afterDiary.retrying, 1, "after resetStaleDiary: 1 retrying");
+
+    // ── promoteBackfetchedCaptions: deferred → pending ──
+    await enrichEvent(storage, "evt-bf", "complete");
+    await storage.write((db) =>
+      db.prepare(`update timeline_events set is_backfetch = 1 where id = 'evt-bf'`).run(),
+    );
+    await storage.insertMediaAsset({
+      id: "asset-bf",
+      event_id: "evt-bf",
+      role: "attachment",
+      media_type: "image",
+      caption_status: "deferred",
+      caption_attempts: 0,
+      download_status: "complete",
+      created_at: 1_000,
+      updated_at: 1_000,
+    });
+    await assertCountsParity(storage);
+    await storage.promoteBackfetchedCaptions(TK);
+    await assertCountsParity(storage);
+    // asset-bf should now be pending (backfetched → eligible)
+    const afterPromote = storage.getPipelineCounts("captioning", { captionAll: true, captionAssistant: true });
+    assert.equal(afterPromote.pending, 1, "after promoteBackfetchedCaptions: 1 pending (asset-bf promoted)");
+  });
+});
