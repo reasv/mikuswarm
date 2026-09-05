@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="MikuSwarm">
+  <rect width="64" height="64" rx="14" fill="#455871"/>
+  <circle cx="22" cy="22" r="8" fill="#ffffff"/>
+  <circle cx="44" cy="28" r="6" fill="#ffffff"/>
+  <circle cx="28" cy="44" r="5" fill="#ffffff"/>
+  <circle cx="46" cy="47" r="7" fill="#5fd3c9"/>
+</svg>
