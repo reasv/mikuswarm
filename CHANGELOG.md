@@ -23,8 +23,26 @@ fresh, empty Unreleased section above it. Keep this guidance comment in the
 Unreleased section; it is not part of any release's notes.
 -->
 
+### Added
+
+- **`[storage].cache_size_mb` / `[storage].mmap_size_mb`.** SQLite page-cache size
+  (default raised from SQLite's ~2 MiB to 64 MiB) and an opt-in memory-mapped I/O
+  window (default off) for large databases, where the tiny default cache made even
+  index-only probes re-read pages through syscalls on every call.
+
 ### Fixed
 
+- **Console pipelines page took seconds per request and stalled the agent.** Every
+  `/api/pipelines*` read ran synchronously on the agent's main thread, and three of
+  them scanned: the summarization/diary item lists resolved each row's session with
+  an unindexed `agent_sessions.trigger_event_id` probe (51 full scans per page, ~3 s
+  on a 10k-session database), the dashboard counts re-aggregated hundreds of
+  thousands of index entries on every 5 s poll, and the captioning list was planned
+  off the wrong index. Counts are now a trigger-maintained `pipeline_counts` table
+  (exact, rebuilt from the base tables at every open, read in microseconds), the
+  session probe and the caption usage sums are index-backed, and the captioning list
+  walks its keyset index — every request on the page now answers in single-digit
+  milliseconds on the same data, and no longer blocks message handling while it runs.
 - **Inactive channels were being summarized.** The eager summarization indexer
   had no channel-lifecycle check, and two of its entry points bypass the inbound
   activation gate: an applied message edit (applied for any timeline state so

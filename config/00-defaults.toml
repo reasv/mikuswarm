@@ -405,6 +405,13 @@ max_duration_seconds = 300
 
 [storage]
 database_path = "./var/mikuswarm.db"
+# SQLite page cache, MiB (PRAGMA cache_size). SQLite's own default is ~2 MiB, which
+# on a multi-GB database re-reads index pages through syscalls on every probe.
+cache_size_mb = 64
+# SQLite memory-mapped I/O window, MiB (PRAGMA mmap_size). 0 = off. Raising it to
+# roughly the database size lets reads bypass read() syscalls entirely on large
+# databases; costs no resident memory beyond the OS page cache.
+mmap_size_mb = 0
 
 # Docker sandbox (ARCHITECTURE.md §11a). Off by default; when enabled, the `bash`
 # tool and `search_files`/ripgrep run inside a long-lived container with the

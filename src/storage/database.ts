@@ -21,6 +21,10 @@ export interface EditReplacementContent {
 export interface StorageOptions {
   databasePath: string;
   logger?: Logger;
+  /** SQLite page-cache size in MiB (`PRAGMA cache_size`); default 64. */
+  cacheSizeMb?: number;
+  /** Memory-mapped I/O window in MiB (`PRAGMA mmap_size`); default 0 = off. */
+  mmapSizeMb?: number;
 }
 
 /**
@@ -1733,73 +1737,47 @@ interface PipelineListSpec {
 }
 
 /**
- * Per-pool wiring for the counts aggregate. Mirrors the scope/status/attempts/done
- * of {@link PIPELINE_LIST_SPECS} but with bare column names, since the counts query
- * hits the single base table directly. The captioning pool optionally carries
- * join-free variants ({@link tableNoJoin} etc.) used when no eligibility split is
- * requested — the inner join against timeline_events is then a no-op (every asset
- * has a parent event via FK NOT NULL) and can be elided for a cheaper index-only
- * scan over idx_media_assets_counts (ARCHITECTURE.md §11).
+ * Per-pool wiring for the materialized counts ({@link PIPELINE_COUNTS_SCHEMA}):
+ * `done` lists the raw statuses that normalize to the `done` bucket, and
+ * `rebuildSelect` is the grouped scan that {@link rebuildPipelineCounts} feeds into
+ * `pipeline_counts` at open — its scope/status/attempts columns mirror the trigger
+ * definitions and {@link PIPELINE_LIST_SPECS} exactly. The captioning rebuild forces
+ * idx_te_caption_eligibility via INDEXED BY so each parent-event probe is a
+ * covering-index read rather than a fat heap row (SQLite forbids an alias after
+ * INDEXED BY, so timeline_events is referenced unaliased).
  */
 interface PipelineCountSpec {
-  table: string;
-  statusCol: string;
-  attemptsCol: string;
-  scope: string | null;
   done: string[];
-  /** Join-free table expression (captioning only, used when eligibility is absent). */
-  tableNoJoin?: string;
-  /** Join-free statusCol (captioning only). */
-  statusColNoJoin?: string;
-  /** Join-free attemptsCol (captioning only). */
-  attemptsColNoJoin?: string;
-  /** Join-free scope (captioning only). */
-  scopeNoJoin?: string | null;
+  /** `select <status>, <retrying>, <elig>, count(*) … group by …` feeding the rebuild. */
+  rebuildSelect: string;
 }
 
 const PIPELINE_COUNT_SPECS: Record<PipelineId, PipelineCountSpec> = {
   enrichment: {
-    table: "timeline_events",
-    statusCol: "enrichment_status",
-    attemptsCol: "enrichment_retries",
-    scope: "enrichment_status != 'inactive'",
     done: ["complete"],
+    rebuildSelect: `select 'enrichment', enrichment_status, enrichment_retries > 0, 0, count(*)
+      from timeline_events where enrichment_status != 'inactive'
+      group by enrichment_status, enrichment_retries > 0`,
   },
   captioning: {
-    // Joins timeline_events to evaluate caption eligibility (the `deferred`
-    // partition). INDEXED BY idx_te_caption_eligibility (id, trigger_group_id,
-    // is_backfetch, role) makes each probe an index-only scan — the planner uses
-    // the autoindex (id→rowid) by default and then reads the fat heap row to reach
-    // the post-event_json columns, but the explicit INDEXED BY hint forces the
-    // covering index, eliminating the overflow-page traversal (ARCHITECTURE.md §11).
-    // SQLite does not allow an alias after INDEXED BY, so timeline_events is
-    // referenced unaliased; eligibleSql is called with alias="timeline_events".
-    table: "media_assets ma join timeline_events INDEXED BY idx_te_caption_eligibility on timeline_events.id = ma.event_id",
-    statusCol: "ma.caption_status",
-    attemptsCol: "ma.caption_attempts",
-    scope: "ma.media_type in ('image', 'video', 'audio')",
     done: ["complete"],
-    // When eligibility is absent the te.* columns are not referenced, so the join
-    // is an identity op. The join-free path hits idx_media_assets_counts instead
-    // (ARCHITECTURE.md §11).
-    tableNoJoin: "media_assets",
-    statusColNoJoin: "caption_status",
-    attemptsColNoJoin: "caption_attempts",
-    scopeNoJoin: "media_type in ('image', 'video', 'audio')",
+    rebuildSelect: `select 'captioning', ma.caption_status, ma.caption_attempts > 0,
+        ${captionEligBitsSql("timeline_events")}, count(*)
+      from media_assets ma
+      join timeline_events INDEXED BY idx_te_caption_eligibility on timeline_events.id = ma.event_id
+      where ma.${captionTrackSql("")}
+      group by ma.caption_status, ma.caption_attempts > 0, ${captionEligBitsSql("timeline_events")}`,
   },
   summarization: {
-    table: "summarization_jobs",
-    statusCol: "status",
-    attemptsCol: "attempts",
-    scope: null,
     done: ["complete"],
+    rebuildSelect: `select 'summarization', status, attempts > 0, 0, count(*)
+      from summarization_jobs group by status, attempts > 0`,
   },
   diary: {
-    table: "summaries",
-    statusCol: "diary_status",
-    attemptsCol: "diary_attempts",
-    scope: "diary_status is not null",
     done: ["done"],
+    rebuildSelect: `select 'diary', diary_status, diary_attempts > 0, 0, count(*)
+      from summaries where diary_status is not null
+      group by diary_status, diary_attempts > 0`,
   },
 };
 
@@ -1866,7 +1844,12 @@ const PIPELINE_LIST_SPECS: Record<PipelineId, PipelineListSpec> = {
     sortCol: "ma.updated_at",
     idCol: "ma.id",
     // The captioning track is image/video/audio assets only (what the pool claims).
-    scope: "ma.media_type in ('image', 'video', 'audio')",
+    // The unary `+` stops the planner from driving the query off the (media_type,…)
+    // count index — three range scans over every tracked asset plus a temp-btree
+    // sort — so the default view walks idx_media_assets_updated in order and stops
+    // at the page limit, and the status chips keep their (status, updated_at, id)
+    // index (ARCHITECTURE.md §11).
+    scope: `+${captionTrackSql("ma.")}`,
     done: ["complete"],
     selectFrom: `select ma.id as id, ma.caption_status as status, ma.caption_attempts as attempts,
         te.timeline_key as room, ma.created_at as created_at, ma.updated_at as updated_at,
@@ -2075,6 +2058,16 @@ export class Storage {
       // checkpoint can still briefly hold a lock; without busy_timeout a transient
       // lock would surface as a swallowed fire-and-forget write failure.
       writer.pragma("busy_timeout = 5000");
+      // Page cache + mmap (ARCHITECTURE.md §11 "Storage read performance"). SQLite's
+      // default page cache is ~2 MiB, so on a multi-GB database even an index-only
+      // probe re-reads its pages through pread() on every call; a larger cache keeps
+      // the hot index pages resident. `cache_size` takes -KiB. mmap (default off,
+      // operator opt-in) maps the file's leading `mmap_size` bytes so reads served
+      // from the OS page cache bypass the syscall entirely.
+      writer.pragma(`cache_size = -${Math.max(1, Math.round((options.cacheSizeMb ?? 64) * 1024))}`);
+      if ((options.mmapSizeMb ?? 0) > 0) {
+        writer.pragma(`mmap_size = ${Math.round(options.mmapSizeMb! * 1024 * 1024)}`);
+      }
       // Distinguish a brand-new database from an existing one BEFORE applying
       // SCHEMA (which uses `if not exists` and so leaves no trace of which case we
       // are in). A fresh DB has no user tables yet; SCHEMA then builds the full
@@ -2111,6 +2104,9 @@ export class Storage {
         runMigrations(writer, false);
         writer.exec(SCHEMA);
       }
+      // Seed/heal the materialized pipeline counts from the base tables (one grouped
+      // index-only scan per pool; the triggers keep them exact from here on).
+      rebuildPipelineCounts(writer);
     });
     return storage;
   }
@@ -4000,12 +3996,14 @@ export class Storage {
     return this.read((db) => {
       const row = db
         .prepare(
+          // The `where` mirrors idx_media_assets_caption_usage's partial predicate
+          // (index-only scan over just the rows that recorded usage).
           `select
-             sum(case when caption_total_tokens is not null then 1 else 0 end) as captionedCount,
+             count(*) as captionedCount,
              coalesce(sum(caption_input_tokens), 0) as totalInputTokens,
              coalesce(sum(caption_output_tokens), 0) as totalOutputTokens,
              coalesce(sum(caption_cost), 0) as totalCost
-           from media_assets`,
+           from media_assets where caption_total_tokens is not null`,
         )
         .get() as { captionedCount: number | null; totalInputTokens: number; totalOutputTokens: number; totalCost: number };
       return {
@@ -4031,7 +4029,9 @@ export class Storage {
         .prepare(`select coalesce(sum(cost), 0) as c from tool_invocations`)
         .get() as { c: number };
       const captioning = db
-        .prepare(`select coalesce(sum(caption_cost), 0) as c from media_assets`)
+        .prepare(
+          `select coalesce(sum(caption_cost), 0) as c from media_assets where caption_total_tokens is not null`,
+        )
         .get() as { c: number };
       return { agentLoopCost: agentLoop.c, toolCost: tool.c, captioningCost: captioning.c };
     });
@@ -7958,61 +7958,59 @@ export class Storage {
 
   /**
    * Status-bucket counts for a pipeline's full history (the `/api/pipelines`
-   * dashboard feed). DB-derived (the single source of truth that survives
-   * restart). Raw statuses normalize into the six {@link PipelineCounts} buckets;
-   * a `pending` row with `attempts > 0` is `retrying` (no explicit state exists).
+   * dashboard feed). Read from the trigger-maintained `pipeline_counts` table
+   * ({@link PIPELINE_COUNTS_SCHEMA}) — a handful of bucket rows per pool, never a
+   * scan of the pool table — and folded into the {@link PipelineCounts} buckets:
+   * a `pending` row with `attempts > 0` is `retrying` (no explicit state exists);
+   * for captioning, `eligibility` splits fresh `pending` rows into real backlog
+   * vs the derived `deferred` bucket by applying the config to each bucket's packed
+   * parent-event facts ({@link captionEligibleBits}). `excluded` is diary-only.
+   * DB-derived (survives restart; rebuilt from the base tables at every open).
    * Pure read.
    */
   getPipelineCounts(pool: PipelineId, eligibility?: CaptionEligibility): PipelineCounts {
     const spec = PIPELINE_COUNT_SPECS[pool];
-    // For the captioning pool without eligibility the timeline_events join is an
-    // identity op (every asset has a parent event via FK NOT NULL). Elide the join
-    // so the aggregate hits idx_media_assets_counts — an index-only scan over
-    // (media_type, caption_status, caption_attempts) — instead of walking the join.
-    const useNoJoin = !eligibility && spec.tableNoJoin != null;
-    const table = useNoJoin ? spec.tableNoJoin! : spec.table;
-    const statusCol = useNoJoin ? spec.statusColNoJoin! : spec.statusCol;
-    const attemptsCol = useNoJoin ? spec.attemptsColNoJoin! : spec.attemptsCol;
-    const scope = useNoJoin ? (spec.scopeNoJoin ?? null) : spec.scope;
-    const where = scope ? `where ${scope}` : "";
-    const donePlaceholders = spec.done.map(() => "?").join(", ");
-    // Captioning: split the raw `pending` bucket into eligible (real backlog) and
-    // `deferred` (never-claimed under the current config). Other pools — and
-    // captioning when no eligibility is supplied — have no `deferred` partition.
-    // The join path uses "timeline_events" unaliased (INDEXED BY forbids an alias),
-    // so the eligibility columns must be qualified as timeline_events.*.
-    const eligibleSql =
-      pool === "captioning" && eligibility
-        ? captionEligibleSql(eligibility, "timeline_events")
-        : null;
-    const freshPending = `${statusCol} = 'pending' and ${attemptsCol} = 0`;
-    const pendingCase = eligibleSql ? `${freshPending} and ${eligibleSql}` : freshPending;
-    const deferredCase = eligibleSql ? `${freshPending} and not ${eligibleSql}` : null;
-    // The `excluded` bucket is diary-only (channel visibility gate, §9h).
-    const excludedCase = pool === "diary" ? `${statusCol} = 'excluded'` : null;
-    const sql = `select
-        sum(case when ${pendingCase} then 1 else 0 end) as pending,
-        sum(case when ${statusCol} = 'pending' and ${attemptsCol} > 0 then 1 else 0 end) as retrying,
-        sum(case when ${statusCol} = 'processing' then 1 else 0 end) as processing,
-        sum(case when ${statusCol} in (${donePlaceholders}) then 1 else 0 end) as done,
-        sum(case when ${statusCol} = 'failed' then 1 else 0 end) as failed,
-        sum(case when ${statusCol} = 'skipped' then 1 else 0 end) as skipped,
-        ${deferredCase ? `sum(case when ${deferredCase} then 1 else 0 end)` : "0"} as deferred,
-        ${excludedCase ? `sum(case when ${excludedCase} then 1 else 0 end)` : "0"} as excluded
-      from ${table} ${where}`;
-    return this.read((db) => {
-      const row = db.prepare(sql).get(...spec.done) as Record<string, number | null>;
-      return {
-        pending: row.pending ?? 0,
-        processing: row.processing ?? 0,
-        retrying: row.retrying ?? 0,
-        done: row.done ?? 0,
-        failed: row.failed ?? 0,
-        skipped: row.skipped ?? 0,
-        deferred: row.deferred ?? 0,
-        excluded: row.excluded ?? 0,
-      };
-    });
+    const rows = this.read(
+      (db) =>
+        db
+          .prepare(`select status, retrying, elig, n from pipeline_counts where pool = ?`)
+          .all(pool) as Array<{ status: string; retrying: number; elig: number; n: number }>,
+    );
+    const counts: PipelineCounts = {
+      pending: 0,
+      processing: 0,
+      retrying: 0,
+      done: 0,
+      failed: 0,
+      skipped: 0,
+      deferred: 0,
+      excluded: 0,
+    };
+    for (const row of rows) {
+      // Clamp: a bucket can only go negative through drift the next open() heals.
+      const n = Math.max(0, row.n);
+      if (n === 0) continue;
+      if (row.status === "pending") {
+        if (row.retrying) counts.retrying += n;
+        else if (pool === "captioning" && eligibility && !captionEligibleBits(row.elig, eligibility))
+          counts.deferred += n;
+        else counts.pending += n;
+      } else if (row.status === "processing") counts.processing += n;
+      else if (spec.done.includes(row.status)) counts.done += n;
+      else if (row.status === "failed") counts.failed += n;
+      else if (row.status === "skipped") counts.skipped += n;
+      else if (row.status === "excluded" && pool === "diary") counts.excluded += n;
+    }
+    return counts;
+  }
+
+  /**
+   * Recompute the materialized `pipeline_counts` table from the base tables
+   * (see {@link PIPELINE_COUNTS_SCHEMA}). Runs automatically at every open; exposed
+   * for tests and operator repair.
+   */
+  rebuildPipelineCounts(): Promise<void> {
+    return this.write((db) => rebuildPipelineCounts(db));
   }
 
   /**
@@ -9546,19 +9544,27 @@ create index if not exists idx_media_assets_updated
 create index if not exists idx_media_assets_status_updated
   on media_assets(caption_status, updated_at, id);
 
--- Pipeline monitor count aggregate: covering index for the no-join captioning
--- counts path (eligibility absent). Partial index over
--- (media_type, caption_status, caption_attempts) lets getPipelineCounts run as
--- an index-only scan without touching the heap or joining timeline_events
--- (ARCHITECTURE.md §11).
+-- Pipeline monitor: covering index for the boot-time captioning rebuild of the
+-- materialized pipeline_counts table (rebuildPipelineCounts) — an index-only scan
+-- over (media_type, caption_status, caption_attempts) that never touches the
+-- media_assets heap (ARCHITECTURE.md §11).
 create index if not exists idx_media_assets_counts
   on media_assets(media_type, caption_status, caption_attempts)
   where media_type in ('image', 'video', 'audio');
 
--- Cost overview: covering index for sum(caption_cost) in getCostOverview so the
--- aggregate is an index-only scan on the small cost column (ARCHITECTURE.md §11).
-create index if not exists idx_media_assets_caption_cost
-  on media_assets(caption_cost);
+-- Captioning usage + cost aggregates (getCaptioningUsageAggregate, polled with the
+-- dashboard, and getCostOverview's sum(caption_cost)): one covering index over the
+-- four usage columns so both are index-only scans over compact entries instead of
+-- walks of the media_assets heap (ARCHITECTURE.md §11). Supersedes the single-column
+-- idx_media_assets_caption_cost, dropped here.
+-- Partial over the rows that recorded usage: the four usage columns are written
+-- together by the one caption-usage write (updateCaptionResult), so a row without
+-- caption_total_tokens has no usage or cost to sum, and both aggregates filter on
+-- the same predicate to stay index-only.
+create index if not exists idx_media_assets_caption_usage
+  on media_assets(caption_total_tokens, caption_input_tokens, caption_output_tokens, caption_cost)
+  where caption_total_tokens is not null;
+drop index if exists idx_media_assets_caption_cost;
 `;
 
 // Message-only history backfetch jobs (spec MESSAGE-BACKFETCH §8.1;
@@ -9673,6 +9679,224 @@ create table if not exists workspace_seed_ledger (
 // Evolve the schema by editing this block in place (keeping it idempotent), and
 // only add a MIGRATIONS step for a rename/transform — or a data fix on existing
 // rows — that `if not exists` cannot express.
+/** SQL boolean: the media asset row (`alias`) is on the captioning track. */
+function captionTrackSql(alias: string): string {
+  return `${alias}media_type in ('image', 'video', 'audio')`;
+}
+
+/**
+ * Captioning eligibility facts of a parent `timeline_events` row (`alias`), packed
+ * into one integer for the `pipeline_counts.elig` bucket key: bit 1 = has a
+ * trigger group, bit 2 = backfetched, bit 4 = assistant-authored. The config-relative
+ * eligible/deferred decision ({@link captionEligibleSql}) is applied to these bits at
+ * read time ({@link captionEligibleBits}), so a config flip reclassifies the counts
+ * live without touching the table.
+ */
+function captionEligBitsSql(alias: string): string {
+  return `((case when ${alias}.trigger_group_id is not null then 1 else 0 end)
+    + (case when ${alias}.is_backfetch = 1 then 2 else 0 end)
+    + (case when ${alias}.role = 'assistant' then 4 else 0 end))`;
+}
+
+/** JS mirror of {@link captionEligibleSql} over a packed {@link captionEligBitsSql} value. */
+function captionEligibleBits(bits: number, e: CaptionEligibility): boolean {
+  if (e.captionAll) return true;
+  if (bits & 1) return true; // trigger group
+  if (bits & 2) return true; // backfetched (promoted rows are claimable)
+  return e.captionAssistant && (bits & 4) !== 0;
+}
+
+/**
+ * Materialized pipeline status counts (ARCHITECTURE.md §11 "Count aggregate cost").
+ * One row per `(pool, raw status, retrying, elig)` bucket, kept exact by the
+ * triggers below on every insert/update/delete of the four pool tables, so the
+ * dashboard's `/api/pipelines` poll reads a handful of rows instead of scanning
+ * hundreds of thousands of index entries per request. The table is a cache of the
+ * base tables, not a source of truth: {@link rebuildPipelineCounts} recomputes it
+ * from scratch at every `Storage.open()`, so any drift (a write that predates the
+ * triggers, a hand edit) is healed on the next boot.
+ *
+ * Bucket key semantics: `retrying` = attempts > 0 (the monitor's derived state);
+ * `elig` = captioning only, the parent event's packed eligibility facts
+ * ({@link captionEligBitsSql}) — 0 for every other pool. Scope predicates mirror
+ * the list specs: enrichment excludes `inactive`, captioning tracks
+ * image/video/audio, diary tracks summaries with a non-null `diary_status`.
+ *
+ * Cascade note: a `timeline_events` delete cascades to its media_assets AFTER the
+ * parent row is gone, so a child-level delete trigger could no longer read the
+ * parent's eligibility bits. The parent's BEFORE DELETE trigger therefore settles
+ * its assets' buckets (with the bits still readable), and the child AFTER DELETE
+ * trigger only acts when the parent still exists (a direct asset delete).
+ */
+const PIPELINE_COUNTS_SCHEMA = `
+create table if not exists pipeline_counts (
+  pool text not null,
+  status text not null,
+  retrying integer not null,
+  elig integer not null,
+  n integer not null,
+  primary key (pool, status, retrying, elig)
+) without rowid;
+
+-- enrichment: timeline_events(enrichment_status, enrichment_retries), scope != inactive
+create trigger if not exists pc_te_ai after insert on timeline_events
+  when new.enrichment_status != 'inactive' begin
+  insert into pipeline_counts (pool, status, retrying, elig, n)
+    values ('enrichment', new.enrichment_status, new.enrichment_retries > 0, 0, 1)
+    on conflict (pool, status, retrying, elig) do update set n = n + 1;
+end;
+create trigger if not exists pc_te_au after update of enrichment_status, enrichment_retries on timeline_events
+  when old.enrichment_status is not new.enrichment_status
+    or (old.enrichment_retries > 0) is not (new.enrichment_retries > 0) begin
+  update pipeline_counts set n = n - 1
+    where old.enrichment_status != 'inactive'
+      and pool = 'enrichment' and status = old.enrichment_status
+      and retrying = (old.enrichment_retries > 0) and elig = 0;
+  insert into pipeline_counts (pool, status, retrying, elig, n)
+    select 'enrichment', new.enrichment_status, new.enrichment_retries > 0, 0, 1
+    where new.enrichment_status != 'inactive'
+    on conflict (pool, status, retrying, elig) do update set n = n + 1;
+end;
+create trigger if not exists pc_te_ad after delete on timeline_events
+  when old.enrichment_status != 'inactive' begin
+  update pipeline_counts set n = n - 1
+    where pool = 'enrichment' and status = old.enrichment_status
+      and retrying = (old.enrichment_retries > 0) and elig = 0;
+end;
+
+-- captioning: media_assets(caption_status, caption_attempts) x parent eligibility bits,
+-- scope media_type in (image, video, audio)
+create trigger if not exists pc_ma_ai after insert on media_assets
+  when new.${captionTrackSql("")} begin
+  insert into pipeline_counts (pool, status, retrying, elig, n)
+    values ('captioning', new.caption_status, new.caption_attempts > 0,
+      coalesce((select ${captionEligBitsSql("timeline_events")} from timeline_events where id = new.event_id), 0), 1)
+    on conflict (pool, status, retrying, elig) do update set n = n + 1;
+end;
+create trigger if not exists pc_ma_au after update of caption_status, caption_attempts, media_type, event_id on media_assets
+  when old.caption_status is not new.caption_status
+    or (old.caption_attempts > 0) is not (new.caption_attempts > 0)
+    or old.media_type is not new.media_type
+    or old.event_id is not new.event_id begin
+  update pipeline_counts set n = n - 1
+    where old.${captionTrackSql("")}
+      and pool = 'captioning' and status = old.caption_status
+      and retrying = (old.caption_attempts > 0)
+      and elig = coalesce((select ${captionEligBitsSql("timeline_events")} from timeline_events where id = old.event_id), 0);
+  insert into pipeline_counts (pool, status, retrying, elig, n)
+    select 'captioning', new.caption_status, new.caption_attempts > 0,
+      coalesce((select ${captionEligBitsSql("timeline_events")} from timeline_events where id = new.event_id), 0), 1
+    where new.${captionTrackSql("")}
+    on conflict (pool, status, retrying, elig) do update set n = n + 1;
+end;
+create trigger if not exists pc_ma_ad after delete on media_assets
+  when old.${captionTrackSql("")}
+    and exists (select 1 from timeline_events where id = old.event_id) begin
+  update pipeline_counts set n = n - 1
+    where pool = 'captioning' and status = old.caption_status
+      and retrying = (old.caption_attempts > 0)
+      and elig = coalesce((select ${captionEligBitsSql("timeline_events")} from timeline_events where id = old.event_id), 0);
+end;
+-- parent event removal: settle its assets' buckets while the bits are still readable
+-- (the cascade fires the child triggers only after the parent row is gone)
+create trigger if not exists pc_te_bd before delete on timeline_events begin
+  insert into pipeline_counts (pool, status, retrying, elig, n)
+    select 'captioning', ma.caption_status, ma.caption_attempts > 0,
+      ${captionEligBitsSql("old")}, -count(*)
+    from media_assets ma
+    where ma.event_id = old.id and ma.${captionTrackSql("")}
+    group by ma.caption_status, ma.caption_attempts > 0
+    on conflict (pool, status, retrying, elig) do update set n = n + excluded.n;
+end;
+-- parent eligibility facts changing (trigger-group assignment, backfetch promotion):
+-- move the event's assets between elig buckets
+create trigger if not exists pc_te_au_elig after update of trigger_group_id, is_backfetch, role on timeline_events
+  when old.trigger_group_id is not new.trigger_group_id
+    or old.is_backfetch is not new.is_backfetch
+    or old.role is not new.role begin
+  insert into pipeline_counts (pool, status, retrying, elig, n)
+    select 'captioning', ma.caption_status, ma.caption_attempts > 0,
+      ${captionEligBitsSql("old")}, -count(*)
+    from media_assets ma
+    where ma.event_id = old.id and ma.${captionTrackSql("")}
+    group by ma.caption_status, ma.caption_attempts > 0
+    on conflict (pool, status, retrying, elig) do update set n = n + excluded.n;
+  insert into pipeline_counts (pool, status, retrying, elig, n)
+    select 'captioning', ma.caption_status, ma.caption_attempts > 0,
+      ${captionEligBitsSql("new")}, count(*)
+    from media_assets ma
+    where ma.event_id = new.id and ma.${captionTrackSql("")}
+    group by ma.caption_status, ma.caption_attempts > 0
+    on conflict (pool, status, retrying, elig) do update set n = n + excluded.n;
+end;
+
+-- summarization: summarization_jobs(status, attempts), no scope
+create trigger if not exists pc_sj_ai after insert on summarization_jobs begin
+  insert into pipeline_counts (pool, status, retrying, elig, n)
+    values ('summarization', new.status, new.attempts > 0, 0, 1)
+    on conflict (pool, status, retrying, elig) do update set n = n + 1;
+end;
+create trigger if not exists pc_sj_au after update of status, attempts on summarization_jobs
+  when old.status is not new.status or (old.attempts > 0) is not (new.attempts > 0) begin
+  update pipeline_counts set n = n - 1
+    where pool = 'summarization' and status = old.status
+      and retrying = (old.attempts > 0) and elig = 0;
+  insert into pipeline_counts (pool, status, retrying, elig, n)
+    values ('summarization', new.status, new.attempts > 0, 0, 1)
+    on conflict (pool, status, retrying, elig) do update set n = n + 1;
+end;
+create trigger if not exists pc_sj_ad after delete on summarization_jobs begin
+  update pipeline_counts set n = n - 1
+    where pool = 'summarization' and status = old.status
+      and retrying = (old.attempts > 0) and elig = 0;
+end;
+
+-- diary: summaries(diary_status, diary_attempts), scope diary_status is not null
+create trigger if not exists pc_su_ai after insert on summaries
+  when new.diary_status is not null begin
+  insert into pipeline_counts (pool, status, retrying, elig, n)
+    values ('diary', new.diary_status, new.diary_attempts > 0, 0, 1)
+    on conflict (pool, status, retrying, elig) do update set n = n + 1;
+end;
+create trigger if not exists pc_su_au after update of diary_status, diary_attempts on summaries
+  when old.diary_status is not new.diary_status
+    or (old.diary_attempts > 0) is not (new.diary_attempts > 0) begin
+  update pipeline_counts set n = n - 1
+    where old.diary_status is not null
+      and pool = 'diary' and status = old.diary_status
+      and retrying = (old.diary_attempts > 0) and elig = 0;
+  insert into pipeline_counts (pool, status, retrying, elig, n)
+    select 'diary', new.diary_status, new.diary_attempts > 0, 0, 1
+    where new.diary_status is not null
+    on conflict (pool, status, retrying, elig) do update set n = n + 1;
+end;
+create trigger if not exists pc_su_ad after delete on summaries
+  when old.diary_status is not null begin
+  update pipeline_counts set n = n - 1
+    where pool = 'diary' and status = old.diary_status
+      and retrying = (old.diary_attempts > 0) and elig = 0;
+end;
+`;
+
+/**
+ * Recompute {@link PIPELINE_COUNTS_SCHEMA}'s table from the base tables — the
+ * boot-time seed/heal (every `Storage.open()`), a one-off grouped scan per pool
+ * (index-only via idx_timeline_events_enrichment_counts / idx_media_assets_counts +
+ * idx_te_caption_eligibility). Runs inside one transaction so a reader never sees a
+ * half-rebuilt table.
+ */
+function rebuildPipelineCounts(db: Database.Database): void {
+  db.transaction(() => {
+    db.exec("delete from pipeline_counts");
+    for (const pool of PIPELINE_IDS) {
+      db.exec(
+        `insert into pipeline_counts (pool, status, retrying, elig, n)
+         ${PIPELINE_COUNT_SPECS[pool].rebuildSelect}`,
+      );
+    }
+  })();
+}
+
 const SCHEMA = `
 create table if not exists timeline_events (
   id text primary key,
@@ -9771,8 +9995,7 @@ create index if not exists idx_timeline_events_updated
 -- pre-existing partial index only covers pending/processing; a status=failed /
 -- complete / skipped list must filter+sort without a full scan, so a non-partial
 -- composite ordered to match the keyset sort (status, updated_at, id) is needed
--- (spec §3.4; ARCHITECTURE.md §11). (Does not cover getPipelineCounts, whose
--- pending/retrying split reads the uncovered attempts column — see §11 perf note.)
+-- (spec §3.4; ARCHITECTURE.md §11).
 create index if not exists idx_timeline_events_status_updated
   on timeline_events(enrichment_status, updated_at, id);
 
@@ -9787,23 +10010,23 @@ create index if not exists idx_timeline_events_active_updated
   on timeline_events(updated_at, id)
   where enrichment_status not in ('inactive', 'skipped');
 
--- Pipeline monitor count aggregate: covering index for getPipelineCounts on
--- enrichment. A partial index over the non-inactive rows carrying
--- (enrichment_status, enrichment_retries) lets the SUM(CASE…) aggregate skip
--- the fat body/event_json overflow pages entirely — an index-only scan over the
--- non-inactive minority. Partial predicate mirrors the WHERE term emitted by
--- getPipelineCounts so the planner can use it (ARCHITECTURE.md §11).
+-- Pipeline monitor: covering index for the boot-time enrichment rebuild of the
+-- materialized pipeline_counts table (rebuildPipelineCounts). A partial index over
+-- the non-inactive rows carrying (enrichment_status, enrichment_retries) lets that
+-- grouped scan skip the fat body/event_json overflow pages entirely. Partial
+-- predicate mirrors the rebuild's WHERE term so the planner can use it
+-- (ARCHITECTURE.md §11).
 create index if not exists idx_timeline_events_enrichment_counts
   on timeline_events(enrichment_status, enrichment_retries)
   where enrichment_status != 'inactive';
 
--- Captioning count aggregate: covering index that lets the getPipelineCounts join
--- probe be index-only. SQLite prefers the PK autoindex for te.id = ma.event_id
--- lookups and then reads the full heap row, which forces traversal of the fat
--- event_json overflow pages to reach the post-event_json columns
--- (trigger_group_id, is_backfetch, role). This index stores those columns compactly;
--- getPipelineCounts forces it via INDEXED BY so each probe is a covering-index scan
--- with no heap access (ARCHITECTURE.md §11).
+-- Captioning eligibility probe: covering index that lets the boot-time
+-- pipeline_counts rebuild's join be index-only. SQLite prefers the PK autoindex for
+-- te.id = ma.event_id lookups and then reads the full heap row, which forces
+-- traversal of the fat event_json overflow pages to reach the post-event_json
+-- columns (trigger_group_id, is_backfetch, role). This index stores those columns
+-- compactly; the rebuild forces it via INDEXED BY so each probe is a covering-index
+-- scan with no heap access (ARCHITECTURE.md §11).
 create index if not exists idx_te_caption_eligibility
   on timeline_events(id, trigger_group_id, is_backfetch, role);
 
@@ -9945,7 +10168,7 @@ create index if not exists idx_summaries_diary_list
 -- failing?"). The diary list sorts by latest_timestamp (summaries has no
 -- updated_at), so the composite is (diary_status, latest_timestamp, id), partial on
 -- the diary-bearing rows to mirror idx_summaries_diary_list (spec §3.4;
--- ARCHITECTURE.md §11). (Does not cover getPipelineCounts — see §11 perf note.)
+-- ARCHITECTURE.md §11).
 create index if not exists idx_summaries_diary_status_updated
   on summaries(diary_status, latest_timestamp, id)
   where diary_status is not null;
@@ -10016,7 +10239,7 @@ create index if not exists idx_summarization_jobs_updated
 -- pre-existing partial index only covers pending/processing; a status=failed /
 -- complete list must filter+sort without a full scan, so a non-partial composite
 -- ordered to match the keyset sort (status, updated_at, id) is needed (spec §3.4;
--- ARCHITECTURE.md §11). (Does not cover getPipelineCounts — see §11 perf note.)
+-- ARCHITECTURE.md §11).
 create index if not exists idx_summarization_jobs_status_updated
   on summarization_jobs(status, updated_at, id);
 
@@ -10123,6 +10346,13 @@ create index if not exists idx_agent_sessions_sender_recent
 create index if not exists idx_agent_sessions_usage_cost
   on agent_sessions(usage_cost);
 
+-- Pipeline monitor: the summarization/diary item lists resolve each item's latest
+-- background session with a correlated probe on trigger_event_id
+-- ('summarize:<job>' / 'diary:<summary>', newest first). Without this index every
+-- probe is a full agent_sessions scan — one per listed row (ARCHITECTURE.md §11).
+create index if not exists idx_agent_sessions_trigger_event
+  on agent_sessions(trigger_event_id, created_at desc);
+
 -- Blob side-table: holds only the heavyweight frozen context snapshot and the
 -- appended transcript, keyed by session_id (1:1 with agent_sessions). Written
 -- lazily (null until the session saves each payload). Cascades on delete.
@@ -10156,7 +10386,8 @@ ${BACKFETCH_JOBS_SCHEMA}
 ${USER_IDENTITIES_SCHEMA}
 ${DM_OPTOUTS_SCHEMA}
 ${DM_PEERS_SCHEMA}
-${WORKSPACE_SEED_LEDGER_SCHEMA}`;
+${WORKSPACE_SEED_LEDGER_SCHEMA}
+${PIPELINE_COUNTS_SCHEMA}`;
 
 // SCHEMA above defines the complete current shape with idempotent
 // `create … if not exists` DDL, so a fresh database is built directly at the

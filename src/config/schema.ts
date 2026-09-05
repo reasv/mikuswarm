@@ -1854,6 +1854,10 @@ export const AppConfigSchema = StrictObject({
   media: Type.Optional(MediaSchema),
   storage: StrictObject({
     database_path: Type.String(),
+    /** SQLite page cache in MiB (`PRAGMA cache_size`); unset = 64. */
+    cache_size_mb: Type.Optional(Type.Integer({ minimum: 1 })),
+    /** SQLite memory-mapped I/O window in MiB (`PRAGMA mmap_size`); unset/0 = off. */
+    mmap_size_mb: Type.Optional(Type.Integer({ minimum: 0 })),
   }),
   /**
    * Legacy single-agent workspace. When `[agents]` is present, `root_dir` is a

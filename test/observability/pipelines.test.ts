@@ -1459,3 +1459,233 @@ test("retry-failed bulk-resets only failed items and returns the count", async (
     });
   });
 });
+
+// ── pipeline_counts materialization ──────────────────────────────────────────
+//
+// getPipelineCounts reads the trigger-maintained `pipeline_counts` table. These
+// tests drive every write path that feeds it (status transitions, retry counters,
+// scope entry/exit, direct + cascade deletes, parent eligibility flips) and assert
+// the live buckets equal a from-scratch rebuild — the invariant the triggers exist
+// to hold.
+
+function snapshotCounts(storage: Storage) {
+  return {
+    enrichment: storage.getPipelineCounts("enrichment"),
+    captioningNone: storage.getPipelineCounts("captioning", { captionAll: false, captionAssistant: false }),
+    captioningAsst: storage.getPipelineCounts("captioning", { captionAll: false, captionAssistant: true }),
+    captioningAll: storage.getPipelineCounts("captioning", { captionAll: true, captionAssistant: true }),
+    captioningLegacy: storage.getPipelineCounts("captioning"),
+    summarization: storage.getPipelineCounts("summarization"),
+    diary: storage.getPipelineCounts("diary"),
+  };
+}
+
+function rawBuckets(storage: Storage) {
+  return storage.read((db) =>
+    db
+      .prepare(`select pool, status, retrying, elig, n from pipeline_counts order by 1, 2, 3, 4`)
+      .all(),
+  ) as Array<{ pool: string; status: string; retrying: number; elig: number; n: number }>;
+}
+
+/** Live (trigger-maintained) buckets must equal a from-scratch rebuild. */
+async function assertCountsParity(storage: Storage): Promise<void> {
+  const live = snapshotCounts(storage);
+  const liveRaw = rawBuckets(storage);
+  assert.ok(liveRaw.every((r) => r.n >= 0), `negative bucket: ${JSON.stringify(liveRaw)}`);
+  await storage.rebuildPipelineCounts();
+  assert.deepEqual(live, snapshotCounts(storage));
+  assert.deepEqual(liveRaw.filter((r) => r.n !== 0), rawBuckets(storage));
+}
+
+test("pipeline_counts stays exact through transitions, scope changes, deletes, and cascades", async () => {
+  await withStorage(async (storage) => {
+    // ── enrichment ──
+    await enrichEvent(storage, "e1", "pending");
+    await enrichEvent(storage, "e2", "complete");
+    await enrichEvent(storage, "e3", "failed", { retries: 2 });
+    await enrichEvent(storage, "e4", "skipped");
+    await storage.appendTimelineEvent(userEvent("e5"), "inactive"); // never in scope
+    await assertCountsParity(storage);
+    await storage.write((db) => {
+      db.prepare(`update timeline_events set enrichment_status = 'processing' where id = 'e1'`).run();
+      db.prepare(`update timeline_events set enrichment_status = 'complete' where id = 'e1'`).run();
+      // failed → retrying (pending with attempts)
+      db.prepare(`update timeline_events set enrichment_status = 'pending' where id = 'e3'`).run();
+      // no-op rewrite of the same status must not move anything
+      db.prepare(`update timeline_events set enrichment_status = 'complete' where id = 'e2'`).run();
+      // scope entry (inactive → pending) and exit (skipped → inactive)
+      db.prepare(`update timeline_events set enrichment_status = 'pending' where id = 'e5'`).run();
+      db.prepare(`update timeline_events set enrichment_status = 'inactive' where id = 'e4'`).run();
+    });
+    await assertCountsParity(storage);
+    assert.deepEqual(storage.getPipelineCounts("enrichment"), {
+      pending: 1, // e5
+      processing: 0,
+      retrying: 1, // e3
+      done: 2, // e1, e2
+      failed: 0,
+      skipped: 0,
+      deferred: 0,
+      excluded: 0,
+    });
+
+    // ── captioning ──
+    await captionAsset(storage, "c1", "a1"); // plain user message: deferred unless caption_all
+    await captionAsset(storage, "c2", "a2", { role: "assistant" }); // eligible only with captionAssistant
+    await captionAsset(storage, "c3", "a3", { triggerGroup: true, status: "complete" });
+    await mediaAsset(storage, "a4", "c3", "pending", { mediaType: "file" }); // out of track
+    await mediaAsset(storage, "a5", "c1", "failed", { attempts: 2 });
+    await assertCountsParity(storage);
+    const none = storage.getPipelineCounts("captioning", { captionAll: false, captionAssistant: false });
+    assert.equal(none.pending, 0);
+    assert.equal(none.deferred, 2); // a1, a2
+    assert.equal(none.done, 1);
+    assert.equal(none.failed, 1);
+    const asst = storage.getPipelineCounts("captioning", { captionAll: false, captionAssistant: true });
+    assert.equal(asst.pending, 1); // a2
+    assert.equal(asst.deferred, 1); // a1
+
+    await storage.write((db) => {
+      // parent becomes a trigger: a1 moves deferred → pending under every config
+      db.prepare(`update timeline_events set trigger_group_id = 'g9' where id = 'c1'`).run();
+      // backfetch promotion on c2: a2 eligible even without captionAssistant
+      db.prepare(`update timeline_events set is_backfetch = 1 where id = 'c2'`).run();
+      // a4 enters the track (file → image), a5 leaves it (image → file)
+      db.prepare(`update media_assets set media_type = 'image' where id = 'a4'`).run();
+      db.prepare(`update media_assets set media_type = 'file' where id = 'a5'`).run();
+      // a1 claimed with a retry counter, then completes
+      db.prepare(`update media_assets set caption_status = 'processing', caption_attempts = 1 where id = 'a1'`).run();
+      db.prepare(`update media_assets set caption_status = 'complete' where id = 'a1'`).run();
+    });
+    await assertCountsParity(storage);
+    const after = storage.getPipelineCounts("captioning", { captionAll: false, captionAssistant: false });
+    assert.deepEqual(after, {
+      pending: 2, // a2 (backfetched), a4 (on trigger-bearing c3)
+      processing: 0,
+      retrying: 0,
+      done: 2, // a1, a3
+      failed: 0,
+      skipped: 0,
+      deferred: 0,
+      excluded: 0,
+    });
+
+    await storage.write((db) => {
+      db.prepare(`delete from media_assets where id = 'a2'`).run(); // direct child delete
+      db.prepare(`delete from timeline_events where id = 'c3'`).run(); // cascades a3 + a4
+    });
+    await assertCountsParity(storage);
+    assert.deepEqual(storage.getPipelineCounts("captioning", { captionAll: true, captionAssistant: true }), {
+      pending: 0,
+      processing: 0,
+      retrying: 0,
+      done: 1, // a1
+      failed: 0,
+      skipped: 0,
+      deferred: 0,
+      excluded: 0,
+    });
+
+    // ── summarization ──
+    await summarizationJob(storage, "s1", "pending");
+    await summarizationJob(storage, "s2", "complete");
+    await summarizationJob(storage, "s3", "failed", { attempts: 1 });
+    await storage.write((db) => {
+      db.prepare(`update summarization_jobs set status = 'processing', attempts = 1 where id = 's1'`).run();
+      db.prepare(`delete from summarization_jobs where id = 's3'`).run();
+    });
+    await assertCountsParity(storage);
+    assert.equal(storage.getPipelineCounts("summarization").processing, 1);
+    assert.equal(storage.getPipelineCounts("summarization").done, 1);
+    assert.equal(storage.getPipelineCounts("summarization").failed, 0);
+
+    // ── diary ──
+    await diarySummary(storage, "d1", "pending");
+    await diarySummary(storage, "d2", "done");
+    await diarySummary(storage, "d3", null, { level: 2 }); // out of scope
+    await storage.write((db) => {
+      db.prepare(`update summaries set diary_status = 'pending' where id = 'd3'`).run(); // enters
+      db.prepare(`update summaries set diary_status = 'excluded' where id = 'd1'`).run();
+      db.prepare(`delete from summaries where id = 'd2'`).run();
+    });
+    await assertCountsParity(storage);
+    assert.deepEqual(storage.getPipelineCounts("diary"), {
+      pending: 1, // d3
+      processing: 0,
+      retrying: 0,
+      done: 0,
+      failed: 0,
+      skipped: 0,
+      deferred: 0,
+      excluded: 1, // d1
+    });
+  });
+});
+
+test("pipeline_counts is rebuilt from the base tables at every open", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const path = await import("node:path");
+  const dir = await mkdtemp(path.join(tmpdir(), "mikuswarm-pc-"));
+  const databasePath = path.join(dir, "t.db");
+  try {
+    const first = await Storage.open({ databasePath });
+    await enrichEvent(first, "e1", "pending");
+    await enrichEvent(first, "e2", "failed", { retries: 1 });
+    await captionAsset(first, "c1", "a1", { triggerGroup: true });
+    // Poison the cache the way a pre-trigger write or a hand edit would.
+    await first.write((db) => db.exec(`update pipeline_counts set n = 99`));
+    assert.equal(first.getPipelineCounts("enrichment").pending, 99);
+    await first.waitForIdle();
+    first.close();
+
+    const second = await Storage.open({ databasePath });
+    try {
+      const e = second.getPipelineCounts("enrichment");
+      assert.equal(e.pending, 2); // e1 + the c1 parent event (default 'pending')
+      assert.equal(e.failed, 1);
+      const c = second.getPipelineCounts("captioning", { captionAll: false, captionAssistant: false });
+      assert.equal(c.pending, 1);
+      await assertCountsParity(second);
+    } finally {
+      await second.waitForIdle();
+      second.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("pipeline monitor read paths are index-backed (session probe, usage sums)", async () => {
+  await withStorage(async (storage) => {
+    const plan = (sql: string) =>
+      (storage.read((db) => db.prepare(`explain query plan ${sql}`).all()) as Array<{ detail: string }>)
+        .map((r) => r.detail)
+        .join(" | ");
+    // The summarization/diary lists' correlated latest-session probe.
+    assert.match(
+      plan(
+        `select id from agent_sessions where trigger_event_id = 'summarize:x' order by created_at desc limit 1`,
+      ),
+      /idx_agent_sessions_trigger_event/,
+    );
+    // Captioning usage + cost overview sums are covering-index scans.
+    assert.match(
+      plan(`select sum(caption_cost) from media_assets where caption_total_tokens is not null`),
+      /COVERING INDEX idx_media_assets_caption_usage/,
+    );
+    assert.match(
+      plan(
+        `select count(*), sum(caption_input_tokens), sum(caption_output_tokens), sum(caption_cost) from media_assets where caption_total_tokens is not null`,
+      ),
+      /COVERING INDEX idx_media_assets_caption_usage/,
+    );
+    const names = storage.read((db) =>
+      (db.prepare(`select name from sqlite_master where type = 'index'`).all() as Array<{ name: string }>).map(
+        (r) => r.name,
+      ),
+    );
+    assert.ok(!names.includes("idx_media_assets_caption_cost"), "superseded index should be dropped");
+  });
+});

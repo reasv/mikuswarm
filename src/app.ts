@@ -329,6 +329,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
 
   const storage = await Storage.open({
     databasePath: config.storage.database_path,
+    cacheSizeMb: config.storage.cache_size_mb,
+    mmapSizeMb: config.storage.mmap_size_mb,
     logger: logger.child("storage"),
   });
   const timeline = new TimelineStore(storage);
