@@ -167,7 +167,11 @@ export class SummarizationIndexer {
     // would otherwise cascade a leaked first job through the whole backlog), so
     // the gate lives here, where every entry point converges. `reconcileAll`'s
     // active-only sweep is the same rule applied to the startup path.
-    if (storage.getTimelineState(timelineKey) !== "active") return;
+    const timelineState = storage.getTimelineState(timelineKey);
+    if (timelineState !== "active") {
+      this.options.logger?.debug("summarization_lifecycle_gate_skip", { timelineKey, timelineState });
+      return;
+    }
 
     // §10b: skip mirrored timelines — the mirror worker provides summaries.
     if (this.options.isMirroredTimeline?.(timelineKey)) return;
