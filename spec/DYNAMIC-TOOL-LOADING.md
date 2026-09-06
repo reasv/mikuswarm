@@ -77,6 +77,16 @@ Two consequences drive the whole design:
    all its tools in one event) and tend to happen early in a session, before the
    transcript grows.
 
+   > **Correction (2026-09-05, post-implementation).** The "cheap where cache writes
+   > are free" premise was wrong: a prefix replay re-bills the *whole* context at the
+   > uncached input (or cache-write) price instead of the cache-read price on every
+   > provider — never free. Worse, the `openai-responses` row above shipped with
+   > `supportsToolSearch` left at pi-ai's off default and unexposed in config, so on
+   > GPT-5.6 (which bills cache writes at 1.25× input) 71 of 72 skill loads in one
+   > week each re-wrote the entire context. Fixed by defaulting
+   > `compat.supports_tool_search` ON in `createModelFromConfig` (opt-out only for an
+   > endpoint that rejects the items) — see ARCHITECTURE.md §10 Transport.
+
 Not covered by the contract: starting a session with a *server-side* hidden catalog
 (Anthropic's native tool-search over `defer_loading` tools present from request 1).
 pi-ai keys deferral off transcript markers, so tools present at session start are

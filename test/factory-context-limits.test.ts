@@ -383,6 +383,22 @@ test("createModelFromConfig: text-only member → input ['text'] (triggers pi-ai
   assert.deepEqual(multimodal.input, ["text", "image"]);
 });
 
+test("createModelFromConfig: compat.supportsToolSearch defaults ON (prefix-stable tool loading on openai-responses), opt-out honored", async () => {
+  const { createModelFromConfig } = await import("../src/agent/factory.js");
+  // pi-ai's openai-responses driver reads `compat.supportsToolSearch` to decide whether a
+  // mid-session tool load is serialized as in-transcript `tool_search_call/output` items
+  // (prefix stable) or by growing `params.tools` (the tools array leads the Responses
+  // prompt-cache prefix → the whole cached context is re-billed). pi-ai defaults it OFF;
+  // MikuSwarm must default it ON and only honor an explicit `supports_tool_search = false`.
+  const base = { context_window: 1000, max_tokens: 100, input_modalities: ["text"] };
+  const dflt = createModelFromConfig({ id: "sol", api: "openai-responses", ...base } as any);
+  assert.equal(dflt.compat?.supportsToolSearch, true, "unset → ON");
+  const on = createModelFromConfig({ id: "sol", api: "openai-responses", compat: { supports_tool_search: true }, ...base } as any);
+  assert.equal(on.compat?.supportsToolSearch, true);
+  const off = createModelFromConfig({ id: "sol", api: "openai-responses", compat: { supports_tool_search: false }, ...base } as any);
+  assert.equal(off.compat?.supportsToolSearch, false, "explicit false → opt-out");
+});
+
 test("agent capability filter: image session drops a text-only fallback; text session keeps it", async () => {
   const { buildModelFallback, resolveModelChain } = await import("../src/agent/model-fallback.js");
   const { rawInputsRequireMultimodal } = await import("../src/agent/factory.js");

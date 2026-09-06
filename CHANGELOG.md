@@ -32,6 +32,8 @@ Unreleased section; it is not part of any release's notes.
 
 ### Fixed
 
+- **Dynamic tool loading no longer busts the prompt cache on the OpenAI Responses API.** Loading a skill mid-session grew the request's `tools` array, which leads the Responses prompt-cache prefix, so the next request re-wrote the entire cached context at the cache-write price (on GPT-5.6, every load cost a full-context re-bill). pi-ai's prefix-stable `tool_search_call/output` + `defer_loading` serialization is now on by default for every `api = "openai-responses"` model (`compat.supports_tool_search`, default `true`; set `false` only for a Responses-compatible endpoint that rejects those item types).
+
 - **Console pipelines page took seconds per request and stalled the agent.** Every
   `/api/pipelines*` read ran synchronously on the agent's main thread, and three of
   them scanned: the summarization/diary item lists resolved each row's session with

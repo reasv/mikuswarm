@@ -676,6 +676,16 @@ const ModelSchema = StrictObject({
     // deserialization 400. Set false to force the plain `system` role. Unset =
     // keep pi-ai's auto-detection.
     supports_developer_role: Type.Optional(Type.Boolean()),
+    // openai-responses only. Dynamic tool loading (§10) adds tools mid-session;
+    // pi-ai can serialize the load point as `tool_search_call`/`tool_search_output`
+    // items carrying the added definitions with `defer_loading: true`, so the
+    // `tools` array — the FIRST thing in the Responses API's prompt-cache prefix —
+    // never changes and the cached context survives the load. MikuSwarm turns
+    // this ON by default (pi-ai's own default is off): without it every load
+    // event re-bills the whole context at the uncached/cache-write price. Set
+    // false only for a Responses-compatible endpoint that rejects those item
+    // types, accepting one full prefix re-write per load event there.
+    supports_tool_search: Type.Optional(Type.Boolean()),
     // Override pi-ai's "reasoning_content required on every assistant message"
     // safety net (auto-enabled for `provider = "deepseek"`). When on, pi-ai
     // stamps `reasoning_content: ""` on any assistant turn that carried no

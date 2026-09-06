@@ -2506,6 +2506,13 @@ export function createModelFromConfig(model: ModelConfig, contextWindow?: number
       // DeepSeek upstream rejects `developer`, so set false to force `system`.
       // Undefined = leave auto-detection in place.
       supportsDeveloperRole: model.compat?.supports_developer_role,
+      // Prefix-stable dynamic tool loading on the Responses API (§10): loaded
+      // tools ride in-transcript `tool_search_*` items with `defer_loading`
+      // instead of growing `params.tools`, so a load event never invalidates the
+      // prompt cache. Default ON (pi-ai defaults off) — a bust re-bills the whole
+      // context at the uncached price on every provider. Only read by the
+      // openai-responses driver; inert elsewhere.
+      supportsToolSearch: model.compat?.supports_tool_search ?? true,
       // Suppress pi-ai's empty-string `reasoning_content` stamp on reasoning-less
       // assistant turns (auto-enabled for DeepSeek); V4 Pro thinking mode 400s on
       // a present-but-empty value. Undefined = leave auto-detection in place.
