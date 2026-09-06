@@ -23,12 +23,17 @@ fresh, empty Unreleased section above it. Keep this guidance comment in the
 Unreleased section; it is not part of any release's notes.
 -->
 
+## [v0.5.0] - 2026-09-06
+
 ### Added
 
 - **`[storage].cache_size_mb` / `[storage].mmap_size_mb`.** SQLite page-cache size
   (default raised from SQLite's ~2 MiB to 64 MiB) and an opt-in memory-mapped I/O
   window (default off) for large databases, where the tiny default cache made even
   index-only probes re-read pages through syscalls on every call.
+
+- **Console favicon.** The observability console now ships a tab icon (SVG with
+  ICO/PNG fallbacks) instead of the browser's default blank page icon.
 
 ### Fixed
 
