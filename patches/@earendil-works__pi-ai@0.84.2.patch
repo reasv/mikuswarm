@@ -1,0 +1,43 @@
+diff --git a/dist/api/openai-responses-shared.js b/dist/api/openai-responses-shared.js
+index c35771dcc9b2173d0b459d13c6d86e622de45e9a..da80ad9e8219e09844c0c15edc2ed929cd417754 100644
+--- a/dist/api/openai-responses-shared.js
++++ b/dist/api/openai-responses-shared.js
+@@ -176,7 +176,15 @@ export function convertResponsesMessages(model, context, allowedToolCallProvider
+                         (customInputProperty === undefined && !itemId?.startsWith("fc_"))) {
+                         itemId = undefined;
+                     }
+-                    const canReplayNamespace = isSameModel || options?.deferredTools?.has(toolCall.name) === true;
++                    const isDeferredCall = options?.deferredTools?.has(toolCall.name) === true;
++                    const canReplayNamespace = isSameModel || isDeferredCall;
++                    // A bare deferred function (loaded through tool_search, not declared
++                    // inside a `namespace` tool) lives in a namespace named after itself,
++                    // and the API requires that namespace on the replayed function_call.
++                    // Some Responses-compatible endpoints omit it on the model's own
++                    // function_call item, so fall back to the function name.
++                    const replayNamespace = toolCall.namespace ??
++                        (isDeferredCall && options?.deferredToolsMode === "tool-search" ? toolCall.name : undefined);
+                     if (customInputProperty !== undefined) {
+                         output.push({
+                             type: "custom_tool_call",
+@@ -184,8 +192,8 @@ export function convertResponsesMessages(model, context, allowedToolCallProvider
+                             call_id: callId,
+                             name: toolCall.name,
+                             input: sanitizeSurrogates(getGrammarToolInput(toolCall.name, toolCall.arguments, customInputProperty)),
+-                            ...(canReplayNamespace && toolCall.namespace !== undefined
+-                                ? { namespace: toolCall.namespace }
++                            ...(canReplayNamespace && replayNamespace !== undefined
++                                ? { namespace: replayNamespace }
+                                 : {}),
+                         });
+                     }
+@@ -196,8 +204,8 @@ export function convertResponsesMessages(model, context, allowedToolCallProvider
+                             call_id: callId,
+                             name: toolCall.name,
+                             arguments: JSON.stringify(toolCall.arguments),
+-                            ...(canReplayNamespace && toolCall.namespace !== undefined
+-                                ? { namespace: toolCall.namespace }
++                            ...(canReplayNamespace && replayNamespace !== undefined
++                                ? { namespace: replayNamespace }
+                                 : {}),
+                         });
+                     }

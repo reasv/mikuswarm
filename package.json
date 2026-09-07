@@ -51,6 +51,9 @@
       "esbuild",
       "onnxruntime-node",
       "sharp"
-    ]
+    ],
+    "patchedDependencies": {
+      "@earendil-works/pi-ai@0.84.2": "patches/@earendil-works__pi-ai@0.84.2.patch"
+    }
   }
 }

@@ -48,6 +48,8 @@ RUN corepack enable && corepack prepare pnpm@10.11.0 --activate
 # modules listed under pnpm.onlyBuiltDependencies (better-sqlite3, sharp,
 # onnxruntime-node, esbuild).
 COPY package.json pnpm-lock.yaml ./
+# pnpm.patchedDependencies (package.json) are applied at install time from ./patches.
+COPY patches ./patches
 RUN pnpm install --frozen-lockfile
 
 # Build the Rust NAPI matrix module → /app/npm (needs rust-toolchain.toml at the

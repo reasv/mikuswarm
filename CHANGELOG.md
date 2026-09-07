@@ -23,6 +23,18 @@ fresh, empty Unreleased section above it. Keep this guidance comment in the
 Unreleased section; it is not part of any release's notes.
 -->
 
+### Fixed
+
+- Dynamic tool loading on the OpenAI Responses API (`compat.supports_tool_search`,
+  default on) broke the turn after a loaded tool was called on endpoints that
+  accept the `tool_search_*` items but omit the `namespace` field on the model's
+  `function_call` item and then reject the replay with 400 "Missing namespace for
+  function_call '<tool>'. It does not exist in the default namespace." A bare
+  deferred function lives in a namespace named after itself, so the bundled
+  pi-ai is patched (`patches/`) to default the replayed namespace to the function
+  name when the provider left it out. Loaded tools keep riding the prefix-stable
+  transport; no prompt-cache re-write.
+
 ## [v0.5.0] - 2026-09-06
 
 ### Added
