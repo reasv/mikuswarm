@@ -684,7 +684,12 @@ const ModelSchema = StrictObject({
     // this ON by default (pi-ai's own default is off): without it every load
     // event re-bills the whole context at the uncached/cache-write price. Set
     // false only for a Responses-compatible endpoint that rejects those item
-    // types, accepting one full prefix re-write per load event there.
+    // types, accepting one full prefix re-write per load event there. Also
+    // set false for an endpoint that ACCEPTS the items but emits the model's
+    // `function_call` for a tool loaded that way without its `namespace`
+    // field and then 400s the round-trip ("Missing namespace for function_call
+    // '<tool>'. It does not exist in the default namespace.") — observed on a
+    // Bedrock-hosted GPT-5.6 route; direct OpenAI round-trips fine.
     supports_tool_search: Type.Optional(Type.Boolean()),
     // Override pi-ai's "reasoning_content required on every assistant message"
     // safety net (auto-enabled for `provider = "deepseek"`). When on, pi-ai
