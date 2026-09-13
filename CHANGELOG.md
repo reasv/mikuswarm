@@ -23,6 +23,8 @@ fresh, empty Unreleased section above it. Keep this guidance comment in the
 Unreleased section; it is not part of any release's notes.
 -->
 
+## [v0.5.1] - 2026-09-13
+
 ### Fixed
 
 - Dynamic tool loading on the OpenAI Responses API (`compat.supports_tool_search`,
