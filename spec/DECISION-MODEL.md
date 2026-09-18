@@ -303,7 +303,25 @@ Today `send_message` refuses to *reply to a message another session has claimed*
 
 **Summary pre-expansion (design sketch, not for the first slice).** The summary layer is a decision-tree-shaped memory: each node has a range, a level, and children. A pre-expansion pass would ask, per rendered top-level node, "would the details under this be needed for `query`?" and expand the top-k confident nodes one level, then repeat once on the expanded children (bounded depth 2, bounded total tokens), rendering the result as `<expanded_summary id="…">` blocks in the *final user turn* — the summary layer itself stays byte-identical so the cached prefix is untouched. Open points the owner raised and which this sketch does not settle: the choice is hierarchical (expand, then choose which children to include), the state per node is a summary of a summary and may be too thin for the model to judge, and whether expanded material belongs in the tail or should be allowed to reshape the layer at the cost of cache misses. This needs its own short spec after §5.1–5.4 land.
 
-### 5.6 Deferred: hold extension
+### 5.6 Reactions as a presence signal (sketch — deferred, owner-raised 2026-09-18)
+
+Today reactions are display-only and never wake a session (§9f): the bot sees reactions to its own posts only if a session is built later for some other reason, at which point it is focused on that other task, and if no session follows it never sees them at all. The wish is for the bot to be able to *respond* to reactions on its own messages — a mocking reaction, a pile-on, a "🤔" that reads as a question — instead of being blind to them.
+
+**Why not a "classify the reaction" point.** Whether a reaction is mocking, and whether it deserves a reply, is a nuanced social judgment, exactly what a decision model is weakest at; custom emoji arrive as shortcodes with no visual meaning; and the same emoji is mockery from one person and affection from another. A point built as "is this reaction hostile?" would be wrong often and would be a poor thing to act on.
+
+**Reframe: a reaction burst is an activity signal for presence (§5.3), not a trigger of its own.** The question presence already asks — "would a regular who has been reading say something now?" — is the right one here too, and the reactions are just more state. Concretely:
+
+- **Mechanical pre-gates carry the burden.** A reaction *episode* (the existing §9f seam logic: a burst of reactions on one message, settled when no new reaction arrives for a short quiet period) on a **bot-authored** message that is younger than `reaction_max_age_ms`, from a non-bot sender, where the bot has not posted since, and where the message has not already earned a reaction-armed evaluation (once per message), **arms a presence evaluation** in a presence-enabled channel — subject to all of presence's gates (quota, no active session, min gap, dead channel). Rooms not opted into presence see no change; reactions in them stay display-only.
+- **State addition.** The transcript window plus a `reactions_to_self` field: the §9f View B lines for the bot's recent messages (`Fleur, Alice and Bo reacted 🤡 to your message [$id]: "snippet"`), with `fields.reactions_since_self_last_message` precomputed.
+- **Questions.** The presence fan-out, unchanged, plus `reaction_response` — `noul`: "A person whose message received these reactions would naturally say or do something in response (answer, clarify, push back, or play along)." `reason` gains `respond_to_reactions`; `target` may name the bot's own reacted-to message.
+- **Verdict.** A reaction-armed evaluation launches only on `reaction_response ≥ reaction_threshold` (default 0.85 — deliberately high; a false positive costs one cheap session that may `NO_REPLY` or just react back, a false negative is today's behaviour). The kickoff carries the reaction lines and the target id, so the natural cheap response — an emoji reaction back via `react` — is one tool call away, and a text reply can `reply_to_id` the reacted-to message.
+- **Spam control** is presence's: the daily quota, `min_eval_gap_ms`, once-per-message arming, and an optional `reaction_daily_max` (default 2) sub-cap on reaction-armed launches so a busy room's pile-ons cannot consume the whole quota.
+
+**Heuristic.** None — without the decision model, reactions stay display-only (today). This is the one point where the heuristic is "do nothing", which is acceptable because the feature is additive and off by default.
+
+**Not designed here**: reactions to *other users'* messages as a signal (inter-user reactions are already surfaced on a tight horizon and are conversation topics, not addresses); a startup backfill of reaction history (§9f, deferred).
+
+### 5.7 Deferred: hold extension
 
 Asking `pending_media` at trigger time and stretching the 2 s hold to ~10 s only when it fires is cheap and fits the same client, but follow-up folding already covers the common late-image case. Listed for completeness; not designed.
 
@@ -315,6 +333,7 @@ Asking `pending_media` at trigger time and stretching the 2 s hold to ~10 s only
 4. **Presence (§5.3)** — the structured kickoff and activity-armed evaluator; tuned live.
 5. **Dedup (§5.4)**.
 6. **Retrieval re-rank (§5.5, first half)**; summary pre-expansion gets its own spec.
+7. **Reactions as a presence signal (§5.6)** — after presence has been tuned live.
 
 Each phase is independently shippable and independently switchable; phase 1 alone changes nothing observable.
 
