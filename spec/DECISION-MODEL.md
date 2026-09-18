@@ -331,6 +331,8 @@ Everything above is on the hot path. This point is not: it reads **completed** s
 
 **Mechanical triggers (no model needed to detect).** The runner already knows when a session: entered forced completion (≥1 corrective user message injected, §8 "Forced completion"); ended `noReply` because `forced_completion_retries` was exhausted; received one or more `send_message` error results; sent a `final: false` progress message and then never sent again; or was force-completed after prior sends. Each of these is a row-level fact and should be **persisted as such** on `agent_sessions` (a small `contract_events` JSON column, or counters) regardless of the decision model — the counts alone are useful and today they exist only in logs. The audit worker consumes these facts; a configurable sample of *clean* sessions is also audited for the refusal questions, since a refusal is a terminally valid turn.
 
+**Backfill is mandatory (owner, 2026-09-18).** Months of expensive rollouts already exist and must be used. Consequently the mechanical facts are **derived from the persisted transcript**, never only captured live: `deriveContractEvents(transcript)` is a pure function over `agent_session_payloads.transcript_json` (count of corrective user turns — matched on the exported `FORCED_COMPLETION_PROMPTS` constants, which become a single source of truth shared with `forceCompletion` in `runner.ts`; whether a prior `send_message` call preceded each; `send_message` error results; a `final: false` send with no later send; the `NO_REPLY` outcome, already on `agent_sessions.no_reply`). The live path calls the same function at completion and writes the result; a **one-time reconciliation** (startup step, resumable, batched through the single-writer queue) computes it for every historical row with a payload and stamps a `contract_version` so a later change to the derivation can re-run only what changed. The decision-model audit worker then treats history and new sessions identically: its queue is "sessions with a payload and no `session_audits` row for an enabled audit", oldest-first for the backlog and newest-first for live, paced by the `audit` budget cap so the backlog never starves anything (`audit_backlog_max_age_ms` defaults to unlimited — the whole history is in scope). A transcript-less session (payload pruned or never persisted) is marked `unauditable`, not retried.
+
 **Worker.** A background pool in the shape of the diary/summarization pools: claims sessions on completion (or by reconciliation over `agent_sessions` after a restart), runs at `background` scheduler priority, never blocks or delays anything, and stops claiming when its budget is blocked. State is built from the persisted `transcript_json`: the trigger, the assistant text and tool calls immediately before each corrective prompt, the corrective prompt, everything after it, and the messages actually delivered (from `timeline_events` by `agent_session_id`). Long rollouts are pruned to those segments to stay under `state_max_tokens`.
 
 **Audits and questions** (one call per audited session; each audit is a group of questions):
@@ -349,9 +351,9 @@ Everything above is on the hot path. This point is not: it reads **completed** s
 
 **Billing.** Audits are operator observability, not part of serving a user, so they must never touch a per-user meter. They use a distinct ledger class, `"audit"`, which the per-user fan-in ignores and which `[[limits]].classes` can cap on its own (`{ classes = ["audit"], max_usd = … }`). Rows still carry `agent_session_id` for provenance. (§3.3 is amended: the decision lane has two classes, `decision` for runtime points billed to the session payee and `audit` for this point, never payee-billed.)
 
-**Heuristic.** None; the mechanical counters persist without the model, and the semantic classification is simply absent when it is off or unavailable (reconciliation picks up unaudited sessions later if it returns within `audit_backlog_max_age`).
+**Heuristic.** None; the mechanical counters persist without the model (and are backfilled regardless), and the semantic classification is simply absent when it is off or unavailable — reconciliation picks unaudited sessions up whenever the model is back, history included.
 
-**Config.** `[decisions.audit]`: `enabled`, `sample_clean_sessions` (0–1, default 0.1), `audits = ["send_contract", "refusal"]`, `state_max_tokens`, `audit_backlog_max_age_ms`, `workers` (default 1).
+**Config.** `[decisions.audit]`: `enabled`, `sample_clean_sessions` (0–1, default 0.1; applies to history and live alike, seeded per session id so re-runs pick the same sample), `audits = ["send_contract", "refusal"]`, `state_max_tokens`, `audit_backlog_max_age_ms` (default unlimited), `workers` (default 1). The contract-event reconciliation has no switch: it runs once per `contract_version` on every deployment, model or not.
 
 ## 6. Phasing
 
@@ -362,7 +364,7 @@ Everything above is on the hot path. This point is not: it reads **completed** s
 5. **Dedup (§5.4)**.
 6. **Retrieval re-rank (§5.5, first half)**; summary pre-expansion gets its own spec.
 7. **Reactions as a presence signal (§5.6)** — after presence has been tuned live.
-8. **Transcript audit (§5.8)** — can ship any time after phase 1; the mechanical contract counters on `agent_sessions` are worth shipping even earlier, without the model.
+8. **Transcript audit (§5.8)** — can ship any time after phase 1; the mechanical contract counters on `agent_sessions` **plus their historical backfill** are worth shipping even earlier, without the model.
 
 Each phase is independently shippable and independently switchable; phase 1 alone changes nothing observable.
 
