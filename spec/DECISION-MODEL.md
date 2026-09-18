@@ -96,7 +96,7 @@ cache_write = 0.042                      # real per-token prices; no cache exist
 
 ### 3.3 Billing: a `decision` ledger class, payee-attributed
 
-- `UsageEventClass` gains `"decision"`; `[[limits]].classes` accepts it. Rows carry `class = "decision"`, `tool_name = <point name>` (reusing the column as the sub-lane label, as the tool lane does), `model_id`/`logical_model_id` = the served member, and the usual attribution columns.
+- `UsageEventClass` gains `"decision"` (and `"audit"`, §5.8, which is never payee-billed); `[[limits]].classes` accepts both. Rows carry `class = "decision"`, `tool_name = <point name>` (reusing the column as the sub-lane label, as the tool lane does), `model_id`/`logical_model_id` = the served member, and the usual attribution columns.
 - **Session-bound points** (routing, continuation-when-a-session-results, dedup, retrieval) fire after the session placeholder exists, so the row carries `agent_session_id`, `session_type`, `timeline_key`, and `trigger_sender_id`. The per-user engine (`recordUsageEvent`, `app.ts`) treats class `decision` exactly like class `tool`: it credits the payee's fungible total and shared pools but never a model-scoped sub-cap (a decision has no requested chat model). This is constraint 7's first half with a one-line change at the fan-in and one added literal in `UsageEventClass`.
 - **Session-less points** (the presence evaluator when it decides *not* to launch; a continuation verdict of "ignore") carry `timeline_key` and the *would-be* session type (`proactive.session_type` for presence) but no session and no sender. They count toward `[[limits]]` rules selecting by `classes`/`session_types` and toward nothing per-user.
 - **The aggregate cap** is an ordinary `[[limits]]` rule, e.g. `{ name = "decisions-daily", classes = ["decision"], max_usd = 1.5, window = day }`. The BudgetEngine's existing gate covers it; the registry consults `engine.check({ class: "decision", modelId })` in step 1 and falls back to the heuristic when blocked (never refuses the underlying work — a blocked decision budget means "decide the old way", constraint 2).
@@ -325,6 +325,34 @@ Today reactions are display-only and never wake a session (§9f): the bot sees r
 
 Asking `pending_media` at trigger time and stretching the 2 s hold to ~10 s only when it fires is cheap and fits the same client, but follow-up folding already covers the common late-image case. Listed for completeness; not designed.
 
+### 5.8 Transcript audit — offline classification of model failures (sketch, owner-raised 2026-09-18)
+
+Everything above is on the hot path. This point is not: it reads **completed** sessions and classifies what went wrong, for statistics and examples. It is the best-suited use of a decision model in this spec — the questions are about the *shape of text in a transcript*, not about social judgment — and a wrong answer costs nothing but a miscounted statistic.
+
+**Mechanical triggers (no model needed to detect).** The runner already knows when a session: entered forced completion (≥1 corrective user message injected, §8 "Forced completion"); ended `noReply` because `forced_completion_retries` was exhausted; received one or more `send_message` error results; sent a `final: false` progress message and then never sent again; or was force-completed after prior sends. Each of these is a row-level fact and should be **persisted as such** on `agent_sessions` (a small `contract_events` JSON column, or counters) regardless of the decision model — the counts alone are useful and today they exist only in logs. The audit worker consumes these facts; a configurable sample of *clean* sessions is also audited for the refusal questions, since a refusal is a terminally valid turn.
+
+**Worker.** A background pool in the shape of the diary/summarization pools: claims sessions on completion (or by reconciliation over `agent_sessions` after a restart), runs at `background` scheduler priority, never blocks or delays anything, and stops claiming when its budget is blocked. State is built from the persisted `transcript_json`: the trigger, the assistant text and tool calls immediately before each corrective prompt, the corrective prompt, everything after it, and the messages actually delivered (from `timeline_events` by `agent_session_id`). Long rollouts are pruned to those segments to stay under `state_max_tokens`.
+
+**Audits and questions** (one call per audited session; each audit is a group of questions):
+
+- *Send-contract audit* (runs when a corrective prompt fired):
+  - `had_user_message` — `noul`: "The assistant text before the corrective prompt contains a message written to be read by the users, not notes to itself."
+  - `after_correction` — `choice`: `sent_same` ("sent essentially the same text"), `sent_reworded` ("same content, substantially reworded"), `sent_cut` ("sent it with a significant part removed"), `sent_different` ("sent something with different content"), `switched_to_no_reply`, `nothing` (retries exhausted).
+  - `self_talk_only` — `noul`: "Before the corrective prompt the assistant only reasoned or narrated to itself and finished without addressing anyone."
+- *Refusal audit* (runs on every audited session):
+  - `refused` — `noul`: "The assistant declines to do what was asked on safety, policy, or capability grounds."
+  - `refusal_kind` — `choice`: `safety_policy`, `capability`, `persona_boundary`, `misunderstood_request`, `none`.
+  - `refusal_delivered` — `noul`: "The refusal was sent to the users rather than kept in internal text."
+- *Candidates for later audits* (listed, not designed): a `final: false` progress message followed by no further send ("promised and did not deliver"); answering a `<handled_by_session>` message despite the marker; an interjection that was ignored; persona breaks ("as an AI…"); internal reasoning sent as the message; replying in the wrong language; tool use that nothing in the request called for.
+
+**Storage and console.** A new `session_audits` table: `(session_id, audit, answers_json, confidence, model_id, cost_usd, created_at)`, one row per audit per session. The console session view shows the audit chips next to the existing forced-completion/no-reply markers; the usage/pipelines pages gain a per-model, per-day breakdown (e.g. share of sessions that hit forced completion, and of those, `after_correction` distribution; refusal rate per model). This is the one place the spec adds a table, and it is worth it: the value of this point *is* the aggregate over time, and examples must be findable later.
+
+**Billing.** Audits are operator observability, not part of serving a user, so they must never touch a per-user meter. They use a distinct ledger class, `"audit"`, which the per-user fan-in ignores and which `[[limits]].classes` can cap on its own (`{ classes = ["audit"], max_usd = … }`). Rows still carry `agent_session_id` for provenance. (§3.3 is amended: the decision lane has two classes, `decision` for runtime points billed to the session payee and `audit` for this point, never payee-billed.)
+
+**Heuristic.** None; the mechanical counters persist without the model, and the semantic classification is simply absent when it is off or unavailable (reconciliation picks up unaudited sessions later if it returns within `audit_backlog_max_age`).
+
+**Config.** `[decisions.audit]`: `enabled`, `sample_clean_sessions` (0–1, default 0.1), `audits = ["send_contract", "refusal"]`, `state_max_tokens`, `audit_backlog_max_age_ms`, `workers` (default 1).
+
 ## 6. Phasing
 
 1. **Foundation** — `[models.*].api = "system-one"`, `DecisionClient` over `runFetchWithFallback`, registry with heuristic fallback + logging, `decision` ledger class through the fan-in and the per-user engine, `[decisions]` schema + validation, console class breakdown. Tests: fake client (answers, 529, timeout, malformed), fallback matrix, ledger attribution for session-bound vs session-less points.
@@ -334,6 +362,7 @@ Asking `pending_media` at trigger time and stretching the 2 s hold to ~10 s only
 5. **Dedup (§5.4)**.
 6. **Retrieval re-rank (§5.5, first half)**; summary pre-expansion gets its own spec.
 7. **Reactions as a presence signal (§5.6)** — after presence has been tuned live.
+8. **Transcript audit (§5.8)** — can ship any time after phase 1; the mechanical contract counters on `agent_sessions` are worth shipping even earlier, without the model.
 
 Each phase is independently shippable and independently switchable; phase 1 alone changes nothing observable.
 
@@ -352,4 +381,4 @@ Each phase is independently shippable and independently switchable; phase 1 alon
 - No change to how mentions, DMs, and explicit replies trigger.
 - No model switching mid-session, and no de-escalation.
 - No dependence on a vendor SDK; the client is ~100 lines of fetch against a documented JSON shape.
-- No new database tables: one enum literal on `usage_events.class`, one column on `agent_sessions` for initial preloads (phase 2).
+- No new database tables for the runtime points: two enum literals on `usage_events.class` (`decision`, `audit`), one column on `agent_sessions` for initial preloads (phase 2), contract counters on `agent_sessions` (§5.8). The only new table is `session_audits` (§5.8).
