@@ -163,13 +163,13 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
 
       // A send with no text, no HTML, and no media has nothing to deliver — it would
       // produce an empty event (or, historically, silently send nothing). If you
-      // have nothing to say, terminate the turn by outputting exactly NO_REPLY instead.
+      // have nothing to say, end the turn by calling no_reply instead.
       const hasMedia = Array.isArray(args.media)
         ? args.media.some((s) => s.trim())
         : (args.media?.trim() ?? "").length > 0;
       if (!args.message.trim() && !args.html?.trim() && !hasMedia) {
         return {
-          content: [{ type: "text", text: "error: nothing to send — provide message text, html, or media. If you have nothing to say, output exactly NO_REPLY to end your turn silently." }],
+          content: [{ type: "text", text: "error: nothing to send — provide message text, html, or media. If you have nothing to say, call no_reply to end your turn silently." }],
           details: null,
         };
       }

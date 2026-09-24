@@ -41,7 +41,7 @@ The analysis property is also added to each tool's canonical schema as optional 
 
 ## no_reply tool
 
-A session-scoped tool registered only when prefill is enabled. Calling it is terminal: `isTerminallyValid` and `isExplicitNoReply` in runner.ts both recognize it. The dedup/claim/diary logic treats it identically to the existing text-based NO_REPLY.
+Originally a session-scoped tool registered only when prefill was enabled; since the follow-up commit it is an ordinary catalog tool in every chat session (`src/tools/no-reply.ts`), and the prefill transform treats it like any other tool. Calling it is terminal (`terminate: true`): `isTerminallyValid` and `isExplicitNoReply` in runner.ts both recognize it. The dedup/claim/diary logic treats it identically to the legacy text-based NO_REPLY, which stays accepted but is no longer taught.
 
 ## Why not a grammar wrapper
 

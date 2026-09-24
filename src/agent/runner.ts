@@ -174,11 +174,11 @@ async function forceCompletion(agent: Agent): Promise<void> {
     const content = alreadySent
       ? "You already sent a message but your turn did not end cleanly. Either:\n" +
         "- Call send_message again with your follow-up and final=true to end your turn, OR\n" +
-        "- Output exactly NO_REPLY if you have nothing more to say.\n\n" +
+        "- Call no_reply if you have nothing more to say.\n\n" +
         "Text you write outside of send_message is not visible to users."
       : "Your turn ended without sending a message. You must end every turn by either:\n" +
         "- Calling send_message with your response, OR\n" +
-        "- Outputting exactly NO_REPLY if you have nothing to say.\n\n" +
+        "- Calling no_reply if you have nothing to say.\n\n" +
         "Text you write outside of send_message is not visible to users.";
     await promptAgent(agent, {
       role: "user",

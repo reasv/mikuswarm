@@ -121,6 +121,7 @@ import {
   IRC_TERMINOLOGY,
   type ToolUsageRecord,
 } from "./tools/index.js";
+import { createNoReplyTool } from "./tools/no-reply.js";
 import { SauceNaoRateLimiter } from "./saucenao/rate-limiter.js";
 import { setEgressGuardEnabled } from "./tools/ssrf.js";
 import { configureHttpLimiter } from "./tools/http-limiter.js";
@@ -4513,6 +4514,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           return claim ? { sessionId: claim.sessionId } : undefined;
         },
       }),
+      // Silence is a tool call too (ARCHITECTURE.md §8 "Turn contract"): filtered by
+      // the same session-type allowlist as send_message, always in the initial set.
+      createNoReplyTool(),
       createDelegateToSessionTool({
         currentEvent: inbound.event,
         steerSession: (sessionId, content) =>

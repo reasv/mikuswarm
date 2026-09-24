@@ -227,7 +227,7 @@ const DEFAULT_PROACTIVE_KICKOFF =
   "It is {time}. No message is addressed to you right now — you have not been triggered. " +
   "Read the recent conversation above and decide, honestly, whether you have something " +
   "genuinely worth adding right now. If you do, say it with send_message — one message, " +
-  "natural, not forced. If you do not, output exactly NO_REPLY. Staying quiet is the normal, " +
+  "natural, not forced. If you do not, call no_reply. Staying quiet is the normal, " +
   "common outcome; only post when it actually adds something.";
 
 export class ContextBuilder {

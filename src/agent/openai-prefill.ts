@@ -6,7 +6,7 @@
  * property) whose value must match the configured prefix pattern. The wire
  * format uses strict JSON schema mode (strict = true) and tool_choice =
  * "required", so the model is forced to call a tool on every turn and to
- * start its arguments with the analysis prefix. A special no_reply tool
+ * start its arguments with the analysis prefix. The catalog no_reply tool
  * allows the model to signal silence without sending a message.
  *
  * Design rationale: the analysis argument form (vs a grammar wrapper) keeps
@@ -200,30 +200,6 @@ export function makePrefillInjector(): (payload: unknown, model: unknown) => unk
     if (!payload || typeof payload !== "object") return payload;
     return applyPrefillToParams(payload as Record<string, unknown>, prefillText);
   };
-}
-
-/**
- * Build the no_reply tool for prefill-enabled sessions. This tool has the
- * same analysis argument as all other tools and is called when the model
- * wants to stay silent for this turn.
- */
-export function buildNoReplyTool(prefillText: string): AgentTool {
-  const pattern = buildAnalysisPattern(prefillText);
-  return {
-    name: "no_reply",
-    label: "No reply",
-    description: "Stay silent this turn without posting a message to the chat. Use this instead of send_message when you have nothing to say.",
-    parameters: Type.Object({
-      analysis: Type.String({ description: "Analysis of the situation and why staying silent is appropriate.", pattern }),
-    }),
-    execute: async (_toolCallId: string, _params: unknown): Promise<AgentToolResult<{ noReply: true }>> => {
-      // The content text "NO_REPLY_CALLED" signals explicit no-reply to the runner.
-      // `terminate: true` ends the run the same way a final send_message does:
-      // under tool_choice = "required" the model can never end a turn with plain
-      // text, so the tool result itself has to stop the loop.
-      return { content: [{ type: "text", text: "NO_REPLY_CALLED" }], details: { noReply: true }, terminate: true };
-    },
-  } as unknown as AgentTool;
 }
 
 /**

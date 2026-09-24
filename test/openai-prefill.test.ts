@@ -6,10 +6,10 @@ import {
   buildAnalysisPattern,
   escapeForPattern,
   dropReasoningBlocks,
-  buildNoReplyTool,
   wrapToolWithAnalysisStripping,
 } from "../src/agent/openai-prefill.js";
 import { isTerminallyValid, isExplicitNoReply } from "../src/agent/runner.js";
+import { createNoReplyTool } from "../src/tools/no-reply.js";
 
 // ---------------------------------------------------------------------------
 // escapeForPattern and buildAnalysisPattern
@@ -264,8 +264,8 @@ test("dropReasoningBlocks: preserves non-thinking blocks unchanged", () => {
 // no_reply tool
 // ---------------------------------------------------------------------------
 
-test("buildNoReplyTool: execute returns NO_REPLY_CALLED content", async () => {
-  const tool = buildNoReplyTool("We must ");
+test("createNoReplyTool: execute returns NO_REPLY_CALLED content and terminates", async () => {
+  const tool = createNoReplyTool();
   assert.equal(tool.name, "no_reply");
   const result = await (tool.execute as Function)("id", {});
   assert.equal((result.content as Array<Record<string, unknown>>)[0]["text"], "NO_REPLY_CALLED");

@@ -6,7 +6,7 @@ import type { AppConfig } from "../config/index.js";
 import type { AgentModelOverrides } from "./agent-model-overrides.js";
 import { dumpBuiltContext, CACHE_BOUNDARIES, estimateTokens, renderToolBlock, type BuiltContext, type ContextBuilder, type ToolBlockSummary, type ToolDefinitionLike } from "../context/index.js";
 import { makeBreakpointInjector } from "./cache-breakpoints.js";
-import { makePrefillInjector, makeDropReasoningInjector, wrapToolWithAnalysisStripping, buildNoReplyTool } from "./openai-prefill.js";
+import { makePrefillInjector, makeDropReasoningInjector, wrapToolWithAnalysisStripping } from "./openai-prefill.js";
 import type { ContextMessage } from "../context/builder.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import { convertToLlm } from "./convert.js";
@@ -1376,17 +1376,14 @@ export class AgentSessionFactory {
 
     // Prefill: if any chain member has prefill enabled, wrap all catalog tools to
     // accept an optional analysis argument (so canonical schema validation passes
-    // and transcripts keep the argument) and add the no_reply tool (allows the
-    // model to signal silence via a tool call under tool_choice = "required").
+    // and transcripts keep the argument). Silence is the catalog's no_reply tool,
+    // present in every chat session, so nothing is added here.
     const chain = resolveModelChain(modelKey, this.options.config.models);
     const prefillText = chain.find(
       (m) => m.config.prefill?.enabled && m.config.prefill.text,
     )?.config.prefill?.text;
     const prefillCatalog = prefillText
-      ? [
-          ...sessionCatalog.map(wrapToolWithAnalysisStripping),
-          buildNoReplyTool(prefillText),
-        ]
+      ? sessionCatalog.map(wrapToolWithAnalysisStripping)
       : sessionCatalog;
 
     // Wrap each catalog tool with the result-shaping layer (spec TOOL-RESULT-BUDGET

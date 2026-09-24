@@ -1989,8 +1989,8 @@ Error returns from `send_message` never set `terminate` — the agent gets anoth
 
 If a turn is not terminally valid, the runner injects a corrective user message. The prompt is context-aware:
 
-- **No prior sends**: tells the agent to call `send_message` or output `NO_REPLY`.
-- **Prior sends detected** (scanned from message history): tells the agent it already sent a message and should either send a follow-up or output `NO_REPLY` to end cleanly. This prevents the agent from calling `send_message` with `final: false` in a loop.
+- **No prior sends**: tells the agent to call `send_message` or `no_reply`.
+- **Prior sends detected** (scanned from message history): tells the agent it already sent a message and should either send a follow-up or call `no_reply` to end cleanly. This prevents the agent from calling `send_message` with `final: false` in a loop.
 
 If the last message role is not assistant, the runner calls `agent.continue()` instead.
 
@@ -2000,7 +2000,7 @@ Retry budget: `forced_completion_retries` from config. If exhausted without a te
 
 ### NO_REPLY
 
-The exact literal `NO_REPLY` as the assistant's text output signals intentional silence. No JSON envelope, no variants (`no_reply`, `No Reply`). The session completes normally with `noReply: true`.
+Silence is a tool call: `no_reply` (see the `no_reply` tool below) ends the turn and the session completes normally with `noReply: true`. The exact literal `NO_REPLY` as the assistant's text output is still accepted for compatibility with older prompts and models; no JSON envelope, no variants. The shipped prompts, templates, and corrective messages teach the tool call only.
 
 ### Proactive sessions (§9g)
 
@@ -2135,14 +2135,19 @@ the argument as the model's own past function-call arguments. The `execute` wrap
 strips it before the real tool runs. On non-prefill fallback members the optional
 property is harmless (non-strict, optional, never sent).
 
-**`no_reply` tool**: registered only for prefill-enabled sessions (any chain member).
+**`no_reply` tool** (`src/tools/no-reply.ts`): part of every chat session's catalog,
+registered next to `send_message` and filtered by the same session-type allowlist; it is
+not prefill-specific. Under a prefill-enabled member the wire transform gives it the
+leading `analysis` argument like every other tool; otherwise it takes no arguments.
 Its result carries `terminate: true`, so it ends the run the way a final
 `send_message` does; under `tool_choice = "required"` nothing else could.
 `isTerminallyValid` and `isExplicitNoReply` in `src/agent/runner.ts` recognize it as
 terminal and as explicit no-reply, with the same dedup/claim/diary semantics as the
-text-based `NO_REPLY` marker. Under dynamic tool loading it is always in the initial
-wire set (`splitDefsForDynamic` promotes it regardless of the configured `immediate`
-list): deferred behind `tool_search` it could not serve its purpose.
+text-based `NO_REPLY` marker, which remains accepted for compatibility but is no
+longer what the shipped prompts and templates teach. Under dynamic tool loading it is
+always in the initial wire set (both the live registry and `splitDefsForDynamic`
+promote it regardless of the configured `immediate` list): deferred behind
+`tool_search` it could not serve its purpose.
 
 **`drop_reasoning`** (default false): when true, native thinking blocks are stripped
 from outgoing assistant history on the wire (via `onPayload`) without mutating frozen

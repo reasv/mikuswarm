@@ -13,7 +13,16 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
 <!--
 Accumulate user-visible changes here as they land, under any of:
 
-  ### Added
+  ### Changed
+
+- **Silence is now a tool call.** `no_reply` is part of every chat session's tool set
+  (next to `send_message`, same session-type filtering, always in the initial set
+  under dynamic loading); calling it ends the turn. The shipped prompts, workspace
+  templates, proactive kickoff, and forced-completion messages now say "call
+  `no_reply`" instead of "output `NO_REPLY`". The text marker is still accepted for
+  compatibility.
+
+### Added
   ### Changed
   ### Fixed
 

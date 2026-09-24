@@ -78,3 +78,4 @@ export { MATRIX_TERMINOLOGY, DISCORD_TERMINOLOGY, IRC_TERMINOLOGY } from "./term
 export { createLoadSkillTool, loadSkillToolDefinition, type LoadSkillContext } from "./load-skill.js";
 export { createToolSearchTool, toolSearchToolDefinition, type ToolSearchContext } from "./tool-search.js";
 export { createCrossChannelTools, type CrossChannelToolContext } from "./cross-channel.js";
+export { createNoReplyTool } from "./no-reply.js";
