@@ -120,7 +120,11 @@ function applyAnalysisToWireTool(tool: Record<string, unknown>, pattern: string)
   const params = strictify(
     (tool["parameters"] as Record<string, unknown>) ?? { type: "object", properties: {} }
   ) as Record<string, unknown>;
-  const props = params["properties"] as Record<string, unknown> ?? {};
+  // The canonical schema may already carry the optional `analysis` that
+  // wrapToolWithAnalysisStripping adds (strictify has just made it nullable).
+  // Drop that copy: the wire property must be the required, non-null,
+  // pattern-constrained one, and it must come first.
+  const { analysis: _canonical, ...props } = (params["properties"] as Record<string, unknown>) ?? {};
   const req = (params["required"] as string[]) ?? [];
   return {
     ...tool,

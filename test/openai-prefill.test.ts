@@ -321,3 +321,31 @@ test("isExplicitNoReply: false when send_message is called (not a no-reply)", ()
   const messages = [makeMsg([{ type: "toolCall", name: "send_message" }])];
   assert.equal(isExplicitNoReply(messages), false);
 });
+
+// ---------------------------------------------------------------------------
+// Regression: the canonical schema already carries the optional `analysis`
+// added by wrapToolWithAnalysisStripping. The wire copy must still be the
+// required, non-null, pattern-constrained property, and it must come first.
+// (Live bug 2026-09-24: the strictified optional copy won the spread, so the
+// wire carried {"type":["string","null"]} with no pattern.)
+// ---------------------------------------------------------------------------
+
+test("applyPrefillToParams: overrides a pre-existing optional analysis with the patterned one", () => {
+  const params = {
+    tools: [{
+      type: "function", name: "send_message", description: "post",
+      parameters: {
+        type: "object",
+        properties: { text: { type: "string" }, analysis: { type: "string" } },
+        required: ["text"],
+      },
+    }],
+  };
+  const result = applyPrefillToParams(params, "We must ") as { tools: Array<Record<string, unknown>> };
+  const p = result.tools[0]!["parameters"] as { properties: Record<string, Record<string, unknown>>; required: string[] };
+  assert.deepEqual(Object.keys(p.properties)[0], "analysis");
+  assert.equal(p.properties["analysis"]!["type"], "string");
+  assert.match(String(p.properties["analysis"]!["pattern"]), /^\^We must /);
+  assert.equal(p.required[0], "analysis");
+  assert.equal(p.required.filter((r) => r === "analysis").length, 1);
+});

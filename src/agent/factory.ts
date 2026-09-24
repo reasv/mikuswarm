@@ -1977,6 +1977,10 @@ export class AgentSessionFactory {
     if (!enabled) return undefined;
     const names = defs.map((d) => d.name);
     const immediate = new Set(matchToolPatterns(names, dynCfg?.immediate ?? []));
+    // The prefill `no_reply` tool (spec OPENAI-PREFILL) only exists so a session
+    // under tool_choice = "required" can end a turn silently; deferring it behind
+    // tool_search would defeat that, so it is always in the initial wire set.
+    if (names.includes("no_reply")) immediate.add("no_reply");
     if (workspace) {
       for (const skill of workspace.skills.inlined) {
         if (!skill.tools) continue;
