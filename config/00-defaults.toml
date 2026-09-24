@@ -327,6 +327,14 @@ cache_write = 0
 supports_cache_control_on_tools = false
 supports_long_cache_retention = false
 
+# Explicit prompt-cache breakpoints for openai-responses models on Amazon Bedrock
+# (GPT-5.6 Sol/Terra/Luna, GPT-6 Sol/Luna). Marks up to 3 stable prefix boundaries
+# so consecutive sessions in the same room reuse the shared context prefix at the
+# Bedrock cache-read rate (0.1×) instead of writing it fresh each time.
+# Only valid for api = "openai-responses"; ignored on all other wire APIs.
+# Enable in local config for each *_aws model block: cache_breakpoints = "explicit"
+# (default: unset / off)
+
 # Grok model backing the x_search tool (spec MODEL-FALLBACK §2.3 unified registry).
 # x_search references this by name; connection + pricing live here. Add a `fallback`
 # chain or point x_search.deep_model at a separate reasoning [models.*] block as

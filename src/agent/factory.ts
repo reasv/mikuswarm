@@ -4,7 +4,8 @@ import { createAssistantMessageEventStream, type Api, type Model, type Assistant
 import { streamSimple, completeSimple } from "@earendil-works/pi-ai/compat";
 import type { AppConfig } from "../config/index.js";
 import type { AgentModelOverrides } from "./agent-model-overrides.js";
-import { dumpBuiltContext, CACHE_BOUNDARIES, renderToolBlock, type BuiltContext, type ContextBuilder, type ToolBlockSummary, type ToolDefinitionLike } from "../context/index.js";
+import { dumpBuiltContext, CACHE_BOUNDARIES, estimateTokens, renderToolBlock, type BuiltContext, type ContextBuilder, type ToolBlockSummary, type ToolDefinitionLike } from "../context/index.js";
+import { makeBreakpointInjector } from "./cache-breakpoints.js";
 import type { ContextMessage } from "../context/builder.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import { convertToLlm } from "./convert.js";
@@ -1634,7 +1635,16 @@ export class AgentSessionFactory {
       convertToLlm,
       streamFn,
       getApiKey: () => modelConfig.api_key,
-      onPayload: (payload) => payload,
+      // Explicit prompt-cache breakpoints for Bedrock's checkpoint-based cache
+      // (OpenAI models via amazon-bedrock).  The injector is installed for every
+      // session; it gates on the serving member's Model descriptor
+      // (compat.cacheBreakpoints === "explicit", set in createModelFromConfig) so
+      // fallback members without the option — e.g. a direct-OpenAI model in the
+      // same chain as a Bedrock head — pass their payloads through unchanged.
+      // pi-ai passes the wire Model as the second arg to onPayload, so the gate
+      // follows whichever chain member is actually serving the attempt.
+      // See ARCHITECTURE.md §8 "Cache control".
+      onPayload: makeBreakpointInjector(estimateTokens),
       steeringMode: "one-at-a-time",
       sessionId: session.timelineKey,
       // Dynamic tool loading (spec DYNAMIC-TOOL-LOADING §7): a load event mid-run
@@ -2518,6 +2528,11 @@ export function createModelFromConfig(model: ModelConfig, contextWindow?: number
       // a present-but-empty value. Undefined = leave auto-detection in place.
       requiresReasoningContentOnAssistantMessages:
         model.compat?.requires_reasoning_content_on_assistant_messages,
+      // Carry the Bedrock explicit cache_breakpoints preference on the wire Model
+      // descriptor so the onPayload injector can gate per serving member (not per
+      // chain head).  Only meaningful on openai-responses members backed by Bedrock;
+      // undefined on all other models so the injector passes their payloads through.
+      cacheBreakpoints: model.cache_breakpoints,
     },
   };
 }

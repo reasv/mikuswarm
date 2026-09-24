@@ -23,6 +23,16 @@ fresh, empty Unreleased section above it. Keep this guidance comment in the
 Unreleased section; it is not part of any release's notes.
 -->
 
+### Added
+
+- **Bedrock explicit prompt-cache breakpoints** (`cache_breakpoints = "explicit"` on
+  `[models.<name>]` with `api = "openai-responses"`). Injects up to 3 explicit
+  breakpoints at the stable prefix boundaries (agent instructions, conversation
+  summary, last stable timeline batch) so consecutive sessions in the same room
+  reuse the shared prefix at Amazon Bedrock's 0.1x cache-read rate instead of
+  rewriting ~28k tokens at each session start. Default off; ignored on all wire
+  APIs other than `openai-responses`.
+
 ## [v0.5.1] - 2026-09-13
 
 ### Fixed

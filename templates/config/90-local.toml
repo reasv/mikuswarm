@@ -79,6 +79,12 @@ output = 0         # USD per 1M output tokens
 cache_read = 0
 cache_write = 0
 
+# Explicit prompt-cache breakpoints (openai-responses + Amazon Bedrock only).
+# Marks stable prefix boundaries (agent instructions, summary, last stable
+# timeline batch) so the shared prefix is reused at the 0.1× cache-read rate
+# across sessions in the same room. Enable by adding to your *_aws model blocks:
+# cache_breakpoints = "explicit"
+
 # --- Captioning model -------------------------------------------------------
 # Multimodal model that captions inbound images/video/audio. Can be a cheaper
 # model than the chat model. Must declare every modality it captions.

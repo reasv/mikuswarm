@@ -176,6 +176,7 @@ models:     Record<string, { id, provider, endpoint, api_key, input_modalities, 
                              context_window?,                      // §8b the model ceiling AND the always-on enforcement base; required for any session-resolved model (fail-fast). No model-level max_context_tokens any more
                              image_input_bytes?,
                              cost?, compat?, streaming?,
+                             cache_breakpoints?,                   // openai-responses only: "explicit" enables Bedrock explicit prompt-cache breakpoints (see §8 "Cache control"); unset = off
                              rate_limit_group?,                    // which shared LLM budget; see §8a
                              llm_request_max_wait_ms?,             // §8 per-model interactive budget override
                              llm_probe_backoff_max_ms? }>          // §8a per-model probe-backoff ceiling override (capped backoff); else recovery.llm_probe_backoff_max_ms
@@ -1998,7 +1999,7 @@ Factory creation is **async** — it loads workspace content from disk before co
 - `thinkingLevel` → the model config's `thinking_level` (default `"off"`); pi-agent-core threads it per request as pi-ai's `options.reasoning` through the whole streamFn chain, so a non-off level actually enables extended thinking (adaptive effort hint on Opus/Sonnet 4.6+, token budget on older models). The model descriptor's `reasoning` flag is capability-only and never enables thinking by itself. On the openai-completions **Together** dialect the level is normally only a binary on/off (`reasoning:{enabled}`); to forward an actual effort the model sets `compat.supports_reasoning_effort = true` (pi-ai auto-disables `reasoning_effort` for `provider="together"`) plus a `thinkingLevelMap` translating the pi-ai level to the upstream's wire value — the live GLM-5.2 model maps `xhigh → "max"`, so it runs at max reasoning effort. A second dialect override, `compat.supports_developer_role`, forces the system-prompt role: pi-ai sends the OpenAI `developer` role whenever `reasoning` is on and it auto-detects that role as supported, but some OAI-compatible upstreams behind a gateway (a proxied DeepSeek, whose API only accepts `system/user/assistant/tool`) reject `developer` with a deserialization 400 — set `supports_developer_role = false` to force the plain `system` role (unset = pi-ai auto-detection). A third dialect override, `compat.requires_reasoning_content_on_assistant_messages`, disables pi-ai's DeepSeek safety net: pi-ai auto-enables (for `provider="deepseek"`) a rule that stamps `reasoning_content: ""` onto any assistant message that carried no thinking block, but DeepSeek V4 Pro **thinking mode** rejects a present-but-empty `reasoning_content` with a 400 (`"The \`reasoning_content\` in the thinking mode must be passed back to the API"`) on those reasoning-less turns — which include historical/plain context assistant messages (the bot's own live replies go out as `send_message` tool-calls and DO carry real reasoning via the independent thinking-signature path, so they are unaffected). Per DeepSeek's docs the field is optional and ignored on non-tool-call turns, so omitting it is correct; set `requires_reasoning_content_on_assistant_messages = false` to suppress the empty-string stamp (unset = pi-ai auto-detection). A fourth, `compat.supports_tool_search` (openai-responses only, **default true**), keeps dynamically loaded tools out of the cache-leading `tools` array — see §10 "Dynamic tool loading", Transport. Required reasoning on tool-call turns still round-trips
 - `transformContext` → **append-only over a frozen prefix** (see "Frozen context" below) — it merges cached prefix + live runtime messages and never rebuilds per turn
 - `convertToLlm` → all custom message types → standard `Message[]`
-- `onPayload` → identity passthrough (cache control deferred)
+- `onPayload` → `makeBreakpointInjector` — injects explicit Bedrock prompt-cache breakpoints; gates per serving member via `model.compat.cacheBreakpoints` so direct-OpenAI fallback members in the same chain are never affected (see "Cache control" below)
 - `steeringMode` → `"one-at-a-time"`
 - `sessionId` → **timeline key** (not session ID), for LLM-side cache affinity across sessions on the same timeline
 - `streamFn` → the chosen stream function (`streamSimple`, or `wrapCompleteAsStream` for non-streaming models), first pinned to `maxRetries: 0` (`withSdkRetriesDisabled` — see Layer-0 below), then **wrapped by scheduler admission (§8a), then by Layer-0 request retry** — `withRequestRetry(withSchedulerAdmission(withSdkRetriesDisabled(base)))`, so each retry attempt re-acquires a fresh scheduler slot
@@ -2610,12 +2611,17 @@ The same timeline state must produce identical byte-for-byte output. No renderin
 
 ### Cache control
 
-Cache control breakpoints (`onPayload`) are currently a **passthrough identity function**. This is intentional: the primary target model (a non-Anthropic model reached through an Anthropic-compatible gateway) does not apply Anthropic cache control. The architecture is designed for two breakpoints when switching to Anthropic models:
+**Explicit prompt-cache breakpoints** for the OpenAI Responses API on Amazon Bedrock (`src/agent/cache-breakpoints.ts`, `makeBreakpointInjector`). Bedrock's cache for OpenAI models (GPT-5.6 Sol/Terra/Luna, GPT-6 Sol/Luna) is checkpoint-based: a `prompt_cache_breakpoint: {mode:"explicit"}` field on a content block tells the provider "the prefix up to and including this block is stable and may be cached." Up to 4 breakpoints per request (1 automatic + up to 3 explicit), each requiring >= 1024 cumulative tokens; cached prefix billed at 0.1× input, writes at 1.25×, 30-minute TTL.
 
-1. After the system prompt (stable)
-2. After the compact tier (changes only at compaction events)
+Three breakpoints are injected on the last `input_text` block of each target item (when the cumulative token count qualifies):
 
-Model config supports `compat` flags for cache control on tools, long cache retention, eager tool input streaming, and session affinity headers — consumed by pi-ai. The `streaming` flag (default `true`) controls whether the model uses streaming or non-streaming completion; when `false`, `completeSimple` is wrapped to produce a compatible `AssistantMessageEventStream` with a single `done` event.
+1. **(a)** The leading developer/system item (agent instructions) — always stable across sessions in the same room. The item's string `content` is converted to a one-block `input_text` array to carry the field.
+2. **(b)** The conversation-summary user item (identified by `<conversation_summary` prefix) — stable until the summary advances.
+3. **(c)** The second-to-last user item before the per-session trigger item — the last user timeline batch that is reproduced verbatim, excluding the trailing batched user message that grows as new messages arrive. The trigger item is identified by `<system>` or `<retrieved_memory>` prefix (the satellite block + optional auto-retrieval).
+
+The option is enabled per model with `cache_breakpoints = "explicit"` in `[models.<name>]` (only valid for `api = "openai-responses"`; ignored on all other wire APIs). Default: off. The factory wires `makeBreakpointInjector(estimateTokens)` as the `onPayload` hook — installed once per session, shared by all fallback chain members. **Per-member gating**: injection is keyed on the wire `Model` descriptor that pi-ai passes as the second `onPayload` argument — specifically `model.compat.cacheBreakpoints === "explicit"`, which `createModelFromConfig` sets from the member's own `cache_breakpoints` config. This means a Bedrock chain head with the option enabled injects normally, while a direct-OpenAI fallback member in the same chain — whose descriptor has `cacheBreakpoints: undefined` — receives an identity passthrough; the reverse is also safe (a head without the option, a fallback with it, would only inject on fallback attempts). No payload mutation; the `prompt_cache_options` request-level field is NOT set (implicit mode is preserved so within-session whole-input extension keeps hitting).
+
+Anthropic-style `cache_control` breakpoints (block-prefix matching) are a different mechanism and remain not implemented for this project's current gateways. Model config `compat` flags (`supports_cache_control_on_tools`, `supports_long_cache_retention`, `supports_eager_tool_input_streaming`, `send_session_affinity_headers`) are consumed by pi-ai for its own caching paths. The `streaming` flag (default `true`) controls whether the model uses streaming or non-streaming completion; when `false`, `completeSimple` is wrapped to produce a compatible `AssistantMessageEventStream` with a single `done` event.
 
 ---
 
@@ -4134,7 +4140,7 @@ These are properties the codebase must maintain. Violations are bugs.
 | 4 | Agent loop, model calls, streaming, forced completion | Complete |
 | 5 | Chat delivery (explicit send via `send_message` tool only), typing indicators | Complete |
 | 6 | Parallel sessions, delegation, steer routing | Coded, verification incomplete |
-| 7 | Cache control (onPayload breakpoints) | Deferred (not applicable to the current non-Anthropic gateway target) |
+| 7 | Cache control (onPayload breakpoints) | Complete: explicit Bedrock breakpoints for openai-responses models (see §8 "Cache control"); Anthropic cache_control deferred (not applicable to current gateways) |
 | 8 | Tools (web, file, media, memory, danbooru, user profiles, character cards) | Complete |
 | 9 | Hierarchical summarization (summary layer, worker pool, condensation, truncation) | Complete (§9b) |
 | 10 | MCP remote tool integration (HTTP servers) | Complete |
@@ -4152,7 +4158,7 @@ These are properties the codebase must maintain. Violations are bugs.
 
 ### Deferred features
 
-- **Anthropic cache control breakpoints** — `onPayload` hook and tiered structure are designed for it
+- **Anthropic cache control breakpoints** — `cache_control` block-prefix matching for anthropic-messages models; `onPayload` hook exists but is not wired for that path
 - **Session trace preservation** — storing internal traces (tool calls, thinking) for future inspection tools
 - **Sandbox execution** — Docker containers for code/command tools
 - **Matrix threads** — separate timeline per thread with parent room history prefix
