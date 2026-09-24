@@ -346,7 +346,9 @@ export class EnrichmentWorker {
    *    implements one — authoritative: its answer (including `null`) is final
    *    and no fallback runs. Matrix lives here; the native summary applies the
    *    reply-fallback stripping and UTD handling of §6 that a stored copy could
-   *    not reproduce.
+   *    not reproduce. The one exception is an edited target: the provider
+   *    returns the original event, so the stored post-edit body replaces its
+   *    body (`Storage.getEditedBody`).
    * 2. **Ingest-time snapshot** (`event.replyTo`) when it carries a body or
    *    attachments. Providers whose payload includes the referenced message
    *    (Discord `referenced_message`) populate this at normalization, and it is
@@ -367,7 +369,14 @@ export class EnrichmentWorker {
   ): Promise<ReplyTargetSummary | null> {
     const messageSummary = this.options.capabilities.messageSummary;
     if (messageSummary) {
-      return await messageSummary.call(this.options.capabilities, { roomId, eventId: replyToId });
+      const summary = await messageSummary.call(this.options.capabilities, { roomId, eventId: replyToId });
+      // A provider lookup by id returns the original event (a Matrix edit is a
+      // separate event that never rewrites its target); our stored copy carries
+      // the latest applied edit, so it wins for the body.
+      const editedBody = summary
+        ? this.options.storage.getEditedBody(event.timelineKey, replyToId)
+        : undefined;
+      return summary && editedBody !== undefined ? { ...summary, body: editedBody } : summary;
     }
 
     const snapshot = event.replyTo;

@@ -262,6 +262,12 @@ export function createReadMessagesTool(context: ReadMessagesToolContext): AgentT
               details: null,
             };
           }
+          // The provider returns the original event (a Matrix edit is a separate
+          // event); the stored copy carries the latest applied edit.
+          const editedBody = activeTimelineKey
+            ? context.storage?.getEditedBody(activeTimelineKey, args.message_id.trim())
+            : undefined;
+          if (editedBody !== undefined) summary.body = editedBody;
           const senderLabel = summary.sender.displayName ?? summary.sender.id;
           return {
             content: [{ type: "text", text: `[${fmtTs(summary.timestamp)}] ${senderLabel}: ${summary.body}` }],

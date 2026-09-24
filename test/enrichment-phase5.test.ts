@@ -73,6 +73,7 @@ function makeStorage(opts: { ingestUrls?: string[] } = {}): Storage & {
       persisted.push({ eventId, result });
     },
     isBackfetchEvent: () => false,
+    getEditedBody: () => undefined,
     getIngestLinkPreviewUrls: (_eventId: string) => opts.ingestUrls ?? [],
     _persisted: persisted,
   };

@@ -51,6 +51,13 @@ Unreleased section; it is not part of any release's notes.
 
 ### Fixed
 
+- **Matrix: quoted and looked-up messages showed their pre-edit text.** Reply
+  context and `read_messages` with `message_id` fetch the message from the
+  homeserver, which returns the original event (an edit is a separate event), so an
+  edited message was quoted with its old body even though the edit had been applied
+  to the stored copy. Both now use the stored post-edit body, and applying an edit
+  also refreshes existing stored quotes of that message.
+
 - **Discord: messages carrying an embed at delivery time lost it** (`provider_error`
   `FOREIGN KEY constraint failed` in `messageCreate`). On an active channel the
   inbound pipeline yields to the activation gate before it enqueues the event

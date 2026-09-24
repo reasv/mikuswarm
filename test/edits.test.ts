@@ -757,3 +757,96 @@ test("resolveMultiAccountRetry does not return null when an account fetched a cl
   });
   assert.equal(out, decrypted);
 });
+
+// ── Stored edits serve by-id lookups and refresh existing quotes ─────────────
+
+function replyContextBody(storage: Storage, eventId: string): string | null | undefined {
+  return storage.read(
+    (db) =>
+      (
+        db.prepare("select body from reply_contexts where event_id = ?").get(eventId) as
+          | { body: string | null }
+          | undefined
+      )?.body,
+  );
+}
+
+async function editOrig(store: TimelineStore, timelineKey: string, body: string): Promise<void> {
+  const replacement = { body, attachments: [] };
+  await store.applyEdit(
+    "matrix",
+    "$orig",
+    timelineKey,
+    replacement,
+    1_700_000_002_000,
+    (t) => applyEditToCanonical(t, replacement),
+    editStatus,
+  );
+}
+
+test("getEditedBody returns the stored post-edit body only once an edit has applied", async () => {
+  await withStores(async (store, storage) => {
+    await store.append(targetEvent(), "skipped");
+    assert.equal(storage.getEditedBody(ROOM_TK, "$orig"), undefined, "never edited → undefined");
+    assert.equal(storage.getEditedBody(ROOM_TK, "$missing"), undefined, "not stored → undefined");
+
+    await editOrig(store, ROOM_TK, "edited text");
+    assert.equal(storage.getEditedBody(ROOM_TK, "$orig"), "edited text");
+  });
+});
+
+test("getEditedBody spans a room and its threads but never another account", async () => {
+  await withStores(async (store, storage) => {
+    const threadTk = `${ROOM_TK}:thread:$root`;
+    await store.append(targetEvent({ timelineKey: threadTk }), "skipped");
+    await store.append(
+      targetEvent({ id: `matrix:${ACCOUNT_B}:$orig`, timelineKey: ROOM_TK_B }),
+      "skipped",
+    );
+    await editOrig(store, threadTk, "edited in thread");
+    await editOrig(store, ROOM_TK_B, "edited via B");
+
+    assert.equal(storage.getEditedBody(ROOM_TK, "$orig"), "edited in thread", "room key finds a thread target");
+    assert.equal(
+      storage.getEditedBody(`${ROOM_TK}:thread:$other`, "$orig"),
+      "edited in thread",
+      "a sibling thread key finds it too",
+    );
+    assert.equal(storage.getEditedBody(ROOM_TK_B, "$orig"), "edited via B", "each account sees its own row");
+  });
+});
+
+test("applyEdit refreshes stored quotes of the target in its room and threads only", async () => {
+  await withStores(async (store, storage) => {
+    const threadTk = `${ROOM_TK}:thread:$root`;
+    await store.append(targetEvent(), "skipped");
+    await store.append(
+      targetEvent({ id: `matrix:${ACCOUNT_B}:$orig`, timelineKey: ROOM_TK_B }),
+      "skipped",
+    );
+    const replies = [
+      { id: `matrix:${ACCOUNT}:$reply`, externalId: "$reply", timelineKey: ROOM_TK },
+      { id: `matrix:${ACCOUNT}:$threadReply`, externalId: "$threadReply", timelineKey: threadTk },
+      { id: `matrix:${ACCOUNT_B}:$reply`, externalId: "$reply", timelineKey: ROOM_TK_B },
+    ];
+    for (const reply of replies) {
+      await store.append(targetEvent({ ...reply, body: "replying" }), "skipped");
+      await storage.insertReplyContext({
+        event_id: reply.id,
+        reply_external_id: "$orig",
+        body: "original text",
+        created_at: 1_700_000_001_000,
+      });
+    }
+
+    await editOrig(store, ROOM_TK, "edited text");
+
+    assert.equal(replyContextBody(storage, `matrix:${ACCOUNT}:$reply`), "edited text");
+    assert.equal(replyContextBody(storage, `matrix:${ACCOUNT}:$threadReply`), "edited text");
+    assert.equal(
+      replyContextBody(storage, `matrix:${ACCOUNT_B}:$reply`),
+      "original text",
+      "another account's quote is untouched",
+    );
+  });
+});

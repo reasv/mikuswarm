@@ -81,6 +81,7 @@ async function makeHarness(opts: {
     // Backfetch provenance lookup (caption deferral, MESSAGE-BACKFETCH §7.3); these
     // fixtures are all live events.
     isBackfetchEvent: () => false,
+    getEditedBody: () => undefined,
   } as unknown as Storage;
   const capabilities = {
     messageSummary: async () => null,

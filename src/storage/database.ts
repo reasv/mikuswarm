@@ -5,7 +5,7 @@ import type { Logger } from "../observability/index.js";
 import type { AttachmentMeta, CanonicalChatEvent, TimelineState } from "../types.js";
 import { nanoid } from "nanoid";
 import type { RawTokenUsage, SessionUsageTotals } from "../agent/usage.js";
-import { roomIdFromTimelineKeyOpt, threadKeyLikePattern } from "./timeline-key.js";
+import { buildTimelineKey, parseTimelineKey, roomIdFromTimelineKeyOpt, threadKeyLikePattern } from "./timeline-key.js";
 
 /**
  * The resolved replacement content an edit carries: the post-edit body and the
@@ -2894,6 +2894,43 @@ export class Storage {
   }
 
   /**
+   * The stored post-edit body of a message, or `undefined` when the message is
+   * not stored or has never been edited (`last_edit_timestamp` null). A provider
+   * lookup by id (Matrix fetches the original event) returns the pre-edit
+   * content, because an edit is a separate event that never rewrites its target;
+   * this is the latest edit the edit-application path recorded. Scoped to the
+   * room of `timelineKey` together with its threads, since the lookup can come
+   * from a different sub-timeline than the target (mirrors
+   * {@link resolveEditTargetTimelineKey}); an exact room-key row wins.
+   */
+  getEditedBody(timelineKey: string, externalId: string): string | undefined {
+    const parsed = parseTimelineKey(timelineKey);
+    if (!parsed) return undefined;
+    const roomKey = buildTimelineKey({ ...parsed, threadId: undefined });
+    const row = this.read(
+      (db) =>
+        db
+          .prepare(
+            `select body from timeline_events
+             where provider = @provider and external_id = @externalId
+               and last_edit_timestamp is not null
+               and (timeline_key = @roomKey
+                    or timeline_key like @threadPrefix escape '\\')
+             order by case when timeline_key = @roomKey then 0 else 1 end,
+                      timeline_key
+             limit 1`,
+          )
+          .get({
+            provider: parsed.provider,
+            externalId,
+            roomKey,
+            threadPrefix: threadKeyLikePattern(roomKey),
+          }) as { body: string } | undefined,
+    );
+    return row?.body;
+  }
+
+  /**
    * Resolve the ACTUAL stored timeline_key of an edit target (issue #4). A
    * re-decrypted `m.replace` placeholder always lands on the room/DM key (its
    * thread relation was megolm-encrypted at store time), but the target original,
@@ -3283,6 +3320,30 @@ export class Storage {
         lastEditTimestamp: editTimestamp,
         updatedAt: Date.now(),
       });
+      // Quotes of this message stored before the edit (a reply's reply_contexts
+      // row) take the post-edit text too, the way a client's reply preview does.
+      // Scoped to quoting events in the target's room and its threads, so a
+      // multi-account shared room never touches another account's quotes.
+      const parsedKey = parseTimelineKey(timelineKey);
+      if (parsedKey) {
+        const roomKey = buildTimelineKey({ ...parsedKey, threadId: undefined });
+        db.prepare(
+          `update reply_contexts set body = @body
+           where reply_external_id = @targetExternalId
+             and event_id in (
+               select id from timeline_events
+               where provider = @provider
+                 and (timeline_key = @roomKey
+                      or timeline_key like @threadPrefix escape '\\')
+             )`,
+        ).run({
+          body: updated.body,
+          targetExternalId,
+          provider,
+          roomKey,
+          threadPrefix: threadKeyLikePattern(roomKey),
+        });
+      }
       return { applied: true, event: updated, status };
     });
   }
@@ -10147,6 +10208,8 @@ create table if not exists reply_contexts (
   timestamp integer,
   created_at integer not null
 );
+-- Edit application refreshes every quote of the edited message by this column.
+create index if not exists idx_reply_contexts_reply_external_id on reply_contexts(reply_external_id);
 
 create table if not exists link_previews (
   id text primary key,

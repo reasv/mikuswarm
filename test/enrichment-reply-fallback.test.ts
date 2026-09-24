@@ -68,7 +68,10 @@ function storedTarget(overrides: Partial<CanonicalChatEvent> = {}): CanonicalCha
 type Persisted = Array<{ eventId: string; result: EnrichmentResult }>;
 type Lookup = { provider: string; externalId: string; timelineKey: string };
 
-function makeStorage(stored?: CanonicalChatEvent): Storage & { _persisted: Persisted; _lookups: Lookup[] } {
+function makeStorage(
+  stored?: CanonicalChatEvent,
+  editedBodies: Record<string, string> = {},
+): Storage & { _persisted: Persisted; _lookups: Lookup[] } {
   const persisted: Persisted = [];
   const lookups: Lookup[] = [];
   const storage = {
@@ -76,6 +79,7 @@ function makeStorage(stored?: CanonicalChatEvent): Storage & { _persisted: Persi
       persisted.push({ eventId, result });
     },
     isBackfetchEvent: () => false,
+    getEditedBody: (_timelineKey: string, externalId: string) => editedBodies[externalId],
     getIngestLinkPreviewUrls: () => [],
     getTimelineEventByExternalId: (provider: string, externalId: string, timelineKey: string) => {
       lookups.push({ provider, externalId, timelineKey });
@@ -386,4 +390,37 @@ test("messageSummary present: its summary is used verbatim and receives the full
   assert.equal(rc.timestamp, Date.parse("2024-01-01T00:00:00.000Z"));
   assert.deepEqual(logger.warns, []);
   assert.equal(storage._lookups.length, 0);
+});
+
+test("messageSummary present, target edited: the stored post-edit body replaces the original", async () => {
+  // A Matrix by-id fetch returns the original event (an edit is a separate
+  // m.replace event); the stored row carries the latest applied edit.
+  const storage = makeStorage(undefined, { $orig: "the full edited message" });
+  const logger = recordingLogger();
+  const capabilities: EnrichmentCapabilities = {
+    ...discordCapabilities(),
+    messageSummary: async () => ({
+      eventId: "$orig",
+      sender: "@alice:example.org",
+      senderName: "Alice",
+      body: "the ful",
+      timestamp: "2024-01-01T00:00:00.000Z",
+    }),
+  };
+  const worker = makeWorker({ storage, capabilities, logger });
+
+  await worker.process(
+    discordEvent({
+      provider: "matrix",
+      timelineKey: "matrix:miku:room:!r:example.org",
+      replyTo: { externalId: "$orig" },
+    }),
+  );
+
+  const rc = storage._persisted[0].result.replyContext;
+  assert.ok(rc);
+  assert.equal(rc.body, "the full edited message");
+  assert.equal(rc.sender_id, "@alice:example.org", "the rest of the provider summary is kept");
+  assert.equal(rc.timestamp, Date.parse("2024-01-01T00:00:00.000Z"));
+  assert.deepEqual(logger.warns, []);
 });

@@ -106,6 +106,7 @@ function makeWorker(
     // Backfetch provenance lookup (caption deferral, MESSAGE-BACKFETCH §7.3); the
     // fixtures here are all live events.
     isBackfetchEvent: () => false,
+    getEditedBody: () => undefined,
   } as unknown as Storage;
   const capabilities = {
     messageSummary: async (params: { roomId: string; eventId: string }) => {

@@ -640,6 +640,39 @@ test("read_messages: anchor=last_self returns window around last self event", as
   });
 });
 
+test("read_messages: message_id returns the stored post-edit body over the provider's original", async () => {
+  await withStorage(async (storage) => {
+    const tk = "matrix:default:room:!r:s";
+    await storage.appendTimelineEvent(
+      makeEvent({ id: "matrix:default:$orig", externalId: "$orig", timelineKey: tk, body: "Also I don'" }),
+      "skipped",
+    );
+    await storage.applyEditToTarget(
+      "matrix",
+      "$orig",
+      tk,
+      { body: "Also I don't remember", attachments: [] },
+      5000,
+      (t) => ({ ...t, body: "Also I don't remember" }),
+      () => "skipped",
+    );
+    // A by-id provider fetch returns the original event, never the edit.
+    const channelClient: ChannelClient = {
+      ...stubChannelClient(),
+      readMessage: async (externalId) => ({
+        externalId,
+        sender: { id: "@u:example.org", displayName: "U" },
+        timestamp: 1000,
+        body: "Also I don'",
+      }),
+    };
+    const tool = createReadMessagesTool({ channelClient, storage, currentTimelineKey: tk });
+    const result = await tool.execute("call1", { message_id: "$orig" }, undefined as never);
+    const text = result.content[0]!.text as string;
+    assert.ok(text.endsWith("U: Also I don't remember"), `expected the edited body, got: ${text}`);
+  });
+});
+
 // ── Context-note rendering ────────────────────────────────────────────────────
 
 test("renderRichMessage: cross_channel note emits <cross_channel_note> element", () => {
