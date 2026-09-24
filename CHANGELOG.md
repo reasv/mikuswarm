@@ -16,6 +16,9 @@ Accumulate user-visible changes here as they land, under any of:
   ### Added
   ### Changed
   ### Fixed
+
+- **Startup gap backfetch now covers Discord** (and any provider with paged history). The coordinator looked up each account's self-id at `prepare()` — which runs before any provider starts — so every Discord account (whose id is only resolved inside `start()`) was skipped on every boot with `gap_backfetch_skip_room: unknown_self_user`, and Discord channels never recovered the messages missed while the bot was down. Self-ids and read clients are now resolved from the providers at `run()`; descent units are provider-qualified; Discord threads (separate history channels) are paged as their own units with their own floors; and a unit that cannot be filled at all (no self-id, no read client, or history the provider reports as permanently unavailable — e.g. a Discord 403) is released instead of left frozen. New optional `ProviderCapabilities.threadHistory` (`"inline"` default / `"separate"`).
+- **Discord history reads**: messages read from a thread channel now carry `threadRootExternalId` (initial backfill of a Discord thread timeline previously filtered every message out), and an edited message is no longer flagged as a replacement event (previously dropped by the backfill classifiers).
   ### Removed
 
 Cutting a release renames this heading to `## [vX.Y.Z] - YYYY-MM-DD` and adds a

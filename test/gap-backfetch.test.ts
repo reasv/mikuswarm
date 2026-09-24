@@ -4,8 +4,9 @@ import {
   GapBackfetchCoordinator,
   type GapBackfetchConfig,
   type GapBackfetchCoordinatorOptions,
+  type GapBackfetchUnit,
 } from "../src/backfill/coordinator.js";
-import type { BackfillReadClient } from "../src/backfill/paginate.js";
+import { HistoryUnavailableError, type BackfillReadClient } from "../src/backfill/paginate.js";
 import { Storage } from "../src/storage/index.js";
 import { TimelineStore } from "../src/timeline/index.js";
 import { SummarizationIndexer } from "../src/summarization/index.js";
@@ -167,6 +168,8 @@ async function makeHarness(
   storeOverride?: Pick<GapBackfetchCoordinatorOptions, "timeline">,
   clientOverride?: BackfillReadClient & { calls: Array<string | undefined> },
   isDraining: () => boolean = () => false,
+  /** Provider-boundary overrides (scope, read client, self-id resolution). */
+  optsOverride: Partial<Pick<GapBackfetchCoordinatorOptions, "providerHistory" | "getClient" | "resolveSelfUserId">> = {},
 ): Promise<Harness> {
   const storage = await Storage.open({ databasePath: ":memory:" });
   const timeline = new TimelineStore(storage);
@@ -183,8 +186,11 @@ async function makeHarness(
     storage,
     timeline: (storeOverride?.timeline ?? (recording as unknown as TimelineStore)),
     config: { ...DEFAULT_CONFIG, ...configOverride },
+    // Default provider boundary: one Matrix account whose threads page inline.
+    providerHistory: (provider) => (provider === "matrix" ? { threadHistory: "inline" } : undefined),
     getClient: () => client,
-    selfUserIds: new Map([[ACCOUNT, SELF]]),
+    resolveSelfUserId: (provider, accountId) => (provider === "matrix" && accountId === ACCOUNT ? SELF : undefined),
+    ...optsOverride,
     notifyEnrichment: (id) => enriched.push(id),
     notifyCaptions: () => { captioned.count++; },
     enqueueChatSearch: (id) => chatIndexed.push(id),
@@ -509,7 +515,8 @@ test("crash mid-commit (fails after K oldest rows) leaves a single gap above K n
     timeline: failingStore,
     config: DEFAULT_CONFIG,
     getClient: () => client1,
-    selfUserIds: new Map([[ACCOUNT, SELF]]),
+    providerHistory: (provider) => (provider === "matrix" ? { threadHistory: "inline" } : undefined),
+    resolveSelfUserId: (provider, accountId) => (provider === "matrix" && accountId === ACCOUNT ? SELF : undefined),
     notifyEnrichment() {},
     notifyCaptions() {},
     enqueueChatSearch() {},
@@ -540,7 +547,8 @@ test("crash mid-commit (fails after K oldest rows) leaves a single gap above K n
     timeline,
     config: DEFAULT_CONFIG,
     getClient: () => new ScriptedClient(pages2),
-    selfUserIds: new Map([[ACCOUNT, SELF]]),
+    providerHistory: (provider) => (provider === "matrix" ? { threadHistory: "inline" } : undefined),
+    resolveSelfUserId: (provider, accountId) => (provider === "matrix" && accountId === ACCOUNT ? SELF : undefined),
     notifyEnrichment() {},
     notifyCaptions() {},
     enqueueChatSearch() {},
@@ -641,7 +649,8 @@ test("read failure mid-descent: nothing committed, room failed/frozen, high-wate
     timeline: h.timeline,
     config: DEFAULT_CONFIG,
     getClient: () => client2,
-    selfUserIds: new Map([[ACCOUNT, SELF]]),
+    providerHistory: (provider) => (provider === "matrix" ? { threadHistory: "inline" } : undefined),
+    resolveSelfUserId: (provider, accountId) => (provider === "matrix" && accountId === ACCOUNT ? SELF : undefined),
     notifyEnrichment() {},
     notifyCaptions() {},
     enqueueChatSearch() {},
@@ -841,7 +850,8 @@ test("draining before commit: room does NOT commit, stays frozen, gap re-derivab
           null,
         ),
       ]),
-    selfUserIds: new Map([[ACCOUNT, SELF]]),
+    providerHistory: (provider) => (provider === "matrix" ? { threadHistory: "inline" } : undefined),
+    resolveSelfUserId: (provider, accountId) => (provider === "matrix" && accountId === ACCOUNT ? SELF : undefined),
     notifyEnrichment() {},
     notifyCaptions() {},
     enqueueChatSearch() {},
@@ -1101,7 +1111,8 @@ test("crash mid-fill: a discarded run commits nothing; a fresh coordinator re-de
     timeline,
     config: DEFAULT_CONFIG,
     getClient: () => new ScriptedClient(pages1),
-    selfUserIds: new Map([[ACCOUNT, SELF]]),
+    providerHistory: (provider) => (provider === "matrix" ? { threadHistory: "inline" } : undefined),
+    resolveSelfUserId: (provider, accountId) => (provider === "matrix" && accountId === ACCOUNT ? SELF : undefined),
     notifyEnrichment() {},
     notifyCaptions() {},
     enqueueChatSearch() {},
@@ -1134,7 +1145,8 @@ test("crash mid-fill: a discarded run commits nothing; a fresh coordinator re-de
           null,
         ),
       ]),
-    selfUserIds: new Map([[ACCOUNT, SELF]]),
+    providerHistory: (provider) => (provider === "matrix" ? { threadHistory: "inline" } : undefined),
+    resolveSelfUserId: (provider, accountId) => (provider === "matrix" && accountId === ACCOUNT ? SELF : undefined),
     notifyEnrichment() {},
     notifyCaptions() {},
     enqueueChatSearch() {},
@@ -1482,7 +1494,8 @@ function makeBareCoordinator(
     timeline,
     config: DEFAULT_CONFIG,
     getClient,
-    selfUserIds: new Map([[ACCOUNT, SELF]]),
+    providerHistory: (provider) => (provider === "matrix" ? { threadHistory: "inline" } : undefined),
+    resolveSelfUserId: (provider, accountId) => (provider === "matrix" && accountId === ACCOUNT ? SELF : undefined),
     notifyEnrichment() {},
     notifyCaptions() {},
     enqueueChatSearch() {},
@@ -1607,5 +1620,322 @@ test("commit dedups a re-fetched same-ms bot message against its assistant: row 
     1,
     "exactly one row for the bot's same-ms message",
   );
+  h.storage.close();
+});
+
+// ── Provider-generic descent units & boot ordering ───────────────────────────
+//
+// The coordinator freezes at prepare() — before any provider has started — and
+// asks the providers for self-ids and read clients only at run(). These tests
+// replay the app's boot sequence (prepare → provider.start → run) for a provider
+// that, like Discord, learns its self-id inside start(), and exercise the other
+// provider-boundary behaviours: separately-paged threads, out-of-scope providers,
+// provider-qualified units, and the release path for an unfillable unit.
+
+const D_ACCOUNT = "bot";
+const D_CHANNEL = "111222333";
+const D_ROOM_TK = `discord:${D_ACCOUNT}:room:${D_CHANNEL}`;
+const D_SELF = "999000";
+
+function discordSeparate(provider: string) {
+  return provider === "discord" ? { threadHistory: "separate" as const } : undefined;
+}
+
+/** Seed a committed Discord event (the floor) under the provider's live id scheme and mark its timeline active. */
+async function seedDiscordFloor(h: Harness, msgId: string, timestamp: number, timelineKey = D_ROOM_TK): Promise<void> {
+  const threadMarker = timelineKey.lastIndexOf(":thread:");
+  const event: CanonicalChatEvent = {
+    id: `discord:${D_ACCOUNT}:${msgId}`,
+    externalId: msgId,
+    timelineKey,
+    provider: "discord",
+    role: "user",
+    sender: { id: "123", isSelf: false },
+    body: "old",
+    timestamp,
+    receivedAt: timestamp,
+    threadId: threadMarker >= 0 ? timelineKey.slice(threadMarker + ":thread:".length) : undefined,
+  };
+  await h.timeline.appendIfMissing(event, "skipped");
+  await h.storage.setTimelineState(timelineKey, "active");
+}
+
+function makeDiscordInbound(msgId: string, timestamp: number, timelineKey = D_ROOM_TK): InboundChatEvent {
+  const event: CanonicalChatEvent = {
+    id: `discord:${D_ACCOUNT}:${msgId}`,
+    externalId: msgId,
+    timelineKey,
+    provider: "discord",
+    role: "user",
+    sender: { id: "123", isSelf: false },
+    body: "live",
+    timestamp,
+    receivedAt: timestamp,
+  };
+  return { provider: "discord", timelineKey, event };
+}
+
+function skipWarnings(h: Harness) {
+  return h.warnings.filter((w) => w.event === "gap_backfetch_skip_room");
+}
+
+test("boot ordering: a provider whose self-id is only known after start() is frozen at prepare() and filled at run()", async () => {
+  // A self-id registry that is EMPTY at prepare() time — the app's exact state for
+  // a Discord account: its id is resolved inside DiscordProvider.start(), which
+  // app.ts awaits AFTER gapBackfetch.prepare() and BEFORE gapBackfetch.run().
+  // (The former prepare()-time lookup skipped every such account on every boot.)
+  const selfIds = new Map<string, string>();
+  const h = await makeHarness(
+    [
+      page(
+        [
+          summary({ externalId: "m3", timestamp: 3000, sender: { id: "456" } }),
+          summary({ externalId: "m2", timestamp: 2000, sender: { id: D_SELF } }),
+          summary({ externalId: "m1", timestamp: 1000, sender: { id: "123" } }),
+        ],
+        null,
+      ),
+    ],
+    {},
+    undefined,
+    undefined,
+    () => false,
+    { providerHistory: discordSeparate, resolveSelfUserId: (p, a) => selfIds.get(`${p}:${a}`) },
+  );
+  await seedDiscordFloor(h, "m1", 1000);
+
+  h.coordinator.prepare();
+  assert.equal(h.coordinator.isFrozen(D_ROOM_TK), true, "frozen at prepare() with no self-id known yet");
+  assert.deepEqual(skipWarnings(h), [], "prepare() must not skip a unit for a missing self-id");
+  assert.equal(h.client.calls.length, 0, "nothing is read before run()");
+
+  // provider.start() runs now and resolves the account's self-id.
+  selfIds.set(`discord:${D_ACCOUNT}`, D_SELF);
+
+  await h.coordinator.run();
+
+  assert.deepEqual(storedIds(h.storage, D_ROOM_TK), ["m1", "m2", "m3"], "the gap is recovered");
+  const rows = h.storage.read((db) =>
+    db.prepare(`select id, role from timeline_events where timeline_key = ? order by timestamp asc`).all(D_ROOM_TK) as Array<{ id: string; role: string }>,
+  );
+  assert.deepEqual(
+    rows,
+    [
+      { id: `discord:${D_ACCOUNT}:m1`, role: "user" },
+      { id: `discord:${D_ACCOUNT}:m2`, role: "assistant" },
+      { id: `discord:${D_ACCOUNT}:m3`, role: "user" },
+    ],
+    "ids follow the provider's live scheme; the self message is recognised via the run()-time self-id",
+  );
+  assert.equal(h.coordinator.isFrozen(D_ROOM_TK), false, "unfrozen after commit");
+  assert.deepEqual(skipWarnings(h), []);
+  assert.deepEqual(
+    h.coordinator.snapshot().map((r) => [r.provider, r.accountId, r.phase, r.committed]),
+    [["discord", D_ACCOUNT, "done", 2]],
+  );
+  h.storage.close();
+});
+
+test("run(): a unit whose self-id never resolves is released — skip logged, live buffer replayed, nothing read or committed, not left frozen", async () => {
+  const h = await makeHarness(
+    [page([summary({ externalId: "m2", timestamp: 2000 })], null)],
+    {},
+    undefined,
+    undefined,
+    () => false,
+    { providerHistory: discordSeparate, resolveSelfUserId: () => undefined },
+  );
+  await seedDiscordFloor(h, "m1", 1000);
+
+  h.coordinator.prepare();
+  assert.equal(h.coordinator.isFrozen(D_ROOM_TK), true);
+  h.coordinator.bufferLive(makeDiscordInbound("live1", 5000));
+
+  await h.coordinator.run();
+
+  const skips = skipWarnings(h);
+  assert.equal(skips.length, 1);
+  assert.equal(skips[0]!.fields?.reason, "unknown_self_user");
+  assert.equal(skips[0]!.fields?.provider, "discord");
+  assert.equal(h.client.calls.length, 0, "no read is attempted without a self-id");
+  assert.deepEqual(storedIds(h.storage, D_ROOM_TK), ["m1"], "nothing committed");
+  assert.deepEqual(h.replayed.map((i) => i.event.externalId), ["live1"], "the live buffer is replayed, not held hostage");
+  assert.equal(h.coordinator.isFrozen(D_ROOM_TK), false, "released, not frozen");
+  assert.deepEqual(h.coordinator.snapshot().map((r) => r.phase), ["done"]);
+  h.storage.close();
+});
+
+test("threadHistory 'separate': each thread key is its own unit with its own floor and read client; events route to the thread key", async () => {
+  const THREAD = "777";
+  const THREAD_TK = `${D_ROOM_TK}:thread:${THREAD}`;
+  const roomClient = new ScriptedClient([
+    page(
+      [
+        summary({ externalId: "p3", timestamp: 3000 }),
+        summary({ externalId: "p2", timestamp: 2000 }),
+        summary({ externalId: "p1", timestamp: 1000 }),
+      ],
+      null,
+    ),
+  ]);
+  // A thread channel's history client stamps every summary with the thread root
+  // (as DiscordHistoryClient does for a thread channel).
+  const threadClient = new ScriptedClient([
+    page(
+      [
+        summary({ externalId: "t2", timestamp: 6000, threadRootExternalId: THREAD }),
+        summary({ externalId: "t1", timestamp: 5000, threadRootExternalId: THREAD }),
+      ],
+      null,
+    ),
+  ]);
+  const units: GapBackfetchUnit[] = [];
+  const h = await makeHarness([], {}, undefined, undefined, () => false, {
+    providerHistory: discordSeparate,
+    resolveSelfUserId: () => D_SELF,
+    getClient: (unit) => {
+      units.push(unit);
+      return unit.threadId === THREAD ? threadClient : roomClient;
+    },
+  });
+  await seedDiscordFloor(h, "p1", 1000);
+  await seedDiscordFloor(h, "t1", 5000, THREAD_TK);
+
+  h.coordinator.prepare();
+  assert.equal(h.coordinator.isFrozen(D_ROOM_TK), true);
+  assert.equal(h.coordinator.isFrozen(THREAD_TK), true);
+  assert.equal(h.coordinator.snapshot().length, 2, "the channel and its thread are separate units");
+
+  await h.coordinator.run();
+
+  // The channel's floor is its OWN high-water (1000), not the thread's newer one
+  // (5000): p2/p3 are recovered. Under a whole-room (inline) floor they would sit
+  // below 5000 and be lost — which is why a separate-thread provider gets per-thread units.
+  assert.deepEqual(storedIds(h.storage, D_ROOM_TK), ["p1", "p2", "p3"]);
+  assert.deepEqual(storedIds(h.storage, THREAD_TK), ["t1", "t2"]);
+  assert.deepEqual(
+    units.map((u) => ({ roomId: u.roomId, threadId: u.threadId, timelineKey: u.timelineKey })).sort((a, b) => a.timelineKey.localeCompare(b.timelineKey)),
+    [
+      { roomId: D_CHANNEL, threadId: undefined, timelineKey: D_ROOM_TK },
+      { roomId: D_CHANNEL, threadId: THREAD, timelineKey: THREAD_TK },
+    ],
+    "each unit is handed to getClient with its own timeline key (the thread key for the thread)",
+  );
+  const t2 = h.storage.getTimelineEventById(`discord:${D_ACCOUNT}:t2`);
+  assert.equal(t2?.timelineKey, THREAD_TK);
+  assert.equal(t2?.threadId, THREAD, "a recovered thread message carries its thread id like a live one");
+  assert.equal(h.coordinator.isFrozen(D_ROOM_TK), false);
+  assert.equal(h.coordinator.isFrozen(THREAD_TK), false);
+  assert.deepEqual(
+    h.coordinator.snapshot().map((r) => [r.threadId ?? null, r.phase, r.committed]).sort(),
+    [[THREAD, "done", 1], [null, "done", 2]].sort(),
+  );
+  h.storage.close();
+});
+
+test("a provider without paged history is out of scope: never frozen, no skip warning, absent from the snapshot", async () => {
+  const IRC_TK = "irc:net:room:#chan";
+  const h = await makeHarness([page([summary({ externalId: "$b", timestamp: 2000 })], null)]);
+  await seedFloor(h.timeline, h.storage, "$a", 1000);
+  await h.timeline.appendIfMissing(
+    {
+      id: "irc:net:x1",
+      externalId: "x1",
+      timelineKey: IRC_TK,
+      provider: "irc",
+      role: "user",
+      sender: { id: "alice", isSelf: false },
+      body: "hi",
+      timestamp: 1500,
+      receivedAt: 1500,
+    },
+    "skipped",
+  );
+
+  h.coordinator.prepare();
+  assert.equal(h.coordinator.isFrozen(IRC_TK), false, "an out-of-scope provider's room is never frozen");
+  assert.equal(h.coordinator.isFrozen(ROOM_TK), true);
+  assert.deepEqual(h.coordinator.snapshot().map((r) => r.provider), ["matrix"]);
+  assert.deepEqual(skipWarnings(h), [], "being out of scope is not a skip");
+  await h.coordinator.run();
+  assert.deepEqual(storedIds(h.storage, ROOM_TK), ["$a", "$b"]);
+  h.storage.close();
+});
+
+test("units are provider-qualified: two providers sharing an operator account key fill independently with their own self-ids", async () => {
+  // Matrix account "miku" and Discord account "miku" (same config key) each own a room.
+  const SHARED = ACCOUNT; // "miku"
+  const DISCORD_TK = `discord:${SHARED}:room:${D_CHANNEL}`;
+  const DISCORD_SELF = "424242";
+  const matrixClient = new ScriptedClient([
+    page([summary({ externalId: "$m2", timestamp: 2000, sender: { id: SELF } }), summary({ externalId: "$m1", timestamp: 1000 })], null),
+  ]);
+  const discordClient = new ScriptedClient([
+    page([summary({ externalId: "d2", timestamp: 2000, sender: { id: DISCORD_SELF } }), summary({ externalId: "d1", timestamp: 1000 })], null),
+  ]);
+  const h = await makeHarness([], {}, undefined, undefined, () => false, {
+    providerHistory: (p) => (p === "matrix" ? { threadHistory: "inline" } : p === "discord" ? { threadHistory: "separate" } : undefined),
+    resolveSelfUserId: (p) => (p === "matrix" ? SELF : p === "discord" ? DISCORD_SELF : undefined),
+    getClient: (unit) => (unit.provider === "matrix" ? matrixClient : discordClient),
+  });
+  await seedFloor(h.timeline, h.storage, "$m1", 1000);
+  await h.timeline.appendIfMissing(
+    {
+      id: `discord:${SHARED}:d1`,
+      externalId: "d1",
+      timelineKey: DISCORD_TK,
+      provider: "discord",
+      role: "user",
+      sender: { id: "123", isSelf: false },
+      body: "old",
+      timestamp: 1000,
+      receivedAt: 1000,
+    },
+    "skipped",
+  );
+  await h.storage.setTimelineState(DISCORD_TK, "active");
+
+  h.coordinator.prepare();
+  assert.equal(h.coordinator.snapshot().length, 2, "same account key on two providers ⇒ two units");
+  await h.coordinator.run();
+
+  const roles = (tk: string) =>
+    h.storage.read((db) =>
+      db.prepare(`select id, role from timeline_events where timeline_key = ? order by timestamp asc`).all(tk) as Array<{ id: string; role: string }>,
+    );
+  assert.deepEqual(roles(ROOM_TK), [
+    { id: `matrix:${SHARED}:$m1`, role: "user" },
+    { id: `matrix:${SHARED}:$m2`, role: "assistant" },
+  ]);
+  assert.deepEqual(roles(DISCORD_TK), [
+    { id: `discord:${SHARED}:d1`, role: "user" },
+    { id: `discord:${SHARED}:d2`, role: "assistant" },
+  ]);
+  assert.deepEqual(skipWarnings(h), []);
+  h.storage.close();
+});
+
+test("run(): a read client reporting HistoryUnavailableError releases the unit (unfrozen, live replayed) instead of failing it frozen", async () => {
+  const client = new FailingAtClient([], 1, new HistoryUnavailableError("HTTP 403 Missing Access"));
+  const h = await makeHarness([], {}, undefined, client, () => false, {
+    providerHistory: discordSeparate,
+    resolveSelfUserId: () => D_SELF,
+  });
+  await seedDiscordFloor(h, "m1", 1000);
+
+  h.coordinator.prepare();
+  h.coordinator.bufferLive(makeDiscordInbound("live1", 5000));
+  await h.coordinator.run();
+
+  const skips = skipWarnings(h);
+  assert.equal(skips.length, 1);
+  assert.equal(skips[0]!.fields?.reason, "history_unavailable");
+  assert.equal(skips[0]!.fields?.error, "HTTP 403 Missing Access");
+  assert.equal(h.coordinator.isFrozen(D_ROOM_TK), false, "a permanently unreadable channel is released, not frozen until the next restart");
+  assert.deepEqual(h.replayed.map((i) => i.event.externalId), ["live1"]);
+  assert.deepEqual(storedIds(h.storage, D_ROOM_TK), ["m1"], "nothing committed");
+  assert.deepEqual(h.coordinator.snapshot().map((r) => r.phase), ["done"]);
+  // Contrast: a plain (transient) read error keeps the room frozen — see the
+  // "read failure mid-descent" test above.
   h.storage.close();
 });

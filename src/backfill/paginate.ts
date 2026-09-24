@@ -131,6 +131,11 @@ export interface BackwardPaginateResult {
   errored: boolean;
   /** Message of the read failure when `errored` is true. */
   error?: string;
+  /**
+   * The read failure was a {@link HistoryUnavailableError}: the provider reports
+   * this channel's history as permanently unavailable (set only with `errored`).
+   */
+  historyUnavailable?: true;
   /** Paging stopped after a long run of consecutive undecryptable (UTD) events. */
   haltedOnUtd: boolean;
   /**
@@ -160,6 +165,22 @@ function deriveStopReason(r: BackwardPaginateResult): BackwardPaginateStopReason
 }
 
 export class BackfillTimeoutError extends Error {}
+
+/**
+ * Thrown by a {@link BackfillReadClient} when the channel's history is
+ * *permanently* unavailable to this account — e.g. the provider denies
+ * read-history permission or the channel no longer exists — as opposed to a
+ * transient read failure. `paginateBackward` reports it as `errored` plus
+ * `historyUnavailable`, so a caller can release the room instead of holding it
+ * frozen for a retry that can never succeed. Providers opt in by throwing it;
+ * any other error keeps the transient-failure semantics.
+ */
+export class HistoryUnavailableError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "HistoryUnavailableError";
+  }
+}
 
 /**
  * Drive backward `/messages` pagination from the room head (no `before` token)
@@ -219,6 +240,7 @@ export async function paginateBackward(
         const message = error instanceof Error ? error.message : String(error);
         result.errored = true;
         result.error = message;
+        if (error instanceof HistoryUnavailableError) result.historyUnavailable = true;
         logger?.warn(readFailedEvent, { ...options.logFields, error: message });
       }
       break;

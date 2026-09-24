@@ -65,8 +65,11 @@ export interface MessageBackfetchCoordinatorOptions {
   config: MessageBackfetchConfig;
   /** Resolve the native read client for an account + room (provider boundary). */
   getClient: (accountId: string, roomId: string) => BackfillReadClient;
-  /** Bot's own Matrix user id per account, for role assignment / self-detection. */
-  selfUserIds: Map<string, string>;
+  /**
+   * The bot's own user id on a provider account, for role assignment /
+   * self-detection. Resolved per job (post-start), shared with gap backfetch.
+   */
+  resolveSelfUserId: (provider: string, accountId: string) => string | undefined;
   /** Nudge the enrichment pool for a single committed event. */
   notifyEnrichment: (eventId: string) => void;
   /** Nudge the caption pool (drains all pending captions) — used after a promote. */
@@ -133,7 +136,8 @@ export class MessageBackfetchCoordinator {
     input: BackfetchJobInput,
   ): Promise<{ ok: true; job: BackfetchJobRow } | { ok: false; reason: string }> {
     if (!this.opts.config.enabled) return { ok: false, reason: "backfetch disabled" };
-    if (!this.opts.selfUserIds.has(input.accountId)) {
+    const provider = parseTimelineKey(input.timelineKey)?.provider;
+    if (!provider || !this.opts.resolveSelfUserId(provider, input.accountId)) {
       return { ok: false, reason: `unknown account ${input.accountId}` };
     }
     // Atomic single-flight: the active-job check and the insert run in one
@@ -248,7 +252,9 @@ export class MessageBackfetchCoordinator {
   private async runJob(job: BackfetchJobRow, ctl: JobControl): Promise<void> {
     const { storage, timeline, config } = this.opts;
     const isDm = timelineKindOf(job.timelineKey) === "dm";
-    const selfUserId = this.opts.selfUserIds.get(job.accountId);
+    // Derive provider from the job's timeline key (shared grammar, spec §4.2).
+    const provider = parseTimelineKey(job.timelineKey)?.provider ?? "matrix";
+    const selfUserId = this.opts.resolveSelfUserId(provider, job.accountId);
     if (!selfUserId) {
       await storage.updateBackfetchJob(job.id, { status: "failed", error: "unknown self user" });
       return;
@@ -343,8 +349,6 @@ export class MessageBackfetchCoordinator {
       if (job.targetKind === "date" && Number.isFinite(targetMs) && timestamp < targetMs) {
         return "window";
       }
-      // Derive provider from the job's timeline key (shared grammar, spec §4.2).
-      const provider = parseTimelineKey(job.timelineKey)?.provider ?? "matrix";
       const classified = classifyForRoom(summary, {
         provider,
         accountId: job.accountId,

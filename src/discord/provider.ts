@@ -206,6 +206,9 @@ export class DiscordProvider implements IChatProvider {
     voiceMessages: true,
     threads: true,
     history: true,
+    // Each Discord thread is its own channel with its own /messages history, so
+    // a startup gap descent must page every thread separately (§7c).
+    threadHistory: "separate",
     encrypted: false,
     linkPreviews: "none",
     singleAttachmentPerMessage: false,
@@ -520,10 +523,11 @@ export class DiscordProvider implements IChatProvider {
     if (!runtime) return undefined;
 
     const parsed = parseTimelineKey(target.timelineKey);
-    const channelId = target.roomId ?? (parsed?.threadId ?? parsed?.channelId);
+    const threadId = parsed?.threadId ?? target.threadId;
+    const channelId = target.roomId ?? (threadId ?? parsed?.channelId);
     if (!channelId) return undefined;
 
-    return new DiscordHistoryClient(runtime.client, channelId, accountId);
+    return new DiscordHistoryClient(runtime.client, channelId, accountId, threadId);
   }
 
   // ── IChatProvider: send / typing ──────────────────────────────────────────

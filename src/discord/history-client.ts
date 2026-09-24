@@ -12,13 +12,26 @@
  *
  * Thread channels: the `channelId` passed at construction is the actual channel
  * id (thread id for thread messages, parent id for room messages). The provider
- * passes the correct id based on the resolved timeline key.
+ * passes the correct id based on the resolved timeline key, plus `threadId` when
+ * the channel is a thread: every message read from a thread channel is then
+ * reported with `threadRootExternalId = threadId`, mirroring the live normalizer
+ * (`threadId = msg.channelId` for thread channel types), so the shared backfill
+ * classifiers route it to the `…:thread:<id>` timeline key.
+ *
+ * `HistorySummary.edited` is deliberately NOT set: it marks a *replacement event*
+ * (Matrix `m.replace`), which the classifiers apply as an edit — or drop when it
+ * names no target. A Discord message that has been edited is still the message
+ * itself, already carrying its current content.
+ *
+ * A 403/404 from the messages endpoint (no read-history permission, channel
+ * gone) is reported as {@link HistoryUnavailableError} so a caller can tell a
+ * permanent condition from a transient read failure.
  */
 
 import type { Client } from "discord.js";
-import { Routes } from "discord.js";
+import { DiscordAPIError, Routes } from "discord.js";
 import type { AttachmentMeta, HistoryClient, HistoryPageRequest, HistoryPageResult, HistorySummary } from "../types.js";
-import type { BackfillReadClient } from "../backfill/paginate.js";
+import { HistoryUnavailableError, type BackfillReadClient } from "../backfill/paginate.js";
 
 // ── Raw Discord REST response types ──────────────────────────────────────────
 
@@ -61,6 +74,8 @@ export class DiscordHistoryClient implements HistoryClient, BackfillReadClient {
     private readonly client: Client,
     private readonly channelId: string,
     private readonly accountId: string,
+    /** Set when `channelId` is a thread channel; stamped on every summary as its thread root. */
+    private readonly threadId?: string,
   ) {}
 
   async readMessages(req: HistoryPageRequest): Promise<HistoryPageResult> {
@@ -73,9 +88,20 @@ export class DiscordHistoryClient implements HistoryClient, BackfillReadClient {
     const query = new URLSearchParams({ limit: String(limit) });
     if (before) query.set("before", before);
 
-    const rawMessages = await this.client.rest.get(Routes.channelMessages(this.channelId), {
-      query,
-    }) as RawDiscordMessage[];
+    let rawMessages: RawDiscordMessage[];
+    try {
+      rawMessages = await this.client.rest.get(Routes.channelMessages(this.channelId), {
+        query,
+      }) as RawDiscordMessage[];
+    } catch (error) {
+      if (error instanceof DiscordAPIError && (error.status === 403 || error.status === 404)) {
+        throw new HistoryUnavailableError(
+          `Discord history unavailable for channel ${this.channelId}: HTTP ${error.status} (${error.message})`,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
 
     if (!Array.isArray(rawMessages) || rawMessages.length === 0) {
       return { messages: [], nextCursor: undefined };
@@ -122,7 +148,7 @@ export class DiscordHistoryClient implements HistoryClient, BackfillReadClient {
       body: msg.content,
       attachments: attachments.length > 0 ? attachments : undefined,
       replyToExternalId: msg.message_reference?.message_id,
-      edited: msg.edited_timestamp != null,
+      threadRootExternalId: this.threadId,
     };
   }
 }

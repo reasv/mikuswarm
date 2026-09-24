@@ -124,7 +124,7 @@ import {
 import { SauceNaoRateLimiter } from "./saucenao/rate-limiter.js";
 import { setEgressGuardEnabled } from "./tools/ssrf.js";
 import { configureHttpLimiter } from "./tools/http-limiter.js";
-import type { CanonicalChatEvent, ChatProviderHost, IChatProvider, InboundChatEvent, TriggerInfo } from "./types.js";
+import type { CanonicalChatEvent, ChatProviderHost, IChatProvider, InboundChatEvent, OutboundTarget, TriggerInfo } from "./types.js";
 import { EnrichmentWorkerPool, FetchClient } from "./enrichment/index.js";
 import { AttachmentStore } from "./enrichment/attachment-store.js";
 import { FxTwitterClient, resolveFxTwitterConfig } from "./fxtwitter/index.js";
@@ -1415,24 +1415,19 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   const matrixProviderInstance: MatrixProvider | undefined =
     config.matrix.enabled !== false ? new MatrixProvider(config.matrix) : undefined;
 
-  // Self-id containers populated eagerly from Matrix config and lazily from
-  // Discord's READY event (via onSelfResolved). Declared before the providers
-  // IIFE so that both the Discord callbacks (inside) and the budget/backfetch
-  // coordinators (outside) share the SAME mutable Set/Map — the Discord
-  // callback fires post-start() and adds ids to whichever objects these
-  // variables refer to at that time (boot-ordering constraint, spec §6.3).
+  // Self-id set populated eagerly from Matrix config and lazily from Discord's
+  // self-id resolution (via onSelfResolved). Declared before the providers IIFE
+  // so that both the Discord callbacks (inside) and the budget engine (outside)
+  // share the SAME mutable Set — the Discord callback fires inside start() and
+  // adds ids to whichever object this variable refers to at that time
+  // (boot-ordering constraint, spec §6.3). The backfetch coordinators do NOT use
+  // a pre-seeded registry: they ask the providers (`getSelf`) at run() time,
+  // after every start() (ARCHITECTURE.md §7c).
   const botSelfIdsForLimits = new Set<string>(
     Object.values(config.matrix?.accounts ?? {})
       .map((a) => (a as { user_id?: string }).user_id)
       .filter((id): id is string => typeof id === "string" && id.length > 0),
   );
-  // accountId → selfUserId for backfetch coordinators. Populated with Matrix
-  // ids here; Discord ids added at READY via onSelfResolved.
-  const gapBackfetchSelfIds = new Map<string, string>();
-  for (const [accountId, account] of Object.entries(config.matrix?.accounts ?? {})) {
-    const uid = (account as { user_id?: string }).user_id;
-    if (uid) gapBackfetchSelfIds.set(accountId, uid);
-  }
 
   const providers: Map<string, IChatProvider> = opts?.providers ?? (() => {
     const map = new Map<string, IChatProvider>();
@@ -1473,13 +1468,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         async setChannelMetadata(timelineKey, meta) {
           await storage.setChannelMetadata(timelineKey, meta);
         },
-        onSelfResolved(accountId, selfId) {
-          // Add Discord self-id to the budget engine's exclusion set and the
-          // backfetch coordinators' accountId→selfUserId maps (spec §6.3).
-          // These sets/maps are already wired into the coordinators and
-          // UserLimitEngine by reference.
+        onSelfResolved(_accountId, selfId) {
+          // Add the Discord self-id to the budget engine's exclusion set (spec
+          // §6.3); the Set is already wired into UserLimitEngine by reference.
           botSelfIdsForLimits.add(selfId);
-          gapBackfetchSelfIds.set(accountId, selfId);
         },
       });
       map.set("discord", discordProvider);
@@ -2560,21 +2552,44 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     utdHaltThreshold: config.timeline?.gap_backfetch_utd_halt_threshold ?? 50,
     concurrency: config.timeline?.gap_backfetch_concurrency ?? 3,
   };
-  // Gap backfetch self-ids: pre-seeded with Matrix ids (above, before providers IIFE)
-  // and extended with Discord ids post-READY via onSelfResolved. The gapBackfetchSelfIds
-  // Map is passed by reference to the coordinators below — mutations are live.
+  // Backfetch self-ids are resolved from the providers at run time (`getSelf`,
+  // valid once start() has returned — Discord resolves its id inside start()),
+  // never pre-seeded: a registry read at prepare() time (which runs BEFORE
+  // provider.start) would miss every account whose id is only known post-start.
+  const backfetchSelfUserId = (providerId: string, accountId: string): string | undefined =>
+    providers.get(providerId)?.getSelf(accountId)?.id;
+  // Gap backfetch is provider-generic (ARCHITECTURE.md §7c): every registered
+  // provider with paged history is in scope. Matrix pages through the native
+  // client adaptor (which also carries the key-backup hook); every other
+  // provider serves its own BackfillReadClient via history() — the same split
+  // as runInitialBackfill.
   const gapBackfetch = new GapBackfetchCoordinator({
     storage,
     timeline,
     config: gapBackfetchConfig,
-    getClient: (accountId, roomId) => {
-      if (!matrixProvider) throw new Error("gap backfetch requires a matrix provider");
-      return makeBackfillReadClient(
-        matrixProvider.getClient({ provider: "matrix", timelineKey: `matrix:${accountId}:`, accountId }),
-        roomId,
-      );
+    providerHistory: (providerId) => {
+      const p = providers.get(providerId);
+      if (!p?.capabilities.history) return undefined;
+      return { threadHistory: p.capabilities.threadHistory ?? "inline" };
     },
-    selfUserIds: gapBackfetchSelfIds,
+    getClient: (unit) => {
+      const p = providers.get(unit.provider);
+      if (!p) return undefined;
+      const target: OutboundTarget = {
+        provider: unit.provider,
+        accountId: unit.accountId,
+        timelineKey: unit.timelineKey,
+        // A separately-paged thread is addressed by its own channel id (the same
+        // convention the live normalizer uses for a thread message's target).
+        roomId: unit.threadId ?? unit.roomId,
+        threadId: unit.threadId,
+      };
+      if (p === matrixProvider && matrixProvider) {
+        return makeBackfillReadClient(matrixProvider.getClient(target), unit.roomId);
+      }
+      return p.history?.(target) as import("./backfill/paginate.js").BackfillReadClient | undefined;
+    },
+    resolveSelfUserId: backfetchSelfUserId,
     notifyEnrichment: (eventId) => enrichmentPool.notifyNewEvent(eventId),
     notifyCaptions: () => captionPool.notifyNewWork(),
     enqueueChatSearch: (eventId) => chatSearchIndexer.enqueueReconcileEvent(eventId),
@@ -2590,7 +2605,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
 
   // Message-only history backfetch (ARCHITECTURE.md §7d): console-triggered jobs
   // that page history BELOW each room's context floor into the search-only region.
-  // Shares the same per-account read client + self-id map as gap backfetch.
+  // Shares the same self-id resolution as gap backfetch; its read client is
+  // still the Matrix native adaptor (the feature pages Matrix rooms).
   const messageBackfetchConfig: MessageBackfetchConfig = {
     enabled: config.backfetch?.enabled ?? false,
     pageSize: config.backfetch?.page_size ?? 100,
@@ -2612,7 +2628,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         roomId,
       );
     },
-    selfUserIds: gapBackfetchSelfIds,
+    resolveSelfUserId: backfetchSelfUserId,
     notifyEnrichment: (eventId) => enrichmentPool.notifyNewEvent(eventId),
     notifyCaptions: () => captionPool.notifyNewWork(),
     enqueueChatSearch: (eventId) => chatSearchIndexer.enqueueReconcileEvent(eventId),
@@ -6646,6 +6662,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // The old fire-and-forgotten resolveEagerSelfIds() call has been removed; the
   // gateway READY event continues to call onSelfResolved() as a belt-and-suspenders
   // backstop (e.g. when READY races the REST call on a very fast connection).
+  // Every provider's self-id is therefore known from here on, which is what lets
+  // gapBackfetch.run() (below) resolve them via getSelf() for the rooms that
+  // prepare() froze before any provider started.
 
   // Resolve room labels for already-known (possibly idle) rooms so the console
   // shows real names without waiting for each room's next message. Throttled and

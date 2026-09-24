@@ -354,6 +354,15 @@ export interface ProviderCapabilities {
   threads: boolean;
   /** history = read_messages tool + backfill. */
   history: boolean;
+  /**
+   * How a channel's paged history relates to its threads. `"inline"` (the default
+   * when absent): the channel's history stream already contains its thread
+   * messages (Matrix — thread relations live in the room timeline), so one
+   * backward descent per room covers every thread. `"separate"`: each thread is
+   * its own history channel (Discord) and must be paged on its own. Consumed by
+   * startup gap backfetch (ARCHITECTURE.md §7c) to choose its descent units.
+   */
+  threadHistory?: "inline" | "separate";
   /** gates re-decryption instantiation (encrypted provider only). */
   encrypted: boolean;
   /** "none" → framework-level direct-HTTP preview fallback. */

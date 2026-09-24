@@ -65,15 +65,29 @@ type BufferItem =
 type RoomPhase = "frozen" | "filling" | "committing" | "done" | "failed";
 
 interface RoomState {
+  /** Provider id (the timeline key's first segment, e.g. "matrix", "discord"). */
+  provider: string;
   accountId: string;
   roomId: string;
-  /** Composite identity key `accountId roomId` (space-separated; §10 multi-account keying). */
+  /**
+   * Set when this unit is one thread of a `threadHistory: "separate"` provider
+   * (the thread is its own history channel and is paged on its own). Absent for
+   * a room/DM unit, which on an `"inline"` provider also covers every thread.
+   */
+  threadId?: string;
+  /** Composite identity key (see `unitKeyOf`; §10 multi-account keying). */
   roomKey: string;
   /** The room's base (non-thread) timeline key — `room:` or `dm:`. */
   baseTimelineKey: string;
   isDm: boolean;
-  selfUserId: string;
-  /** All currently-known timeline keys for this room (room/DM + threads). */
+  /**
+   * The bot's own user id on this provider account. Resolved at `run()` (not
+   * `prepare()`): a provider may only learn its self-id inside `start()`, which
+   * runs between the two, so a `prepare()`-time lookup would wrongly skip every
+   * such account. Undefined until `runRoom` resolves it.
+   */
+  selfUserId?: string;
+  /** All currently-known timeline keys for this unit (room/DM + threads, or the one thread key). */
   timelineKeys: string[];
   floor: Floor | undefined;
   phase: RoomPhase;
@@ -101,8 +115,11 @@ export interface GapBackfetchConfig {
 }
 
 export interface GapBackfetchSnapshotRoom {
+  provider: string;
   accountId: string;
   roomId: string;
+  /** Present when the unit is one separately-paged thread (see `RoomState.threadId`). */
+  threadId?: string;
   baseTimelineKey: string;
   phase: RoomPhase;
   backfillBuffered: number;
@@ -117,14 +134,53 @@ export interface GapBackfetchSnapshotRoom {
   cappedHole?: { fromTimestamp: number; toTimestamp: number; reason: BackwardPaginateStopReason };
 }
 
+/** One descent unit, as handed to `getClient` (provider boundary). */
+export interface GapBackfetchUnit {
+  provider: string;
+  accountId: string;
+  /** Channel id (Matrix room id / Discord channel snowflake). */
+  roomId: string;
+  /** Set for a separately-paged thread unit (`threadHistory: "separate"`). */
+  threadId?: string;
+  /** The unit's own timeline key: the thread key for a thread unit, else the base room/DM key. */
+  timelineKey: string;
+}
+
+/** How one provider's paged history is shaped, as reported by `providerHistory`. */
+export interface GapBackfetchProviderHistory {
+  /**
+   * `"inline"`: a channel's history stream already contains its thread messages
+   * (Matrix — thread relations live in the room timeline), so one descent per room
+   * covers the room and every thread. `"separate"`: each thread is its own history
+   * channel (Discord), so every thread timeline key is its own descent unit with
+   * its own floor and read client.
+   */
+  threadHistory: "inline" | "separate";
+}
+
 export interface GapBackfetchCoordinatorOptions {
   storage: Storage;
   timeline: TimelineStore;
   config: GapBackfetchConfig;
-  /** Resolve the native read client for an account + room (provider boundary). */
-  getClient: (accountId: string, roomId: string) => BackfillReadClient;
-  /** Bot's own Matrix user id per account, for role assignment / self-detection. */
-  selfUserIds: Map<string, string>;
+  /**
+   * Describe a provider's paged history, or return undefined when the provider is
+   * not registered or has no paged history (its timelines are then out of scope:
+   * never frozen, never fetched). Consulted once per provider at `prepare()`.
+   */
+  providerHistory: (provider: string) => GapBackfetchProviderHistory | undefined;
+  /**
+   * Resolve the read client for one descent unit, or undefined when the provider
+   * cannot serve it (the unit is then released unfilled at `run()`). Called at
+   * `run()`, after every provider has started.
+   */
+  getClient: (unit: GapBackfetchUnit) => BackfillReadClient | undefined;
+  /**
+   * The bot's own user id on a provider account, for role assignment /
+   * self-detection. Called at `run()` — never at `prepare()` — because a provider
+   * may only resolve its self-id inside `start()`, which runs between the two
+   * (the boot-ordering constraint that once skipped every such account).
+   */
+  resolveSelfUserId: (provider: string, accountId: string) => string | undefined;
   /** Nudge the enrichment pool for a single committed event. */
   notifyEnrichment: (eventId: string) => void;
   /** Nudge the caption pool (drains all pending captions). */
@@ -146,6 +202,7 @@ export interface GapBackfetchCoordinatorOptions {
 }
 
 interface ParsedKey {
+  provider: string;
   accountId: string;
   kind: "room" | "dm";
   roomId: string;
@@ -161,16 +218,24 @@ interface ParsedKey {
 function parseKey(timelineKey: string): ParsedKey | null {
   const p = parseTimelineKey(timelineKey);
   if (!p) return null;
-  return { accountId: p.accountId, kind: p.kind, roomId: p.channelId, threadRootId: p.threadId };
+  return { provider: p.provider, accountId: p.accountId, kind: p.kind, roomId: p.channelId, threadRootId: p.threadId };
 }
 
-function roomKeyOf(accountId: string, roomId: string): string {
-  return `${accountId} ${roomId}`;
+/**
+ * Composite identity of one descent unit: `provider accountId roomId` (space-
+ * separated), plus ` thread <id>` for a separately-paged thread. Provider-qualified
+ * so two providers whose operator-chosen account keys coincide never share a unit.
+ */
+function unitKeyOf(provider: string, accountId: string, roomId: string, threadId?: string): string {
+  const base = `${provider} ${accountId} ${roomId}`;
+  return threadId ? `${base} thread ${threadId}` : base;
 }
 
 export class GapBackfetchCoordinator {
-  /** Keyed by `accountId roomId` (space-separated); only rooms in a non-terminal phase are frozen. */
+  /** Keyed by `unitKeyOf(...)`; only units in a non-terminal phase are frozen. */
   private readonly rooms = new Map<string, RoomState>();
+  /** Per-provider history shape captured at `prepare()`; absent ⇒ provider out of scope. */
+  private readonly providerHistory = new Map<string, GapBackfetchProviderHistory>();
 
   constructor(private readonly opts: GapBackfetchCoordinatorOptions) {}
 
@@ -180,28 +245,74 @@ export class GapBackfetchCoordinator {
   }
 
   /**
+   * Resolve the history shape of `provider`, consulting the app once per provider
+   * (memoized for the coordinator's lifetime — the provider set is fixed at boot).
+   */
+  private historyOf(provider: string): GapBackfetchProviderHistory | undefined {
+    let shape = this.providerHistory.get(provider);
+    if (!shape) {
+      shape = this.opts.providerHistory(provider);
+      if (shape) this.providerHistory.set(provider, shape);
+    }
+    return shape;
+  }
+
+  /** The unit key a timeline key belongs to, or undefined when its provider is out of scope. */
+  private unitKeyFor(parsed: ParsedKey): string | undefined {
+    const shape = this.historyOf(parsed.provider);
+    if (!shape) return undefined;
+    const threadId = shape.threadHistory === "separate" ? parsed.threadRootId : undefined;
+    return unitKeyOf(parsed.provider, parsed.accountId, parsed.roomId, threadId);
+  }
+
+  /**
    * Freeze every in-scope room (§5.1) — MUST run before `provider.start` so no
    * live event is missed and no commit can race ahead of the floor capture.
    * Enumerates all known rooms (§6.1), records each `floor`, and marks it frozen.
-   * No-op when disabled.
+   * Requires nothing from the providers themselves (self-ids and read clients are
+   * resolved at `run()`, after they have started). No-op when disabled.
    */
   prepare(): void {
     if (!this.opts.config.enabled) return;
     const keys = this.opts.storage.listKnownTimelineKeys();
-    // Group known timeline keys by (account, room), tracking every key's kind. A
-    // room's `m.direct` flag is mutable, so a single roomId can hold BOTH `room:`
-    // and `dm:` keys; the base kind is resolved per group below (#7).
+    // Group known timeline keys by descent unit — (provider, account, room), plus
+    // the thread for a `threadHistory: "separate"` provider — tracking every key's
+    // kind. A Matrix room's `m.direct` flag is mutable, so a single roomId can hold
+    // BOTH `room:` and `dm:` keys; the base kind is resolved per group below (#7).
+    // Keys of a provider with no paged history are left out of scope entirely
+    // (never frozen), counted per provider for the prepared log.
     const groups = new Map<
       string,
-      { accountId: string; roomId: string; keysByKind: Map<"room" | "dm", string[]>; keys: string[] }
+      {
+        provider: string;
+        accountId: string;
+        roomId: string;
+        threadId?: string;
+        keysByKind: Map<"room" | "dm", string[]>;
+        keys: string[];
+      }
     >();
+    const outOfScope = new Map<string, number>();
     for (const key of keys) {
       const parsed = parseKey(key);
       if (!parsed) continue;
-      const rk = roomKeyOf(parsed.accountId, parsed.roomId);
+      const rk = this.unitKeyFor(parsed);
+      if (!rk) {
+        outOfScope.set(parsed.provider, (outOfScope.get(parsed.provider) ?? 0) + 1);
+        continue;
+      }
       let existing = groups.get(rk);
       if (!existing) {
-        existing = { accountId: parsed.accountId, roomId: parsed.roomId, keysByKind: new Map(), keys: [] };
+        const threadId =
+          this.historyOf(parsed.provider)?.threadHistory === "separate" ? parsed.threadRootId : undefined;
+        existing = {
+          provider: parsed.provider,
+          accountId: parsed.accountId,
+          roomId: parsed.roomId,
+          threadId,
+          keysByKind: new Map(),
+          keys: [],
+        };
         groups.set(rk, existing);
       }
       existing.keys.push(key);
@@ -210,16 +321,7 @@ export class GapBackfetchCoordinator {
       else existing.keysByKind.set(parsed.kind, [key]);
     }
 
-    for (const [rk, { accountId, roomId, keysByKind, keys: roomKeys }] of groups) {
-      const selfUserId = this.opts.selfUserIds.get(accountId);
-      if (!selfUserId) {
-        this.opts.logger.warn("gap_backfetch_skip_room", {
-          accountId,
-          roomId,
-          reason: "unknown_self_user",
-        });
-        continue;
-      }
+    for (const [rk, { provider, accountId, roomId, threadId, keysByKind, keys: roomKeys }] of groups) {
       // Resolve the group's base kind (#7). Single-kind groups (the normal case)
       // take that one kind unchanged. A mixed `room:`/`dm:` group picks the side
       // whose timeline keys have the newest committed high-water — i.e. where the
@@ -231,25 +333,28 @@ export class GapBackfetchCoordinator {
       const baseKind = this.selectBaseKind(accountId, roomId, keysByKind);
       const isDm = baseKind === "dm";
       // Use buildTimelineKey (shared grammar) rather than a template literal so
-      // key construction goes through the same module as parsing.
-      // GapBackfetchCoordinator is intentionally Matrix-specific; it is only
-      // activated when matrixProvider is non-null (see app.ts wiring).
+      // key construction goes through the same module as parsing. The base key is
+      // always the room/DM key — a separately-paged thread unit still routes its
+      // events through `classifyForRoom`, which derives `${base}:thread:<root>`
+      // from each summary's `threadRootExternalId`.
       const baseTimelineKey = buildTimelineKey({
-        provider: "matrix",
+        provider,
         accountId,
         kind: isDm ? "dm" : "room",
         channelId: roomId,
       });
-      // Floor = MAX across ALL the room's keys (room/DM + threads), independent of
-      // the base-kind choice; this bounds the descent regardless (#7).
+      // Floor = MAX across ALL the unit's keys (room/DM + threads, or the single
+      // thread key), independent of the base-kind choice; this bounds the descent
+      // regardless (#7).
       const floor = this.opts.storage.getHighWaterMark(roomKeys);
       this.rooms.set(rk, {
+        provider,
         accountId,
         roomId,
+        threadId,
         roomKey: rk,
         baseTimelineKey,
         isDm,
-        selfUserId,
         timelineKeys: roomKeys,
         floor,
         phase: "frozen",
@@ -259,7 +364,10 @@ export class GapBackfetchCoordinator {
         startedAt: 0,
       });
     }
-    this.opts.logger.info("gap_backfetch_prepared", { rooms: this.rooms.size });
+    this.opts.logger.info("gap_backfetch_prepared", {
+      rooms: this.rooms.size,
+      ...(outOfScope.size > 0 ? { outOfScope: Object.fromEntries(outOfScope) } : {}),
+    });
   }
 
   /**
@@ -309,10 +417,16 @@ export class GapBackfetchCoordinator {
 
   /** True while the room owning `timelineKey` has not yet finished its gap fill. */
   isFrozen(timelineKey: string): boolean {
-    const parsed = parseKey(timelineKey);
-    if (!parsed) return false;
-    const room = this.rooms.get(roomKeyOf(parsed.accountId, parsed.roomId));
+    const room = this.unitOf(timelineKey);
     return room != null && this.isActivePhase(room.phase);
+  }
+
+  /** The unit owning `timelineKey`, if its provider is in scope and the unit was prepared. */
+  private unitOf(timelineKey: string): RoomState | undefined {
+    const parsed = parseKey(timelineKey);
+    if (!parsed) return undefined;
+    const rk = this.unitKeyFor(parsed);
+    return rk ? this.rooms.get(rk) : undefined;
   }
 
   /**
@@ -322,9 +436,7 @@ export class GapBackfetchCoordinator {
    * the floor.
    */
   bufferLive(inbound: InboundChatEvent): void {
-    const parsed = parseKey(inbound.timelineKey);
-    if (!parsed) return;
-    const room = this.rooms.get(roomKeyOf(parsed.accountId, parsed.roomId));
+    const room = this.unitOf(inbound.timelineKey);
     if (!room || !this.isActivePhase(room.phase)) return;
     room.liveBuf.push(inbound);
   }
@@ -353,17 +465,85 @@ export class GapBackfetchCoordinator {
     await Promise.all(Array.from({ length: Math.min(concurrency, queue.length) }, () => worker()));
   }
 
+  /**
+   * Release a unit whose gap cannot be filled at all (no self-id, no read client,
+   * or history the provider reports as permanently unavailable): unfreeze it and
+   * replay its live buffer, exactly as if it had never been in scope. Unlike a
+   * transient read failure this does NOT leave the room frozen — there is no
+   * fill to retry, and a frozen room would hold its live traffic (and its
+   * sessions) hostage until the next restart. Logged as `gap_backfetch_skip_room`.
+   */
+  private release(room: RoomState, reason: string, extra: Record<string, unknown> = {}): void {
+    this.opts.logger.warn("gap_backfetch_skip_room", {
+      provider: room.provider,
+      accountId: room.accountId,
+      roomId: room.roomId,
+      ...(room.threadId ? { threadId: room.threadId } : {}),
+      reason,
+      ...extra,
+    });
+    room.backfillBuf = [];
+    const live = room.liveBuf;
+    room.liveBuf = [];
+    room.phase = "done";
+    for (const inbound of live) this.opts.replayLiveInbound(inbound);
+  }
+
   /** Per-room run: fill, commit, unfreeze. Errors leave the room frozen (recovered on restart). */
   private async runRoom(room: RoomState): Promise<void> {
     room.startedAt = Date.now();
+    // Provider-side prerequisites, resolved now — after every provider's `start()`
+    // — rather than at `prepare()` (see `RoomState.selfUserId`).
+    const selfUserId = this.opts.resolveSelfUserId(room.provider, room.accountId);
+    if (!selfUserId) {
+      this.release(room, "unknown_self_user");
+      return;
+    }
+    room.selfUserId = selfUserId;
+    let client: BackfillReadClient | undefined;
+    try {
+      client = this.opts.getClient({
+        provider: room.provider,
+        accountId: room.accountId,
+        roomId: room.roomId,
+        threadId: room.threadId,
+        timelineKey: room.threadId
+          ? buildTimelineKey({
+              provider: room.provider,
+              accountId: room.accountId,
+              kind: room.isDm ? "dm" : "room",
+              channelId: room.roomId,
+              threadId: room.threadId,
+            })
+          : room.baseTimelineKey,
+      });
+    } catch (error) {
+      this.release(room, "client_unavailable", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
+    if (!client) {
+      this.release(room, "client_unavailable");
+      return;
+    }
     this.opts.logger.info("gap_backfetch_start", {
+      provider: room.provider,
       accountId: room.accountId,
       roomId: room.roomId,
+      ...(room.threadId ? { threadId: room.threadId } : {}),
       floorTimestamp: room.floor?.timestamp ?? null,
     });
     try {
       room.phase = "filling";
-      const result = await this.fill(room);
+      const result = await this.fill(room, client, selfUserId);
+      // The provider reported this channel's history as permanently unavailable
+      // (e.g. no permission to read it) — nothing to retry on a restart either, so
+      // release the unit instead of freezing it (see `release`).
+      if (result.historyUnavailable) {
+        this.release(room, "history_unavailable", { error: result.error ?? null });
+        return;
+      }
       this.opts.logger.info("gap_backfetch_filled", {
         roomId: room.roomId,
         fetched: result.fetched,
@@ -427,22 +607,23 @@ export class GapBackfetchCoordinator {
   }
 
   /** Buffer the backward descent (§5.2). No DB writes happen here. */
-  private fill(room: RoomState) {
+  private fill(room: RoomState, client: BackfillReadClient, selfUserId: string) {
     const cfg = this.opts.config;
     const windowFloor = cfg.windowMs > 0 ? Date.now() - cfg.windowMs : Number.NEGATIVE_INFINITY;
     const floor = room.floor;
+    // Canonical ids follow each provider's live-ingest scheme
+    // (`<provider>:<account>:<externalId>`) so gap rows dedup against live rows.
+    const buildId = (externalId: string) => `${room.provider}:${room.accountId}:${externalId}`;
 
     const onMessage = (summary: HistorySummary, timestamp: number): MessageDisposition => {
-      // Derive provider from the room's base timeline key (shared grammar, spec §4.2).
-      const provider = parseTimelineKey(room.baseTimelineKey)?.provider ?? "matrix";
       const classified = classifyForRoom(summary, {
-        provider,
+        provider: room.provider,
         accountId: room.accountId,
-        selfUserId: room.selfUserId,
+        selfUserId,
         baseTimelineKey: room.baseTimelineKey,
         isDm: room.isDm,
         timestamp,
-        buildId: (externalId) => `matrix:${room.accountId}:${externalId}`,
+        buildId,
       });
       if (!classified) return "skip";
 
@@ -468,7 +649,7 @@ export class GapBackfetchCoordinator {
       // is never re-fetched, the descent stops at the first strictly-older event
       // after buffering the same-ms layer.
       if (floor) {
-        const candidateId = `matrix:${room.accountId}:${summary.externalId}`;
+        const candidateId = buildId(summary.externalId);
         if (
           timestamp < floor.timestamp ||
           candidateId === floor.id ||
@@ -495,8 +676,8 @@ export class GapBackfetchCoordinator {
     };
 
     return paginateBackward({
-      client: this.opts.getClient(room.accountId, room.roomId),
-      roomId: room.roomId,
+      client,
+      roomId: room.threadId ?? room.roomId,
       pageSize: cfg.pageSize,
       // 0 ⇒ unbounded (the default); the floor is the natural stop (§9).
       maxMessages: cfg.maxMessages,
@@ -514,7 +695,7 @@ export class GapBackfetchCoordinator {
       utdHaltThreshold: room.floor ? 0 : cfg.utdHaltThreshold,
       logger: this.opts.logger,
       readFailedEvent: "gap_backfetch_read_failed",
-      logFields: { accountId: room.accountId, roomId: room.roomId },
+      logFields: { provider: room.provider, accountId: room.accountId, roomId: room.roomId, threadId: room.threadId },
       onMessage,
     });
   }
@@ -621,8 +802,7 @@ export class GapBackfetchCoordinator {
     const edits = room.backfillBuf
       .filter((i): i is Extract<BufferItem, { kind: "edit" }> => i.kind === "edit")
       .sort((a, b) => a.editTimestamp - b.editTimestamp);
-    // Derive provider from the room's base timeline key (shared grammar, spec §4.2).
-    const editProvider = parseTimelineKey(room.baseTimelineKey)?.provider ?? "matrix";
+    const editProvider = room.provider;
     for (const ed of edits) {
       const targetKey =
         this.opts.timeline.resolveEditTargetTimelineKey(editProvider, ed.targetExternalId, room.baseTimelineKey) ??
@@ -666,8 +846,10 @@ export class GapBackfetchCoordinator {
   /** Observability snapshot (§11): every room's phase and buffered/committed counts. */
   snapshot(): GapBackfetchSnapshotRoom[] {
     return [...this.rooms.values()].map((room) => ({
+      provider: room.provider,
       accountId: room.accountId,
       roomId: room.roomId,
+      ...(room.threadId ? { threadId: room.threadId } : {}),
       baseTimelineKey: room.baseTimelineKey,
       phase: room.phase,
       backfillBuffered: room.backfillBuf.length,
