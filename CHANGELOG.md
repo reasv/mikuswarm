@@ -15,6 +15,7 @@ Accumulate user-visible changes here as they land, under any of:
 
   ### Changed
 
+- **Prefill: past `analysis` arguments are no longer replayed to the model.** They stay in the stored transcript; the wire history is stripped deterministically so prompt caching is unaffected.
 - **Silence is now a tool call.** `no_reply` is part of every chat session's tool set
   (next to `send_message`, same session-type filtering, always in the initial set
   under dynamic loading); calling it ends the turn. The shipped prompts, workspace

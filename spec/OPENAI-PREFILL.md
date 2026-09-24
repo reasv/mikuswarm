@@ -39,6 +39,10 @@ The transform is applied per serving fallback member (not per chain head) via th
 
 The analysis property is also added to each tool's canonical schema as optional (not required) so pi's argument validation accepts it and the transcript retains it as the model's own past function-call arguments. The `execute` wrapper strips it before forwarding to the real tool. On non-prefill fallback members the optional property is harmless (non-strict, optional, never sent).
 
+## Past analyses are not replayed
+
+`applyPrefillToParams` strips `analysis` from every replayed `function_call` input item. The model sees the forced prefix only on the call it is producing; the stored transcript keeps every analysis for later inspection. The strip is deterministic and applied to all past calls, so consecutive requests within a session replay byte-identical history and Bedrock's checkpoint at the previous request's end still hits. Keeping only the last N would rewrite a history item on every turn and lose that cache, so there is no window option. Native encrypted reasoning items are replayed as before and carry the chain of thought between tool steps.
+
 ## no_reply tool
 
 Originally a session-scoped tool registered only when prefill was enabled; since the follow-up commit it is an ordinary catalog tool in every chat session (`src/tools/no-reply.ts`), and the prefill transform treats it like any other tool. Calling it is terminal (`terminate: true`): `isTerminallyValid` and `isExplicitNoReply` in runner.ts both recognize it. The dedup/claim/diary logic treats it identically to the legacy text-based NO_REPLY, which stays accepted but is no longer taught.

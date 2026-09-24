@@ -2135,6 +2135,16 @@ the argument as the model's own past function-call arguments. The `execute` wrap
 strips it before the real tool runs. On non-prefill fallback members the optional
 property is harmless (non-strict, optional, never sent).
 
+**Past analyses are never replayed**: the wire transform strips `analysis` from every
+replayed `function_call` input item, so the model sees the forced prefix only on the
+call it is producing, never repeated down its own history (a long working session
+would otherwise put the same opening in context dozens of times). The stored
+transcript keeps them all. The strip is deterministic and applied to every past call,
+so consecutive requests replay byte-identical history and the Bedrock checkpoint at the
+previous request's end still matches; a windowed variant (keep the last N) would
+rewrite a history item every turn and forfeit that cache, which is why it does not exist.
+The encrypted native reasoning items still carry the chain of thought between steps.
+
 **`no_reply` tool** (`src/tools/no-reply.ts`): part of every chat session's catalog,
 registered next to `send_message` and filtered by the same session-type allowlist; it is
 not prefill-specific. Under a prefill-enabled member the wire transform gives it the

@@ -349,3 +349,39 @@ test("applyPrefillToParams: overrides a pre-existing optional analysis with the 
   assert.equal(p.required[0], "analysis");
   assert.equal(p.required.filter((r) => r === "analysis").length, 1);
 });
+
+// ---------------------------------------------------------------------------
+// Past analyses are never replayed, and the stripped history is byte-stable
+// across consecutive requests (Bedrock checkpoint at the previous request's
+// end must still match).
+// ---------------------------------------------------------------------------
+
+test("applyPrefillToParams: strips analysis from replayed function_call items, history stays byte-stable", () => {
+  const fc = (id: string, analysis: string, text: string) => ({
+    type: "function_call",
+    call_id: id,
+    name: "send_message",
+    arguments: JSON.stringify({ analysis, text }),
+  });
+  const out = (id: string) => ({ type: "function_call_output", call_id: id, output: "ok" });
+  const tools = [{ type: "function", name: "send_message", parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } }];
+  const turn2 = { tools, input: [{ role: "user", content: "hi" }, fc("c1", "We must reply", "a"), out("c1")] };
+  const turn3 = { tools, input: [...turn2.input, fc("c2", "We must follow up", "b"), out("c2")] };
+  const r2 = applyPrefillToParams(turn2, "We must ") as { input: unknown[] };
+  const r3 = applyPrefillToParams(turn3, "We must ") as { input: unknown[] };
+  for (const item of [...r2.input, ...r3.input]) {
+    const it = item as Record<string, unknown>;
+    if (it["type"] !== "function_call") continue;
+    const args = JSON.parse(it["arguments"] as string) as Record<string, unknown>;
+    assert.equal(args["analysis"], undefined, "analysis must not be replayed");
+    assert.ok(typeof args["text"] === "string", "other arguments survive");
+  }
+  assert.equal(JSON.stringify(r3.input.slice(0, r2.input.length)), JSON.stringify(r2.input), "prefix identical across turns");
+  // Inputs are not mutated; the stored transcript keeps the analysis.
+  assert.ok((turn2.input[1] as { arguments: string }).arguments.includes("We must reply"));
+  // Unparseable or analysis-free arguments pass through untouched.
+  const odd = { tools, input: [{ type: "function_call", call_id: "x", name: "t", arguments: "{not json" }, { type: "function_call", call_id: "y", name: "t", arguments: "{\"text\":\"z\"}" }] };
+  const ro = applyPrefillToParams(odd, "We must ") as { input: Array<{ arguments: string }> };
+  assert.equal(ro.input[0]!.arguments, "{not json");
+  assert.equal(ro.input[1]!.arguments, "{\"text\":\"z\"}");
+});

@@ -141,9 +141,34 @@ function applyAnalysisToWireTool(tool: Record<string, unknown>, pattern: string)
 }
 
 /**
+ * Strip the `analysis` argument from a replayed function_call input item.
+ * The stored transcript keeps every analysis (it is the model's own past
+ * arguments); only the wire copy loses it, so the model never sees the
+ * forced prefix repeated across its history. The rewrite is deterministic
+ * (parse, delete, re-serialize in key order) and applied to every past call,
+ * so consecutive requests replay byte-identical history and Bedrock's
+ * checkpoint at the previous request's end still matches.
+ */
+function stripAnalysisFromFunctionCall(item: Record<string, unknown>): Record<string, unknown> {
+  const raw = item["arguments"];
+  if (typeof raw !== "string") return item;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return item;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return item;
+  if (!("analysis" in (parsed as Record<string, unknown>))) return item;
+  const { analysis: _dropped, ...rest } = parsed as Record<string, unknown>;
+  return { ...item, arguments: JSON.stringify(rest) };
+}
+
+/**
  * Apply the prefill wire transform to an OpenAI Responses API params object.
  * - Transforms all tools in params.tools
  * - Transforms deferred tool definitions inside tool_search_output items in params.input
+ * - Strips `analysis` from every replayed function_call item in params.input
  * - Sets tool_choice = "required"
  * Returns a new object; does not mutate the input.
  */
@@ -161,11 +186,13 @@ export function applyPrefillToParams(params: Record<string, unknown>, prefillTex
     });
   }
 
-  // Transform deferred tool definitions in tool_search_output items
+  // Transform deferred tool definitions in tool_search_output items and
+  // strip past analyses from replayed function_call items.
   if (Array.isArray(result["input"])) {
     result["input"] = (result["input"] as unknown[]).map((item) => {
       if (!item || typeof item !== "object") return item;
       const it = item as Record<string, unknown>;
+      if (it["type"] === "function_call") return stripAnalysisFromFunctionCall(it);
       if (it["type"] !== "tool_search_output") return item;
       if (!Array.isArray(it["tools"])) return item;
       return {
