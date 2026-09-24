@@ -2124,9 +2124,13 @@ strips it before the real tool runs. On non-prefill fallback members the optiona
 property is harmless (non-strict, optional, never sent).
 
 **`no_reply` tool**: registered only for prefill-enabled sessions (any chain member).
+Its result carries `terminate: true`, so it ends the run the way a final
+`send_message` does; under `tool_choice = "required"` nothing else could.
 `isTerminallyValid` and `isExplicitNoReply` in `src/agent/runner.ts` recognize it as
 terminal and as explicit no-reply, with the same dedup/claim/diary semantics as the
-text-based `NO_REPLY` marker.
+text-based `NO_REPLY` marker. Under dynamic tool loading it is always in the initial
+wire set (`splitDefsForDynamic` promotes it regardless of the configured `immediate`
+list): deferred behind `tool_search` it could not serve its purpose.
 
 **`drop_reasoning`** (default false): when true, native thinking blocks are stripped
 from outgoing assistant history on the wire (via `onPayload`) without mutating frozen
