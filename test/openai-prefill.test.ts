@@ -269,6 +269,8 @@ test("buildNoReplyTool: execute returns NO_REPLY_CALLED content", async () => {
   assert.equal(tool.name, "no_reply");
   const result = await (tool.execute as Function)("id", {});
   assert.equal((result.content as Array<Record<string, unknown>>)[0]["text"], "NO_REPLY_CALLED");
+  // Under tool_choice = "required" only the tool result can end the run.
+  assert.equal(result.terminate, true);
 });
 
 // ---------------------------------------------------------------------------

@@ -214,7 +214,10 @@ export function buildNoReplyTool(prefillText: string): AgentTool {
     }),
     execute: async (_toolCallId: string, _params: unknown): Promise<AgentToolResult<{ noReply: true }>> => {
       // The content text "NO_REPLY_CALLED" signals explicit no-reply to the runner.
-      return { content: [{ type: "text", text: "NO_REPLY_CALLED" }], details: { noReply: true } };
+      // `terminate: true` ends the run the same way a final send_message does:
+      // under tool_choice = "required" the model can never end a turn with plain
+      // text, so the tool result itself has to stop the loop.
+      return { content: [{ type: "text", text: "NO_REPLY_CALLED" }], details: { noReply: true }, terminate: true };
     },
   } as unknown as AgentTool;
 }
