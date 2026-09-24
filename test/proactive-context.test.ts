@@ -105,7 +105,7 @@ test("proactive build: falls back to a built-in kickoff when none is configured"
     });
     const finalTurn = result.messages[result.messages.length - 1]!;
     assert.ok(finalTurn.content.includes(`It is ${formatAgentTimestamp(wakeAt)}`), "default kickoff used + substituted");
-    assert.ok(finalTurn.content.includes("NO_REPLY"), "default kickoff mentions the NO_REPLY protocol");
+    assert.ok(finalTurn.content.includes("no_reply"), "default kickoff points at the no_reply tool");
   } finally {
     storage.close();
     resetAgentTimezone();

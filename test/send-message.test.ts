@@ -95,7 +95,7 @@ test("media-only send (empty message) still delivers the attachment", async () =
   });
 });
 
-test("empty send with no media is rejected and points at NO_REPLY", async () => {
+test("empty send with no media is rejected and points at no_reply", async () => {
   await withWorkspace(async (workspace) => {
     const { provider, calls } = makeProvider();
     const context: SendMessageToolContext = {
@@ -123,7 +123,7 @@ test("empty send with no media is rejected and points at NO_REPLY", async () => 
     );
     const text = result.content[0]?.type === "text" ? result.content[0].text : "";
     assert.match(text, /^error:/);
-    assert.match(text, /NO_REPLY/);
+    assert.match(text, /no_reply/);
   });
 });
 
