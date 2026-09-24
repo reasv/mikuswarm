@@ -321,12 +321,18 @@ export function isTerminallyValid(messages: unknown[]): boolean {
 
   if (extractTextFromBlocks(blocks).trim() === "NO_REPLY") return true;
   if (blocks.some((b) => b.type === "toolCall" && b.name === "send_message")) return true;
+  if (blocks.some((b) => b.type === "toolCall" && b.name === "no_reply")) return true;
 
   return false;
 }
 
 export function isExplicitNoReply(messages: unknown[]): boolean {
-  return extractLastAssistantText(messages).trim() === "NO_REPLY";
+  const text = extractLastAssistantText(messages).trim();
+  if (text === "NO_REPLY") return true;
+  const last = findLastAssistantMessage(messages);
+  if (!last) return false;
+  const blocks = last.content as Array<{ type: string; name?: string }>;
+  return blocks.some((b) => b.type === "toolCall" && b.name === "no_reply");
 }
 
 /** How many trailing assistant messages `wasAborted` scans for an abort marker. */

@@ -2088,6 +2088,52 @@ A present record in `resuming` (the `runResumeSession` adopt→markRunning gap, 
 
 **Config** (`[agent.sessions.followup.{media,text,mention}]`, cross-field validation in `app.ts` — each lever's `wall_clock_ms ≥ user_gap_ms`): per-lever `enabled`/`user_gap_ms`/`wall_clock_ms`. The whole block is optional (omitting it leaves folding off); `00-defaults.toml` ships all three levers on.
 
+### Model-scoped OpenAI prefill (§8)
+
+`[models.<name>.prefill]` with `enabled = true` and `text = "We must "` forces every
+tool call on that model to begin with an `analysis` argument matching the configured
+prefix. This anchors persona adherence on models (GPT-6 Sol, Luna) that refuse to
+answer as the persona under normal prompting.
+
+**Contract**: validation requires non-empty `text`, `provider = "openai"`, and
+`api = "openai-responses"`. `enabled = false` disables an inherited setting. The
+option applies to agent sessions only; standalone caption calls are unaffected.
+
+**Wire transform** (`src/agent/openai-prefill.ts`, `applyPrefillToParams`): on every
+request to an enabled member, every function tool's parameters schema is transformed
+to strict-compatible form (recursively: optionals to nullable, `additionalProperties:
+false`, unsupported keywords removed) and `analysis: { type: "string", pattern:
+"^<escaped text>[\\s\\S]*" }` is inserted as the first required property with
+`strict: true`. Deferred definitions in `tool_search_output` items receive the same
+transform. `tool_choice` is set to `"required"`.
+
+**Per-serving-member gating**: the transform is applied via the `onPayload` hook
+(composing with the Bedrock cache-breakpoints injector). Each serving fallback
+member's wire Model descriptor carries `compat.prefillText` (the configured text,
+or null if disabled), set by `createModelFromConfig`. The decision follows the member
+actually serving the request, not the chain head.
+
+**Analysis in canonical schema**: each tool's canonical schema gains an optional
+`analysis` string property so pi's validator accepts it and stored transcripts retain
+the argument as the model's own past function-call arguments. The `execute` wrapper
+strips it before the real tool runs. On non-prefill fallback members the optional
+property is harmless (non-strict, optional, never sent).
+
+**`no_reply` tool**: registered only for prefill-enabled sessions (any chain member).
+`isTerminallyValid` and `isExplicitNoReply` in `src/agent/runner.ts` recognize it as
+terminal and as explicit no-reply, with the same dedup/claim/diary semantics as the
+text-based `NO_REPLY` marker.
+
+**`drop_reasoning`** (default false): when true, native thinking blocks are stripped
+from outgoing assistant history on the wire (via `onPayload`) without mutating frozen
+snapshots.
+
+**Why the argument form**: native function calling, pi's parsing, dynamic tool
+loading, Bedrock cache breakpoints, fallback, and budgets all work unchanged. The
+analysis argument is the most in-distribution form for replay. Compared to the
+grammar/wrapper approach in MR !1: no re-billing on skill load, no JSON-in-text
+encoding, no decoder layer needed.
+
 ### Frozen context (built once)
 
 A session's context is built **once, at creation, and is append-only thereafter** — it is never rebuilt per turn. `factory.create()`:

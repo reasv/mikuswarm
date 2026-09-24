@@ -6,6 +6,7 @@ import type { AppConfig } from "../config/index.js";
 import type { AgentModelOverrides } from "./agent-model-overrides.js";
 import { dumpBuiltContext, CACHE_BOUNDARIES, estimateTokens, renderToolBlock, type BuiltContext, type ContextBuilder, type ToolBlockSummary, type ToolDefinitionLike } from "../context/index.js";
 import { makeBreakpointInjector } from "./cache-breakpoints.js";
+import { makePrefillInjector, makeDropReasoningInjector, wrapToolWithAnalysisStripping, buildNoReplyTool } from "./openai-prefill.js";
 import type { ContextMessage } from "../context/builder.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import { convertToLlm } from "./convert.js";
@@ -1373,6 +1374,21 @@ export class AgentSessionFactory {
         ]
       : filteredTools;
 
+    // Prefill: if any chain member has prefill enabled, wrap all catalog tools to
+    // accept an optional analysis argument (so canonical schema validation passes
+    // and transcripts keep the argument) and add the no_reply tool (allows the
+    // model to signal silence via a tool call under tool_choice = "required").
+    const chain = resolveModelChain(modelKey, this.options.config.models);
+    const prefillText = chain.find(
+      (m) => m.config.prefill?.enabled && m.config.prefill.text,
+    )?.config.prefill?.text;
+    const prefillCatalog = prefillText
+      ? [
+          ...sessionCatalog.map(wrapToolWithAnalysisStripping),
+          buildNoReplyTool(prefillText),
+        ]
+      : sessionCatalog;
+
     // Wrap each catalog tool with the result-shaping layer (spec TOOL-RESULT-BUDGET
     // §2) BEFORE the dynamic split, so dynamically loaded tools get result shaping
     // identically to immediate ones (the wrapper spreads the result, preserving
@@ -1380,7 +1396,7 @@ export class AgentSessionFactory {
     // rate-limiting: 20 events/session prevents log floods while still catching
     // the first burst (spec §6).
     let _truncationLogCount = 0;
-    const wrappedTools = wrapToolsWithResultBudget(sessionCatalog, {
+    const wrappedTools = wrapToolsWithResultBudget(prefillCatalog, {
       resultMaxTokens,
       turnBudget,
       getRunningContext: () => {
@@ -1644,7 +1660,13 @@ export class AgentSessionFactory {
       // pi-ai passes the wire Model as the second arg to onPayload, so the gate
       // follows whichever chain member is actually serving the attempt.
       // See ARCHITECTURE.md §8 "Cache control".
-      onPayload: makeBreakpointInjector(estimateTokens),
+      onPayload: (() => {
+        const breakpoints = makeBreakpointInjector(estimateTokens);
+        const prefill = makePrefillInjector();
+        const dropReasoning = makeDropReasoningInjector();
+        return (payload: unknown, model: unknown) =>
+          dropReasoning(prefill(breakpoints(payload, model), model), model);
+      })(),
       steeringMode: "one-at-a-time",
       sessionId: session.timelineKey,
       // Dynamic tool loading (spec DYNAMIC-TOOL-LOADING §7): a load event mid-run
@@ -2533,6 +2555,12 @@ export function createModelFromConfig(model: ModelConfig, contextWindow?: number
       // chain head).  Only meaningful on openai-responses members backed by Bedrock;
       // undefined on all other models so the injector passes their payloads through.
       cacheBreakpoints: model.cache_breakpoints,
+      // Carry the prefill text on the wire Model descriptor so the onPayload
+      // injector can gate per serving member (not per chain head). null means
+      // prefill is disabled for this member.
+      prefillText: model.prefill?.enabled && model.prefill.text ? model.prefill.text : null,
+      // When true, strip native thinking blocks from outgoing assistant history.
+      dropReasoning: model.prefill?.enabled && model.prefill.drop_reasoning ? true : undefined,
     },
   };
 }

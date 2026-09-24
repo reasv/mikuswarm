@@ -25,6 +25,9 @@ Unreleased section; it is not part of any release's notes.
 
 ### Added
 
+- **OpenAI Responses API prefill**: `[models.<name>.prefill]` forces a required `analysis` argument on every tool call via strict JSON schema `pattern`, anchoring persona adherence on GPT-6 Sol/Luna. Includes `no_reply` tool, `drop_reasoning` option, and per-serving-member gating via `onPayload`. See spec/OPENAI-PREFILL.md.
+- **Captioning via OpenAI Responses API**: `[models.*]` with `api = "openai-responses"` can now serve as a caption model for images. Incomplete, refused, and unsupported-modality results are classified as content failures. (Port of MR !1 captioning code by contributor nopm.)
+
 - **Bedrock explicit prompt-cache breakpoints** (`cache_breakpoints = "explicit"` on
   `[models.<name>]` with `api = "openai-responses"`). Injects up to 3 explicit
   breakpoints at the stable prefix boundaries (agent instructions, conversation
