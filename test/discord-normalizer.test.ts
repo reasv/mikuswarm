@@ -561,15 +561,21 @@ describe("normalizeDiscordMessage: key shapes", () => {
 // ── Embed previews in normalizeDiscordMessage ─────────────────────────────────
 
 describe("normalizeDiscordMessage: embed previews", () => {
-  it("embeds are returned as embedPreviews and attached to event.linkPreviews", () => {
+  it("embeds are attached to event.linkPreviews as discord_embed previews", () => {
     const msg = baseMsg({
       embeds: [{ url: "https://example.com", title: "Test" }],
     });
-    const { inbound, embedPreviews } = normalizeDiscordMessage(msg, baseCtx);
-    assert.equal(embedPreviews.length, 1);
-    assert.equal(embedPreviews[0]!.sourceKind, "discord_embed");
-    // Also on the canonical event
+    const { inbound } = normalizeDiscordMessage(msg, baseCtx);
+    // The canonical event carries them; the timeline store persists them with
+    // the event row (test/discord-ingest-embeds.test.ts).
     assert.equal(inbound.event.linkPreviews?.length, 1);
+    assert.equal(inbound.event.linkPreviews?.[0]?.sourceKind, "discord_embed");
+    assert.equal(inbound.event.linkPreviews?.[0]?.url, "https://example.com");
+  });
+
+  it("a message without embeds carries no linkPreviews", () => {
+    const { inbound } = normalizeDiscordMessage(baseMsg({ embeds: [] }), baseCtx);
+    assert.equal(inbound.event.linkPreviews, undefined);
   });
 });
 

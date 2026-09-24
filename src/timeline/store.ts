@@ -89,6 +89,12 @@ export class TimelineStore {
         isBackfetch: options?.isBackfetch ? 1 : 0,
       });
 
+      // Ingest-time link previews (e.g. Discord embeds delivered with the
+      // message) are written here, in the same transaction as the event row —
+      // never as a separate write that could be queued ahead of it and trip the
+      // link_previews.event_id FK.
+      this.storage.insertIngestLinkPreviews(db, event);
+
       // Replay a pending edit that arrived before this target was stored (issue
       // #12). Scoped by (provider, externalId, timelineKey) for the same
       // multi-account reason as the edit lookup (issue #3). Same transaction as

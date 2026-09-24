@@ -1440,8 +1440,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
 
     // Construct DiscordProvider when [discord] is enabled and has accounts.
     // Callbacks close over storage (already initialized above) to perform
-    // late-embed merges and ingest-time embed writes without coupling the
-    // provider to the storage module directly (spec §8.3 / §9.3).
+    // late-embed merges and identity/channel upserts without coupling the
+    // provider to the storage module directly (spec §8.3 / §6.5 / §6.6).
+    // Ingest-time embeds need no callback: they ride on `event.linkPreviews`
+    // and the timeline store persists them in the same write as the event row.
     if (config.discord?.enabled && config.discord.accounts && Object.keys(config.discord.accounts).length > 0) {
       const discordProvider = new DiscordProvider(config.discord, {
         async mergeLateEmbeds(provider, externalId, timelineKey, previews) {
@@ -1453,24 +1455,6 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             await storage.insertLinkPreview({
               id: `${event.id}:late_embed:${i}`,
               event_id: event.id,
-              context: "message",
-              url: preview.url,
-              title: preview.title ?? null,
-              description: preview.description ?? null,
-              source_kind: "discord_embed",
-              preview_index: i,
-              fetched_at: preview.fetchedAt ?? Date.now(),
-              fetch_status: "complete",
-              created_at: Date.now(),
-            });
-          }
-        },
-        async storeIngestEmbeds(eventId, previews) {
-          for (let i = 0; i < previews.length; i++) {
-            const preview = previews[i]!;
-            await storage.insertLinkPreview({
-              id: `${eventId}:embed:${i}`,
-              event_id: eventId,
               context: "message",
               url: preview.url,
               title: preview.title ?? null,

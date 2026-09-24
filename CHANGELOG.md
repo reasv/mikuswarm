@@ -36,6 +36,18 @@ Unreleased section; it is not part of any release's notes.
   rewriting ~28k tokens at each session start. Default off; ignored on all wire
   APIs other than `openai-responses`.
 
+### Fixed
+
+- **Discord: messages carrying an embed at delivery time lost it** (`provider_error`
+  `FOREIGN KEY constraint failed` in `messageCreate`). On an active channel the
+  inbound pipeline yields to the activation gate before it enqueues the event
+  insert, so the provider's separate ingest-embed write landed on the single-writer
+  queue first and failed the `link_previews → timeline_events` foreign key. Typical
+  victims were bot replies (link-fixer bots) whose embed is already in the payload.
+  Ingest-time previews now ride on the event and are persisted in the same write
+  transaction as the event row on every ingest path (active, inactive, trigger-hold
+  flush, backfetch). The message itself was never lost; only its preview was.
+
 ## [v0.5.1] - 2026-09-13
 
 ### Fixed

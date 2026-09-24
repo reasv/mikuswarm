@@ -22,7 +22,6 @@ import { EmojiCatalog } from "../src/discord/emoji-catalog.js";
 
 const noopCallbacks: DiscordProviderCallbacks = {
   async mergeLateEmbeds() {},
-  async storeIngestEmbeds() {},
   async upsertUserIdentity() {},
   async setChannelMetadata() {},
 };

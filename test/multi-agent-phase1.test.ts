@@ -713,7 +713,6 @@ test("§9 reply-trigger: Discord sibling reply does not produce a trigger", asyn
   // Minimal callbacks (no real storage — we only care about the trigger path)
   const callbacks: DiscordProviderCallbacks = {
     async mergeLateEmbeds() {},
-    async storeIngestEmbeds() {},
     async upsertUserIdentity() {},
     async setChannelMetadata() {},
   };

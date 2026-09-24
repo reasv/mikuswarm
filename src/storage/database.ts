@@ -2181,7 +2181,54 @@ export class Storage {
         createdAt: now,
         updatedAt: now,
       });
+      this.insertIngestLinkPreviews(db, event);
     });
+  }
+
+  /**
+   * Persist the link previews a provider resolved at ingest time
+   * (`event.linkPreviews`, e.g. embeds delivered inside a Discord MESSAGE_CREATE
+   * payload) as `link_previews` rows, in the SAME write job as the event row.
+   *
+   * Runs inside the caller's write/transaction (`db` is the single-writer
+   * handle): the rows carry a `link_previews.event_id → timeline_events(id)` FK,
+   * so they must never be enqueued as a separate write that could land ahead of
+   * the event insert. Any path that persists an inbound event — live ingest on an
+   * active timeline (where the pipeline yields to the activation gate before it
+   * enqueues the insert), the inactive/held store, trigger-hold flush, backfetch
+   * — therefore gets the previews for free and in order. Idempotent
+   * (`insert or replace` keyed on `{eventId}:embed:{i}`); a no-op for events
+   * without ingest previews (Matrix/IRC, where previews come from enrichment).
+   */
+  insertIngestLinkPreviews(db: Database.Database, event: CanonicalChatEvent): void {
+    const previews = event.linkPreviews;
+    if (!previews || previews.length === 0) return;
+    const now = Date.now();
+    const stmt = db.prepare(
+      `insert or replace into link_previews (
+        id, event_id, context, url, title, description, site_name,
+        source_kind, preview_index, fetched_at, fetch_status, error,
+        payload_json, created_at
+      ) values (
+        @id, @eventId, 'message', @url, @title, @description, null,
+        @sourceKind, @previewIndex, @fetchedAt, 'complete', null,
+        null, @createdAt
+      )`,
+    );
+    for (let i = 0; i < previews.length; i++) {
+      const preview = previews[i]!;
+      stmt.run({
+        id: `${event.id}:embed:${i}`,
+        eventId: event.id,
+        url: preview.url,
+        title: preview.title ?? null,
+        description: preview.description ?? null,
+        sourceKind: preview.sourceKind ?? null,
+        previewIndex: i,
+        fetchedAt: preview.fetchedAt ?? now,
+        createdAt: now,
+      });
+    }
   }
 
   /**

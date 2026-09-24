@@ -423,11 +423,6 @@ export interface DiscordNormalizeResult {
   inbound: InboundChatEvent;
   /** Custom emoji pairs observed in this message (name → id). */
   emojiObservations: Array<{ name: string; id: string; animated: boolean }>;
-  /**
-   * Embed previews for ingest-time storage (spec §8.1 / §9.3).
-   * Written to link_previews with source_kind = 'discord_embed' at ingest time.
-   */
-  embedPreviews: LinkPreviewMeta[];
 }
 
 /**
@@ -532,7 +527,7 @@ export function normalizeDiscordMessage(
     },
   };
 
-  return { inbound, emojiObservations, embedPreviews };
+  return { inbound, emojiObservations };
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

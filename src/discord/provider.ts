@@ -123,7 +123,6 @@ interface AccountRuntime {
 
 interface PendingTrigger {
   event: import("../types.js").InboundChatEvent;
-  embedPreviews: LinkPreviewMeta[];
   timer: NodeJS.Timeout;
 }
 
@@ -145,17 +144,6 @@ export interface DiscordProviderCallbacks {
     provider: string,
     externalId: string,
     timelineKey: string,
-    previews: LinkPreviewMeta[],
-  ): Promise<void>;
-
-  /**
-   * Called at ingest time after the provider stores discord_embed link previews
-   * for a new message. Allows the storage layer to write them before enrichment.
-   * Each preview corresponds to one embed with a URL.
-   * Silently ignored if there are no previews.
-   */
-  storeIngestEmbeds(
-    eventId: string,
     previews: LinkPreviewMeta[],
   ): Promise<void>;
 
@@ -989,7 +977,9 @@ export class DiscordProvider implements IChatProvider {
       siblingRepliesMode: this.siblingRepliesMode,
     };
 
-    const { inbound, embedPreviews } = normalizeDiscordMessage(msgData, ctx);
+    // Embeds delivered with the payload ride on `inbound.event.linkPreviews`;
+    // the timeline store persists them in the same write as the event row.
+    const { inbound } = normalizeDiscordMessage(msgData, ctx);
 
     // Record custom emoji observed inline so the catalog can display them later.
     // These are NOT added to the sendable set (spec §10.2/§10.3).
@@ -1014,24 +1004,15 @@ export class DiscordProvider implements IChatProvider {
     }).catch(() => {});
 
     // Self-sent message: mark isSelf and flow through for echo-merge.
-    // host.onEvent first (synchronously enqueues the FIFO single-writer event insert),
-    // then storeIngestEmbeds (so the link_previews FK on timeline_events(id) is
-    // satisfied — the event row is always committed before the preview rows).
     if (isSelf) {
       inbound.event.sender.isSelf = true;
       this.host!.onEvent(inbound);
-      if (embedPreviews.length > 0) {
-        await this.callbacks.storeIngestEmbeds(inbound.event.id, embedPreviews);
-      }
       return;
     }
 
     // Trigger-hold mechanism (mirrors Matrix provider, spec §8.4).
-    // embedPreviews are passed into the hold structure and stored at flush time,
-    // after host.onEvent fires, so the link_previews FK on timeline_events(id) is
-    // satisfied on the held path too.
     if (inbound.trigger && this.config.trigger_hold_ms) {
-      this.applyTriggerHold(runtime, inbound, embedPreviews);
+      this.applyTriggerHold(runtime, inbound);
       return;
     }
 
@@ -1058,11 +1039,7 @@ export class DiscordProvider implements IChatProvider {
       }
     }
 
-    // host.onEvent first, then embeds (same FK ordering reason as above).
     this.host!.onEvent(inbound);
-    if (embedPreviews.length > 0) {
-      await this.callbacks.storeIngestEmbeds(inbound.event.id, embedPreviews);
-    }
   }
 
   private async handleMessageUpdate(
@@ -1280,14 +1257,10 @@ export class DiscordProvider implements IChatProvider {
   private applyTriggerHold(
     runtime: AccountRuntime,
     inbound: import("../types.js").InboundChatEvent,
-    embedPreviews: LinkPreviewMeta[],
   ): void {
     const holdMs = this.config.trigger_hold_ms ?? 0;
     if (!holdMs) {
       this.host!.onEvent(inbound);
-      if (embedPreviews.length > 0) {
-        void this.callbacks.storeIngestEmbeds(inbound.event.id, embedPreviews);
-      }
       return;
     }
 
@@ -1299,25 +1272,18 @@ export class DiscordProvider implements IChatProvider {
       // Read holdStartedAt from the EXISTING held trigger (not the incoming event)
       // so a steady drip of triggers cannot extend the hold beyond 4× from the
       // FIRST trigger (mirrors Matrix provider logic, src/matrix/provider.ts:~347).
-      // The incoming event's embedPreviews replace the held ones; each event's
-      // previews stay paired with that event's id (only the final merged event is
-      // flushed to host.onEvent, so only its previews are stored).
+      // Only the final merged event is flushed to host.onEvent; its ingest embeds
+      // travel on `event.linkPreviews`, so they are stored with it at flush.
       const now = Date.now();
       const startedAt = existing.event.trigger?.holdStartedAt ?? now;
       const maxEnd = startedAt + holdMs * TRIGGER_HOLD_MAX_MULTIPLIER;
       const remaining = Math.max(0, Math.min(holdMs, maxEnd - now));
       clearTimeout(existing.timer);
       existing.event = inbound;
-      existing.embedPreviews = embedPreviews;
       existing.timer = setTimeout(() => {
         this.pendingTriggers.delete(key);
         if (!this.stopped) {
           this.host!.onEvent(existing.event);
-          // Store embeds after host.onEvent so link_previews FK on timeline_events(id)
-          // is satisfied on the held path: event row is enqueued first, previews after.
-          if (existing.embedPreviews.length > 0) {
-            void this.callbacks.storeIngestEmbeds(existing.event.event.id, existing.embedPreviews);
-          }
         }
       }, remaining);
       return;
@@ -1328,18 +1294,12 @@ export class DiscordProvider implements IChatProvider {
       inbound.trigger.holdStartedAt = Date.now();
     }
     // Build pending structure first so the flush closure references it by identity;
-    // subsequent merges that update pending.event / pending.embedPreviews are visible
-    // when the timer fires.
-    const pending: PendingTrigger = { event: inbound, embedPreviews, timer: undefined! };
+    // subsequent merges that update pending.event are visible when the timer fires.
+    const pending: PendingTrigger = { event: inbound, timer: undefined! };
     pending.timer = setTimeout(() => {
       this.pendingTriggers.delete(key);
       if (!this.stopped) {
         this.host!.onEvent(pending.event);
-        // Store embeds after host.onEvent so link_previews FK on timeline_events(id)
-        // is satisfied on the held path: event row is enqueued first, previews after.
-        if (pending.embedPreviews.length > 0) {
-          void this.callbacks.storeIngestEmbeds(pending.event.event.id, pending.embedPreviews);
-        }
       }
     }, holdMs);
     this.pendingTriggers.set(key, pending);

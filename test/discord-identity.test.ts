@@ -95,7 +95,6 @@ describe("handleMessageCreate: upsertUserIdentity", () => {
     const captured: UserIdentityUpsertInput[] = [];
     const callbacks: DiscordProviderCallbacks = {
       async mergeLateEmbeds() {},
-      async storeIngestEmbeds() {},
       async upsertUserIdentity(input) { captured.push({ ...input }); },
       async setChannelMetadata() {},
     };
@@ -127,7 +126,6 @@ describe("handleMessageCreate: upsertUserIdentity", () => {
     const captured: UserIdentityUpsertInput[] = [];
     const callbacks: DiscordProviderCallbacks = {
       async mergeLateEmbeds() {},
-      async storeIngestEmbeds() {},
       async upsertUserIdentity(input) { captured.push({ ...input }); },
       async setChannelMetadata() {},
     };
@@ -160,7 +158,6 @@ describe("handleMessageCreate: setChannelMetadata", () => {
     const capturedMeta: Array<[string, { displayName: string; serverId?: string; serverName?: string }]> = [];
     const callbacks: DiscordProviderCallbacks = {
       async mergeLateEmbeds() {},
-      async storeIngestEmbeds() {},
       async upsertUserIdentity() {},
       async setChannelMetadata(timelineKey, meta) {
         capturedMeta.push([timelineKey, { ...meta }]);
@@ -191,7 +188,6 @@ describe("handleMessageCreate: setChannelMetadata", () => {
     const capturedMeta: Array<{ serverId?: string; serverName?: string }> = [];
     const callbacks: DiscordProviderCallbacks = {
       async mergeLateEmbeds() {},
-      async storeIngestEmbeds() {},
       async upsertUserIdentity() {},
       async setChannelMetadata(_key, meta) { capturedMeta.push({ ...meta }); },
     };
@@ -232,7 +228,6 @@ describe("onSelfResolved callback", () => {
     const resolved: Array<[string, string]> = [];
     const callbacks: DiscordProviderCallbacks = {
       async mergeLateEmbeds() {},
-      async storeIngestEmbeds() {},
       async upsertUserIdentity() {},
       async setChannelMetadata() {},
       onSelfResolved(accountId, selfId) {
@@ -254,7 +249,6 @@ describe("onSelfResolved callback", () => {
   it("absence of onSelfResolved doesn't crash when READY fires", () => {
     const callbacks: DiscordProviderCallbacks = {
       async mergeLateEmbeds() {},
-      async storeIngestEmbeds() {},
       async upsertUserIdentity() {},
       async setChannelMetadata() {},
       // onSelfResolved intentionally absent

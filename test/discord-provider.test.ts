@@ -18,8 +18,9 @@
  *  - Dual-provider boot wiring test (construction only, no start)
  *  - membershipRoster reflects any member_intent=true account
  *  - BLOCKER 1: referencedMessage via channel message cache (discord.js v14 fix)
- *  - BLOCKER 2: storeIngestEmbeds runs after host.onEvent (FK ordering via real Storage)
- *  - MODERATE: trigger-hold FK ordering — embeds stored at flush, after host.onEvent fires
+ *  - (ingest-time embed persistence — incl. the trigger-hold flush — lives in
+ *    test/discord-ingest-embeds.test.ts: previews ride on event.linkPreviews and
+ *    are written by the timeline store in the same transaction as the event row)
  *  - MAJOR: @username → <@id> mention resolution in send path (spec §7.3, §14)
  *  - MINOR: case-insensitive username match in resolveMentionTokens
  *  - NIT 2: MESSAGE_UPDATE routing — null editedTimestamp vs non-null
@@ -34,12 +35,9 @@ import {
   DiscordChannelClient,
   EmojiCatalog,
   resolveMentionTokens,
-  normalizeDiscordMessage,
   type DiscordProviderCallbacks,
 } from "../src/discord/index.js";
 import { MatrixProvider } from "../src/matrix/index.js";
-import { Storage, type LinkPreviewRow } from "../src/storage/index.js";
-import { TimelineStore } from "../src/timeline/index.js";
 import type { AppConfig } from "../src/config/index.js";
 import type { IChatProvider } from "../src/types.js";
 import type { TextChannel, DMChannel } from "discord.js";
@@ -48,7 +46,6 @@ import type { TextChannel, DMChannel } from "discord.js";
 
 const noopCallbacks: import("../src/discord/provider.js").DiscordProviderCallbacks = {
   async mergeLateEmbeds() {},
-  async storeIngestEmbeds() {},
   async upsertUserIdentity() {},
   async setChannelMetadata() {},
 };
@@ -468,7 +465,6 @@ describe("BLOCKER 1: referencedMessage — channel message cache lookup", () => 
     let capturedInbound: unknown;
     const callbacks: DiscordProviderCallbacks = {
       async mergeLateEmbeds() {},
-      async storeIngestEmbeds() {},
       async upsertUserIdentity() {},
       async setChannelMetadata() {},
     };
@@ -522,196 +518,6 @@ describe("BLOCKER 1: referencedMessage — channel message cache lookup", () => 
     assert.equal(event.replyTo.sender?.username, "carol");
   });
 });
-
-// ── BLOCKER 2: FK ordering (storeIngestEmbeds after host.onEvent) ─────────────
-
-describe("BLOCKER 2: storeIngestEmbeds runs after host.onEvent (FK ordering)", () => {
-  it("message with embeds: both event row and preview rows committed via real in-memory Storage", async () => {
-    const storage = await Storage.open({ databasePath: ":memory:" });
-    try {
-      const timeline = new TimelineStore(storage);
-
-      // Wire callbacks exactly as app.ts does — real Storage writes
-      const callbacks: DiscordProviderCallbacks = {
-        async mergeLateEmbeds() {},
-        async storeIngestEmbeds(eventId, previews) {
-          for (let i = 0; i < previews.length; i++) {
-            const preview = previews[i]!;
-            await storage.insertLinkPreview({
-              id: `${eventId}:embed:${i}`,
-              event_id: eventId,
-              context: "message",
-              url: preview.url,
-              title: preview.title ?? null,
-              description: preview.description ?? null,
-              source_kind: "discord_embed",
-              preview_index: i,
-              fetched_at: preview.fetchedAt ?? Date.now(),
-              fetch_status: "complete",
-              created_at: Date.now(),
-            } satisfies LinkPreviewRow);
-          }
-        },
-        async upsertUserIdentity() {},
-        async setChannelMetadata() {},
-      };
-
-      // Build an inbound event with embed previews using the normalizer directly
-      const { inbound, embedPreviews } = normalizeDiscordMessage(
-        {
-          id: "100000000000000001",
-          content: "check this out",
-          channelId: "200000000000000001",
-          channelType: 0,
-          guildId: "300000000000000001",
-          authorId: "400000000000000001",
-          authorUsername: "alice",
-          authorDisplayName: "Alice",
-          timestamp: 1_700_000_000_000,
-          editedTimestamp: null,
-          mentionedUsers: [],
-          mentionedRoles: [],
-          mentionedChannels: [],
-          mentionEveryone: false,
-          attachments: [],
-          stickers: [],
-          embeds: [{ url: "https://example.com/article", title: "Example" }],
-        },
-        { accountId: "main", selfUserId: "999" },
-      );
-      assert.equal(embedPreviews.length, 1, "test requires at least one embed preview");
-
-      // Simulate the FIXED ordering: host.onEvent first (enqueues event write),
-      // then await storeIngestEmbeds (queues preview write after event write).
-      // The FIFO single-writer queue ensures the event row exists before the FK check.
-      const appendPromise = timeline.append(inbound.event);
-      await callbacks.storeIngestEmbeds(inbound.event.id, embedPreviews);
-      await appendPromise;
-
-      const eventCount = storage.read((db) =>
-        (db.prepare("select count(*) as n from timeline_events where id = ?")
-          .get(inbound.event.id) as { n: number }).n,
-      );
-      const previewCount = storage.read((db) =>
-        (db.prepare("select count(*) as n from link_previews where event_id = ?")
-          .get(inbound.event.id) as { n: number }).n,
-      );
-      assert.equal(eventCount, 1, "timeline_events row must exist");
-      assert.equal(previewCount, 1, "link_previews row must exist (FK satisfied)");
-    } finally {
-      storage.close();
-    }
-  });
-});
-
-// ── MODERATE: trigger-hold FK ordering ───────────────────────────────────────
-
-describe("MODERATE: trigger-hold FK ordering — embeds stored after hold flush", () => {
-  it("trigger_hold_ms > 0, triggered message with embeds → event row and preview rows both exist after flush", async () => {
-    const storage = await Storage.open({ databasePath: ":memory:" });
-    try {
-      const timeline = new TimelineStore(storage);
-
-      const callbacks: DiscordProviderCallbacks = {
-        async mergeLateEmbeds() {},
-        async storeIngestEmbeds(eventId, previews) {
-          for (let i = 0; i < previews.length; i++) {
-            const preview = previews[i]!;
-            await storage.insertLinkPreview({
-              id: `${eventId}:embed:${i}`,
-              event_id: eventId,
-              context: "message",
-              url: preview.url,
-              title: preview.title ?? null,
-              description: preview.description ?? null,
-              source_kind: "discord_embed",
-              preview_index: i,
-              fetched_at: preview.fetchedAt ?? Date.now(),
-              fetch_status: "complete",
-              created_at: Date.now(),
-            } satisfies LinkPreviewRow);
-          }
-        },
-        async upsertUserIdentity() {},
-        async setChannelMetadata() {},
-      };
-
-      // trigger_hold_ms = 5 ms (very short) so the hold fires well within the wait below
-      const provider = new DiscordProvider(
-        makeDiscordConfig({ trigger_hold_ms: 5 }),
-        callbacks,
-      );
-
-      let capturedInbound: { event: { id: string } } | undefined;
-      (provider as unknown as Record<string, unknown>).host = {
-        onEvent(inbound: unknown) {
-          capturedInbound = inbound as { event: { id: string } };
-          // Mirror app.ts: append the event to storage via the timeline store
-          void timeline.append((inbound as { event: Parameters<TimelineStore["append"]>[0] }).event);
-        },
-        resolveReplyTrigger: () => undefined,
-      };
-
-      // DM channel (type 1) auto-triggers without needing a bot mention.
-      // The message carries one embed so embedPreviews will be non-empty.
-      const dmMsgWithEmbed = makeMsgStub({
-        channel: {
-          type: 1, // DM
-          messages: { cache: { get: () => undefined } },
-        },
-        guildId: null, // DMs have no guild
-        embeds: [
-          {
-            url: "https://example.com/trigger-hold-test",
-            title: "Test Title",
-            description: null,
-            provider: null,
-            data: { type: null },
-          },
-        ],
-      });
-
-      // Call handleMessageCreate — the hold timer starts but does NOT fire yet
-      await (provider as unknown as Record<string, (...args: unknown[]) => unknown>)
-        .handleMessageCreate(makeRuntime("main"), dmMsgWithEmbed);
-
-      // host.onEvent must NOT have been called yet (still within the hold window)
-      assert.equal(capturedInbound, undefined, "host.onEvent must not fire before the hold expires");
-
-      // Wait for the hold timer to fire and for the async storage writes to settle.
-      // trigger_hold_ms = 5 ms; waiting 80 ms is well beyond both the timer and the
-      // single-writer queue flush time.
-      await new Promise<void>((resolve) => setTimeout(resolve, 80));
-
-      assert.ok(capturedInbound, "host.onEvent must have fired after the hold expires");
-      const eventId = capturedInbound.event.id;
-
-      // Verify both rows exist — FK constraint would have rejected the preview row
-      // if the event row had not been written first.
-      const eventCount = storage.read((db) =>
-        (
-          db.prepare("select count(*) as n from timeline_events where id = ?").get(eventId) as {
-            n: number;
-          }
-        ).n,
-      );
-      const previewCount = storage.read((db) =>
-        (
-          db.prepare("select count(*) as n from link_previews where event_id = ?").get(
-            eventId,
-          ) as { n: number }
-        ).n,
-      );
-
-      assert.equal(eventCount, 1, "timeline_events row must exist after hold flush");
-      assert.equal(previewCount, 1, "link_previews row must exist (FK satisfied) after hold flush");
-    } finally {
-      storage.close();
-    }
-  });
-});
-
-// ── MAJOR: @username mention resolution in send path (spec §7.3, §14) ─────────
 
 /** Build a stubbed TextChannel with a controlled guild member cache + REST search. */
 function makeGuildChannel(opts: {
@@ -876,7 +682,6 @@ describe("NIT 2: MESSAGE_UPDATE routing", () => {
       async mergeLateEmbeds(_p, _id, _key, previews) {
         mergedPreviews.push(...previews);
       },
-      async storeIngestEmbeds() {},
       async upsertUserIdentity() {},
       async setChannelMetadata() {},
     };
@@ -905,7 +710,6 @@ describe("NIT 2: MESSAGE_UPDATE routing", () => {
 
     const callbacks: DiscordProviderCallbacks = {
       async mergeLateEmbeds() { mergeCalled = true; },
-      async storeIngestEmbeds() {},
       async upsertUserIdentity() {},
       async setChannelMetadata() {},
     };
