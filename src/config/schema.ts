@@ -714,6 +714,21 @@ const ModelSchema = StrictObject({
     requires_reasoning_content_on_assistant_messages: Type.Optional(Type.Boolean()),
   })),
   prefill: Type.Optional(PrefillSchema),
+  // openai-responses only. Inject explicit prompt-cache breakpoints at stable
+  // prefix boundaries (agent instructions, conversation summary, last stable
+  // timeline item) so the shared prefix is reusable across sessions on
+  // providers that use checkpoint-based caching (e.g. Amazon Bedrock for
+  // OpenAI models — GPT-5.6 Sol/Terra/Luna, GPT-6 Sol/Luna). Each breakpoint
+  // marks a point up to which the prefix is byte-stable: the provider caches
+  // it and bills subsequent requests with the same prefix at the cache-read
+  // rate (0.1× input) rather than cache-write (1.25×). Up to 3 explicit
+  // breakpoints are injected; the provider's implicit automatic breakpoint
+  // occupies the 4th slot (30-minute TTL, >= 1024 cumulative tokens required
+  // per breakpoint). Only valid for `api = "openai-responses"`; ignored on all
+  // other wire APIs (the field has no effect on direct OpenAI, which uses
+  // block-prefix matching instead). Default: unset (off).
+  // Enable with: cache_breakpoints = "explicit"
+  cache_breakpoints: Type.Optional(Type.Literal("explicit")),
 });
 
 const MatrixAccountSchema = StrictObject({
