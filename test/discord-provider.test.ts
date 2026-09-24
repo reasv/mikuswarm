@@ -239,6 +239,18 @@ describe("DiscordProvider.enrichment", () => {
     const caps = p.enrichment("unknown-account");
     assert.equal(caps, undefined);
   });
+
+  it("omits messageSummary: reply context comes from the ingest snapshot / stored event, never a REST lookup", () => {
+    const p = new DiscordProvider(makeDiscordConfig(), noopCallbacks);
+    (p as unknown as { accounts: Map<string, unknown> }).accounts.set("main", {
+      client: { guilds: { cache: new Map() } },
+    });
+    const caps = p.enrichment("main");
+    assert.ok(caps, "capabilities for a running account");
+    assert.equal(caps.messageSummary, undefined);
+    assert.equal(caps.resolveLinkPreviews, undefined);
+    assert.equal(typeof caps.memberInfo, "function");
+  });
 });
 
 // ── history() returns undefined ───────────────────────────────────────────────

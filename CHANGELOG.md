@@ -48,6 +48,17 @@ Unreleased section; it is not part of any release's notes.
   transaction as the event row on every ingest path (active, inactive, trigger-hold
   flush, backfetch). The message itself was never lost; only its preview was.
 
+- **Discord: every reply rendered its quoted message as `[original message
+  unavailable]`** and logged `enrichment_reply_target_missing`. The Discord
+  provider's reply-context lookup (`messageSummary`) was a stub that always
+  answered "no such message", so enrichment wrote a body-less `reply_contexts`
+  row for every reply — and that stub row overrode the full quote the message
+  already carried from the gateway payload at hydration time. The provider
+  lookup is now optional; when a provider has none, the enrichment worker
+  resolves the target from the event's own ingest-time reply snapshot (body or
+  attachments) and then from the stored copy of the target message, and only
+  warns when both come up empty. Matrix keeps its native lookup unchanged.
+
 ## [v0.5.1] - 2026-09-13
 
 ### Fixed

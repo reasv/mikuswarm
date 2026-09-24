@@ -1,8 +1,8 @@
 import { nanoid } from "nanoid";
 import { unlink } from "node:fs/promises";
-import type { CanonicalChatEvent } from "../types.js";
+import type { AttachmentMeta, CanonicalChatEvent } from "../types.js";
 import type { MediaAssetRow, LinkPreviewRow, ReplyContextRow, Storage } from "../storage/index.js";
-import type { EnrichmentCapabilities, EnrichmentResult } from "./types.js";
+import type { EnrichmentCapabilities, EnrichmentResult, ReplyTargetSummary } from "./types.js";
 import type { FetchClient } from "./fetch-client.js";
 import { saveMediaToWorkspace, moveFileToWorkspace, generateTempDownloadPath } from "./media.js";
 import type { AttachmentStore } from "./attachment-store.js";
@@ -288,13 +288,12 @@ export class EnrichmentWorker {
     if (!replyToId) return;
 
     try {
-      const summary = await this.options.capabilities.messageSummary({
-        roomId,
-        eventId: replyToId,
-      });
+      const summary = await this.lookupReplyTarget(event, roomId, replyToId);
       if (!summary) {
-        // Target genuinely unrepresentable (redacted, non-message, …) — stub it
-        // so the renderer can say "unavailable", and say why in the log.
+        // Every source came up empty (provider says unrepresentable — redacted,
+        // non-message, … — or, without a provider lookup, neither the ingest
+        // snapshot nor our stored copy knows the target). Stub it so the
+        // renderer can say "unavailable", and say why in the log.
         this.options.logger.warn("enrichment_reply_target_missing", {
           eventId: event.id,
           replyToId,
@@ -341,6 +340,68 @@ export class EnrichmentWorker {
   }
 
   /**
+   * Resolve the replied-to message into a {@link ReplyTargetSummary}.
+   *
+   * 1. **Provider lookup** (`capabilities.messageSummary`) when the provider
+   *    implements one — authoritative: its answer (including `null`) is final
+   *    and no fallback runs. Matrix lives here; the native summary applies the
+   *    reply-fallback stripping and UTD handling of §6 that a stored copy could
+   *    not reproduce.
+   * 2. **Ingest-time snapshot** (`event.replyTo`) when it carries a body or
+   *    attachments. Providers whose payload includes the referenced message
+   *    (Discord `referenced_message`) populate this at normalization, and it is
+   *    refreshed on every reply — so it reflects edits and carries re-signed
+   *    CDN URLs, which our stored copy may not. A sender-only stub (author
+   *    known, empty body, no attachments — what Discord builds on a message
+   *    cache miss) does not count as resolved.
+   * 3. **Stored copy** (`timeline_events` by provider / external id / timeline
+   *    key) — the target was ingested earlier on this timeline even though the
+   *    provider could not quote it now.
+   *
+   * `null` when all applicable sources come up empty.
+   */
+  private async lookupReplyTarget(
+    event: CanonicalChatEvent,
+    roomId: string,
+    replyToId: string,
+  ): Promise<ReplyTargetSummary | null> {
+    const messageSummary = this.options.capabilities.messageSummary;
+    if (messageSummary) {
+      return await messageSummary.call(this.options.capabilities, { roomId, eventId: replyToId });
+    }
+
+    const snapshot = event.replyTo;
+    if (snapshot && (snapshot.body || (snapshot.attachments?.length ?? 0) > 0)) {
+      return {
+        eventId: replyToId,
+        sender: snapshot.sender?.id ?? "",
+        senderName: snapshot.sender?.displayName ?? snapshot.sender?.username,
+        body: snapshot.body ?? "",
+        attachments: summaryAttachments(snapshot.attachments),
+        timestamp: isoTimestamp(snapshot.timestamp),
+      };
+    }
+
+    const stored = this.options.storage.getTimelineEventByExternalId(
+      event.provider,
+      replyToId,
+      event.timelineKey,
+    );
+    if (stored) {
+      return {
+        eventId: replyToId,
+        sender: stored.sender.id,
+        senderName: stored.sender.displayName ?? stored.sender.username,
+        body: stored.body,
+        attachments: summaryAttachments(stored.attachments),
+        timestamp: isoTimestamp(stored.timestamp),
+      };
+    }
+
+    return null;
+  }
+
+  /**
    * Download all attachments from a replied-to message summary. Loops over
    * every element of `summary.attachments` (fixing the audit finding that only
    * index 0 was ever downloaded). For each attachment:
@@ -354,16 +415,7 @@ export class EnrichmentWorker {
   private async downloadReplyAttachments(
     eventId: string,
     roomId: string,
-    summary: {
-      eventId: string;
-      body: string;
-      attachments?: Array<{
-        mediaType: string;
-        filename?: string;
-        mimeType?: string;
-        remoteUrl?: string;
-      }>;
-    },
+    summary: ReplyTargetSummary,
     result: EnrichmentResult,
   ): Promise<void> {
     const attachments = summary.attachments ?? [];
@@ -1148,6 +1200,27 @@ export class EnrichmentWorker {
 
     await Promise.allSettled(downloads);
   }
+}
+
+/**
+ * Map canonical `AttachmentMeta`s (ingest snapshot or stored event) onto the
+ * neutral summary attachment shape used by the reply-attachment download loop.
+ */
+function summaryAttachments(
+  attachments: AttachmentMeta[] | undefined,
+): ReplyTargetSummary["attachments"] {
+  if (!attachments || attachments.length === 0) return undefined;
+  return attachments.map((a) => ({
+    mediaType: a.mediaType,
+    filename: a.filename,
+    mimeType: a.mimeType,
+    remoteUrl: a.remoteUrl,
+  }));
+}
+
+/** Epoch-ms → ISO-8601; an absent/invalid timestamp yields "" (parses as NaN → null timestamp). */
+function isoTimestamp(ms: number | undefined): string {
+  return typeof ms === "number" && Number.isFinite(ms) ? new Date(ms).toISOString() : "";
 }
 
 function inferMediaType(contentType?: string): string {

@@ -465,9 +465,10 @@ export class DiscordProvider implements IChatProvider {
    *
    * Discord attachments carry a remoteUrl (CDN URL), so the enrichment worker
    * downloads them via FetchClient.downloadUrl directly — it never calls
-   * downloadMedia. For reply-context enrichment, messageSummary is a stub
-   * returning null: the Discord normalizer already populates replyTo fully
-   * at ingest from referenced_message, so no REST lookup is needed.
+   * downloadMedia. messageSummary is omitted: the Discord normalizer already
+   * populates replyTo fully at ingest from referenced_message, so the
+   * enrichment worker resolves reply context from that snapshot (then the
+   * stored timeline event) instead of a REST lookup.
    * resolveLinkPreviews is absent (linkPreviews: "none" → DirectLinkPreviewClient
    * fallback in the enrichment worker).
    */
@@ -483,11 +484,10 @@ export class DiscordProvider implements IChatProvider {
           "DiscordProvider.enrichment.downloadMedia: Discord attachments use remoteUrl, not this path",
         );
       },
-      async messageSummary(_params) {
-        // Reply context is fully populated at ingest from referenced_message;
-        // the enrichment worker's resolveReplyContext call is a no-op for Discord.
-        return null;
-      },
+      // messageSummary omitted: reply context is populated at ingest from
+      // referenced_message (`replyTo` on the canonical event), so the
+      // enrichment worker resolves the target from that snapshot — and from the
+      // stored timeline event on a message-cache miss — without a REST lookup.
       async memberInfo(params) {
         // Look up displayName from the guild member cache for the given userId.
         const rt = accounts.get(accountId);

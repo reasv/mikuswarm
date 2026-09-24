@@ -5,4 +5,4 @@ export { DirectLinkPreviewClient, DIRECT_SCRAPE_SOURCE_KIND, DISCORD_EMBED_SOURC
 export { generateMediaFilename, saveMediaToWorkspace, moveFileToWorkspace, generateTempDownloadPath } from "./media.js";
 export { extractLinkedMediaUrls } from "./linked-media.js";
 export { detectCharacterCard, type CardDetectionResult } from "./card-detect.js";
-export type { EnrichmentCapabilities, EnrichmentConfig, EnrichmentResult } from "./types.js";
+export type { EnrichmentCapabilities, EnrichmentConfig, EnrichmentResult, ReplyTargetSummary } from "./types.js";
