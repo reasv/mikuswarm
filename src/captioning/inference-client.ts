@@ -1,5 +1,5 @@
 import { readFile, unlink } from "node:fs/promises";
-import { describeMedia, type CaptionModelConfig, type MediaModality } from "./describe.js";
+import { describeMedia, CaptionContentError, type CaptionModelConfig, type MediaModality } from "./describe.js";
 import { type LlmScheduler } from "../agent/scheduler.js";
 import { extractStatus } from "../agent/request-retry.js";
 import {
@@ -36,7 +36,13 @@ function costRatesOf(config: ModelChainEntry["config"]): CostRates {
 
 /** Build the caption wire-call descriptor from a resolved chain member. */
 function toCaptionModelConfig(config: ModelChainEntry["config"]): CaptionModelConfig {
-  return { id: config.id, endpoint: config.endpoint, api_key: config.api_key, provider: config.provider ?? null };
+  const level = config.thinking_level;
+  return {
+    id: config.id, endpoint: config.endpoint, api_key: config.api_key,
+    provider: config.provider ?? null, api: config.api,
+    reasoning_effort: level === undefined ? undefined :
+      config.thinking_level_map?.[level] ?? (level === "off" ? "none" : level),
+  };
 }
 
 export interface InferenceClientOptions {
@@ -276,15 +282,8 @@ export class InferenceClient {
           if (this.stopController.signal.aborted) throw err;
           const message = err instanceof Error ? err.message : String(err);
           const status = extractStatus(message.toLowerCase());
-          // A status-less "empty response" (HTTP 200 but empty body, thrown by
-          // describeMedia) is NOT an endpoint outage — it is a deterministic-ish
-          // content result for that input. Classifying it `content` keeps it out
-          // of the model-health streak (3 environmental-in-a-row would otherwise
-          // trip the breaker and mis-route ALL captioning to the fallback) and,
-          // per the §3 taxonomy, rethrows it without falling over to another
-          // member (review issue #7). Only this exact sentinel — genuine
-          // 5xx/timeout/reset still fall through to environmental below.
-          if (status === undefined && message.includes("Caption inference returned empty response")) {
+          // Empty, incomplete, refused, and unsupported captions are content failures, not endpoint outages; keep them out of model health and do not retry them against another model.
+          if (err instanceof CaptionContentError) {
             return { ok: false as const, kind: "content", status, error: err };
           }
           const kind = status === 400 || status === 413 || status === 422 ? "content" : "environmental";

@@ -8,6 +8,10 @@ export interface CaptionModelConfig {
   api_key: string;
   /** pi-ai provider label, recorded on caption usage_events rows (accounting only). */
   provider?: string | null;
+  /** The selected model's transport; absent retains Chat Completions. */
+  api?: string;
+  /** Configured thinking level after the model's wire-level remapping. */
+  reasoning_effort?: string;
 }
 
 export interface DescribeMediaOptions {
@@ -60,33 +64,112 @@ export function parseOpenAiUsage(usage: OpenAiUsageBlock | undefined | null): Ra
   };
 }
 
+interface ResponsesUsageBlock {
+  input_tokens?: number;
+  output_tokens?: number;
+  input_tokens_details?: { cached_tokens?: number };
+}
+
+/** A caption cannot be used; retrying another model is not an outage recovery. */
+export class CaptionContentError extends Error {}
+
+interface ResponsesCaptionResult {
+  status?: string;
+  model?: string;
+  error?: { message?: string };
+  incomplete_details?: { reason?: string };
+  output?: Array<{
+    type?: string;
+    role?: string;
+    content?: Array<{ type?: string; text?: string; refusal?: string }>;
+  }>;
+  usage?: ResponsesUsageBlock;
+}
+
+export function parseResponsesUsage(usage: ResponsesUsageBlock | undefined | null): RawTokenUsage | null {
+  if (!usage) return null;
+  return parseOpenAiUsage({
+    prompt_tokens: usage.input_tokens,
+    completion_tokens: usage.output_tokens,
+    prompt_tokens_details: usage.input_tokens_details,
+  });
+}
+
+function responsesCaption(result: ResponsesCaptionResult, modelId: string): DescribeMediaResult {
+  if (result.status === "failed") {
+    throw new Error(`Caption API failed: ${result.error?.message ?? "Responses request failed"}`);
+  }
+  if (result.status && result.status !== "completed") {
+    throw new CaptionContentError(
+      `Caption inference returned ${result.status} response: ${result.incomplete_details?.reason ?? "no complete caption"}`,
+    );
+  }
+  const parts: string[] = [];
+  for (const item of result.output ?? []) {
+    if (item.type !== "message" || item.role !== "assistant") continue;
+    for (const block of item.content ?? []) {
+      if (block.type === "refusal") {
+        throw new CaptionContentError(`Caption inference was refused: ${(block.refusal ?? "").slice(0, 500)}`);
+      }
+      if (block.type === "output_text" && typeof block.text === "string") parts.push(block.text);
+    }
+  }
+  const text = parts.join("").trim();
+  if (!text) throw new CaptionContentError("Caption inference returned empty response");
+  return { text, model: result.model ?? modelId, usage: parseResponsesUsage(result.usage) };
+}
+
 export async function describeMedia(options: DescribeMediaOptions): Promise<DescribeMediaResult> {
+  const responses = options.model.api === "openai-responses";
+  if (responses && options.modality !== "image") {
+    throw new CaptionContentError(
+      `Responses captioning does not accept direct ${options.modality} input. ` +
+        `Set [captioning.${options.modality}].model to a Chat Completions model that accepts ${options.modality}.`,
+    );
+  }
+
   const promptWithLimit = `${options.prompt} Respond in at most ${options.maxChars} characters.`;
+  const encoded = options.data.toString("base64");
+  const dataUrl = `data:${options.mimeType};base64,${encoded}`;
   const contentBlocks: unknown[] = [{ type: "text", text: promptWithLimit }];
 
   if (options.modality === "image") {
     contentBlocks.push({
       type: "image_url",
-      image_url: { url: `data:${options.mimeType};base64,${options.data.toString("base64")}` },
+      image_url: { url: dataUrl },
     });
   } else if (options.modality === "video") {
     contentBlocks.push({
       type: "video_url",
-      video_url: { url: `data:${options.mimeType};base64,${options.data.toString("base64")}` },
+      video_url: { url: dataUrl },
     });
   } else {
     const format = audioFormatFromMime(options.mimeType);
     contentBlocks.push({
       type: "input_audio",
-      input_audio: { data: options.data.toString("base64"), format },
+      input_audio: { data: encoded, format },
     });
   }
 
-  const body = {
-    model: options.model.id,
-    messages: [{ role: "user", content: contentBlocks }],
-    max_tokens: options.maxTokens,
-  };
+  const body = responses
+    ? {
+        model: options.model.id,
+        input: [{
+          role: "user",
+          content: [
+            { type: "input_text", text: promptWithLimit },
+            { type: "input_image", image_url: dataUrl, detail: "auto" },
+          ],
+        }],
+        max_output_tokens: options.maxTokens,
+        store: false,
+        ...(options.model.reasoning_effort ? { reasoning: { effort: options.model.reasoning_effort } } : {}),
+      }
+    : {
+        model: options.model.id,
+        messages: [{ role: "user", content: contentBlocks }],
+        max_tokens: options.maxTokens,
+      };
 
   const controller = new AbortController();
   const timeout = options.timeoutMs
@@ -101,7 +184,8 @@ export async function describeMedia(options: DescribeMediaOptions): Promise<Desc
   }
 
   try {
-    const response = await fetch(`${options.model.endpoint}/chat/completions`, {
+    const endpoint = options.model.endpoint.replace(/\/+$/, "");
+    const response = await fetch(`${endpoint}/${responses ? "responses" : "chat/completions"}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -109,6 +193,7 @@ export async function describeMedia(options: DescribeMediaOptions): Promise<Desc
       },
       body: JSON.stringify(body),
       signal: controller.signal,
+      ...(responses ? { redirect: "error" as const } : {}),
     });
 
     if (!response.ok) {
@@ -116,6 +201,10 @@ export async function describeMedia(options: DescribeMediaOptions): Promise<Desc
       // "status NNN" phrasing is load-bearing: the scheduler's unconditional
       // 429/503 backoff parses it via extractStatus (src/agent/request-retry.ts).
       throw new Error(`Caption API returned status ${response.status}: ${errorBody.slice(0, 500)}`);
+    }
+
+    if (responses) {
+      return responsesCaption((await response.json()) as ResponsesCaptionResult, options.model.id);
     }
 
     const result = (await response.json()) as {
@@ -134,10 +223,10 @@ export async function describeMedia(options: DescribeMediaOptions): Promise<Desc
         .map((b) => b.text)
         .join("");
     } else {
-      throw new Error("Caption inference returned empty response");
+      throw new CaptionContentError("Caption inference returned empty response");
     }
 
-    if (!text.trim()) throw new Error("Caption inference returned empty response");
+    if (!text.trim()) throw new CaptionContentError("Caption inference returned empty response");
 
     return { text: text.trim(), model: result.model ?? options.model.id, usage: parseOpenAiUsage(result.usage) };
   } finally {

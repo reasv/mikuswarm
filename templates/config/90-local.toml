@@ -79,6 +79,36 @@ output = 0         # USD per 1M output tokens
 cache_read = 0
 cache_write = 0
 
+# --- Optional Astra model ---------------------------------------------------
+# Uncomment this block and set the existing session
+# model selector (e.g. [agent.session_types.default] model = "astra") to use it.
+# Set [models.astra.cost] to your real rates, as for models.default above.
+# The pinned pi transport accepts this model ID without a dependency upgrade.
+# [models.astra]
+# id = "gpt-6-astra"
+# provider = "openai"
+# api = "openai-responses"
+# endpoint = "https://api.openai.com/v1"
+# api_key = "${OPENAI_API_KEY}"
+# input_modalities = ["text", "image"]
+# max_tokens = 16384
+# context_window = 272000
+# reasoning = true
+# thinking_level = "low"
+# [models.astra.thinking_level_map]
+# off = "low"          # Astra requires reasoning, including when used as a fallback
+# minimal = "low"
+# xhigh = "xhigh"
+# [models.astra.prefill]
+# enabled = true
+# text = "We must "    # literal text; TOML multiline strings work too
+# To use Astra for image captions as well:
+# [captioning.image]
+# model = "astra"
+# max_tokens = 4096
+# Caption calls honor the model's Responses API and reasoning settings; agent
+# prefill is not applied. Direct audio/video captions need a compatible model.
+
 # --- Captioning model -------------------------------------------------------
 # Multimodal model that captions inbound images/video/audio. Can be a cheaper
 # model than the chat model. Must declare every modality it captions.
