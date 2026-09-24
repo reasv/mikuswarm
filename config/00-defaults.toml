@@ -316,6 +316,11 @@ llm_request_max_wait_ms = 120000
 #   fallback = ["caption-cheap"]
 # Optional per-model probe-backoff ceiling (else recovery.llm_probe_backoff_max_ms):
 #   llm_probe_backoff_max_ms = 60000
+# [models.<name>.prefill]
+# enabled = false        # set true to add analysis argument to every tool call (OpenAI Responses only)
+# text = ""             # prefix text the analysis must begin with, e.g. "We must "
+# tools = []            # which tools carry analysis; absent = all tools (including no_reply)
+# drop_reasoning = false # strip native thinking blocks from history and storage
 
 [models.default.cost]
 input = 0

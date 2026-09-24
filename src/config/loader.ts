@@ -215,6 +215,23 @@ export async function loadConfig(configDir: string, options: ConfigLoadOptions =
   return config;
 }
 
+/** Validate [models.*].prefill settings (cross-field checks). */
+function validatePrefillSettings(config: AppConfig): void {
+  for (const [name, model] of Object.entries(config.models)) {
+    const prefill = model.prefill;
+    if (!prefill || !prefill.enabled) continue;
+    if (!prefill.text || prefill.text.length === 0) {
+      throw new Error(`config: [models.${name}.prefill] enabled = true requires a non-empty text`);
+    }
+    if (model.provider !== "openai") {
+      throw new Error(`config: [models.${name}.prefill] enabled = true requires provider = "openai" (got "${model.provider}")`);
+    }
+    if (model.api !== "openai-responses") {
+      throw new Error(`config: [models.${name}.prefill] enabled = true requires api = "openai-responses" (got "${model.api ?? "anthropic-messages (default)"}")`);
+    }
+  }
+}
+
 /**
  * Cross-field, fail-fast checks the TypeBox schema can't express on its own.
  * Runs after structural validation/decoding so all values are present and typed.
@@ -316,4 +333,5 @@ function validateConfig(config: AppConfig): void {
       }
     }
   }
+  validatePrefillSettings(config);
 }

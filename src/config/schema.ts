@@ -499,6 +499,17 @@ const TimelineSchema = StrictObject({
   gap_backfetch_concurrency: Type.Optional(Type.Number({ minimum: 1 })),
 });
 
+const PrefillSchema = StrictObject({
+  // Master switch. false disables an inherited prefill setting.
+  enabled: Type.Boolean(),
+  // Literal text the analysis argument must start with (required when enabled).
+  text: Type.Optional(Type.String()),
+  // Which tool names carry the analysis argument; absent = all tools.
+  tools: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  // Strip native thinking blocks from outgoing assistant history and storage.
+  drop_reasoning: Type.Optional(Type.Boolean()),
+});
+
 const ModelSchema = StrictObject({
   // Model inheritance (spec MODEL-FALLBACK §2.1). When set, the named `[models.*]`
   // block is deep-merged UNDER this one (child fields win, everything else
@@ -702,6 +713,7 @@ const ModelSchema = StrictObject({
     // is unaffected. Unset = keep pi-ai's auto-detection.
     requires_reasoning_content_on_assistant_messages: Type.Optional(Type.Boolean()),
   })),
+  prefill: Type.Optional(PrefillSchema),
 });
 
 const MatrixAccountSchema = StrictObject({
