@@ -13,22 +13,9 @@ See [RELEASING.md](RELEASING.md) for how a release is cut.
 <!--
 Accumulate user-visible changes here as they land, under any of:
 
-  ### Changed
-
-- **Prefill: past `analysis` arguments are no longer replayed to the model.** They stay in the stored transcript; the wire history is stripped deterministically so prompt caching is unaffected.
-- **Silence is now a tool call.** `no_reply` is part of every chat session's tool set
-  (next to `send_message`, same session-type filtering, always in the initial set
-  under dynamic loading); calling it ends the turn. The shipped prompts, workspace
-  templates, proactive kickoff, and forced-completion messages now say "call
-  `no_reply`" instead of "output `NO_REPLY`". The text marker is still accepted for
-  compatibility.
-
-### Added
+  ### Added
   ### Changed
   ### Fixed
-
-- **Startup gap backfetch now covers Discord** (and any provider with paged history). The coordinator looked up each account's self-id at `prepare()` — which runs before any provider starts — so every Discord account (whose id is only resolved inside `start()`) was skipped on every boot with `gap_backfetch_skip_room: unknown_self_user`, and Discord channels never recovered the messages missed while the bot was down. Self-ids and read clients are now resolved from the providers at `run()`; descent units are provider-qualified; Discord threads (separate history channels) are paged as their own units with their own floors; and a unit that cannot be filled at all (no self-id, no read client, or history the provider reports as permanently unavailable — e.g. a Discord 403) is released instead of left frozen. New optional `ProviderCapabilities.threadHistory` (`"inline"` default / `"separate"`).
-- **Discord history reads**: messages read from a thread channel now carry `threadRootExternalId` (initial backfill of a Discord thread timeline previously filtered every message out), and an edited message is no longer flagged as a replacement event (previously dropped by the backfill classifiers).
   ### Removed
 
 Cutting a release renames this heading to `## [vX.Y.Z] - YYYY-MM-DD` and adds a
@@ -48,6 +35,16 @@ Unreleased section; it is not part of any release's notes.
   reuse the shared prefix at Amazon Bedrock's 0.1x cache-read rate instead of
   rewriting ~28k tokens at each session start. Default off; ignored on all wire
   APIs other than `openai-responses`.
+
+### Changed
+
+- **Prefill: past `analysis` arguments are no longer replayed to the model.** They stay in the stored transcript; the wire history is stripped deterministically so prompt caching is unaffected.
+- **Silence is now a tool call.** `no_reply` is part of every chat session's tool set
+  (next to `send_message`, same session-type filtering, always in the initial set
+  under dynamic loading); calling it ends the turn. The shipped prompts, workspace
+  templates, proactive kickoff, and forced-completion messages now say "call
+  `no_reply`" instead of "output `NO_REPLY`". The text marker is still accepted for
+  compatibility.
 
 ### Fixed
 
@@ -73,12 +70,15 @@ Unreleased section; it is not part of any release's notes.
   unavailable]`** and logged `enrichment_reply_target_missing`. The Discord
   provider's reply-context lookup (`messageSummary`) was a stub that always
   answered "no such message", so enrichment wrote a body-less `reply_contexts`
-  row for every reply — and that stub row overrode the full quote the message
+  row for every reply, and that stub row overrode the full quote the message
   already carried from the gateway payload at hydration time. The provider
   lookup is now optional; when a provider has none, the enrichment worker
   resolves the target from the event's own ingest-time reply snapshot (body or
   attachments) and then from the stored copy of the target message, and only
   warns when both come up empty. Matrix keeps its native lookup unchanged.
+
+- **Startup gap backfetch now covers Discord** (and any provider with paged history). The coordinator looked up each account's self-id at `prepare()`, which runs before any provider starts, so every Discord account (whose id is only resolved inside `start()`) was skipped on every boot with `gap_backfetch_skip_room: unknown_self_user`, and Discord channels never recovered the messages missed while the bot was down. Self-ids and read clients are now resolved from the providers at `run()`; descent units are provider-qualified; Discord threads (separate history channels) are paged as their own units with their own floors; and a unit that cannot be filled at all (no self-id, no read client, or history the provider reports as permanently unavailable, e.g. a Discord 403) is released instead of left frozen. New optional `ProviderCapabilities.threadHistory` (`"inline"` default / `"separate"`).
+- **Discord history reads**: messages read from a thread channel now carry `threadRootExternalId` (initial backfill of a Discord thread timeline previously filtered every message out), and an edited message is no longer flagged as a replacement event (previously dropped by the backfill classifiers).
 
 ## [v0.5.1] - 2026-09-13
 
