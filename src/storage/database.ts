@@ -3323,13 +3323,16 @@ export class Storage {
       // Quotes of this message stored before the edit (a reply's reply_contexts
       // row) take the post-edit text too, the way a client's reply preview does.
       // Scoped to quoting events in the target's room and its threads, so a
-      // multi-account shared room never touches another account's quotes.
+      // multi-account shared room never touches another account's quotes. A
+      // body-less stub stays a stub: the provider could not quote the target
+      // (possibly redacted), and the stored copy must not resurrect it.
       const parsedKey = parseTimelineKey(timelineKey);
       if (parsedKey) {
         const roomKey = buildTimelineKey({ ...parsedKey, threadId: undefined });
         db.prepare(
           `update reply_contexts set body = @body
            where reply_external_id = @targetExternalId
+             and body is not null
              and event_id in (
                select id from timeline_events
                where provider = @provider
@@ -10523,7 +10526,7 @@ ${PIPELINE_COUNTS_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 19;
+export const LATEST_SCHEMA_VERSION = 20;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -11271,6 +11274,66 @@ function addWorkspaceSeedLedger(db: Database.Database): void {
   db.exec(WORKSPACE_SEED_LEDGER_SCHEMA);
 }
 
+/**
+ * v19→v20: one-off repair of reply quotes stored before by-id lookups became
+ * edit-aware. Reply-context enrichment used to take the quoted body from the
+ * provider's by-id fetch, which returns the original event (a Matrix edit is a
+ * separate event), so a reply to an already-edited message stored its pre-edit
+ * text; and an edit arriving after a reply never touched the stored quote.
+ *
+ * For every `reply_contexts` row whose target has an applied edit
+ * (`last_edit_timestamp` set), the body becomes the target's stored post-edit
+ * body, choosing the target exactly as `Storage.getEditedBody` does: same
+ * provider, in the quoting event's room or one of its threads (never another
+ * account's room), an exact room-key row over a thread row. Body-less stubs are
+ * left alone, matching the live refresh in `applyEditToTarget`.
+ */
+function repairStaleEditedQuotes(db: Database.Database): void {
+  const candidates = db
+    .prepare(
+      `select rc.event_id as eventId, rc.body as quoteBody,
+              e.timeline_key as quoteKey, t.timeline_key as targetKey, t.body as targetBody
+       from reply_contexts rc
+       join timeline_events e on e.id = rc.event_id
+       join timeline_events t
+         on t.provider = e.provider and t.external_id = rc.reply_external_id
+       where t.last_edit_timestamp is not null
+         and rc.body is not null`,
+    )
+    .all() as Array<{
+    eventId: string;
+    quoteBody: string;
+    quoteKey: string;
+    targetKey: string;
+    targetBody: string;
+  }>;
+  if (candidates.length === 0) return;
+
+  const roomKeyOf = (key: string): string | undefined => {
+    const parsed = parseTimelineKey(key);
+    return parsed ? buildTimelineKey({ ...parsed, threadId: undefined }) : undefined;
+  };
+  const chosen = new Map<string, { quoteBody: string; targetKey: string; targetBody: string; exact: boolean }>();
+  for (const candidate of candidates) {
+    const roomKey = roomKeyOf(candidate.quoteKey);
+    if (!roomKey || roomKeyOf(candidate.targetKey) !== roomKey) continue;
+    const exact = candidate.targetKey === roomKey;
+    const previous = chosen.get(candidate.eventId);
+    if (
+      !previous ||
+      (exact && !previous.exact) ||
+      (exact === previous.exact && candidate.targetKey < previous.targetKey)
+    ) {
+      chosen.set(candidate.eventId, { ...candidate, exact });
+    }
+  }
+
+  const update = db.prepare("update reply_contexts set body = ? where event_id = ?");
+  for (const [eventId, target] of chosen) {
+    if (target.quoteBody !== target.targetBody) update.run(target.targetBody, eventId);
+  }
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -11295,6 +11358,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   addDmOptoutsTable,                    // v16→v17
   addDmPeersTable,                      // v17→v18
   addWorkspaceSeedLedger,               // v18→v19
+  repairStaleEditedQuotes,              // v19→v20
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write

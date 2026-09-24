@@ -850,3 +850,22 @@ test("applyEdit refreshes stored quotes of the target in its room and threads on
     );
   });
 });
+
+test("applyEdit leaves a body-less quote stub alone", async () => {
+  await withStores(async (store, storage) => {
+    await store.append(targetEvent(), "skipped");
+    await store.append(
+      targetEvent({ id: `matrix:${ACCOUNT}:$reply`, externalId: "$reply", body: "replying" }),
+      "skipped",
+    );
+    await storage.insertReplyContext({
+      event_id: `matrix:${ACCOUNT}:$reply`,
+      reply_external_id: "$orig",
+      created_at: 1_700_000_001_000,
+    });
+
+    await editOrig(store, ROOM_TK, "edited text");
+
+    assert.equal(replyContextBody(storage, `matrix:${ACCOUNT}:$reply`), null);
+  });
+});

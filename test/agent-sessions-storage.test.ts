@@ -271,7 +271,7 @@ test("resetStaleSessions flips only running/created to interrupted and returns t
 });
 
 test("LATEST_SCHEMA_VERSION is 19", () => {
-  assert.equal(LATEST_SCHEMA_VERSION, 19);
+  assert.equal(LATEST_SCHEMA_VERSION, 20);
 });
 
 // --- Issue #16: the memory_chunks FTS triggers round-trip insert→MATCH→delete→MATCH ---
