@@ -48,6 +48,11 @@ Unreleased section; it is not part of any release's notes.
 
 ### Fixed
 
+- **Every chat request failed on OpenAI-compatible servers that reject tuple-form JSON
+  Schema (e.g. SGLang).** `view_range` on `str_replace_based_edit_tool` and
+  `write_memory` was declared with `items` as an array, which such servers answer
+  with a 400 for the whole request. It is now a plain two-number array, matching the
+  summary and diary tools.
 - **An agent- or account-scoped `[[user_limits]]` rule with a shared pool failed
   startup** (`SqliteError: no such column: timeline_key`). The pool's ledger reseed
   filters by the agent's timeline keys, but the overflow table

@@ -188,7 +188,7 @@ export function createWriteMemoryTool(context: WriteMemoryToolContext): AgentToo
         Type.Literal("str_replace"),
         Type.Literal("insert"),
       ]),
-      view_range: Type.Optional(Type.Tuple([Type.Number(), Type.Number()])),
+      view_range: Type.Optional(Type.Array(Type.Number(), { minItems: 2, maxItems: 2 })),
       old_str: Type.Optional(Type.String()),
       new_str: Type.Optional(Type.String()),
       insert_line: Type.Optional(Type.Number({ minimum: 0 })),

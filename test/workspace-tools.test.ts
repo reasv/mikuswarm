@@ -625,6 +625,22 @@ test("text editor tool declares executionMode: sequential", async () => {
   assert.equal(tool.executionMode, "sequential");
 });
 
+test("view_range schemas avoid tuple-form items", () => {
+  // Some OpenAI-compatible servers (e.g. SGLang) reject a whole request with a
+  // 400 when any tool schema uses the draft-07 tuple form (`items` as an array).
+  const workspaceRoot = "/tmp/unused-for-metadata-check";
+  const tools = [
+    createTextEditorTool({ workspaceRoot }),
+    createWriteMemoryTool({ workspaceRoot, memoryWriter: new MemoryFileWriter(workspaceRoot) }),
+  ];
+  for (const tool of tools) {
+    const viewRange = (tool.parameters as { properties: Record<string, Record<string, unknown>> }).properties.view_range;
+    assert.equal(Array.isArray(viewRange.items), false, `${tool.name}.view_range uses tuple-form items`);
+    assert.equal(viewRange.minItems, 2);
+    assert.equal(viewRange.maxItems, 2);
+  }
+});
+
 test("create reports a workspace-relative path in 'File already exists'", async () => {
   // Regression for #11: previously the error echoed the raw user-supplied path,
   // which was inconsistent with every other tool path that uses

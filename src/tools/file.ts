@@ -35,7 +35,7 @@ export function createTextEditorTool(context: FileToolContext): AgentTool {
         Type.Literal("insert"),
       ]),
       path: Type.String(),
-      view_range: Type.Optional(Type.Tuple([Type.Number(), Type.Number()])),
+      view_range: Type.Optional(Type.Array(Type.Number(), { minItems: 2, maxItems: 2 })),
       old_str: Type.Optional(Type.String()),
       new_str: Type.Optional(Type.String()),
       edits: Type.Optional(Type.Array(Type.Object({
