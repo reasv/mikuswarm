@@ -48,6 +48,12 @@ Unreleased section; it is not part of any release's notes.
 
 ### Fixed
 
+- **An agent- or account-scoped `[[user_limits]]` rule with a shared pool failed
+  startup** (`SqliteError: no such column: timeline_key`). The pool's ledger reseed
+  filters by the agent's timeline keys, but the overflow table
+  `usage_event_partitions` had no `timeline_key` column. The **v20→v21** migration
+  adds it and back-fills it from `usage_events`, and new overflow rows record it.
+
 - **Matrix: quoted and looked-up messages showed their pre-edit text.** Reply
   context and `read_messages` with `message_id` fetch the message from the
   homeserver, which returns the original event (an edit is a separate event), so an

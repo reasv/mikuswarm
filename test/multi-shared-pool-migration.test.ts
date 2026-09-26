@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { Storage } from "../src/storage/index.js";
+import { LATEST_SCHEMA_VERSION, Storage } from "../src/storage/index.js";
 
 // v3 → v4 migration (spec MULTI-SHARED-POOL §6): add the usage_event_partitions
 // overflow-membership child table. Purely ADDITIVE — no back-fill. A pool's pre-v4
@@ -49,7 +49,7 @@ test("v3→v4 recreates the overflow child table and preserves pre-v4 pooled spe
     const storage = await Storage.open({ databasePath: dbPath });
     try {
       const version = storage.read((db) => Number(db.pragma("user_version", { simple: true })));
-      assert.equal(version, 20, "migration stamps the latest version (v20)");
+      assert.equal(version, LATEST_SCHEMA_VERSION, "migration stamps the latest version");
       assert.ok(hasTable(storage, "usage_event_partitions"), "the child table is (re)created");
 
       // The pre-v4 scalar pooled row is still summed by the pool reseed (scalar half of
@@ -70,6 +70,63 @@ test("v3→v4 recreates the overflow child table and preserves pre-v4 pooled spe
       assert.equal(storage.sumUsageCost({ since: 0, partitionKeys: ["fleet"] }), 10);
       // space:!x:hs = the new event's overflow child row ($6).
       assert.equal(storage.sumUsageCost({ since: 0, partitionKeys: ["space:!x:hs"] }), 6);
+    } finally {
+      await storage.waitForIdle();
+      storage.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// v20 → v21: `usage_event_partitions` gains `timeline_key`, back-filled from the parent
+// row, so an agent-scoped shared pool can filter the reseed's child half.
+test("v20→v21 adds timeline_key to the overflow child table and back-fills it", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-multi-pool-"));
+  const dbPath = path.join(dir, "test.db");
+  try {
+    {
+      const storage = await Storage.open({ databasePath: dbPath });
+      await storage.insertUsageEvent({
+        ts: 1_000,
+        class: "agent_loop",
+        modelId: "opus",
+        timelineKey: "matrix:miku:room:!r",
+        budgetPartitions: ["fleet", "all-users"],
+        costUsd: 4,
+      });
+      await storage.waitForIdle();
+      // Simulate a v20 database: rebuild the child table in its pre-v21 shape.
+      await storage.write((db) => {
+        db.exec(`create table uep_old as
+                   select event_id, partition_key, ts, cost_usd, requested_model_id, room_id, space_id
+                   from usage_event_partitions;
+                 drop table usage_event_partitions;
+                 create table usage_event_partitions (
+                   event_id text not null, partition_key text not null, ts integer not null,
+                   cost_usd real not null, requested_model_id text, room_id text, space_id text,
+                   primary key (event_id, partition_key)
+                 ) without rowid;
+                 insert into usage_event_partitions select * from uep_old;
+                 drop table uep_old;`);
+        db.pragma("user_version = 20");
+      });
+      await storage.waitForIdle();
+      storage.close();
+    }
+
+    const storage = await Storage.open({ databasePath: dbPath });
+    try {
+      const version = storage.read((db) => Number(db.pragma("user_version", { simple: true })));
+      assert.equal(version, LATEST_SCHEMA_VERSION);
+      const key = storage.read(
+        (db) =>
+          (db.prepare("select timeline_key as k from usage_event_partitions").get() as { k: string | null }).k,
+      );
+      assert.equal(key, "matrix:miku:room:!r", "child row back-filled from its parent");
+      const scoped = { since: 0, partitionKeys: ["all-users"], timelineKeyPrefixes: ["matrix:miku"] };
+      assert.equal(storage.sumUsageCost(scoped), 4);
+      assert.equal(storage.sumUsageCost({ ...scoped, timelineKeyPrefixes: ["discord:rin"] }), 0);
     } finally {
       await storage.waitForIdle();
       storage.close();

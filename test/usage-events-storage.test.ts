@@ -219,6 +219,26 @@ test("sumUsageCost partitionKeys: a model-scoped pool sub-cap filters the child 
   );
 });
 
+test("sumUsageCost partitionKeys: an agent-scoped pool filters the child half by timeline key", async () => {
+  await withLedger(
+    [
+      // miku: "fleet" on the scalar, "all-users" spills to the child.
+      { ts: 1_000, class: "agent_loop", modelId: "m", timelineKey: TK, budgetPartitions: ["fleet", "all-users"], costUsd: 2 },
+      // miku: "all-users" alone, on the scalar.
+      { ts: 2_000, class: "agent_loop", modelId: "m", timelineKey: TK, budgetPartition: "all-users", costUsd: 3 },
+      // Another agent in the same two pools; must not count toward miku's scope.
+      { ts: 3_000, class: "agent_loop", modelId: "m", timelineKey: "discord:rin:channel:1", budgetPartitions: ["fleet", "all-users"], costUsd: 7 },
+    ],
+    async (storage) => {
+      const miku = { since: 0, partitionKeys: ["all-users"], timelineKeyPrefixes: ["matrix:miku"] };
+      assert.equal(sum(storage, miku), 5);
+      assert.equal(storage.minUsageTs(miku), 1_000);
+      assert.equal(sum(storage, { ...miku, timelineKeyPrefixes: ["discord:rin"] }), 7);
+      assert.equal(sum(storage, { since: 0, partitionKeys: ["all-users"] }), 12);
+    },
+  );
+});
+
 // ---------------------------------------------------------------------------
 // New per-user filter dimensions (spec PER-USER-LIMITS §8.3): triggerSenderIds /
 // roomIds / spaceIds each select the right rows and AND together with each other

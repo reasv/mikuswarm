@@ -84,7 +84,7 @@ test("v19→v20 migration repairs stale quotes of edited messages, scoped like g
     const storage = await Storage.open({ databasePath: dbPath });
     try {
       const version = storage.read((db) => Number(db.pragma("user_version", { simple: true })));
-      assert.equal(version, 20, "migration stamps the latest version");
+      assert.equal(version, 21, "migration stamps the latest version");
 
       assert.equal(quoteOf(storage, "matrix:miku:$q1"), "the full edited text");
       assert.equal(quoteOf(storage, "matrix:miku:$q2"), "the full edited text", "a thread reply gets its room's target");

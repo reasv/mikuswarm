@@ -4264,11 +4264,20 @@ export class Storage {
       if (overflowPoolKeys.length > 0) {
         const child = db.prepare(
           `insert or ignore into usage_event_partitions
-             (event_id, partition_key, ts, cost_usd, requested_model_id, room_id, space_id)
-           values (?, ?, ?, ?, ?, ?, ?)`,
+             (event_id, partition_key, ts, cost_usd, requested_model_id, room_id, space_id, timeline_key)
+           values (?, ?, ?, ?, ?, ?, ?, ?)`,
         );
         for (const key of overflowPoolKeys) {
-          child.run(row.id, key, row.ts, row.cost_usd, row.requested_model_id, row.room_id, row.space_id);
+          child.run(
+            row.id,
+            key,
+            row.ts,
+            row.cost_usd,
+            row.requested_model_id,
+            row.room_id,
+            row.space_id,
+            row.timeline_key,
+          );
         }
       }
     });
@@ -4370,12 +4379,13 @@ export class Storage {
    * double-counts a single pool key. (The seed always passes ONE partition key per
    * meter; passing several risks counting an event that joins two of them once per half,
    * but no caller does — `seedFilterFor` emits a single key.) Only ts / requested-model /
-   * room / space dimensions reach this path (a shared-pool `seedFilterFor`), all of which
-   * exist on both tables; class/session/tool/trigger_sender dims are never set here.
+   * room / space / timeline-key-prefix dimensions reach this path (a shared-pool
+   * `seedFilterFor`; the prefixes come from an agent- or account-scoped rule), all of
+   * which exist on both tables; class/session/tool/trigger_sender dims are never set here.
    */
   private poolReseedUnion(filter: UsageCostFilter): { sql: string; params: unknown[] } {
     // Enforce the child-half invariant the doc above describes: `usage_event_partitions`
-    // has only ts / requested-model / room / space columns, so a filter that ALSO scopes
+    // has only ts / requested-model / room / space / timeline_key columns, so a filter that ALSO scopes
     // by class / session / tool / logical-model / trigger-sender would emit child SQL
     // referencing a column that does not exist (a runtime error, not a silent wrong sum).
     // A shared-pool `seedFilterFor` never sets these, so tripping this is a caller bug.
@@ -9561,6 +9571,9 @@ create table if not exists usage_event_partitions (
   -- (mirrors usage_events.room_id / space_id so the union half filters identically).
   room_id            text,
   space_id           text,
+  -- Agent/account narrowing for a shared pool declared on an agent- or account-scoped
+  -- rule (mirrors usage_events.timeline_key; added v21).
+  timeline_key       text,
   primary key (event_id, partition_key)
 ) without rowid;
 create index if not exists idx_uep_partition_ts on usage_event_partitions(partition_key, ts);
@@ -10526,7 +10539,7 @@ ${PIPELINE_COUNTS_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 20;
+export const LATEST_SCHEMA_VERSION = 21;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -11334,6 +11347,27 @@ function repairStaleEditedQuotes(db: Database.Database): void {
   }
 }
 
+/**
+ * v20→v21: add `timeline_key` to `usage_event_partitions` and back-fill it from the
+ * parent `usage_events` row. A shared pool on an agent- or account-scoped
+ * `[[user_limits]]` rule re-seeds with a `timeline_key LIKE` filter, which the
+ * union's child half could not apply: the column was missing, so startup failed
+ * with `no such column: timeline_key`. Every child row is written in the same
+ * transaction as its parent, so the back-fill finds every parent. PRAGMA
+ * table_info guard keeps the step idempotent.
+ */
+function addUsageEventPartitionsTimelineKey(db: Database.Database): void {
+  const cols = db.prepare("PRAGMA table_info(usage_event_partitions)").all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === "timeline_key")) {
+    db.exec("ALTER TABLE usage_event_partitions ADD COLUMN timeline_key TEXT");
+  }
+  db.exec(
+    `update usage_event_partitions
+        set timeline_key = (select u.timeline_key from usage_events u where u.id = usage_event_partitions.event_id)
+      where timeline_key is null`,
+  );
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -11359,6 +11393,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   addDmPeersTable,                      // v17→v18
   addWorkspaceSeedLedger,               // v18→v19
   repairStaleEditedQuotes,              // v19→v20
+  addUsageEventPartitionsTimelineKey,   // v20→v21
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write
