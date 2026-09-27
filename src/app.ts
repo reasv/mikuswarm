@@ -4725,7 +4725,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             }
           : undefined,
       }),
-      ...(replyModelSeesImages ? [createReadImageTool({ workspaceRoot: sessionWsRoot, maxImageBytes: resolveReadImageMaxBytes(config, replyModelConfig.image_input_bytes) })] : []),
+      ...(replyModelSeesImages ? [createReadImageTool({ workspaceRoot: sessionWsRoot, maxImageBytes: resolveReadImageMaxBytes(config, replyModelConfig.image_input_bytes), inferenceImageOptions })] : []),
       createSearchMemoryTool({ workspaceRoot: sessionWsRoot }),
       ...(retrieval
         ? [

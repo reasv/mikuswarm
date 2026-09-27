@@ -4,12 +4,26 @@ import sharp from "sharp";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { resolveWorkspacePath, workspaceRelative } from "./workspace.js";
-import { SVG_MAX_INPUT_PIXELS, containsEmbeddedRasterDataUri } from "../media/index.js";
+import {
+  RASTER_MAX_INPUT_PIXELS,
+  SVG_MAX_INPUT_PIXELS,
+  computeTargetDimensions,
+  conditionImageBufferForInference,
+  containsEmbeddedRasterDataUri,
+  type ImageProcessingOptions,
+} from "../media/index.js";
 
 export interface ReadImageToolContext {
   workspaceRoot: string;
   /** Max bytes for the image payload sent to the model, measured as the base64-encoded size. */
   maxImageBytes: number;
+  /**
+   * Shared inference-image conditioning options (`media.image`, via
+   * `buildInferenceImageOptions`). A raster over the pixel budget is resized and
+   * re-encoded through the same pipeline as trigger attachments; one within it
+   * ships as-is.
+   */
+  inferenceImageOptions: ImageProcessingOptions;
 }
 
 /**
@@ -115,6 +129,49 @@ async function rasterizeSvgToPng(buffer: Buffer, maxBase64Bytes: number, relPath
 }
 
 /**
+ * Bring a raster down to the inference pixel budget. A byte cap alone is not
+ * enough: a well-compressed JPEG can be several megapixels in under 1 MB, and
+ * some vision servers fail on inputs that large. Images already within the
+ * budget are returned untouched (no lossy re-encode of small screenshots).
+ */
+async function conditionRaster(
+  raw: Buffer,
+  mimeType: string,
+  maxBase64Bytes: number,
+  options: ImageProcessingOptions,
+  relPath: string,
+): Promise<{ data: Buffer; mimeType: string }> {
+  let width: number | undefined;
+  let height: number | undefined;
+  try {
+    const metadata = await sharp(raw, { limitInputPixels: RASTER_MAX_INPUT_PIXELS }).metadata();
+    width = metadata.width;
+    height = metadata.height;
+  } catch (error) {
+    throw new Error(`Failed to decode image ${relPath}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!width || !height) {
+    throw new Error(`Could not read image dimensions: ${relPath}`);
+  }
+  const target = computeTargetDimensions(width, height, options);
+  if (target.width === width && target.height === height) {
+    return { data: raw, mimeType };
+  }
+  // `maxBase64Bytes` is an encoded budget; the conditioner targets raw bytes.
+  const conditioned = await conditionImageBufferForInference(raw, {
+    ...options,
+    maxBytes: Math.min(options.maxBytes, Math.floor((maxBase64Bytes * 3) / 4)),
+  });
+  const encodedSize = base64ByteSize(conditioned.sizeBytes);
+  if (encodedSize > maxBase64Bytes) {
+    throw new Error(
+      `Image ${relPath} base64 size ${(encodedSize / (1024 * 1024)).toFixed(1)}MB after downscaling exceeds limit ${(maxBase64Bytes / (1024 * 1024)).toFixed(1)}MB`,
+    );
+  }
+  return { data: conditioned.buffer, mimeType: conditioned.mimeType };
+}
+
+/**
  * Identify the actual image format from the first few bytes of the file. Returns
  * the canonical MIME type or `null` if the bytes don't match any supported format.
  *
@@ -159,7 +216,7 @@ export function createReadImageTool(context: ReadImageToolContext): AgentTool {
       "Use this instead of `media` when you want to look at the image yourself rather than get a textual caption. " +
       "Workspace paths only. To inspect an image from a URL, save it to the workspace via the `media` tool or download it explicitly first. " +
       "Images already attached to the current user message are visible without calling any tool. " +
-      "Subject to a per-model image-size limit (rejects oversized files; SVG rasterization is downscaled to fit when possible).",
+      "Large images are downscaled before attaching; files over the per-model image-size limit are rejected.",
     parameters: Type.Object({
       path: Type.String(),
     }),
@@ -225,8 +282,9 @@ export function createReadImageTool(context: ReadImageToolContext): AgentTool {
         data = png.toString("base64");
         mimeType = "image/png";
       } else {
-        data = raw.toString("base64");
-        mimeType = declaredMimeType;
+        const conditioned = await conditionRaster(raw, declaredMimeType, maxBytes, context.inferenceImageOptions, relPath);
+        data = conditioned.data.toString("base64");
+        mimeType = conditioned.mimeType;
       }
 
       return {

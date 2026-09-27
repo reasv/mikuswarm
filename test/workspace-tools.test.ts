@@ -8,6 +8,7 @@ import { createSearchMemoryTool, createWriteMemoryTool } from "../src/tools/memo
 import { MemoryFileWriter } from "../src/storage/memory-writer.js";
 import { createTextEditorTool, runRipgrep, runTextEditorCommand } from "../src/tools/file.js";
 import { createReadImageTool } from "../src/tools/read-image.js";
+import { buildInferenceImageOptions } from "../src/media/index.js";
 
 test("text editor tool views, replaces, inserts, and creates within workspace", async () => {
   await withWorkspace(async (workspace) => {
@@ -872,6 +873,44 @@ test("adaptive paging does not affect explicit view_range", async () => {
 });
 
 const TEST_MAX_IMAGE_BYTES = 3_932_160;
+const TEST_IMAGE_OPTIONS = buildInferenceImageOptions(undefined);
+
+test("read_image downscales a raster over the pixel budget", async () => {
+  await withWorkspace(async (workspace) => {
+    // Tall, highly compressible JPEG: ~7 MP in well under the byte cap, so only
+    // the pixel budget catches it.
+    const jpeg = await sharp({
+      create: { width: 1800, height: 4000, channels: 3, background: { r: 200, g: 40, b: 40 } },
+    }).jpeg().toBuffer();
+    assert.ok(4 * Math.ceil(jpeg.byteLength / 3) < TEST_MAX_IMAGE_BYTES);
+    await writeFile(path.join(workspace, "tall.jpg"), jpeg);
+
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES, inferenceImageOptions: TEST_IMAGE_OPTIONS });
+    const result = await tool.execute("t1", { path: "tall.jpg" });
+    const img = result.content[1] as { type: "image"; data: string; mimeType: string };
+    assert.equal(img.mimeType, "image/jpeg");
+    const meta = await sharp(Buffer.from(img.data, "base64")).metadata();
+    assert.ok(
+      (meta.width ?? 0) * (meta.height ?? 0) <= TEST_IMAGE_OPTIONS.maxTotalPixelsHard,
+      `expected downscale, got ${meta.width}x${meta.height}`,
+    );
+  });
+});
+
+test("read_image ships a raster within the pixel budget unchanged", async () => {
+  await withWorkspace(async (workspace) => {
+    const png = await sharp({
+      create: { width: 640, height: 480, channels: 4, background: { r: 0, g: 128, b: 255, alpha: 0.5 } },
+    }).png().toBuffer();
+    await writeFile(path.join(workspace, "small.png"), png);
+
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES, inferenceImageOptions: TEST_IMAGE_OPTIONS });
+    const result = await tool.execute("t1", { path: "small.png" });
+    const img = result.content[1] as { type: "image"; data: string; mimeType: string };
+    assert.equal(img.mimeType, "image/png");
+    assert.equal(img.data, png.toString("base64"));
+  });
+});
 
 test("read_image returns image content block for valid image", async () => {
   await withWorkspace(async (workspace) => {
@@ -882,7 +921,7 @@ test("read_image returns image content block for valid image", async () => {
     );
     await writeFile(path.join(workspace, "test.png"), pngData);
 
-    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES, inferenceImageOptions: TEST_IMAGE_OPTIONS });
     const result = await tool.execute("t1", { path: "test.png" });
 
     assert.equal(result.content.length, 2);
@@ -898,7 +937,7 @@ test("read_image returns image content block for valid image", async () => {
 test("read_image rejects non-image files", async () => {
   await withWorkspace(async (workspace) => {
     await writeFile(path.join(workspace, "notes.txt"), "hello", "utf8");
-    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES, inferenceImageOptions: TEST_IMAGE_OPTIONS });
     await assert.rejects(
       () => tool.execute("t1", { path: "notes.txt" }),
       /Unsupported image format/,
@@ -908,7 +947,7 @@ test("read_image rejects non-image files", async () => {
 
 test("read_image rejects workspace escape", async () => {
   await withWorkspace(async (workspace) => {
-    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES, inferenceImageOptions: TEST_IMAGE_OPTIONS });
     await assert.rejects(
       () => tool.execute("t1", { path: "../outside.png" }),
       /escapes workspace/,
@@ -928,7 +967,7 @@ test("read_image rejects files whose base64 payload exceeds image_input_bytes", 
     const filePath = path.join(workspace, "huge.png");
     await writeFile(filePath, Buffer.alloc(3100));
 
-    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: limit });
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: limit, inferenceImageOptions: TEST_IMAGE_OPTIONS });
     await assert.rejects(
       () => tool.execute("t1", { path: "huge.png" }),
       /Image base64 size.*exceeds image_input_bytes/,
@@ -947,7 +986,7 @@ test("read_image accepts a file whose base64 payload is exactly at the cap", asy
     await writeFile(path.join(workspace, "boundary.png"), pngBytes);
     const exactCap = 4 * Math.ceil(pngBytes.byteLength / 3);
 
-    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: exactCap });
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: exactCap, inferenceImageOptions: TEST_IMAGE_OPTIONS });
     const result = await tool.execute("t1", { path: "boundary.png" });
     assert.equal(result.content.length, 2);
     assert.equal((result.content[1] as { type: string }).type, "image");
@@ -968,7 +1007,7 @@ test("read_image refuses SVGs containing embedded data: URI rasters", async () =
 </svg>`;
     await writeFile(path.join(workspace, "embed.svg"), svgWithDataUri, "utf8");
 
-    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES, inferenceImageOptions: TEST_IMAGE_OPTIONS });
     await assert.rejects(
       () => tool.execute("t1", { path: "embed.svg" }),
       /embedded data: URI raster/,
@@ -997,7 +1036,7 @@ test("read_image still rasterizes plain SVGs without embedded data: URIs", async
   <circle cx="25" cy="25" r="20" fill="green"/>
 </svg>`;
     await writeFile(path.join(workspace, "plain.svg"), svg, "utf8");
-    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES, inferenceImageOptions: TEST_IMAGE_OPTIONS });
     const result = await tool.execute("t1", { path: "plain.svg" });
     assert.equal((result.content[1] as { type: string; mimeType: string }).mimeType, "image/png");
   });
@@ -1006,7 +1045,7 @@ test("read_image still rasterizes plain SVGs without embedded data: URIs", async
 test("read_image description does not direct the agent to web_fetch", async () => {
   // Documentation lock: web_fetch returns text/JSON, not raw image bytes the
   // read_image tool can attach. Description must not recommend it.
-  const tool = createReadImageTool({ workspaceRoot: "/tmp", maxImageBytes: TEST_MAX_IMAGE_BYTES });
+  const tool = createReadImageTool({ workspaceRoot: "/tmp", maxImageBytes: TEST_MAX_IMAGE_BYTES, inferenceImageOptions: TEST_IMAGE_OPTIONS });
   assert.ok(typeof tool.description === "string");
   assert.equal(
     tool.description.includes("web_fetch"),
@@ -1020,7 +1059,7 @@ test("read_image rejects non-regular files (e.g. directories)", async () => {
     // A directory named like an image file should be rejected by the isFile() check,
     // not read as if it were a regular file.
     await mkdir(path.join(workspace, "weird.png"));
-    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES, inferenceImageOptions: TEST_IMAGE_OPTIONS });
     await assert.rejects(
       () => tool.execute("t1", { path: "weird.png" }),
       /Not a regular file/,
@@ -1038,7 +1077,7 @@ test("read_image rasterizes SVG to PNG", async () => {
 `;
     await writeFile(path.join(workspace, "vector.svg"), svg, "utf8");
 
-    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES, inferenceImageOptions: TEST_IMAGE_OPTIONS });
     const result = await tool.execute("t1", { path: "vector.svg" });
 
     assert.equal(result.content.length, 2);
@@ -1060,7 +1099,7 @@ test("read_image surfaces a clean error for malformed SVG", async () => {
     // forces the rasterizer to throw and exercise the catch path in
     // rasterizeSvgToPng.
     await writeFile(path.join(workspace, "broken.svg"), "<svg this is not valid xml", "utf8");
-    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES, inferenceImageOptions: TEST_IMAGE_OPTIONS });
     await assert.rejects(
       () => tool.execute("t1", { path: "broken.svg" }),
       /Failed to rasterize SVG/,
@@ -1074,7 +1113,7 @@ test("read_image rejects files whose magic bytes don't match the extension", asy
     // opaque error; the tool should catch this up front.
     const jpegBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]);
     await writeFile(path.join(workspace, "mislabeled.png"), jpegBytes);
-    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES, inferenceImageOptions: TEST_IMAGE_OPTIONS });
     await assert.rejects(
       () => tool.execute("t1", { path: "mislabeled.png" }),
       /does not match extension/,
@@ -1086,7 +1125,7 @@ test("read_image rejects files whose bytes don't sniff as any supported format",
   await withWorkspace(async (workspace) => {
     // Plain text bytes in a file named .png — neither JPEG, PNG, GIF, WebP, nor SVG.
     await writeFile(path.join(workspace, "junk.png"), "hello world, not an image", "utf8");
-    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES, inferenceImageOptions: TEST_IMAGE_OPTIONS });
     await assert.rejects(
       () => tool.execute("t1", { path: "junk.png" }),
       /Could not determine image format/,
@@ -1102,7 +1141,7 @@ test("read_image rejects SVGs whose rasterization would exceed the pixel budget"
     // should hit the pixel cap and the fallback resize should also be refused.
     const svg = `<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20000 20000" width="20000" height="20000"><rect width="20000" height="20000" fill="red"/></svg>`;
     await writeFile(path.join(workspace, "huge.svg"), svg, "utf8");
-    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+    const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES, inferenceImageOptions: TEST_IMAGE_OPTIONS });
     await assert.rejects(
       () => tool.execute("t1", { path: "huge.svg" }),
       /too complex to rasterize/,
@@ -1124,7 +1163,7 @@ test("read_image rejects symlinks that escape the workspace", async () => {
       // Symlink inside the workspace pointing to the outside file.
       await symlink(realPng, path.join(workspace, "linked.png"), "file");
 
-      const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+      const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES, inferenceImageOptions: TEST_IMAGE_OPTIONS });
       await assert.rejects(
         () => tool.execute("t1", { path: "linked.png" }),
         /escapes workspace/,
@@ -1175,7 +1214,7 @@ test("read_image SVG rasterization does not follow file:// references (regressio
         const svgPath = path.join(workspace, `exfil-${idx}.svg`);
         await writeFile(svgPath, svgs[idx], "utf8");
 
-        const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES });
+        const tool = createReadImageTool({ workspaceRoot: workspace, maxImageBytes: TEST_MAX_IMAGE_BYTES, inferenceImageOptions: TEST_IMAGE_OPTIONS });
         const result = await tool.execute("t1", { path: `exfil-${idx}.svg` });
         const img = result.content[1] as { type: "image"; data: string; mimeType: string };
         assert.equal(img.mimeType, "image/png");
