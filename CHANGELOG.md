@@ -52,6 +52,10 @@ Unreleased section; it is not part of any release's notes.
   checked, so a multi-megapixel JPEG under the byte cap reached the model unresized
   (enough to crash some self-hosted vision servers). Rasters over the `media.image`
   pixel budget are now resized and re-encoded like trigger attachments.
+- **Browser screenshots were only bounded by byte size.** A long full-page PNG could
+  reach the model at tens of megapixels while under the byte cap. Screenshots over the
+  `media.image` pixel budget are now downscaled first, keeping the requested PNG or
+  JPEG format.
 - **Every chat request failed on OpenAI-compatible servers that reject tuple-form JSON
   Schema (e.g. SGLang).** `view_range` on `str_replace_based_edit_tool` and
   `write_memory` was declared with `items` as an array, which such servers answer

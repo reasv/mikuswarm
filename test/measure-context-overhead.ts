@@ -126,7 +126,7 @@ function reconstructTools(config: any): { tools: AgentTool[]; skipped: string[] 
     specs.push(["recall_memory", () => T.createRecallMemoryTool({ search: STUB, defaults: { maxResults: 8, minScore: 0.3 } } as any)]);
   }
   if (config.browser) {
-    specs.push(["browser", () => T.createBrowserTool({ session: STUB, agentSessionId: "s", config: config.browser, maxImageBytes: 5_000_000, workspaceRoot: WS } as any)]);
+    specs.push(["browser", () => T.createBrowserTool({ session: STUB, agentSessionId: "s", config: config.browser, maxImageBytes: 5_000_000, inferenceImageOptions: {}, workspaceRoot: WS } as any)]);
   }
   if (config.danbooru) {
     specs.push(["danbooru", () => T.createDanbooruTool({ workspaceRoot: WS, downloadSizeLimit: 10_000_000, inlineImageMaxBytes: 5_000_000, inferenceImageOptions: {}, modelHasVision: multimodal, imageCaptionClient: STUB, fetchClient: STUB, httpProxyUrl: config.network?.http_proxy_url, config: config.danbooru } as any)]);

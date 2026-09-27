@@ -8,6 +8,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 import { BrowserSession, type DownloadRecord } from "../src/browser/index.js";
 import { createBrowserTool } from "../src/tools/browser.js";
+import { buildInferenceImageOptions } from "../src/media/index.js";
 import type { BrowserConfig } from "../src/config/index.js";
 import type { Logger } from "../src/observability/logger.js";
 
@@ -111,7 +112,7 @@ test("browser docker: end-to-end navigate + snapshot + screenshot through the Ma
 
     const cfg = config();
     session = new BrowserSession({ config: cfg, agentTimezone: "UTC", workspaceRoot: ws, logger: silentLogger });
-    const tool = createBrowserTool({ session, agentSessionId: "docker-s1", config: cfg, maxImageBytes: 5_242_880, workspaceRoot: ws });
+    const tool = createBrowserTool({ session, agentSessionId: "docker-s1", config: cfg, maxImageBytes: 5_242_880, inferenceImageOptions: buildInferenceImageOptions(undefined), workspaceRoot: ws });
 
     // Navigate (lazily bootstraps + launches the profile + connects with auth).
     const nav = await tool.execute("c1", { action: "navigate", url: "https://example.com" }) as {
@@ -158,7 +159,7 @@ test("browser docker: feature additions (rich-wait, element shot, modifiers, upl
     await waitForHealth(90_000);
     const cfg = config();
     session = new BrowserSession({ config: cfg, agentTimezone: "UTC", workspaceRoot: ws, logger: silentLogger });
-    const tool = createBrowserTool({ session, agentSessionId: "docker-feat", config: cfg, maxImageBytes: 5_242_880, workspaceRoot: ws });
+    const tool = createBrowserTool({ session, agentSessionId: "docker-feat", config: cfg, maxImageBytes: 5_242_880, inferenceImageOptions: buildInferenceImageOptions(undefined), workspaceRoot: ws });
 
     type ToolResult = { content: Array<{ type: string; text?: string; mimeType?: string; data?: string }>; details?: Record<string, unknown> };
     const exec = (args: Record<string, unknown>) => tool.execute("c1", args) as Promise<ToolResult>;
@@ -188,7 +189,7 @@ test("browser docker: feature additions (rich-wait, element shot, modifiers, upl
 
     // ── rich wait: a never-satisfied condition times out as act_timeout ───────
     const fastCfg = { ...config(), act_timeout_ms: 3000 };
-    const fastTool = createBrowserTool({ session, agentSessionId: "docker-feat", config: fastCfg, maxImageBytes: 5_242_880, workspaceRoot: ws });
+    const fastTool = createBrowserTool({ session, agentSessionId: "docker-feat", config: fastCfg, maxImageBytes: 5_242_880, inferenceImageOptions: buildInferenceImageOptions(undefined), workspaceRoot: ws });
     await assert.rejects(
       () => fastTool.execute("c1", { action: "act", kind: "wait", wait_selector: ".never-ever" }),
       /browser:act_timeout/,
@@ -311,7 +312,7 @@ test("browser docker: downloads cross the container boundary via the shared stag
     await waitForHealth(90_000);
     const cfg = config({ downloads_dir: "/downloads", downloads_local_dir: staging });
     session = new BrowserSession({ config: cfg, agentTimezone: "UTC", workspaceRoot: ws, logger: silentLogger });
-    const tool = createBrowserTool({ session, agentSessionId: "docker-dl", config: cfg, maxImageBytes: 5_242_880, workspaceRoot: ws });
+    const tool = createBrowserTool({ session, agentSessionId: "docker-dl", config: cfg, maxImageBytes: 5_242_880, inferenceImageOptions: buildInferenceImageOptions(undefined), workspaceRoot: ws });
 
     type ToolResult = { content: Array<{ type: string; text?: string }>; details?: Record<string, unknown> };
     const exec = (args: Record<string, unknown>) => tool.execute("c1", args) as Promise<ToolResult>;

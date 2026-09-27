@@ -13,8 +13,11 @@ import { createBrowserTool, boundScreenshot, resolveUploadFiles, renderConsole }
 import { CONSOLE_DRAIN_MAX_CHARS, CONSOLE_TRUNCATION_MARKER, type ConsoleEntry } from "../src/browser/session.js";
 import { aiSnapshot } from "../src/browser/snapshot.js";
 import { base64ByteSize } from "../src/tools/read-image.js";
+import { buildInferenceImageOptions } from "../src/media/index.js";
 import type { BrowserConfig } from "../src/config/index.js";
 import type { Logger } from "../src/observability/logger.js";
+
+const TEST_IMAGE_OPTIONS = buildInferenceImageOptions(undefined);
 
 const silentLogger: Logger = {
   debug() {}, info() {}, warn() {}, error() {},
@@ -107,7 +110,7 @@ async function withTool(
   const restore = stubManager();
   const connect: ConnectOverCdp = async () => makeBrowser(pageOpts) as unknown as Awaited<ReturnType<ConnectOverCdp>>;
   const session = new BrowserSession({ config, agentTimezone: "UTC", workspaceRoot: ws, logger: silentLogger, connectOverCdp: connect });
-  const tool = createBrowserTool({ session, agentSessionId: "s1", config, maxImageBytes: 5_242_880, workspaceRoot: ws });
+  const tool = createBrowserTool({ session, agentSessionId: "s1", config, maxImageBytes: 5_242_880, inferenceImageOptions: TEST_IMAGE_OPTIONS, workspaceRoot: ws });
   try {
     await fn(tool);
   } finally {
@@ -314,6 +317,7 @@ test("tool: schema bounds `text` length, rejecting pathological multi-MB input (
     agentSessionId: "s1",
     config: baseConfig(),
     maxImageBytes: 5_242_880,
+    inferenceImageOptions: TEST_IMAGE_OPTIONS,
     workspaceRoot: "/tmp",
   });
   const params = tool.parameters as { properties: { text: { maxLength?: number } } };
@@ -577,11 +581,59 @@ test("aiSnapshot: main-doc-fills-budget path emits NO hint when maxFrames=0 or n
 
 // ── #2: screenshot payload bounding via boundScreenshot ──────────────────────
 
+// The byte-fit tests below isolate the base64 loop, so they lift the pixel
+// budget; the pixel-budget tests use the shipped defaults.
+const NO_PIXEL_BUDGET = { ...TEST_IMAGE_OPTIONS, maxTotalPixels: Number.MAX_SAFE_INTEGER, maxTotalPixelsHard: Number.MAX_SAFE_INTEGER };
+
+test("boundScreenshot: a tall capture under the byte cap is still downscaled to the pixel budget", async () => {
+  // 1280x20000 flat page: ~25 MP in a few KB of PNG. Only the pixel budget catches it.
+  const png = await sharp({ create: { width: 1280, height: 20000, channels: 3, background: { r: 250, g: 250, b: 250 } } })
+    .png().toBuffer();
+  const cap = 5_242_880;
+  assert.ok(base64ByteSize(png.byteLength) < cap, "precondition: capture is under the byte cap");
+
+  const bounded = await boundScreenshot(png, cap, TEST_IMAGE_OPTIONS);
+  assert.equal(bounded.downscaled, true);
+  assert.equal(bounded.mimeType, "image/png");
+  const meta = await sharp(Buffer.from(bounded.data, "base64")).metadata();
+  assert.equal(meta.format, "png");
+  assert.ok(
+    (meta.width ?? 0) * (meta.height ?? 0) <= TEST_IMAGE_OPTIONS.maxTotalPixelsHard,
+    `expected pixel-budget downscale, got ${meta.width}x${meta.height}`,
+  );
+});
+
+test("boundScreenshot: a jpeg over the pixel budget stays jpeg", async () => {
+  const jpeg = await sharp({ create: { width: 3000, height: 3000, channels: 3, background: { r: 30, g: 60, b: 90 } } })
+    .jpeg().toBuffer();
+  const bounded = await boundScreenshot(jpeg, 5_242_880, TEST_IMAGE_OPTIONS, "jpeg");
+  assert.equal(bounded.downscaled, true);
+  assert.equal(bounded.mimeType, "image/jpeg");
+  const meta = await sharp(Buffer.from(bounded.data, "base64")).metadata();
+  assert.equal(meta.format, "jpeg");
+  assert.ok((meta.width ?? 0) * (meta.height ?? 0) <= TEST_IMAGE_OPTIONS.maxTotalPixelsHard);
+});
+
+test("boundScreenshot: still over the byte cap after the pixel resize, the byte loop continues", async () => {
+  // Noise does not compress, so the pixel-budget resize alone leaves it over a small cap.
+  const w = 2000, h = 2000;
+  const raw = Buffer.alloc(w * h * 3);
+  for (let i = 0; i < raw.length; i += 1) raw[i] = (i * 2654435761) & 0xff;
+  const png = await sharp(raw, { raw: { width: w, height: h, channels: 3 } }).png().toBuffer();
+  const cap = 400_000;
+
+  const bounded = await boundScreenshot(png, cap, TEST_IMAGE_OPTIONS);
+  assert.equal(bounded.downscaled, true);
+  assert.ok(bounded.base64Bytes <= cap, `resulting base64 ${bounded.base64Bytes} ≤ cap ${cap}`);
+  const meta = await sharp(Buffer.from(bounded.data, "base64")).metadata();
+  assert.ok((meta.width ?? 0) * (meta.height ?? 0) < TEST_IMAGE_OPTIONS.maxTotalPixels);
+});
+
 test("boundScreenshot: a small PNG under the cap passes through untouched (#2)", async () => {
   const png = await sharp({ create: { width: 8, height: 8, channels: 3, background: { r: 10, g: 20, b: 30 } } })
     .png().toBuffer();
   const cap = 5_242_880;
-  const bounded = await boundScreenshot(png, cap);
+  const bounded = await boundScreenshot(png, cap, TEST_IMAGE_OPTIONS);
   assert.equal(bounded.downscaled, false, "not downscaled");
   assert.equal(bounded.data, png.toString("base64"), "identical bytes passed through");
   assert.ok(bounded.base64Bytes <= cap);
@@ -607,7 +659,7 @@ test("boundScreenshot: an over-cap capture is downscaled to fit (#2)", async () 
   const cap = 350_000; // below the full image's base64 size, reachable above the dimension floor
   assert.ok(base64ByteSize(png.byteLength) > cap, "precondition: capture exceeds the cap");
 
-  const bounded = await boundScreenshot(png, cap);
+  const bounded = await boundScreenshot(png, cap, NO_PIXEL_BUDGET);
   assert.equal(bounded.downscaled, true, "downscaled");
   assert.ok(bounded.base64Bytes <= cap, `resulting base64 ${bounded.base64Bytes} ≤ cap ${cap}`);
   // Result is still a valid, smaller PNG.
@@ -630,7 +682,7 @@ test("boundScreenshot: an unshrinkable over-cap capture throws screenshot_failed
   assert.ok(base64ByteSize(png.byteLength) > cap, "precondition: capture exceeds the cap");
 
   await assert.rejects(
-    boundScreenshot(png, cap),
+    boundScreenshot(png, cap, NO_PIXEL_BUDGET),
     (err: unknown) => (err as { code?: string }).code === "screenshot_failed",
     "must throw screenshot_failed rather than ship an oversized block",
   );
@@ -639,7 +691,7 @@ test("boundScreenshot: an unshrinkable over-cap capture throws screenshot_failed
 test("boundScreenshot: jpeg format under the cap passes through with image/jpeg mimeType", async () => {
   const jpeg = await sharp({ create: { width: 8, height: 8, channels: 3, background: { r: 1, g: 2, b: 3 } } })
     .jpeg().toBuffer();
-  const bounded = await boundScreenshot(jpeg, 5_242_880, "jpeg");
+  const bounded = await boundScreenshot(jpeg, 5_242_880, TEST_IMAGE_OPTIONS, "jpeg");
   assert.equal(bounded.downscaled, false);
   assert.equal(bounded.mimeType, "image/jpeg");
   assert.equal(bounded.data, jpeg.toString("base64"));
@@ -648,7 +700,7 @@ test("boundScreenshot: jpeg format under the cap passes through with image/jpeg 
 test("boundScreenshot: png format reports image/png mimeType", async () => {
   const png = await sharp({ create: { width: 8, height: 8, channels: 3, background: { r: 1, g: 2, b: 3 } } })
     .png().toBuffer();
-  const bounded = await boundScreenshot(png, 5_242_880, "png");
+  const bounded = await boundScreenshot(png, 5_242_880, TEST_IMAGE_OPTIONS, "png");
   assert.equal(bounded.mimeType, "image/png");
 });
 
@@ -667,7 +719,7 @@ test("boundScreenshot: an over-cap jpeg downscales and re-encodes as jpeg", asyn
   const cap = 200_000;
   assert.ok(base64ByteSize(jpeg.byteLength) > cap, "precondition: capture exceeds the cap");
 
-  const bounded = await boundScreenshot(jpeg, cap, "jpeg");
+  const bounded = await boundScreenshot(jpeg, cap, NO_PIXEL_BUDGET, "jpeg");
   assert.equal(bounded.downscaled, true);
   assert.equal(bounded.mimeType, "image/jpeg");
   assert.ok(bounded.base64Bytes <= cap);
@@ -810,6 +862,7 @@ test("tool: schema `kind` union includes drag, upload, clear_site_data, dialog",
     agentSessionId: "s1",
     config: baseConfig(),
     maxImageBytes: 5_242_880,
+    inferenceImageOptions: TEST_IMAGE_OPTIONS,
     workspaceRoot: "/tmp",
   });
   const params = tool.parameters as { properties: { kind: { anyOf: Array<{ const?: string }> } } };
@@ -859,7 +912,7 @@ test("tool: a failed download renders as [download failed: name (url)] and a suc
   const cfg = baseConfig();
   const connect: ConnectOverCdp = async () => makeBrowser({}) as unknown as Awaited<ReturnType<ConnectOverCdp>>;
   const session = new BrowserSession({ config: cfg, agentTimezone: "UTC", workspaceRoot: ws, logger: silentLogger, connectOverCdp: connect });
-  const tool = createBrowserTool({ session, agentSessionId: "s1", config: cfg, maxImageBytes: 5_242_880, workspaceRoot: ws });
+  const tool = createBrowserTool({ session, agentSessionId: "s1", config: cfg, maxImageBytes: 5_242_880, inferenceImageOptions: TEST_IMAGE_OPTIONS, workspaceRoot: ws });
   try {
     await session.getActivePage("s1"); // creates the session state whose pendingDownloads we seed
     const state = (session as unknown as SessionsPrivate).sessions.get("s1")!;
@@ -895,7 +948,7 @@ test("tool: when every drained download failed, the header switches to the 'no f
   const cfg = baseConfig();
   const connect: ConnectOverCdp = async () => makeBrowser({}) as unknown as Awaited<ReturnType<ConnectOverCdp>>;
   const session = new BrowserSession({ config: cfg, agentTimezone: "UTC", workspaceRoot: ws, logger: silentLogger, connectOverCdp: connect });
-  const tool = createBrowserTool({ session, agentSessionId: "s1", config: cfg, maxImageBytes: 5_242_880, workspaceRoot: ws });
+  const tool = createBrowserTool({ session, agentSessionId: "s1", config: cfg, maxImageBytes: 5_242_880, inferenceImageOptions: TEST_IMAGE_OPTIONS, workspaceRoot: ws });
   try {
     await session.getActivePage("s1");
     const state = (session as unknown as SessionsPrivate).sessions.get("s1")!;

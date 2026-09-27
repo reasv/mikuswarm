@@ -4683,6 +4683,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             // Same shared per-model base64 cap read_image uses, so inline
             // screenshots respect the model's per-image budget (issue #2).
             maxImageBytes: resolveReadImageMaxBytes(config, replyModelConfig.image_input_bytes),
+            // Same pixel budget as read_image and trigger attachments.
+            inferenceImageOptions,
             // Upload paths resolve within (and are confined to) the workspace (§6).
             workspaceRoot: sessionWsRoot,
           })]

@@ -25,6 +25,7 @@ import {
   type DownloadRecord,
   type UploadFile,
 } from "../browser/index.js";
+import { computeTargetDimensions, type ImageProcessingOptions } from "../media/index.js";
 import { base64ByteSize } from "./read-image.js";
 import { resolveWorkspacePath } from "./workspace.js";
 
@@ -48,6 +49,12 @@ export interface BrowserToolContext {
    * sharp to fit rather than shipped oversized.
    */
   maxImageBytes: number;
+  /**
+   * Shared inference-image options (`media.image`, via `buildInferenceImageOptions`).
+   * A capture over its pixel budget is downscaled before the byte cap is checked,
+   * the same bound `read_image` applies.
+   */
+  inferenceImageOptions: ImageProcessingOptions;
   /**
    * Workspace root for resolving `upload` paths. Upload files must resolve
    * within this directory (no absolute paths, no `../` escape — see §3.5/§6).
@@ -87,7 +94,7 @@ const DESCRIPTION = [
 ].join("\n");
 
 export function createBrowserTool(context: BrowserToolContext): AgentTool {
-  const { session, agentSessionId, config, maxImageBytes, workspaceRoot } = context;
+  const { session, agentSessionId, config, maxImageBytes, inferenceImageOptions, workspaceRoot } = context;
   const actTimeoutMs = config.act_timeout_ms;
 
   return {
@@ -148,7 +155,7 @@ export function createBrowserTool(context: BrowserToolContext): AgentTool {
         // Symmetric even on throw; endOp also refreshes the idle clock so a long
         // op resets it on completion.
         return await session.runOp(agentSessionId, () =>
-          dispatch(session, agentSessionId, config, actTimeoutMs, maxImageBytes, workspaceRoot, args),
+          dispatch(session, agentSessionId, config, actTimeoutMs, maxImageBytes, inferenceImageOptions, workspaceRoot, args),
         );
       } catch (error) {
         if (isBrowserError(error)) {
@@ -218,6 +225,7 @@ async function dispatch(
   config: BrowserConfig,
   actTimeoutMs: number,
   maxImageBytes: number,
+  inferenceImageOptions: ImageProcessingOptions,
   workspaceRoot: string,
   args: BrowserToolArgs,
 ): Promise<AgentToolResult<unknown>> {
@@ -344,11 +352,11 @@ async function dispatch(
         }
         throw new BrowserError("screenshot_failed", `Screenshot failed: ${message}`, { cause: error });
       }
-      // Bound the inline payload to the shared per-model base64 cap (issue #2):
-      // a long full-page capture can be many MB and blow the per-image/context
-      // budget. Downscale to fit rather than reject — the model should still see
-      // the page.
-      const bounded = await boundScreenshot(buffer, maxImageBytes, format);
+      // Bound the inline payload to the inference pixel budget and the shared
+      // per-model base64 cap (issue #2): a long full-page capture can be many
+      // megapixels and many MB. Downscale to fit rather than reject — the model
+      // should still see the page.
+      const bounded = await boundScreenshot(buffer, maxImageBytes, inferenceImageOptions, format);
       const scope = elementRef ? ` (element ${elementRef})` : args.full_page ? " (full page)" : "";
       return {
         content: [
@@ -462,10 +470,15 @@ async function pageResult(
 }
 
 /**
- * Bound a screenshot to `maxBytes` measured as its base64-encoded size (the
- * size providers meter against the per-image budget — the exact accounting
- * read_image uses via `base64ByteSize`). If the capture already fits it passes
- * through untouched (`downscaled: false`). Otherwise it's iteratively downscaled
+ * Bound a screenshot to the inference pixel budget (`imageOptions`, via
+ * `computeTargetDimensions` — the same bound `read_image` applies) and then to
+ * `maxBytes` measured as its base64-encoded size (the size providers meter
+ * against the per-image budget — the exact accounting read_image uses via
+ * `base64ByteSize`). A byte cap alone is not enough: a long full-page PNG can
+ * be tens of megapixels under it, and some vision servers fail on inputs that
+ * large. A capture within both bounds passes through untouched
+ * (`downscaled: false`). One over the pixel budget is first resized to it
+ * (re-encoded in `format`). If it is still over the byte cap it's iteratively downscaled
  * via sharp (re-encoded in `format`) until it fits or a minimum dimension /
  * iteration cap is hit. If it genuinely can't be made to fit, throws a clean
  * `screenshot_failed` BrowserError rather than shipping an oversized block.
@@ -477,25 +490,37 @@ async function pageResult(
 export async function boundScreenshot(
   buffer: Buffer,
   maxBytes: number,
+  imageOptions: ImageProcessingOptions,
   format: ScreenshotFormat = "png",
 ): Promise<{ data: string; downscaled: boolean; base64Bytes: number; mimeType: string }> {
   const mimeType = format === "jpeg" ? "image/jpeg" : "image/png";
   const reencode = (pipeline: sharp.Sharp): sharp.Sharp =>
     format === "jpeg" ? pipeline.jpeg({ quality: JPEG_QUALITY }) : pipeline.png();
 
-  if (base64ByteSize(buffer.byteLength) <= maxBytes) {
-    return {
-      data: buffer.toString("base64"),
-      downscaled: false,
-      base64Bytes: base64ByteSize(buffer.byteLength),
-      mimeType,
-    };
+  // Establish the current pixel dimensions to scale from. Unreadable dimensions
+  // skip the pixel bound; an over-cap capture then fails cleanly below.
+  const meta = await sharp(buffer).metadata().catch(() => undefined);
+  let width = meta?.width ?? 0;
+  let height = meta?.height ?? 0;
+  let current = buffer;
+  let downscaled = false;
+  if (width && height) {
+    const target = computeTargetDimensions(width, height, imageOptions);
+    if (target.width !== width || target.height !== height) {
+      width = target.width;
+      height = target.height;
+      current = await reencode(
+        sharp(buffer).resize({ width, height, fit: "inside", withoutEnlargement: true }),
+      ).toBuffer();
+      downscaled = true;
+    }
   }
 
-  // Establish the current pixel dimensions to scale from.
-  const meta = await sharp(buffer).metadata();
-  let width = meta.width ?? 0;
-  let height = meta.height ?? 0;
+  let currentBytes = base64ByteSize(current.byteLength);
+  if (currentBytes <= maxBytes) {
+    return { data: current.toString("base64"), downscaled, base64Bytes: currentBytes, mimeType };
+  }
+
   if (!width || !height) {
     // Can't introspect dimensions — we have no safe way to downscale, so refuse
     // rather than ship an oversized payload.
@@ -510,8 +535,6 @@ export async function boundScreenshot(
   // oversized capture converges quickly instead of crawling down 20% at a time.
   const MIN_DIMENSION = 320; // below this a screenshot is no longer useful
   const MAX_ITERATIONS = 12;
-  let current = buffer;
-  let currentBytes = base64ByteSize(current.byteLength);
   const initialRatio = Math.sqrt(maxBytes / currentBytes); // <1
   let scale = Math.min(0.9, Math.max(0.1, initialRatio));
 
