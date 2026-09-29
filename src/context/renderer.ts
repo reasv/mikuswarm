@@ -726,7 +726,9 @@ function renderYotsuba4chanThread(
     board: label,
     threadNo: payload.threadNo,
     subject: payload.subject,
-    opExcerpt: !payload.subject ? payload.opExcerpt : undefined,
+    // Spec §6.2: post links always carry the OP excerpt; thread links only
+    // when untitled (the OP itself is the headline there).
+    opExcerpt: !payload.subject || payload.linkedNo != null ? payload.opExcerpt : undefined,
     postCount: payload.postCount,
     fileCount: payload.fileCount,
     posters: payload.posters,
@@ -767,7 +769,7 @@ function renderYotsuba4chanThread(
 
   for (const post of sortedPosts) {
     const gap = post.index - lastIndex - 1;
-    if (gap > 0) {
+    if (gap > 0 && upgrade) {
       // Count files in the gap using filesBefore when available, else approximate.
       let gapFiles: number;
       if (post.filesBefore !== undefined && lastPost !== undefined) {
@@ -796,7 +798,7 @@ function renderYotsuba4chanThread(
 
   // Trailing gap (posts after the last shown post, to the end of the thread).
   const threadEndIndex = totalPosts - 1;
-  if (lastIndex < threadEndIndex) {
+  if (upgrade && lastIndex < threadEndIndex) {
     const trailingGap = threadEndIndex - lastIndex;
     let trailingFiles: number;
     if (lastPost !== undefined && payload.fileCount !== undefined && lastPost.filesBefore !== undefined) {
@@ -964,11 +966,17 @@ function buildYotsubaThreadFooter(
       const headlineNo = payload.headlineNo ?? payload.linkedNo;
       const repliedTo = allPosts.filter((p) => includedNos.includes(p.no) && p.role === "replied_to").length;
       const replies = allPosts.filter((p) => includedNos.includes(p.no) && p.role === "reply").length;
-      desc = `the linked post${repliedTo > 0 ? `, the ${repliedTo} posts it answers` : ""}${replies > 0 ? ` and its first ${replies} replies` : ""} (${includedCount} of ${totalPosts})`;
+      const answers = repliedTo === 1 ? "the post it answers" : `the ${repliedTo} posts it answers`;
+      const firstReplies = replies === 1 ? "its first reply" : `its first ${replies} replies`;
+      desc = `the linked post${repliedTo > 0 ? `, ${answers}` : ""}${replies > 0 ? ` and ${firstReplies}` : ""} (${includedCount} of ${totalPosts})`;
     } else {
       const latestCount = allPosts.filter((p) => includedNos.includes(p.no) && p.role === "latest").length;
       const repliedTo = allPosts.filter((p) => includedNos.includes(p.no) && p.role === "replied_to").length;
-      desc = `the opening post${latestCount > 0 ? `, the last ${latestCount} replies` : ""}${repliedTo > 0 ? ` and the ${repliedTo} posts they answer` : ""} (${includedCount} of ${totalPosts})`;
+      const lastReplies = latestCount === 1 ? "the last reply" : `the last ${latestCount} replies`;
+      const answered = repliedTo === 1
+        ? (latestCount === 1 ? "the post it answers" : "the post they answer")
+        : `the ${repliedTo} posts ${latestCount === 1 ? "it answers" : "they answer"}`;
+      desc = `the opening post${latestCount > 0 ? `, ${lastReplies}` : ""}${repliedTo > 0 ? ` and ${answered}` : ""} (${includedCount} of ${totalPosts})`;
     }
     const left = upgrade.left;
     let leftNote = "";

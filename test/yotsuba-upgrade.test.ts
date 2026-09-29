@@ -28,6 +28,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   computeRefCost,
+  REF_FRAME_TOKENS,
+  POST_OVERHEAD_TOKENS,
+  FILE_ELEMENT_TOKENS,
   allocateGroupFiles,
   planYotsubaUpgrade,
   type PlanBudgets,
@@ -95,40 +98,41 @@ function plan1(payload: YotsubaPreviewPayload, budgets = defaultBudgets, canDown
   return planYotsubaUpgrade({ refs: [{ payload, canDownload }], budgets }).refs[0]!;
 }
 
+/** Realistic text of about `chars` characters (the real tokenizer compresses "xxxx…" to almost nothing). */
+function prose(chars: number): string {
+  const words = "the build finished after a clean install and the cache warmed up so the next run should be faster once the drivers settle ".split(" ");
+  let out = "";
+  for (let i = 0; out.length < chars; i++) out += words[i % words.length] + (i % 7 === 6 ? ".\n" : " ");
+  return out.slice(0, chars);
+}
+
 // ---------------------------------------------------------------------------
 // computeRefCost
 // ---------------------------------------------------------------------------
 
-test("computeRefCost: frame cost alone with no posts and no files", () => {
-  const cost = computeRefCost({
-    includedPosts: [],
-    headlineTextLen: 0,
-    filesInRef: 0,
-    captionAllowanceTokens: 125,
-  });
-  assert.equal(cost, 30, "frame cost = 30");
+test("computeRefCost: frame plus the headline post element with empty text", () => {
+  const cost = computeRefCost({ includedPosts: [], headlineText: "", filesInRef: 0, captionAllowanceTokens: 125 });
+  assert.equal(cost, REF_FRAME_TOKENS + POST_OVERHEAD_TOKENS);
 });
 
-test("computeRefCost: text cost rounds up", () => {
-  // 5-char headline → ceil(5/4) = 2; 4-char post → ceil(4/4) = 1; frame = 30
-  const post = makePost(1, "latest", "four");
-  const cost = computeRefCost({
-    includedPosts: [post],
-    headlineTextLen: 5,
-    filesInRef: 0,
-    captionAllowanceTokens: 0,
-  });
-  assert.equal(cost, 30 + 2 + 1, "frame(30) + headline(2) + post(1)");
+test("computeRefCost: each post adds its element overhead, escaped text, and file element", () => {
+  const plain = makePost(1, "latest", "four");
+  const withFile = { ...makePost(2, "latest", "four"), file: { name: "a", ext: ".png", tim: 1 } } as YotsubaPostNode;
+  const base = computeRefCost({ includedPosts: [], headlineText: "", filesInRef: 0, captionAllowanceTokens: 0 });
+  const one = computeRefCost({ includedPosts: [plain], headlineText: "", filesInRef: 0, captionAllowanceTokens: 0 });
+  const two = computeRefCost({ includedPosts: [plain, withFile], headlineText: "", filesInRef: 0, captionAllowanceTokens: 0 });
+  assert.ok(one - base > POST_OVERHEAD_TOKENS);
+  assert.equal(two - one, one - base + FILE_ELEMENT_TOKENS);
+  // Escaping is charged: ">" renders as "&gt;".
+  const quoted = computeRefCost({ includedPosts: [], headlineText: ">>123 >>456", filesInRef: 0, captionAllowanceTokens: 0 });
+  const bare = computeRefCost({ includedPosts: [], headlineText: "123 456", filesInRef: 0, captionAllowanceTokens: 0 });
+  assert.ok(quoted > bare);
 });
 
-test("computeRefCost: caption cost adds captionAllowanceTokens per file", () => {
-  const cost = computeRefCost({
-    includedPosts: [],
-    headlineTextLen: 0,
-    filesInRef: 2,
-    captionAllowanceTokens: 50,
-  });
-  assert.equal(cost, 30 + 100, "frame(30) + 2 × 50 caption");
+test("computeRefCost: caption cost adds captionAllowanceTokens per processed file", () => {
+  const a = computeRefCost({ includedPosts: [], headlineText: "", filesInRef: 0, captionAllowanceTokens: 50 });
+  const b = computeRefCost({ includedPosts: [], headlineText: "", filesInRef: 2, captionAllowanceTokens: 50 });
+  assert.equal(b - a, 100);
 });
 
 // ---------------------------------------------------------------------------
@@ -148,7 +152,7 @@ test("resolveYotsubaConfig: default trigger budget constants match spec", () => 
 // ---------------------------------------------------------------------------
 
 test("plan: headline text is truncated to headlineCharCap", () => {
-  const longText = "a".repeat(1200);
+  const longText = prose(1200);
   const p = makePayload({ threadNo: 1, posts: [makePost(1, "op", longText)] });
   const ref = plan1(p);
   assert.equal(ref.staysAmbient, false);
@@ -168,7 +172,7 @@ test("plan: headlineChars written to upgrade record (renderer reads it back)", (
   //   const headlineCharCap = upgrade ? upgrade.headlineChars : (payload.ambientChars ?? 300);
   // If headlineChars is undefined the cap is undefined and the renderer never
   // truncates trigger headlines.  Verify the planner always sets it.
-  const p = makePayload({ threadNo: 1, posts: [makePost(1, "op", "x".repeat(1000))] });
+  const p = makePayload({ threadNo: 1, posts: [makePost(1, "op", prose(1000))] });
   const ref = plan1(p);
   assert.ok(ref.headlineChars !== undefined, "headlineChars must be defined for upgrade record");
   assert.equal(ref.headlineChars, 800, "defaults to triggerHeadlineChars = 800");
@@ -181,7 +185,7 @@ test("plan: headlineChars written to upgrade record (renderer reads it back)", (
 test("plan: thread link drops replied_to (oldest first) before latest", () => {
   // Tight budget: headline alone fits but adding two large posts will exceed it.
   // Posts: OP (headline), replied_to #2, replied_to #3, latest #4
-  const bigText = "x".repeat(1000);
+  const bigText = prose(1000);
   const posts = [
     makePost(1, "op", bigText),
     makePost(2, "replied_to", bigText),  // oldest replied_to — dropped first
@@ -202,7 +206,7 @@ test("plan: thread link drops replied_to (oldest first) before latest", () => {
 });
 
 test("plan: thread link drops oldest latest when no replied_to remain", () => {
-  const bigText = "y".repeat(3600); // ~900 tokens per post
+  const bigText = prose(3600); // ~900 tokens per post
   const posts = [
     makePost(1, "op", "short"),
     makePost(2, "latest", bigText),  // oldest latest — dropped first
@@ -225,7 +229,7 @@ test("plan: thread link drops oldest latest when no replied_to remain", () => {
 // ---------------------------------------------------------------------------
 
 test("plan: post link drops reply (newest first) before replied_to", () => {
-  const bigText = "z".repeat(1000);
+  const bigText = prose(1000);
   const posts = [
     makePost(50, "linked", bigText),      // headline (post link)
     makePost(40, "replied_to", bigText),  // the post it answers
@@ -252,7 +256,7 @@ test("plan: post link drops reply (newest first) before replied_to", () => {
 test("plan: stays ambient when headline alone exceeds remaining group budget", () => {
   // Headline 800 chars → cost = 30 + ceil(800/4) = 30 + 200 = 230.
   // Group budget = 100 < 230.
-  const posts = [makePost(1, "op", "x".repeat(1000))]; // truncated to 800 at headlineCharCap=800
+  const posts = [makePost(1, "op", prose(1000))]; // truncated to 800 at headlineCharCap=800
   const tinyGroupBudgets: PlanBudgets = {
     ...defaultBudgets,
     groupTokenBudget: 100,
@@ -279,13 +283,15 @@ test("plan: group order — first ref gets budget before later refs", () => {
   // ref0 should fit; ref1 (added to group budget after ref0) should stay ambient.
   // Headline 800 chars → cost = 30 + 200 = 230.  Group budget = 300.
   // ref0: 230 < 300 ✓; ref1: 230 > (300-230=70) → staysAmbient.
+  // Budget: one headline-only ref fits, two do not.
+  const single = computeRefCost({ includedPosts: [], headlineText: prose(800), filesInRef: 0, captionAllowanceTokens: 0 });
   const groupBudgets: PlanBudgets = {
     ...defaultBudgets,
-    groupTokenBudget: 300,
+    groupTokenBudget: Math.floor(single * 1.5),
     captionAllowanceTokens: 0,
   };
-  const p0 = makePayload({ threadNo: 100, posts: [makePost(100, "op", "x".repeat(1000))] });
-  const p1 = makePayload({ threadNo: 200, posts: [makePost(200, "op", "x".repeat(1000))] });
+  const p0 = makePayload({ threadNo: 100, posts: [makePost(100, "op", prose(1000))] });
+  const p1 = makePayload({ threadNo: 200, posts: [makePost(200, "op", prose(1000))] });
   const result = planYotsubaUpgrade({
     refs: [{ payload: p0, canDownload: false }, { payload: p1, canDownload: false }],
     budgets: groupBudgets,
@@ -303,14 +309,15 @@ test("plan: ambient ref does not consume tier-1 file slots", () => {
   // ref0 and ref1 each have a headline file.
   // With the bug: ref1 (ambient) steals the tier-1 slot from ref0.
   // With the fix: ref1 is excluded from allocation; ref0 gets its slot.
+  const single = computeRefCost({ includedPosts: [], headlineText: prose(800), headlineHasFile: true, filesInRef: 0, captionAllowanceTokens: 0 });
   const groupBudgets: PlanBudgets = {
     ...defaultBudgets,
-    groupTokenBudget: 300,
+    groupTokenBudget: Math.floor(single * 1.5),
     groupFileBudget: 1,
     captionAllowanceTokens: 0, // no caption cost; just text
   };
-  const op0 = makePost(100, "op", "x".repeat(800), true); // file present
-  const op1 = makePost(200, "op", "x".repeat(800), true); // file present; this ref will be ambient
+  const op0 = makePost(100, "op", prose(800), true); // file present
+  const op1 = makePost(200, "op", prose(800), true); // file present; this ref will be ambient
   const p0 = makePayload({ threadNo: 100, posts: [op0] });
   const p1 = makePayload({ threadNo: 200, posts: [op1] });
   const result = planYotsubaUpgrade({
@@ -338,14 +345,14 @@ test("plan: per-ref 900 budget: just under fits, just over triggers drops", () =
   // 3480 chars → ceil(3480/4) = 870 tokens + 30 = 900 ✓
   // 3481 chars → ceil(3481/4) = 871 tokens + 30 = 901 → triggers drop loop.
   // But headline is never dropped; just add a non-headline post to trigger the drop.
-  const headlineText = "a".repeat(3200); // 800 + 800 = safe headline; keep it under 800 for cap
+  const headlineText = prose(3200); // 800 + 800 = safe headline; keep it under 800 for cap
   // Actually headlineCharCap = 800, so max headline = 800 chars → ceil(800/4) = 200 → cost = 230.
   // For per-ref overflow: add posts that push the ref over 900.
   // Cost = 30 + 200 (headline) + N * ceil(postText/4).
   // Adding one post with 2720 chars → ceil(2720/4) = 680 → total = 910 > 900.
-  const extraText = "b".repeat(2720);
+  const extraText = prose(2720);
   const posts = [
-    makePost(1, "op", "x".repeat(1000)),  // headline → 800 chars
+    makePost(1, "op", prose(1000)),  // headline → 800 chars
     makePost(2, "replied_to", extraText),  // pushes ref over 900
   ];
   const perRefBudgets: PlanBudgets = {
@@ -384,8 +391,8 @@ test("plan: group 1800 budget with caption allowances: just over causes ambient"
     headlineCharCap: 800,
     captionAllowanceTokens: 800,
   };
-  const op0 = makePost(1, "op", "x".repeat(1000), true); // file → gets caption allowance
-  const op1 = makePost(2, "op", "x".repeat(1000), true);
+  const op0 = makePost(1, "op", prose(1000), true); // file → gets caption allowance
+  const op1 = makePost(2, "op", prose(1000), true);
   const p0 = makePayload({ threadNo: 1, posts: [op0] });
   const p1 = makePayload({ threadNo: 2, posts: [op1] });
   const result = planYotsubaUpgrade({
@@ -403,7 +410,9 @@ test("plan: group 1800 budget with caption allowances: just over causes ambient"
 test("plan: five thread-link refs — first four OPs processed, fifth stored", () => {
   // Five refs, each with one OP image.  Group file budget = 4.
   // Tier-1 allocation: ref0–ref3 get their headline files; ref4 does not.
-  const budgets: PlanBudgets = { ...defaultBudgets, groupFileBudget: 4 };
+  // Token budgets wide enough that all five refs render; this isolates the
+  // group-wide file allocation.
+  const budgets: PlanBudgets = { ...defaultBudgets, groupTokenBudget: 10_000, groupFileBudget: 4 };
   const refs: PlannerRefInput[] = Array.from({ length: 5 }, (_, i) => ({
     payload: makePayload({
       threadNo: 100 + i,
@@ -511,9 +520,9 @@ test("plan: left counts reflect dropped posts", () => {
   // Total with two non-headline posts: 30 + 200 + 200 + 200 = 630.
   // Per-ref budget = 230 (only headline fits) → both posts must be dropped.
   // Drop order for thread link: replied_to first, then latest.
-  const extraText = "c".repeat(800);
+  const extraText = prose(800);
   const posts = [
-    makePost(1, "op", "x".repeat(1000)),   // headline → 800 chars truncated
+    makePost(1, "op", prose(1000)),   // headline → 800 chars truncated
     makePost(2, "replied_to", extraText),   // dropped first
     makePost(3, "latest", extraText),       // dropped second
   ];
@@ -537,10 +546,10 @@ test("plan: left counts reflect dropped posts", () => {
 
 test("plan: same input yields same plan (deterministic)", () => {
   const posts = [
-    makePost(1, "op", "x".repeat(1000)),
-    makePost(2, "replied_to", "y".repeat(500)),
-    makePost(3, "latest", "z".repeat(500)),
-    makePost(4, "latest", "a".repeat(500), true),
+    makePost(1, "op", prose(1000)),
+    makePost(2, "replied_to", prose(500)),
+    makePost(3, "latest", prose(500)),
+    makePost(4, "latest", prose(500), true),
   ];
   const p = makePayload({ threadNo: 1, posts });
   const budgets: PlanBudgets = { ...defaultBudgets, linkTokenBudget: 500 };
@@ -548,10 +557,10 @@ test("plan: same input yields same plan (deterministic)", () => {
   const run1 = planYotsubaUpgrade({ refs: [{ payload: p, canDownload: true }], budgets });
   // Re-create the payload (same data, fresh object) to ensure no shared mutation.
   const posts2 = [
-    makePost(1, "op", "x".repeat(1000)),
-    makePost(2, "replied_to", "y".repeat(500)),
-    makePost(3, "latest", "z".repeat(500)),
-    makePost(4, "latest", "a".repeat(500), true),
+    makePost(1, "op", prose(1000)),
+    makePost(2, "replied_to", prose(500)),
+    makePost(3, "latest", prose(500)),
+    makePost(4, "latest", prose(500), true),
   ];
   const p2 = makePayload({ threadNo: 1, posts: posts2 });
   const run2 = planYotsubaUpgrade({ refs: [{ payload: p2, canDownload: true }], budgets });

@@ -9,6 +9,8 @@
 
 import type { YotsubaPostNode, YotsubaPreviewPayload } from "./types.js";
 import { safeYotsubaExt } from "./types.js";
+import { estimateTokens } from "../context/tokens.js";
+import { escapeXml } from "../context/xml.js";
 
 // ---------------------------------------------------------------------------
 // computeRefCost
@@ -22,18 +24,36 @@ import { safeYotsubaExt } from "./types.js";
  * text cost:   ceil(chars / 4) per post (headline + included)
  * caption:     captionAllowanceTokens × filesInRef
  */
+/**
+ * Rendering overheads of the trigger rendering (spec §6.6 C/E), measured on
+ * real threads: the `<link_preview>` + `<thread …>` frame and the footer; each
+ * `<post …>` element with its attributes plus the gap marker before it; each
+ * `<file …>` element (processed or stored). Text is costed with the real
+ * tokenizer over its escaped form (`>` renders as `&gt;`), so the planned cost
+ * tracks what the context actually carries.
+ */
+export const REF_FRAME_TOKENS = 190;
+export const POST_OVERHEAD_TOKENS = 32;
+export const FILE_ELEMENT_TOKENS = 40;
+
 export function computeRefCost(opts: {
   includedPosts: YotsubaPostNode[];
-  headlineTextLen: number;
+  /** The headline text as rendered (already capped). */
+  headlineText: string;
+  /** Whether the headline post has a file element. */
+  headlineHasFile?: boolean;
+  /** Processed files in this ref: each reserves a caption allowance. */
   filesInRef: number;
   captionAllowanceTokens: number;
 }): number {
-  const frameCost = 30;
-  const textCost =
-    opts.includedPosts.reduce((sum, p) => sum + Math.ceil(p.text.length / 4), 0) +
-    Math.ceil(opts.headlineTextLen / 4);
-  const captionCost = opts.filesInRef * opts.captionAllowanceTokens;
-  return frameCost + textCost + captionCost;
+  const textCost = (t: string) => estimateTokens(escapeXml(t));
+  let cost = REF_FRAME_TOKENS + POST_OVERHEAD_TOKENS + textCost(opts.headlineText);
+  if (opts.headlineHasFile) cost += FILE_ELEMENT_TOKENS;
+  for (const p of opts.includedPosts) {
+    cost += POST_OVERHEAD_TOKENS + textCost(p.text);
+    if (p.file) cost += FILE_ELEMENT_TOKENS;
+  }
+  return cost + opts.filesInRef * opts.captionAllowanceTokens;
 }
 
 // ---------------------------------------------------------------------------
@@ -297,7 +317,8 @@ export function planYotsubaUpgrade(input: {
 
       const refCost = computeRefCost({
         includedPosts: r.includedPosts,
-        headlineTextLen: r.headlineText.length,
+        headlineText: r.headlineText,
+        headlineHasFile: !!r.headlinePost.file,
         filesInRef,
         captionAllowanceTokens: budgets.captionAllowanceTokens,
       });
@@ -352,7 +373,8 @@ export function planYotsubaUpgrade(input: {
         const headlineFilesInRef = processedNos.has(r.headlinePost.no) ? 1 : 0;
         const headlineCost = computeRefCost({
           includedPosts: [],
-          headlineTextLen: r.headlineText.length,
+          headlineText: r.headlineText,
+          headlineHasFile: !!r.headlinePost.file,
           filesInRef: headlineFilesInRef,
           captionAllowanceTokens: budgets.captionAllowanceTokens,
         });
