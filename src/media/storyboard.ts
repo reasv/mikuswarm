@@ -147,12 +147,10 @@ async function runStoryboardFfmpeg(
   // We use the multi-input approach.
 
   const complexFilterParts: string[] = [];
-  const inputArgs: string[] = [];
   const ts = timestamps;
 
   // Build inputs and per-cell filter.
   for (let i = 0; i < 4; i++) {
-    inputArgs.push("-ss", ts[i].toFixed(3), "-i", inputPath);
     // Scale to cellPx, pad to cellPx square, take first frame only.
     complexFilterParts.push(
       `[${i}:v]scale=${cellPx}:${cellPx}:force_original_aspect_ratio=decrease,` +
@@ -166,6 +164,14 @@ async function runStoryboardFfmpeg(
   const complexFilter = complexFilterParts.join(";");
 
   return new Promise<boolean>((resolve) => {
+    let guard: NodeJS.Timeout | undefined;
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(guard);
+      resolve(ok);
+    };
     const ff = ffmpeg();
     // Attach all four inputs (each with its -ss).
     // fluent-ffmpeg supports this via inputOptions before each input().
@@ -187,27 +193,26 @@ async function runStoryboardFfmpeg(
       .complexFilter(complexFilter, ["out"])
       .outputOptions(["-frames:v", "1", "-q:v", quality.toString()])
       .output(outputPath)
-      .on("end", () => resolve(true))
+      .on("end", () => finish(true))
       .on("error", (err: Error) => {
+        if (settled) return;
         console.warn(`[media/storyboard] ffmpeg failed: ${err.message}`);
         unlink(outputPath).catch(() => {});
-        resolve(false);
+        finish(false);
       })
       .run();
 
-    // Timeout guard.
-    const guard = setTimeout(() => {
+    // Timeout guard; cleared by finish() so a completed storyboard is never
+    // unlinked out from under its caller.
+    guard = setTimeout(() => {
+      if (settled) return;
       try {
         (cmd as unknown as { kill: (sig?: string) => void }).kill("SIGKILL");
       } catch {
         // ignore
       }
       unlink(outputPath).catch(() => {});
-      resolve(false);
+      finish(false);
     }, timeoutMs);
-    // Clear guard on completion (success or error already resolved).
-    // This doesn't perfectly handle the case where resolve() races the timeout,
-    // but the timeout just resolves false again which is idempotent for a Promise.
-    void guard;
   });
 }

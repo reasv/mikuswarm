@@ -133,7 +133,6 @@ function processHtml(
           if (crossMatch) {
             const board = crossMatch[1];
             const postNo = crossMatch[2] ? parseInt(crossMatch[2], 10) : undefined;
-            const ref = postNo != null ? `>>>/b/${postNo}`.replace("b", board) : `>>>/b/`.replace("b", board);
             const finalRef = postNo != null ? `>>>/${board}/${postNo}` : `>>>/${board}/`;
             crossQuotes.push(finalRef);
             out += finalRef;
@@ -294,9 +293,10 @@ export function annotateQuotes(
   result = result.replace(/(?<!>)>>(\d+)/g, (full, numStr) => {
     const no = parseInt(numStr, 10);
     if (deadQuoteNos.has(no)) return `${full} (deleted)`;
+    // Spec §5.4: references to posts shown in this view stay bare.
+    if (shownNos.has(no)) return full;
     if (no === opNo) return `${full} (OP)`;
-    if (!shownNos.has(no)) return `${full} (not shown)`;
-    return full;
+    return `${full} (not shown)`;
   });
 
   return result;

@@ -137,10 +137,16 @@ test("convertComment: realistic quoting thread post", () => {
 // annotateQuotes
 // ---------------------------------------------------------------------------
 
-test("annotateQuotes: marks OP quote", () => {
+test("annotateQuotes: marks OP quote when the OP is not shown", () => {
+  const text = "see >>100 for more";
+  const annotated = annotateQuotes(text, new Set([200]), 100, new Set());
+  assert.ok(annotated.includes(">>100 (OP)"));
+});
+
+test("annotateQuotes: leaves a quote of a shown OP bare (spec §5.4)", () => {
   const text = "see >>100 for more";
   const annotated = annotateQuotes(text, new Set([100, 200]), 100, new Set());
-  assert.ok(annotated.includes(">>100 (OP)"));
+  assert.equal(annotated, "see >>100 for more");
 });
 
 test("annotateQuotes: marks not-shown post", () => {
