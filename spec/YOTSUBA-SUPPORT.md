@@ -1,6 +1,6 @@
 # Yotsuba: 4chan support (rich link previews, `yotsuba` browsing tool, skill)
 
-**Status**: PROPOSED (design session 2026-09-29, revised same day). Not implemented.
+**Status**: IMPLEMENTED — superseded by ARCHITECTURE.md §7f (link previews, module) and §10 "Yotsuba tool"; retained for review.
 
 **Target ARCHITECTURE.md homes once implemented**: new §7f "Yotsuba (4chan) enrichment"
 (sibling of §7a "X.com enrichment via FxTwitter" and §7e YouTube); §10 "Yotsuba tool"; §4
