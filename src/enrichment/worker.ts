@@ -23,6 +23,8 @@ import { probe, transcript } from "../youtube/ytdlp.js";
 import type { YotsubaClient } from "../yotsuba/client.js";
 import {
   YOTSUBA_SOURCE_KIND,
+  safeYotsubaExt,
+  safeYotsubaTim,
   type ResolvedYotsubaConfig,
   type YotsubaPreviewPayload,
   type YotsubaPostNode,
@@ -1450,6 +1452,28 @@ export class EnrichmentWorker {
     // Sort nodes by thread index for the capture.
     captureNodes.sort((a, b) => a.index - b.index);
 
+    // Reply counts (backlinks) from the full thread: how many posts quote each
+    // captured post, and which ones (the renderer's "[N replies: …]" line).
+    {
+      const capturedNos = new Set(captureNodes.map((n) => n.no));
+      const backlinks = new Map<number, number[]>();
+      for (const p of posts) {
+        if (p.no == null || !p.com) continue;
+        const { quotes } = convertComment(p.com);
+        for (const q of new Set(quotes)) {
+          if (!capturedNos.has(q) || q === p.no) continue;
+          let arr = backlinks.get(q);
+          if (!arr) { arr = []; backlinks.set(q, arr); }
+          arr.push(p.no);
+        }
+      }
+      for (const node of captureNodes) {
+        const nos = backlinks.get(node.no) ?? [];
+        node.replies = nos.length;
+        if (nos.length > 0) node.replyNos = nos;
+      }
+    }
+
     // Compute filesBefore for each captured node: count of files in posts
     // at indices 0..(node.index - 1) in the full thread.
     {
@@ -1994,19 +2018,22 @@ function apiPostToNode(
   if (post.trip) node.trip = post.trip;
   if (post.id) node.posterId = post.id;
   if (post.capcode) node.capcode = post.capcode;
-  if (post.board_flag) node.flag = post.board_flag;
+  const flag = post.country_name ?? post.flag_name;
+  if (flag) node.flag = flag;
   if (deadQuotes && deadQuotes.length > 0) node.deadQuotes = deadQuotes;
   if (crossQuotes && crossQuotes.length > 0) node.crossQuotes = crossQuotes;
-  if (post.tim) {
+  const safeTim = safeYotsubaTim(post.tim);
+  const safeExt = safeYotsubaExt(post.ext);
+  if (safeTim && safeExt) {
     node.file = {
-      name: post.filename ?? String(post.tim),
-      ext: post.ext ?? ".jpg",
+      name: post.filename ?? String(safeTim),
+      ext: safeExt,
       w: post.w,
       h: post.h,
       bytes: post.fsize,
       spoiler: post.spoiler === 1,
       deleted: post.filedeleted === 1,
-      tim: post.tim,
+      tim: safeTim,
     };
   }
   return node;
