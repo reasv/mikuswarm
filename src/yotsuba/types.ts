@@ -118,6 +118,8 @@ export interface YotsubaPostNode {
   replies: number;            // backlink count
   replyNos?: number[];        // backlink post numbers (if captured)
   file?: YotsubaPostFile;
+  // count of files in all thread posts BEFORE this post's position (0-indexed prefix sum)
+  filesBefore?: number;
 }
 
 export interface YotsubaPostFile {

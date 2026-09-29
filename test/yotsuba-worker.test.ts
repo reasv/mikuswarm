@@ -150,7 +150,8 @@ async function makeHarness(opts: {
       role: "user",
     }),
     getIngestLinkPreviewUrls: () => [],
-    getYotsubaPreviewByUrl: (_url: string) => existingYotsubaRow,
+    getTimelineEventById: (_id: string) => chatEvent(),
+    getYotsubaPreviewByUrl: (_url: string, _timelineKey?: string) => existingYotsubaRow,
   } as unknown as Storage;
 
   const capabilities: EnrichmentCapabilities = {
@@ -438,13 +439,52 @@ test("reply context reuses existing yotsuba row without fetching", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Cross-timeline reply context non-reuse
+// ---------------------------------------------------------------------------
+
+test("reply context does NOT reuse a row from a different timeline", async () => {
+  // When getYotsubaPreviewByUrl returns null (simulating no row in this timeline),
+  // the worker falls through to the full fetch path and makes an API call.
+  const h = await makeHarness({
+    existingYotsubaRow: null,
+    noMessageSummary: true,
+    threadFixtures: {
+      "g/100000": baseThread(100000, [
+        baseApiPost(100000, { sub: "Test Subject", com: "OP body" }),
+      ]),
+    },
+  });
+  try {
+    const event = chatEvent({
+      body: "@miku explain the joke",
+      replyTo: {
+        externalId: "original-event",
+        sender: { id: "@alice:example.org", displayName: "Alice" },
+        body: "lmao look at this https://boards.4chan.org/g/thread/100000",
+      },
+    });
+
+    await h.worker.process(event);
+
+    // API calls were made (no existing row to reuse — full fetch happened)
+    assert.ok(h.clientCalls.length > 0, "API call made when no existing yotsuba row for timeline");
+
+    // A yotsuba row should still be in the result (from a fresh fetch)
+    const yotPreviews = previews(h).filter((p) => p.source_kind === YOTSUBA_SOURCE_KIND);
+    assert.ok(yotPreviews.length >= 1, "should have a yotsuba preview from fresh fetch");
+  } finally {
+    await cleanup(h);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Headline file created deferred
 // ---------------------------------------------------------------------------
 
 test("headline file is downloaded and stored for thread links", async () => {
-  // The general caption loop at the end of process() sets all completed-download
-  // assets to "pending" (or "deferred" for backfetch events). Yotsuba headline
-  // files are subject to the same loop, so they end up "pending" on normal events.
+  // The post-pass skips yotsuba assets (they manage their own caption_status).
+  // Headline files are created with caption_status="deferred" by enrichYotsubaThreadRef
+  // unless captionImmediately fires; the post-pass does NOT override this.
   const h = await makeHarness({
     threadFixtures: {
       "g/300000": baseThread(300000, [
@@ -469,9 +509,8 @@ test("headline file is downloaded and stored for thread links", async () => {
     assert.ok(previewMedia.length > 0, "headline file asset should be created");
     const headlineAsset = previewMedia[0]!;
     assert.equal(headlineAsset.download_status, "complete", "headline file downloaded successfully");
-    // The general caption loop in process() overrides caption_status to "pending"
-    // for completed downloads on non-backfetch events.
-    assert.equal(headlineAsset.caption_status, "pending", "general caption loop sets pending for completed downloads");
+    // The post-pass skips yotsuba assets; caption_status stays as set by the yotsuba enrichment (deferred).
+    assert.equal(headlineAsset.caption_status, "deferred", "post-pass skips yotsuba assets, caption_status stays deferred");
   } finally {
     await cleanup(h);
   }

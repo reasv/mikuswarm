@@ -218,9 +218,17 @@ export class EnrichmentWorker {
     // event, where they are 'deferred' (spec MESSAGE-BACKFETCH §7.3): inert until an
     // operator retroactively promotes them, regardless of caption_all. This keeps
     // backfetch captioning opt-in and decoupled from the always-on text indexing.
+    const yotsubaPreviewIds = new Set(
+      result.linkPreviews
+        .filter((lp) => lp.source_kind === YOTSUBA_SOURCE_KIND)
+        .map((lp) => lp.id),
+    );
     const isBackfetch = this.options.storage.isBackfetchEvent(event.id);
     const captionableTypes = ["image", "video", "audio"];
     for (const asset of result.mediaAssets) {
+      // Yotsuba assets manage their own caption_status (deferred until upgrade, or
+      // pending when captionImmediately fired at enrichment time).
+      if (asset.link_preview_id && yotsubaPreviewIds.has(asset.link_preview_id)) continue;
       if (captionableTypes.includes(asset.media_type) && asset.download_status === "complete") {
         asset.caption_status = isBackfetch ? "deferred" : "pending";
       } else {
@@ -1099,7 +1107,8 @@ export class EnrichmentWorker {
     // URL, copy its payload and reference its already-downloaded files rather
     // than making another API call.
     if (context === "reply") {
-      const existing = this.options.storage.getYotsubaPreviewByUrl(canonicalUrl);
+      const eventRow = this.options.storage.getTimelineEventById(eventId);
+      const existing = this.options.storage.getYotsubaPreviewByUrl(canonicalUrl, eventRow?.timelineKey);
       if (existing) {
         const copiedRow: LinkPreviewRow = {
           ...existing.row,
@@ -1363,18 +1372,27 @@ export class EnrichmentWorker {
     captureNos.add(headlineNo);
 
     if (linkedMissing == null && headlineNo === opNo) {
-      // Thread link: latest replies + posts they answer.
+      // Thread link: latest replies first, then posts they answer.
       const nonOpPosts = posts.slice(1);
       const latestCount = cfg.preview.latestReplies;
       const latestPosts = nonOpPosts.slice(-latestCount);
-      const alreadyCaptured = new Set<number>([opNo]);
 
-      // Collect posts answered by latest replies (replied-to candidates).
+      // Add latest replies first (so they get 'latest' role).
+      for (const p of latestPosts) {
+        if (!captureNos.has(p.no!)) {
+          const idx = posts.findIndex((pp) => pp.no === p.no);
+          captureNodes.push(apiPostToNode(p, idx, "latest"));
+          captureNos.add(p.no!);
+        }
+      }
+
+      // Now collect replied-to candidates (posts cited by latest replies,
+      // excluding OP and already-captured posts — including the latest replies).
       const answeredNos = new Set<number>();
       for (const lp of latestPosts) {
         const { quotes } = convertComment(lp.com ?? "");
         for (const qno of quotes) {
-          if (!alreadyCaptured.has(qno) && !answeredNos.has(qno)) {
+          if (!captureNos.has(qno) && !answeredNos.has(qno)) {
             answeredNos.add(qno);
           }
         }
@@ -1390,15 +1408,6 @@ export class EnrichmentWorker {
         if (!captureNos.has(p.no!)) {
           const idx = posts.findIndex((pp) => pp.no === p.no);
           captureNodes.push(apiPostToNode(p, idx, "replied_to"));
-          captureNos.add(p.no!);
-        }
-      }
-
-      // Add latest replies.
-      for (const p of latestPosts) {
-        if (!captureNos.has(p.no!)) {
-          const idx = posts.findIndex((pp) => pp.no === p.no);
-          captureNodes.push(apiPostToNode(p, idx, "latest"));
           captureNos.add(p.no!);
         }
       }
@@ -1440,6 +1449,19 @@ export class EnrichmentWorker {
 
     // Sort nodes by thread index for the capture.
     captureNodes.sort((a, b) => a.index - b.index);
+
+    // Compute filesBefore for each captured node: count of files in posts
+    // at indices 0..(node.index - 1) in the full thread.
+    {
+      // Build a prefix sum of file counts over the full thread.
+      const filePrefixSum: number[] = new Array(posts.length + 1).fill(0);
+      for (let i = 0; i < posts.length; i++) {
+        filePrefixSum[i + 1] = filePrefixSum[i]! + (posts[i]!.tim ? 1 : 0);
+      }
+      for (const node of captureNodes) {
+        node.filesBefore = filePrefixSum[node.index] ?? 0;
+      }
+    }
 
     // Build payload (before file download).
     const payload: YotsubaPreviewPayload = {

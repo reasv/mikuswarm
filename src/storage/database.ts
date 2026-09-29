@@ -4976,15 +4976,30 @@ export class Storage {
    * events. Used by the enrichment worker to reuse capture data when a reply
    * context refers to a URL that was already enriched on another event.
    */
-  getYotsubaPreviewByUrl(url: string): { row: LinkPreviewRow; assets: MediaAssetRow[] } | null {
+  getYotsubaPreviewByUrl(url: string, timelineKey?: string): { row: LinkPreviewRow; assets: MediaAssetRow[] } | null {
     return this.read((db) => {
-      const row = db
-        .prepare(
-          `select * from link_previews
-           where url = ? and source_kind = 'yotsuba'
-           order by created_at desc limit 1`,
-        )
-        .get(url) as LinkPreviewRow | undefined;
+      let row: LinkPreviewRow | undefined;
+      if (timelineKey) {
+        row = db
+          .prepare(
+            `select lp.* from link_previews lp
+             join timeline_events te on te.id = lp.event_id
+             where lp.url = ? and lp.source_kind = 'yotsuba'
+             and lp.fetch_status = 'complete'
+             and te.timeline_key = ?
+             order by lp.created_at desc limit 1`,
+          )
+          .get(url, timelineKey) as LinkPreviewRow | undefined;
+      } else {
+        row = db
+          .prepare(
+            `select * from link_previews
+             where url = ? and source_kind = 'yotsuba'
+             and fetch_status = 'complete'
+             order by created_at desc limit 1`,
+          )
+          .get(url) as LinkPreviewRow | undefined;
+      }
       if (!row) return null;
       const assets = db
         .prepare(`select * from media_assets where link_preview_id = ?`)
