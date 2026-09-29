@@ -1320,12 +1320,10 @@ const BrowserSchema = StrictObject({
   // under [agents.<name>.browser]. In legacy mode, absent ⇒ code default "miku"
   // (spec MULTI-AGENT-SUPPORT §10a / §4.2 schema-optional treatment).
   profile_name: Type.Optional(Type.String({ minLength: 1 })),
-  // Fingerprint platform spoof. Most common / least suspicious is windows.
-  platform: Type.Union([
-    Type.Literal("windows"),
-    Type.Literal("macos"),
-    Type.Literal("linux"),
-  ]),
+  // NOTE: `platform` (fingerprint platform spoof) was removed: the Manager now
+  // derives the fingerprint platform from its host runtime and rejects the field
+  // on profile create, so a stale key fail-fasts here instead of breaking the
+  // first browser use of a new profile.
   // Stable fingerprint seed (create-once). 0 (or unset) ⇒ let the Manager pick a
   // random seed once and persist it; a drifting seed defeats the "same person".
   fingerprint_seed: Type.Optional(Type.Number({ minimum: 0 })),

@@ -27,7 +27,7 @@ const silentLogger: Logger = {
 function baseConfig(overrides: Partial<BrowserConfig> = {}): BrowserConfig {
   return {
     enabled: true, manager_url: "http://127.0.0.1:8080", auth_token: "t",
-    profile_name: "miku", platform: "windows", fingerprint_seed: 1, humanize: false,
+    profile_name: "miku", fingerprint_seed: 1, humanize: false,
     evaluate_enabled: false, proxy: "", geoip: false, dialog_policy: "dismiss",
     snapshot_max_chars: 20000, snapshot_max_frames: 10, nav_timeout_ms: 30000, act_timeout_ms: 15000,
     connect_timeout_ms: 20000, session_page_idle_ms: 600000, ...overrides,

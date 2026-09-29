@@ -1136,7 +1136,6 @@ manager_url = "http://127.0.0.1:8080"  # CloakBrowser-Manager base (loopback-pub
 # profile_name is intentionally absent: in agents mode each agent sets its own
 # [agents.<name>.browser] profile_name. In legacy mode the code applies "miku"
 # as the default when absent (spec MULTI-AGENT-SUPPORT §10a / §4.2).
-platform = "windows"                    # fingerprint platform: windows | macos | linux
 fingerprint_seed = 0                    # 0/unset ⇒ Manager picks a random seed once, then persists it
 humanize = true                         # Bézier mouse + per-char typing
 evaluate_enabled = false                # gate browser act:evaluate (arbitrary page JS)

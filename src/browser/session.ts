@@ -527,7 +527,6 @@ export class BrowserSession {
 
     const input: ProfileCreateInput = {
       name,
-      platform: this.config.platform,
       // 0/unset ⇒ let the Manager pick a random seed once and persist it.
       fingerprint_seed: this.config.fingerprint_seed ? this.config.fingerprint_seed : undefined,
       timezone: this.config.timezone ?? this.agentTimezone,

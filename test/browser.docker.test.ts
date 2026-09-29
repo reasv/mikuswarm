@@ -63,7 +63,6 @@ function config(overrides: Partial<BrowserConfig> = {}): BrowserConfig {
     manager_url: `http://127.0.0.1:${PORT}`,
     auth_token: AUTH_TOKEN,
     profile_name: "miku-test",
-    platform: "windows",
     fingerprint_seed: 4242,
     humanize: false,
     evaluate_enabled: true,

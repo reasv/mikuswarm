@@ -71,7 +71,7 @@ test("manager client: createProfile posts the body", async () => {
     new Response(JSON.stringify({ id: "p9", name: call.body && (call.body as { name: string }).name, fingerprint_seed: 7, status: "stopped", cdp_url: null }), { status: 201 }),
   );
   try {
-    const created = await client().createProfile({ name: "miku", platform: "windows", humanize: true, geoip: false, auto_launch: true });
+    const created = await client().createProfile({ name: "miku", humanize: true, geoip: false, auto_launch: true });
     assert.equal(created.id, "p9");
     assert.equal(calls[0]!.method, "POST");
     assert.equal((calls[0]!.body as { auto_launch: boolean }).auto_launch, true);

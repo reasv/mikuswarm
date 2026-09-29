@@ -26,7 +26,6 @@ function baseConfig(): BrowserConfig {
     manager_url: "http://127.0.0.1:8080",
     auth_token: "test-tok",
     profile_name: "miku",
-    platform: "windows",
     fingerprint_seed: 12345,
     humanize: true,
     evaluate_enabled: false,

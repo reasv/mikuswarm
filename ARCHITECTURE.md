@@ -4011,7 +4011,6 @@ manager_url = "http://127.0.0.1:8080"  # schema default (loopback); under compos
 # profile_name: in LEGACY mode only — the single persistent identity (resolved by name). Default: "miku" (code-applied when absent).
 #   In AGENTS mode, profile_name is absent from [browser] (a startup error if set) and each agent
 #   declares its own profile under [agents.<name>.browser].profile_name instead (§10a / §11b).
-platform = "windows"                   # fingerprint platform: windows | macos | linux
 fingerprint_seed = 0                   # 0/unset → Manager picks once and persists (stable thereafter)
 humanize = true                        # Bézier mouse + per-char typing
 evaluate_enabled = false               # gate act:evaluate (arbitrary page JS)
@@ -4044,7 +4043,7 @@ In **agents mode** (`[agents]` table present) each agent can optionally declare 
 profile_name = "profile-rin"   # required; must be distinct from every other agent's profile_name
 ```
 
-An agent with a `[agents.<name>.browser]` block gets its own `BrowserSession` constructed at startup with the global `[browser]` connection settings (`manager_url`, `auth_token`, `platform`, …) and the agent's `profile_name`. The connection settings come from the global `[browser]` block; only `profile_name` is per-agent. All `BrowserSession` instances are stored in `agentBrowserMap: Map<string, BrowserSession>` (keyed by agent name) and in `allBrowserSessions` for coordinated shutdown.
+An agent with a `[agents.<name>.browser]` block gets its own `BrowserSession` constructed at startup with the global `[browser]` connection settings (`manager_url`, `auth_token`, `humanize`, …) and the agent's `profile_name`. The connection settings come from the global `[browser]` block; only `profile_name` is per-agent. All `BrowserSession` instances are stored in `agentBrowserMap: Map<string, BrowserSession>` (keyed by agent name) and in `allBrowserSessions` for coordinated shutdown.
 
 An agent **without** a `[agents.<name>.browser]` block is given no `BrowserSession` and therefore has no `browser` tool wired into its sessions — the tool is simply absent, same as legacy mode with browser disabled.
 

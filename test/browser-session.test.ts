@@ -28,7 +28,6 @@ function baseConfig(overrides: Partial<BrowserConfig> = {}): BrowserConfig {
     manager_url: "http://127.0.0.1:8080",
     auth_token: "test-tok",
     profile_name: "miku",
-    platform: "windows",
     fingerprint_seed: 12345,
     humanize: true,
     evaluate_enabled: false,
@@ -106,18 +105,18 @@ interface ManagerStubOptions {
 }
 
 interface ManagerStub {
-  calls: Array<{ method: string; url: string }>;
+  calls: Array<{ method: string; url: string; body?: unknown }>;
   restore(): void;
 }
 
 function stubManager(opts: ManagerStubOptions = {}): ManagerStub {
   const original = globalThis.fetch;
-  const calls: Array<{ method: string; url: string }> = [];
+  const calls: Array<{ method: string; url: string; body?: unknown }> = [];
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     if (opts.throwOnFetch) throw new Error("ECONNREFUSED");
     const url = String(input);
     const method = init?.method ?? "GET";
-    calls.push({ method, url });
+    calls.push({ method, url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
     if (method === "GET" && url.endsWith("/api/profiles")) {
       return new Response(JSON.stringify((opts.profiles ?? []).map((p) => ({ ...p, fingerprint_seed: 1, cdp_url: null }))), { status: 200 });
     }
@@ -177,6 +176,12 @@ test("session: bootstraps a missing profile (create + launch) and connects with 
       // Created the profile (POST /api/profiles) and launched it (POST .../launch).
       assert.ok(manager.calls.some((c) => c.method === "POST" && c.url.endsWith("/api/profiles")), "should create profile");
       assert.ok(manager.calls.some((c) => c.method === "POST" && /\/launch$/.test(c.url)), "should launch profile");
+      // The Manager's ProfileCreate forbids unknown keys (HTTP 422), so the body
+      // must stay within its field set. `platform` in particular is runtime-derived
+      // by the Manager and rejected.
+      const createBody = manager.calls.find((c) => c.method === "POST" && c.url.endsWith("/api/profiles"))!.body as Record<string, unknown>;
+      const allowed = new Set(["name", "fingerprint_seed", "proxy", "timezone", "locale", "screen_width", "screen_height", "humanize", "geoip", "auto_launch"]);
+      for (const key of Object.keys(createBody)) assert.ok(allowed.has(key), `unexpected ProfileCreate key: ${key}`);
       // Connected to the right CDP endpoint with the Authorization header.
       assert.equal(connectCalls.length, 1);
       assert.match(connectCalls[0]!.endpoint, /\/api\/profiles\/p1\/cdp$/);

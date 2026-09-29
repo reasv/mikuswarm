@@ -24,10 +24,11 @@ export interface ManagerProfileStatus {
 }
 
 // Fields we set on profile creation (spec §4). Names match ProfileCreate; we
-// only send what we manage and let the Manager default the rest.
+// only send what we manage and let the Manager default the rest. No `platform`:
+// the Manager derives the fingerprint platform from its host runtime and rejects
+// the field (ProfileCreate forbids extra keys).
 export interface ProfileCreateInput {
   name: string;
-  platform: "windows" | "macos" | "linux";
   fingerprint_seed?: number;
   timezone?: string;
   locale?: string;

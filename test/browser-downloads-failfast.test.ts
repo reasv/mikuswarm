@@ -74,7 +74,6 @@ enabled = false
 enabled = true
 manager_url = "http://localhost:8080"
 profile_name = "test"
-platform = "windows"
 humanize = false
 evaluate_enabled = false
 geoip = false

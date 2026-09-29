@@ -384,7 +384,6 @@ enabled = true
 manager_url = "${opts.managerUrl}"
 ${opts.authTokenLine}
 profile_name = "miku"
-platform = "windows"
 humanize = true
 evaluate_enabled = false
 geoip = false
@@ -428,6 +427,13 @@ test("config: browser enabled with ABSENT auth_token is accepted (token-less Man
     const config = await loadConfig(dir, { env: false });
     assert.equal(config.browser?.enabled, true);
     assert.equal(config.browser?.auth_token, undefined);
+  });
+});
+
+test("config: stale [browser].platform key is rejected (Manager derives the platform)", async () => {
+  const toml = `${BASE_CONFIG}${BROWSER_BLOCK({ authTokenLine: "", managerUrl: VALID_MANAGER_URL })}platform = "windows"\n`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(() => loadConfig(dir, { env: false }), /platform/i);
   });
 });
 
@@ -481,7 +487,6 @@ enabled = true
 manager_url = "http://127.0.0.1:8080"
 auth_token = "t"
 profile_name = "miku"
-platform = "windows"
 fingerprint_seed = 0
 humanize = true
 evaluate_enabled = false
