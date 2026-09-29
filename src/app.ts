@@ -3286,14 +3286,26 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // upgrade runs. Makes no API calls. Bounded by enrichmentTimeoutMs.
     if (yotsubaSubsystem && yotsubaSubsystem.config.enrichment.enabled) {
       const triggerEventId = inbound.event.id;
-      const upgradePromise = performYotsubaTriggerUpgrade(triggerEventId);
+      // Never let the upgrade fail the trigger path (or surface as an unhandled
+      // rejection after the timeout won): the ref just stays ambient.
+      const upgradePromise = performYotsubaTriggerUpgrade(triggerEventId).catch((err: unknown) => {
+        logger.warn("yotsuba_upgrade_failed", {
+          triggerEventId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+      let upgradeTimer: NodeJS.Timeout | undefined;
       const timeoutPromise = new Promise<void>((resolve) => {
-        setTimeout(() => {
+        upgradeTimer = setTimeout(() => {
           logger.warn("yotsuba_upgrade_timeout", { triggerEventId, timeoutMs: enrichmentTimeoutMs });
           resolve();
         }, enrichmentTimeoutMs);
       });
-      await Promise.race([upgradePromise, timeoutPromise]);
+      try {
+        await Promise.race([upgradePromise, timeoutPromise]);
+      } finally {
+        clearTimeout(upgradeTimer);
+      }
     }
 
     await awaitCaptionsComplete(eventIds, captionTimeoutMs);
