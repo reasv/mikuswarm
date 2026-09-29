@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { recentMemoryWindow, trimToTokenCeiling, buildDiaryHeader } from "../src/diary/index.js";
+import { estimateTokens, truncateToTokens } from "../src/context/tokens.js";
+import { getPrimaryTokenizer } from "../src/context/tokenizer/registry.js";
 
 async function withMemoryDir(run: (workspaceRoot: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(path.join(os.tmpdir(), "miku-diary-window-"));
@@ -147,4 +149,70 @@ test("trimToTokenCeiling hard-truncates header-less legacy content over budget",
 test("trimToTokenCeiling is a no-op when already within budget", () => {
   const text = "## 2026-06-03 14:05 → 2026-06-03 15:30 · UTC · Room\nshort entry";
   assert.equal(trimToTokenCeiling(text, 100000), text);
+});
+
+// The pre-optimization algorithm, kept as the reference: re-count every tail from
+// the front and take the first that fits.
+function referenceTrim(text: string, ceiling: number, splitBlocks: (t: string) => string[]): string {
+  if (estimateTokens(text) <= ceiling) return text;
+  const blocks = splitBlocks(text);
+  let start = 0;
+  while (start < blocks.length - 1) {
+    const candidate = blocks.slice(start).join("");
+    if (estimateTokens(candidate) <= ceiling) return candidate.replace(/^\s+/, "");
+    start += 1;
+  }
+  const remainder = blocks.slice(start).join("").replace(/^\s+/, "");
+  if (estimateTokens(remainder) <= ceiling) return remainder;
+  return truncateToTokens(remainder, ceiling);
+}
+
+function diaryText(seed: string, blockCount: number): { text: string; headers: string[] } {
+  const headers: string[] = [];
+  let text = `# 2026-06-03 Daily Memory\n\n`;
+  for (let i = 0; i < blockCount; i++) {
+    const h = buildDiaryHeader({ earliestTimestamp: i * 1000, latestTimestamp: i * 1000 + 500, room: `Room ${i}`, timezone: "UTC" });
+    headers.push(h);
+    // Varied block sizes so the cut lands at different places per ceiling.
+    text += `${h}\n${seed} entry ${i}: ${"some diary words ".repeat(5 + ((i * 37) % 60))}\n\n`;
+  }
+  return { text, headers };
+}
+
+test("trimToTokenCeiling picks the same cut as the front-to-back scan", () => {
+  const { text, headers } = diaryText("equiv", 40);
+  const split = (t: string): string[] => {
+    const idx = headers.map((h) => t.indexOf(h)).filter((i) => i >= 0);
+    const blocks = [t.slice(0, idx[0])];
+    for (let i = 0; i < idx.length; i++) blocks.push(t.slice(idx[i], idx[i + 1] ?? t.length));
+    return blocks;
+  };
+  const total = estimateTokens(text);
+  for (const ceiling of [10, 50, 120, 333, 700, 1500, Math.floor(total / 2), total - 1, total, total + 10]) {
+    assert.equal(trimToTokenCeiling(text, ceiling), referenceTrim(text, ceiling, split), `ceiling ${ceiling}`);
+  }
+});
+
+test("trimToTokenCeiling tokenizes roughly once, and not at all on a repeat", () => {
+  const { text } = diaryText("cost", 60);
+  const tokenizer = getPrimaryTokenizer();
+  const original = tokenizer.count.bind(tokenizer);
+  let chars = 0;
+  tokenizer.count = (t: string) => {
+    chars += t.length;
+    return original(t);
+  };
+  try {
+    const first = trimToTokenCeiling(text, 400);
+    // Blocks once + a couple of ceiling-sized tails; the old scan re-read ~30× the text.
+    assert.ok(chars < 2 * text.length, `tokenized ${chars} chars for a ${text.length}-char window`);
+    chars = 0;
+    assert.equal(trimToTokenCeiling(text, 400), first);
+    assert.equal(chars, 0, "an unchanged window is served from the memo");
+    chars = 0;
+    trimToTokenCeiling(`${text}\nchanged`, 400);
+    assert.ok(chars > 0, "a changed window is re-trimmed");
+  } finally {
+    tokenizer.count = original;
+  }
 });

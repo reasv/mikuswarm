@@ -1,6 +1,8 @@
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { estimateTokens, truncateToTokens } from "../context/tokens.js";
+import { getPrimaryTokenizer } from "../context/tokenizer/registry.js";
+import type { Tokenizer } from "../context/tokenizer/types.js";
 import { diaryHeaderRegex } from "./header.js";
 
 const DAY_FILE_RE = /^(\d{4}-\d{2}-\d{2})\.md$/;
@@ -76,16 +78,59 @@ export async function recentMemoryWindow(opts: {
  * hard-truncated to keep the layer strictly bounded.
  */
 export function trimToTokenCeiling(text: string, ceilingTokens: number): string {
-  if (estimateTokens(text) <= ceilingTokens) return text;
+  // The window only changes when a day file is written, but every context build
+  // trims it, and each tokenizer pass over a multi-day window is expensive.
+  const tokenizer = getPrimaryTokenizer();
+  const memo = trimMemo.get(ceilingTokens);
+  if (memo && memo.tokenizer === tokenizer && memo.text === text) return memo.result;
+  const result = trimUncached(text, ceilingTokens);
+  if (trimMemo.size >= 8) trimMemo.clear();
+  trimMemo.set(ceilingTokens, { tokenizer, text, result });
+  return result;
+}
 
+/** Last trim per ceiling (the diary session and chat surfacing use different ones). */
+const trimMemo = new Map<number, { tokenizer: Tokenizer; text: string; result: string }>();
+
+function trimUncached(text: string, ceilingTokens: number): string {
   const blocks = splitIntoHeaderBlocks(text);
-  // Drop earliest-in-text blocks until it fits or one block remains.
-  let start = 0;
-  while (start < blocks.length - 1) {
-    const candidate = blocks.slice(start).join("");
-    if (estimateTokens(candidate) <= ceilingTokens) return candidate.replace(/^\s+/, "");
-    start += 1;
+  if (blocks.length === 1) {
+    if (estimateTokens(text) <= ceilingTokens) return text;
+    return hardTrimRemainder(blocks, 0, ceilingTokens);
   }
+
+  // Count each block once; suffix[i] estimates the tail starting at block i.
+  // Re-counting every candidate tail made this quadratic in the window size.
+  const suffix = new Array<number>(blocks.length + 1).fill(0);
+  for (let i = blocks.length - 1; i >= 0; i--) suffix[i] = suffix[i + 1]! + estimateTokens(blocks[i]!);
+
+  // Joining blocks shifts the count by at most a token or so per boundary, so a
+  // block sum clearing the ceiling by more than that cannot fit whole; skip the
+  // whole-text count, the costliest one.
+  if (suffix[0]! <= ceilingTokens + 2 * blocks.length && estimateTokens(text) <= ceilingTokens) return text;
+
+  // Drop earliest-in-text blocks until it fits or one block remains. The suffix
+  // sums pick the starting point; exact counts of ceiling-sized tails settle it
+  // on the same first-fitting start a front-to-back scan finds.
+  const fitsMemo = new Map<number, boolean>();
+  const fits = (start: number): boolean => {
+    let hit = fitsMemo.get(start);
+    if (hit === undefined) {
+      hit = estimateTokens(blocks.slice(start).join("")) <= ceilingTokens;
+      fitsMemo.set(start, hit);
+    }
+    return hit;
+  };
+  const last = blocks.length - 1;
+  let start = 1;
+  while (start < last && suffix[start]! > ceilingTokens) start += 1;
+  while (start > 1 && fits(start - 1)) start -= 1;
+  while (start < last && !fits(start)) start += 1;
+  if (start < last) return blocks.slice(start).join("").replace(/^\s+/, "");
+  return hardTrimRemainder(blocks, last, ceilingTokens);
+}
+
+function hardTrimRemainder(blocks: string[], start: number, ceilingTokens: number): string {
   const remainder = blocks.slice(start).join("").replace(/^\s+/, "");
   if (estimateTokens(remainder) <= ceilingTokens) return remainder;
   // Single residual block (or header-less whole) still over budget → hard-truncate.
