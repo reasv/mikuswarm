@@ -6,7 +6,7 @@ import {
 } from "@earendil-works/pi-ai";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Logger } from "../observability/logger.js";
-import { classifyLlmError, extractStatus, type LlmErrorClass } from "./request-retry.js";
+import { classifyLlmError, extractStatus, isStallAbort, type LlmErrorClass } from "./request-retry.js";
 
 // =============================================================================
 // Local LLM request scheduler (spec CONCURRENCY-AND-RATE-LIMITING §5 / Design A).
@@ -118,7 +118,26 @@ export interface ModelHealthOptions {
    */
   probeBackoffBaseMs?: number;
   probeBackoffMaxMs?: number;
+  /**
+   * Wall-clock cap on one BACKGROUND probe (ARCHITECTURE.md §8a "Background probes"): a probe
+   * still unanswered after this long is a failed probe. Default 60 s.
+   */
+  probeTimeoutMs?: number;
 }
+
+/**
+ * Outcome of one background probe (ARCHITECTURE.md §8a "Background probes"). `ok` = the model
+ * answered a minimal request with a clean terminal `done`; anything else is a
+ * failed probe (a 429 is inconclusive — shared budget, not health).
+ */
+export type ModelProbeResult = { ok: true } | { ok: false; status?: number; message?: string };
+
+/**
+ * A background prober for one failure domain: issues a minimal synthetic request
+ * against the model, honoring `signal` (the probe timeout / scheduler stop).
+ * Registered by the fallback builder ({@link LlmScheduler.registerProber}).
+ */
+export type ModelProber = (signal: AbortSignal) => Promise<ModelProbeResult>;
 
 export interface AcquireOptions {
   /** Rate-limit group (budget). Unset = `default` (§9.2). */
@@ -284,6 +303,7 @@ const DEFAULT_UNHEALTHY_THRESHOLD = 3;
 // meanwhile); the cap bounds the long-outage tail.
 const DEFAULT_PROBE_BACKOFF_BASE_MS = 10_000;
 const DEFAULT_PROBE_BACKOFF_MAX_MS = 300_000;
+const DEFAULT_PROBE_TIMEOUT_MS = 60_000;
 
 function abortError(): Error {
   const error = new Error("LLM scheduler wait aborted");
@@ -305,6 +325,17 @@ export class LlmScheduler {
    * health entry and never pollutes the (failed-models-only) snapshot.
    */
   private readonly probeMaxOverrides = new Map<string, number>();
+  private readonly probeTimeoutMs: number;
+  /**
+   * Background probers by model health key (ARCHITECTURE.md §8a "Background probes"). A model
+   * with a prober is re-tested OUT OF BAND while unhealthy — live traffic is
+   * never used as its canary while any other chain member can serve.
+   */
+  private readonly probers = new Map<string, ModelProber>();
+  /** Pending background-probe timers by model health key. */
+  private readonly probeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** In-flight background probes (aborted on stop). */
+  private readonly probeAborts = new Set<AbortController>();
   private readonly logger?: Logger;
   /** Sticky escalations for keys not yet registered (§5.5). */
   private readonly stickyEscalations = new Map<string, PriorityClass>();
@@ -316,6 +347,7 @@ export class LlmScheduler {
     this.unhealthyThreshold = options.health?.unhealthyThreshold ?? DEFAULT_UNHEALTHY_THRESHOLD;
     this.probeBackoffBaseMs = options.health?.probeBackoffBaseMs ?? DEFAULT_PROBE_BACKOFF_BASE_MS;
     this.probeBackoffMaxMs = options.health?.probeBackoffMaxMs ?? DEFAULT_PROBE_BACKOFF_MAX_MS;
+    this.probeTimeoutMs = options.health?.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
     for (const [name, cfg] of Object.entries(options.groups ?? {})) {
       this.groups.set(name, this.makeGroup(name, cfg));
     }
@@ -574,7 +606,10 @@ export class LlmScheduler {
       // Neutral (§3): neither counts nor resets. If this settled the probe,
       // the probe was inconclusive — clear the in-flight flag; `nextProbeAt`
       // is left as-is (already elapsed), so the next pump re-probes promptly.
-      if (health?.probeInFlight) health.probeInFlight = false;
+      if (health?.probeInFlight) {
+        health.probeInFlight = false;
+        this.armBackgroundProbe(health);
+      }
       return;
     }
 
@@ -619,8 +654,10 @@ export class LlmScheduler {
           consecutiveFailures: health.consecutiveFailures,
           status,
           nextProbeAt: health.nextProbeAt,
+          backgroundProbe: this.probers.has(modelKey),
           waiters: this.countModelWaiters(modelKey),
         });
+        this.armBackgroundProbe(health);
       }
       return;
     }
@@ -655,6 +692,7 @@ export class LlmScheduler {
   private failProbe(health: ModelHealthState, now: number): void {
     health.probeDelayMs = Math.min(health.probeDelayMs * 2, this.effectiveProbeMax(health.key));
     health.nextProbeAt = now + health.probeDelayMs;
+    this.armBackgroundProbe(health);
   }
 
   /**
@@ -664,6 +702,104 @@ export class LlmScheduler {
    */
   private rescheduleProbe(health: ModelHealthState, now: number): void {
     health.nextProbeAt = now + health.probeDelayMs;
+    this.armBackgroundProbe(health);
+  }
+
+  /**
+   * Register the background prober for a failure domain (ARCHITECTURE.md §8a
+   * "Background probes"). Idempotent, last-writer-wins (every session's fallback build
+   * re-registers the same stateless prober). If the model is already unhealthy
+   * its probe is armed now.
+   */
+  registerProber(modelKey: string, prober: ModelProber): void {
+    this.probers.set(modelKey, prober);
+    const health = this.health.get(modelKey);
+    if (health && health.state === "unhealthy" && !this.probeTimers.has(modelKey)) {
+      this.armBackgroundProbe(health);
+    }
+  }
+
+  /**
+   * Read-only: does this model recover through BACKGROUND probes? When true the
+   * fallback resolver never routes a live request to it as a canary while any
+   * other chain member is viable (ARCHITECTURE.md §8a "Background probes").
+   */
+  hasProber(modelKey: string): boolean {
+    return this.probers.has(modelKey);
+  }
+
+  /** (Re)arm the background probe timer for an unhealthy model with a prober. */
+  private armBackgroundProbe(health: ModelHealthState): void {
+    if (this.stopped || health.state !== "unhealthy" || !this.probers.has(health.key)) return;
+    const existing = this.probeTimers.get(health.key);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.probeTimers.delete(health.key);
+      void this.runBackgroundProbe(health.key);
+    }, Math.max(0, health.nextProbeAt - Date.now()) + 1);
+    timer.unref?.();
+    this.probeTimers.set(health.key, timer);
+  }
+
+  /**
+   * Fire one background probe (ARCHITECTURE.md §8a "Background probes"). Takes the model's
+   * single half-open probe slot (a live all-unhealthy waiter and a background
+   * probe never run concurrently); success recovers the model (mass resume),
+   * any failure is a failed probe (backoff ×2) except a 429 (inconclusive,
+   * rescheduled at the current delay). Either settle re-arms via the shared
+   * failProbe / rescheduleProbe path.
+   */
+  private async runBackgroundProbe(modelKey: string): Promise<void> {
+    const health = this.health.get(modelKey);
+    const prober = this.probers.get(modelKey);
+    if (this.stopped || !health || health.state !== "unhealthy" || !prober) return;
+    // A live probe holds the slot: its settle re-arms us.
+    if (health.probeInFlight) return;
+    const now = Date.now();
+    if (now < health.nextProbeAt) {
+      this.armBackgroundProbe(health);
+      return;
+    }
+    health.probeInFlight = true;
+    this.logger?.info("llm_model_probe", {
+      model: modelKey,
+      success: undefined,
+      phase: "launched",
+      background: true,
+      waiters: this.countModelWaiters(modelKey),
+    });
+    const ctrl = new AbortController();
+    this.probeAborts.add(ctrl);
+    const timeout = setTimeout(() => ctrl.abort(), this.probeTimeoutMs);
+    timeout.unref?.();
+    let result: ModelProbeResult;
+    try {
+      result = await prober(ctrl.signal);
+    } catch (err) {
+      result = { ok: false, message: err instanceof Error ? err.message : String(err) };
+    } finally {
+      clearTimeout(timeout);
+      this.probeAborts.delete(ctrl);
+    }
+    if (this.stopped) return;
+    if (!result.ok && ctrl.signal.aborted && result.message === undefined) {
+      result = { ok: false, message: `probe timed out after ${this.probeTimeoutMs}ms` };
+    }
+    if (result.ok) {
+      this.noteModelOutcome(modelKey, undefined);
+      return;
+    }
+    // Every non-429 failure of a minimal synthetic request is failed-probe
+    // evidence, whatever its class: a trivial request that errors means the
+    // model is not serving. (Routing a 4xx through the neutral content path
+    // would re-probe immediately in a tight loop.)
+    this.logger?.warn("llm_model_probe_failed", {
+      model: modelKey,
+      background: true,
+      status: result.status,
+      errorMessage: result.message,
+    });
+    this.noteModelOutcome(modelKey, "environmental", result.status);
   }
 
   /**
@@ -812,6 +948,10 @@ export class LlmScheduler {
   /** Reject all queued waiters (shutdown). In-flight requests are unaffected. */
   stop(): void {
     this.stopped = true;
+    for (const timer of this.probeTimers.values()) clearTimeout(timer);
+    this.probeTimers.clear();
+    for (const ctrl of this.probeAborts) ctrl.abort();
+    this.probeAborts.clear();
     for (const group of this.groups.values()) {
       if (group.backoffTimer) clearTimeout(group.backoffTimer);
       if (group.probeTimer) clearTimeout(group.probeTimer);
@@ -1117,10 +1257,13 @@ export function withSchedulerAdmission(
             if (!throttleNoted) {
               const failure = event.error;
               const message = failure?.errorMessage;
+              // A stall cut short by Layer 0's wall-clock budget is an
+              // environmental failure of THIS model, not a neutral abort.
+              const cls = isStallAbort(signal) ? "environmental" : classifyLlmError(message, failure?.stopReason);
               scheduler.noteOutcome(
                 options.group,
                 modelKey,
-                classifyLlmError(message, failure?.stopReason),
+                cls,
                 message ? extractStatus(message.toLowerCase()) : undefined,
               );
             }
@@ -1162,7 +1305,7 @@ export function withSchedulerAdmission(
           scheduler.noteOutcome(
             options.group,
             modelKey,
-            aborted ? "aborted" : classifyLlmError(message, undefined),
+            isStallAbort(signal) ? "environmental" : aborted ? "aborted" : classifyLlmError(message, undefined),
             aborted ? undefined : extractStatus(message.toLowerCase()),
           );
         }
