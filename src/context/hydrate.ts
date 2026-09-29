@@ -2,6 +2,7 @@ import type { AttachmentMeta, CanonicalChatEvent, LinkPreviewMeta } from "../typ
 import type { LinkPreviewRow, MediaAssetRow, ReplyContextRow, Storage } from "../storage/index.js";
 import { parseXTweetPayload } from "../fxtwitter/types.js";
 import { YOUTUBE_SOURCE_KIND, parseYouTubePreviewPayload } from "../youtube/payload.js";
+import { YOTSUBA_SOURCE_KIND, parseYotsubaPreviewPayload } from "../yotsuba/types.js";
 
 /**
  * Merge the enrichment side-tables (reply context, link previews, media assets +
@@ -119,6 +120,10 @@ export function linkPreviewRowToMeta(lp: LinkPreviewRow, allMedia: MediaAssetRow
     ytPayload:
       lp.source_kind === YOUTUBE_SOURCE_KIND
         ? (parseYouTubePreviewPayload(lp.payload_json) ?? undefined)
+        : undefined,
+    yotsubaPayload:
+      lp.source_kind === YOTSUBA_SOURCE_KIND
+        ? (parseYotsubaPreviewPayload(lp.payload_json) ?? undefined)
         : undefined,
   };
 }

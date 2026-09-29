@@ -10,6 +10,10 @@ import { FX_TWITTER_SOURCE_KIND } from "../fxtwitter/types.js";
 import { formatStatsLine } from "../fxtwitter/format.js";
 import { YOUTUBE_SOURCE_KIND, formatDuration, formatChapterTimestamp, formatUploadDate } from "../youtube/payload.js";
 import type { YouTubePreviewPayload } from "../youtube/payload.js";
+import { YOTSUBA_SOURCE_KIND } from "../yotsuba/types.js";
+import type { YotsubaPreviewPayload, YotsubaPostNode, YotsubaPostFile } from "../yotsuba/types.js";
+import { fileElement, omittedElement, threadOpenTag, boardLabel } from "../yotsuba/format.js";
+import type { FileRenderInfo } from "../yotsuba/format.js";
 import { escapeAttr, escapeXml } from "./xml.js";
 import { compactAgentTimestamp, formatAgentTimestamp } from "../time/index.js";
 
@@ -98,7 +102,7 @@ export function renderRichMessage(event: CanonicalChatEvent, opts?: RenderRichOp
   parts.push(escapeXml(body));
   for (const a of event.attachments ?? []) parts.push(renderAttachment(a));
   for (const m of event.linkedMedia ?? []) parts.push(renderLinkedMedia(m));
-  for (const lp of event.linkPreviews ?? []) parts.push(renderLinkPreview(lp));
+  for (const lp of filterYotsubaSupersededPreviews(event.linkPreviews ?? [])) parts.push(renderLinkPreview(lp));
   // View A (ARCHITECTURE.md §9f): deduped reaction counts, spatially attached to
   // the message. Rich tier only — renderCompactMessage deliberately omits these,
   // which is what confines reaction-driven byte changes to the cache-volatile
@@ -184,7 +188,7 @@ function renderReply(reply: ReplyContext): string {
   if (reply.body && reply.body.trim().length > 0) innerParts.push(escapeXml(reply.body));
   for (const a of reply.attachments ?? []) innerParts.push(renderAttachment(a));
   for (const m of reply.linkedMedia ?? []) innerParts.push(renderLinkedMedia(m));
-  for (const lp of reply.linkPreviews ?? []) innerParts.push(renderLinkPreview(lp));
+  for (const lp of filterYotsubaSupersededPreviews(reply.linkPreviews ?? [])) innerParts.push(renderLinkPreview(lp));
   // Unresolved reply context (enrichment pending or the target couldn't be
   // fetched): say so instead of showing the model an empty quote block.
   if (innerParts.length === 0) innerParts.push("[original message unavailable]");
@@ -239,6 +243,13 @@ function renderLinkPreview(preview: LinkPreviewMeta): string {
   // (ARCHITECTURE.md §7e); without a payload they fall through to the flat form.
   if (preview.sourceKind === YOUTUBE_SOURCE_KIND && preview.ytPayload) {
     return renderYouTubePreview(preview, preview.ytPayload);
+  }
+
+  // 4chan (Yotsuba) previews with a parseable payload get the structured
+  // rendering (ARCHITECTURE.md §7f). Without a payload (failed fetch, legacy
+  // row) they fall through to the flat form below.
+  if (preview.sourceKind === YOTSUBA_SOURCE_KIND) {
+    return renderYotsubaPreview(preview);
   }
 
   const pairs: [string, string][] = [
@@ -441,6 +452,11 @@ function compactLinkPreview(lp: LinkPreviewMeta): string {
     return compactYouTubePreview(lp.ytPayload);
   }
 
+  // 4chan compact previews (ARCHITECTURE.md §7f): one compact inline line.
+  if (lp.sourceKind === YOTSUBA_SOURCE_KIND) {
+    return compactYotsubaPreview(lp);
+  }
+
   return ` [link: ${truncate(lp.title ?? lp.url, MAX_FILENAME)} — ${truncate(lp.description ?? "", 1000)}]`;
 }
 
@@ -582,4 +598,409 @@ function truncate(value: string, max: number): string {
 
 function escapeCompactParens(value: string): string {
   return value.replace(/\(/g, "\\(").replace(/\)/g, "\\)");
+}
+
+// ---------------------------------------------------------------------------
+// Yotsuba discord_embed suppression (spec §6.8)
+// ---------------------------------------------------------------------------
+
+/**
+ * Suppress `discord_embed` rows that are already covered by a yotsuba row
+ * for the same 4chan URL within the same preview list.
+ * The spec says: when an event has a yotsuba row for `(board, threadNo)`,
+ * suppress any `discord_embed` row whose URL maps to the same canonical URL.
+ */
+function filterYotsubaSupersededPreviews(previews: LinkPreviewMeta[]): LinkPreviewMeta[] {
+  if (!previews.some((p) => p.sourceKind === YOTSUBA_SOURCE_KIND)) return previews;
+  // Build a set of URLs covered by yotsuba rows.
+  const yotsubaUrls = new Set<string>();
+  for (const p of previews) {
+    if (p.sourceKind === YOTSUBA_SOURCE_KIND) yotsubaUrls.add(normalizeYotsubaUrl(p.url));
+  }
+  return previews.filter((p) => {
+    if (p.sourceKind !== "discord_embed") return true;
+    return !yotsubaUrls.has(normalizeYotsubaUrl(p.url));
+  });
+}
+
+/** Normalize a 4chan URL by stripping post anchors and trailing slashes. */
+function normalizeYotsubaUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    u.hash = "";
+    return u.toString().replace(/\/$/, "");
+  } catch {
+    return url;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Yotsuba (4chan) renderers (ARCHITECTURE.md §7f, spec §6.6)
+// ---------------------------------------------------------------------------
+
+/**
+ * Rich-zone renderer for a 4chan link preview. Handles thread, board, and
+ * gone/failed cases. The `currentSessionTriggerGroupId` (from the trigger
+ * event) is set on `preview` by the caller when available; image blocks are
+ * only added in the session that did the upgrade.
+ */
+function renderYotsubaPreview(preview: LinkPreviewMeta): string {
+  const urlAttr = `url="${escapeAttr(truncate(preview.url, MAX_URL))}" kind="4chan"`;
+  const payload = preview.yotsubaPayload;
+
+  // Gone (404 at enrichment).
+  if (!payload || (payload.kind === "thread" && !payload.threadNo && !payload.posts)) {
+    // Check if it's a "gone" row.
+    const isGone = !payload;
+    if (isGone) {
+      return `<link_preview ${urlAttr} status="gone" checked="${escapeAttr(
+        preview.fetchedAt ? compactAgentTimestamp(new Date(preview.fetchedAt)) : ""
+      )}"/>`;
+    }
+  }
+
+  if (!payload) {
+    // Fall through to flat form.
+    const pairs: [string, string][] = [["url", truncate(preview.url, MAX_URL)]];
+    if (preview.title) pairs.push(["title", truncate(preview.title, MAX_DISPLAY_NAME)]);
+    const attrStr = pairs.map(([k, v]) => `${k}="${escapeAttr(v)}"`).join(" ");
+    return `<link_preview ${attrStr}>\n${escapeXml(preview.description ?? "")}\n</link_preview>`;
+  }
+
+  if (payload.kind === "board") {
+    return renderYotsuba4chanBoard(urlAttr, payload, preview);
+  }
+
+  return renderYotsuba4chanThread(urlAttr, payload, preview);
+}
+
+function renderYotsuba4chanBoard(
+  urlAttr: string,
+  payload: YotsubaPreviewPayload,
+  preview: LinkPreviewMeta,
+): string {
+  const code = payload.board;
+  const title = payload.boardTitle;
+  const label = boardLabel(code, title);
+  const attrs: string[] = [];
+  attrs.push(`code="${escapeAttr(label)}"`);
+  if (title) attrs.push(`title="${escapeAttr(title)}"`);
+  if (payload.worksafe) attrs.push(`worksafe="true"`);
+  attrs.push(`as_of="${escapeAttr(
+    payload.asOf ? compactAgentTimestamp(new Date(payload.asOf)) : ""
+  )}"`);
+
+  const threads = payload.threads ?? [];
+  const threadLines: string[] = [];
+  for (const t of threads) {
+    const tAttrs: string[] = [`no="${t.no}"`];
+    tAttrs.push(`replies="${t.replies}"`);
+    if (t.files) tAttrs.push(`files="${t.files}"`);
+    tAttrs.push(`started="${escapeAttr(compactAgentTimestamp(new Date(t.time)))}"`);
+    const hasSubject = !!(t.subject?.trim());
+    if (!hasSubject && t.opExcerpt) tAttrs.push(`op_excerpt="true"`);
+    const content = hasSubject ? t.subject! : (t.opExcerpt ?? "");
+    threadLines.push(`<thread ${tAttrs.join(" ")}>${escapeXml(content)}</thread>`);
+  }
+
+  const footer = `[4chan board: the top ${threads.length} threads on page 1. The yotsuba tool can search the catalog.]`;
+  const inner = [...threadLines, footer].join("\n");
+  return `<link_preview ${urlAttr}>\n<board ${attrs.join(" ")}>\n${inner}\n</board>\n</link_preview>`;
+}
+
+function renderYotsuba4chanThread(
+  urlAttr: string,
+  payload: YotsubaPreviewPayload,
+  preview: LinkPreviewMeta,
+): string {
+  if (!payload.threadNo) {
+    // Malformed/gone row — treat as gone.
+    return `<link_preview ${urlAttr} status="gone" checked="${escapeAttr(
+      preview.fetchedAt ? compactAgentTimestamp(new Date(preview.fetchedAt)) : ""
+    )}"/>`;
+  }
+
+  const board = payload.board;
+  const boardTitle = payload.boardTitle;
+  const label = boardLabel(board, boardTitle);
+  const threadOpenStr = threadOpenTag({
+    board: label,
+    threadNo: payload.threadNo,
+    subject: payload.subject,
+    opExcerpt: !payload.subject ? payload.opExcerpt : undefined,
+    postCount: payload.postCount,
+    fileCount: payload.fileCount,
+    posters: payload.posters,
+    statusFlags: payload.status,
+    asOf: payload.asOf,
+    linkedNo: payload.linkedNo,
+  });
+
+  const upgrade = payload.upgrade;
+  const assetById = new Map<string, import("../types.js").AttachmentMeta>();
+  for (const m of preview.media ?? []) assetById.set(m.id, m);
+
+  // Determine which posts to render. If upgraded, use includedNos; else use all posts.
+  const allPosts = payload.posts ?? [];
+  const includedNos: ReadonlySet<number> = upgrade
+    ? new Set(upgrade.includedNos)
+    : new Set(allPosts.map((p) => p.no));
+  const includedPosts = allPosts.filter((p) => includedNos.has(p.no));
+  const processedIds = new Set(upgrade?.processedAssetIds ?? []);
+
+  // Build shownNos for quote annotation.
+  const shownNos = new Set(includedPosts.map((p) => p.no));
+  const opNo = payload.threadNo;
+
+  // Render posts in order with gap markers.
+  const sortedPosts = [...includedPosts].sort((a, b) => a.index - b.index);
+  const parts: string[] = [];
+
+  let lastIndex = -1;
+  let totalPosts = payload.postCount ?? allPosts.length;
+
+  for (const post of sortedPosts) {
+    const gap = post.index - lastIndex - 1;
+    if (gap > 0 && lastIndex >= 0) {
+      // Count files in the gap (approximate).
+      const gapFiles = allPosts.filter((p) => p.index > lastIndex && p.index < post.index && p.file).length;
+      parts.push(`<omitted posts="${gap}"${gapFiles > 0 ? ` files="${gapFiles}"` : ""}/>` );
+    }
+    parts.push(renderYotsubaPostNode(post, shownNos, opNo, assetById, processedIds, preview));
+    lastIndex = post.index;
+  }
+
+  // Trailing gap (posts after the last included post).
+  if (allPosts.length > 0) {
+    const maxIndex = Math.max(...allPosts.map((p) => p.index));
+    if (lastIndex < maxIndex) {
+      const trailingGap = maxIndex - lastIndex;
+      const trailingFiles = allPosts.filter((p) => p.index > lastIndex && p.file).length;
+      parts.push(`<omitted posts="${trailingGap}"${trailingFiles > 0 ? ` files="${trailingFiles}"` : ""}/>` );
+    }
+  }
+
+  // Footer line.
+  parts.push(buildYotsubaThreadFooter(payload, upgrade));
+
+  const inner = parts.join("\n");
+  return `<link_preview ${urlAttr}>\n${threadOpenStr}\n${inner}\n</thread>\n</link_preview>`;
+}
+
+function renderYotsubaPostNode(
+  post: YotsubaPostNode,
+  shownNos: ReadonlySet<number>,
+  opNo: number,
+  assetById: Map<string, import("../types.js").AttachmentMeta>,
+  processedIds: ReadonlySet<string>,
+  preview: LinkPreviewMeta,
+): string {
+  const attrs: string[] = [];
+  attrs.push(`no="${post.no}"`);
+  attrs.push(`role="${post.role}"`);
+  if (post.posterId) attrs.push(`id="${escapeAttr(post.posterId)}"`);
+  if (post.flag) attrs.push(`flag="${escapeAttr(post.flag)}"`);
+  if (post.trip) attrs.push(`trip="${escapeAttr(post.trip)}"`);
+  if (post.capcode) attrs.push(`capcode="${escapeAttr(post.capcode)}"`);
+  attrs.push(`time="${escapeAttr(compactAgentTimestamp(new Date(post.time)))}"`);
+  attrs.push(`replies="${post.replies}"`);
+
+  const parts: string[] = [`<post ${attrs.join(" ")}>`];
+
+  // Text with quote annotation.
+  const deadNos = new Set(post.deadQuotes ?? []);
+  const annotated = annotateYotsubaQuotes(post.text, post.quotes, shownNos, opNo, deadNos);
+  // Cross-board quotes.
+  let textWithCross = annotated;
+  if (post.crossQuotes?.length) {
+    textWithCross = textWithCross + "\n" + post.crossQuotes.join(" ");
+  }
+  parts.push(escapeXml(textWithCross));
+
+  // File element.
+  if (post.file) {
+    parts.push(renderYotsubaFileNode(post.file, assetById, processedIds));
+  }
+
+  parts.push("</post>");
+  return parts.join("\n");
+}
+
+function renderYotsubaFileNode(
+  file: YotsubaPostFile,
+  assetById: Map<string, import("../types.js").AttachmentMeta>,
+  processedIds: ReadonlySet<string>,
+): string {
+  if (file.deleted) {
+    const info: FileRenderInfo = {
+      name: file.name,
+      ext: file.ext,
+      status: "deleted",
+    };
+    return fileElement(info);
+  }
+  const assetId = file.assetId;
+  const sbAssetId = file.storyboardAssetId;
+  const asset = assetId ? assetById.get(assetId) : undefined;
+  const sbAsset = sbAssetId ? assetById.get(sbAssetId) : undefined;
+
+  let status: FileRenderInfo["status"];
+  if (!assetId) {
+    status = "not shown";
+  } else if (processedIds.has(assetId) || (sbAssetId && processedIds.has(sbAssetId))) {
+    status = "shown";
+  } else {
+    status = "stored";
+  }
+
+  // Image block flag: set when asset or storyboard is in processedIds.
+  const isImageBlock = !!(assetId && processedIds.has(assetId))
+    || !!(sbAssetId && processedIds.has(sbAssetId));
+
+  // Caption: prefer storyboard for video (storyboard is the image block asset).
+  const captionSource = sbAsset ?? asset;
+  const caption = captionSource?.caption ?? undefined;
+
+  const info: FileRenderInfo = {
+    name: file.name,
+    ext: file.ext,
+    mimeType: asset?.mimeType ?? undefined,
+    w: file.w,
+    h: file.h,
+    bytes: file.bytes,
+    durationSec: file.durationSec,
+    spoiler: file.spoiler,
+    path: asset?.localPath ?? undefined,
+    storyboardPath: sbAsset?.localPath ?? undefined,
+    caption,
+    status,
+    imageBlock: isImageBlock,
+  };
+  return fileElement(info);
+}
+
+/** Annotate >>N quotelinks in post text. */
+function annotateYotsubaQuotes(
+  text: string,
+  quotes: number[],
+  shownNos: ReadonlySet<number>,
+  opNo: number,
+  deadNos: ReadonlySet<number>,
+): string {
+  // Replace >>N references with annotations for context.
+  return text.replace(/>>([\d]+)/g, (match, numStr) => {
+    const n = parseInt(numStr, 10);
+    if (deadNos.has(n)) return `>>${n} (deleted)`;
+    if (shownNos.has(n)) return `>>${n}`;
+    if (n === opNo) return `>>${n} (OP)`;
+    return `>>${n} (not shown)`;
+  });
+}
+
+function buildYotsubaThreadFooter(
+  payload: YotsubaPreviewPayload,
+  upgrade?: YotsubaPreviewPayload["upgrade"],
+): string {
+  const totalPosts = payload.postCount ?? 0;
+  const threadNo = payload.threadNo!;
+  const isPostLink = !!payload.linkedNo;
+  const allPosts = payload.posts ?? [];
+  const includedNos = upgrade?.includedNos ?? allPosts.map((p) => p.no);
+  const includedCount = includedNos.length;
+
+  let desc: string;
+  if (upgrade) {
+    if (isPostLink) {
+      const headlineNo = payload.headlineNo ?? payload.linkedNo;
+      const repliedTo = allPosts.filter((p) => includedNos.includes(p.no) && p.role === "replied_to").length;
+      const replies = allPosts.filter((p) => includedNos.includes(p.no) && p.role === "reply").length;
+      desc = `the linked post${repliedTo > 0 ? `, the ${repliedTo} posts it answers` : ""}${replies > 0 ? ` and its first ${replies} replies` : ""} (${includedCount} of ${totalPosts})`;
+    } else {
+      const latestCount = allPosts.filter((p) => includedNos.includes(p.no) && p.role === "latest").length;
+      const repliedTo = allPosts.filter((p) => includedNos.includes(p.no) && p.role === "replied_to").length;
+      desc = `the opening post${latestCount > 0 ? `, the last ${latestCount} replies` : ""}${repliedTo > 0 ? ` and the ${repliedTo} posts they answer` : ""} (${includedCount} of ${totalPosts})`;
+    }
+    const left = upgrade.left;
+    let leftNote = "";
+    if (left) {
+      const dropped: string[] = [];
+      if (left.latest) dropped.push(`${left.latest} more latest ${left.latest === 1 ? "reply" : "replies"}`);
+      if (left.repliedTo) dropped.push(`${left.repliedTo} replied-to post${left.repliedTo === 1 ? "" : "s"}`);
+      if (left.replies) dropped.push(`${left.replies} more ${left.replies === 1 ? "reply" : "replies"}`);
+      if (dropped.length) leftNote = `; ${dropped.join(" and ")} left out for length`;
+    }
+    const storedNote = allPosts.some((p) => {
+      if (!p.file || !includedNos.includes(p.no)) return false;
+      const assetId = p.file.assetId;
+      const sbId = p.file.storyboardAssetId;
+      return assetId && !upgrade.processedAssetIds.includes(assetId)
+        && (!sbId || !upgrade.processedAssetIds.includes(sbId));
+    }) ? ` Files marked auto="off" were saved but not captioned or shown (image budget); open them by path with read_image or media.` : "";
+    desc = `4chan thread snapshot as of ${payload.asOf ? compactAgentTimestamp(new Date(payload.asOf)) : "?"}: ${desc}${leftNote}.${storedNote} Read more with the yotsuba tool.`;
+  } else {
+    // Ambient footer.
+    if (isPostLink) {
+      desc = `4chan: the linked post only. The yotsuba tool reads the thread and the conversation around this post.`;
+    } else if (includedCount > 1) {
+      desc = `4chan: opening post only. The yotsuba tool reads the thread.`;
+    } else {
+      desc = `4chan: opening post only. The yotsuba tool reads the thread.`;
+    }
+  }
+  return `[${desc}]`;
+}
+
+/**
+ * Compact-zone renderer for a 4chan link preview.
+ *
+ * Examples (spec §6.6 F):
+ *   [4chan /g/ "/lmg/ - Local Models General" (435 posts): /lmg/ - a general…]
+ *   [4chan /g/ "why does every linux distro..." (54 posts), post >>109934102: because…]
+ *   [4chan /g/ board: 3 threads]
+ *   [4chan /g/ thread 109800000: already gone when linked]
+ */
+function compactYotsubaPreview(lp: LinkPreviewMeta): string {
+  const payload = lp.yotsubaPayload;
+  const board = payload?.board ?? extractBoardFromUrl(lp.url);
+
+  if (!payload) {
+    // Gone / no payload.
+    return ` [4chan ${board ?? "?"} thread: already gone when linked]`;
+  }
+
+  if (payload.kind === "board") {
+    const count = payload.threads?.length ?? 0;
+    return ` [4chan /${board}/ board: ${count} threads]`;
+  }
+
+  // Thread.
+  const threadNo = payload.threadNo;
+  if (!threadNo) return ` [4chan /${board ?? "?"}/: gone]`;
+
+  const headlinePost = payload.posts?.find(
+    (p) => p.no === (payload.headlineNo ?? threadNo)
+  );
+  const headlineText = headlinePost?.text ?? "";
+  const excerptMax = 150;
+  const excerpt = truncate(normalizeWhitespace(headlineText), excerptMax);
+
+  const parts: string[] = [`4chan /${board}/`];
+  const label = payload.subject
+    ? `"${truncate(payload.subject, 80)}"`
+    : (payload.opExcerpt ? `"${truncate(payload.opExcerpt, 80)}"` : `thread ${threadNo}`);
+  parts.push(label);
+  if (payload.postCount) parts.push(`(${payload.postCount} posts)`);
+  if (payload.linkedNo && headlinePost) parts.push(`post >>${payload.headlineNo ?? payload.linkedNo}`);
+  const joined = parts.join(" ");
+  const body = excerpt ? `${joined}: ${excerpt}` : joined;
+  return ` [${body}]`;
+}
+
+function extractBoardFromUrl(url: string): string | null {
+  try {
+    const match = new URL(url).pathname.match(/^\/([^/]+)\//);
+    return match?.[1] ?? null;
+  } catch {
+    return null;
+  }
 }

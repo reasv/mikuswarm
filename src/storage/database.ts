@@ -4970,6 +4970,139 @@ export class Storage {
   }
 
   /**
+   * Yotsuba helpers (ARCHITECTURE.md §7f)
+   *
+   * Look up an existing yotsuba link_previews row by canonical URL across all
+   * events. Used by the enrichment worker to reuse capture data when a reply
+   * context refers to a URL that was already enriched on another event.
+   */
+  getYotsubaPreviewByUrl(url: string): { row: LinkPreviewRow; assets: MediaAssetRow[] } | null {
+    return this.read((db) => {
+      const row = db
+        .prepare(
+          `select * from link_previews
+           where url = ? and source_kind = 'yotsuba'
+           order by created_at desc limit 1`,
+        )
+        .get(url) as LinkPreviewRow | undefined;
+      if (!row) return null;
+      const assets = db
+        .prepare(`select * from media_assets where link_preview_id = ?`)
+        .all(row.id) as MediaAssetRow[];
+      return { row, assets };
+    });
+  }
+
+  /**
+   * Return all yotsuba link_previews rows (message + reply contexts) for events
+   * whose trigger_group_id equals triggerEventId, together with their associated
+   * media_assets. Used by the trigger upgrade and by the context builder's
+   * yotsuba image-block lane.
+   */
+  getYotsubaPreviewsForTriggerGroup(triggerEventId: string): Array<{
+    row: LinkPreviewRow;
+    assets: MediaAssetRow[];
+  }> {
+    return this.read((db) => {
+      const rows = db
+        .prepare(
+          `select lp.* from link_previews lp
+           where lp.source_kind = 'yotsuba'
+             and lp.fetch_status = 'complete'
+             and lp.event_id in (
+               select id from timeline_events where trigger_group_id = ?
+             )
+           order by lp.event_id, lp.preview_index`,
+        )
+        .all(triggerEventId) as LinkPreviewRow[];
+      if (rows.length === 0) return [];
+      const previewIds = rows.map((r) => r.id);
+      const placeholders = previewIds.map(() => "?").join(",");
+      const assets = db
+        .prepare(`select * from media_assets where link_preview_id in (${placeholders})`)
+        .all(...previewIds) as MediaAssetRow[];
+      const assetsByPreview = new Map<string, MediaAssetRow[]>();
+      for (const a of assets) {
+        if (!a.link_preview_id) continue;
+        let arr = assetsByPreview.get(a.link_preview_id);
+        if (!arr) { arr = []; assetsByPreview.set(a.link_preview_id, arr); }
+        arr.push(a);
+      }
+      return rows.map((row) => ({ row, assets: assetsByPreview.get(row.id) ?? [] }));
+    });
+  }
+
+  /**
+   * Atomically write the results of a yotsuba trigger upgrade for one trigger
+   * group: update payload_json on existing link_previews rows, insert new
+   * media_assets, and flip specified asset caption_status from 'deferred' to
+   * 'pending'. Single-writer queue.
+   */
+  writeYotsubaUpgrade(
+    payloadUpdates: Array<{ previewId: string; newPayloadJson: string }>,
+    newAssets: MediaAssetRow[],
+    flipAssetIds: string[],
+  ): Promise<void> {
+    return this.write((db) => {
+      const now = Date.now();
+      for (const { previewId, newPayloadJson } of payloadUpdates) {
+        db.prepare(
+          `update link_previews set payload_json = ? where id = ?`,
+        ).run(newPayloadJson, previewId);
+      }
+      const insertAsset = db.prepare(
+        `insert or replace into media_assets (
+          id, event_id, role, source_index, link_preview_id, local_path,
+          mime_type, media_type, size_bytes, width, height, duration_seconds,
+          original_filename, content_hash, caption, caption_model,
+          caption_status, caption_error, caption_attempts,
+          download_status, download_error, created_at, updated_at
+        ) values (
+          @id, @eventId, @role, @sourceIndex, @linkPreviewId, @localPath,
+          @mimeType, @mediaType, @sizeBytes, @width, @height, @durationSeconds,
+          @originalFilename, @contentHash, @caption, @captionModel,
+          @captionStatus, @captionError, @captionAttempts,
+          @downloadStatus, @downloadError, @createdAt, @updatedAt
+        )`,
+      );
+      for (const ma of newAssets) {
+        insertAsset.run({
+          id: ma.id,
+          eventId: ma.event_id,
+          role: ma.role,
+          sourceIndex: ma.source_index ?? null,
+          linkPreviewId: ma.link_preview_id ?? null,
+          localPath: ma.local_path ?? null,
+          mimeType: ma.mime_type ?? null,
+          mediaType: ma.media_type,
+          sizeBytes: ma.size_bytes ?? null,
+          width: ma.width ?? null,
+          height: ma.height ?? null,
+          durationSeconds: ma.duration_seconds ?? null,
+          originalFilename: ma.original_filename ?? null,
+          contentHash: ma.content_hash ?? null,
+          caption: ma.caption ?? null,
+          captionModel: ma.caption_model ?? null,
+          captionStatus: ma.caption_status,
+          captionError: ma.caption_error ?? null,
+          captionAttempts: ma.caption_attempts ?? 0,
+          downloadStatus: ma.download_status,
+          downloadError: ma.download_error ?? null,
+          createdAt: ma.created_at,
+          updatedAt: ma.updated_at ?? ma.created_at,
+        });
+      }
+      if (flipAssetIds.length > 0) {
+        const placeholders = flipAssetIds.map(() => "?").join(",");
+        db.prepare(
+          `update media_assets set caption_status = 'pending', updated_at = ?
+           where id in (${placeholders}) and caption_status = 'deferred'`,
+        ).run(now, ...flipAssetIds);
+      }
+    });
+  }
+
+  /**
    * The durable trigger-group membership: the ids of every timeline event whose
    * `trigger_group_id` column names this trigger (written by {@link setTriggerGroup}).
    * Mirrors {@link getMediaAssetsForTriggerGroup}'s key. Synchronous (`read`). Used by

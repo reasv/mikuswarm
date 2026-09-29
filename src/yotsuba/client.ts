@@ -184,6 +184,26 @@ export class YotsubaClient {
     }, cls);
   }
 
+  /**
+   * Download a file via the media lane and return the raw temp-file result.
+   * Unlike `fetchFile`, the caller receives the temp file path directly and
+   * is responsible for deleting it. This path is used by the enrichment and
+   * trigger-upgrade stages that need to move the file into the workspace via
+   * `moveFileToWorkspace`. `fileRef` is either `{tim}{ext}` (original) or
+   * `{tim}s.jpg` (thumbnail).
+   */
+  async fetchFilePath(
+    board: string,
+    fileRef: string,
+    cls: PacedLimiterClass = "background",
+  ): Promise<import("../enrichment/fetch-client.js").FetchResult> {
+    const url = `${this.config.mediaBase}/${board}/${fileRef}`;
+    if (!this.fetchClient) throw new Error("No FetchClient configured for YotsubaClient.fetchFilePath");
+    return this.mediaLimiter.run(async () => {
+      return this.fetchClient!.fetch(url);
+    }, cls);
+  }
+
   // ---------------------------------------------------------------------------
   // Internal fetch machinery
   // ---------------------------------------------------------------------------

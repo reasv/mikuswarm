@@ -20,6 +20,22 @@ import type { YouTubeEnrichmentConfig } from "../youtube/config.js";
 import { YOUTUBE_SOURCE_KIND, formatDuration, type YouTubePreviewPayload } from "../youtube/payload.js";
 import { extractYouTubeUrls, type YouTubeVideoUrlMatch } from "../youtube/url.js";
 import { probe, transcript } from "../youtube/ytdlp.js";
+import type { YotsubaClient } from "../yotsuba/client.js";
+import {
+  YOTSUBA_SOURCE_KIND,
+  type ResolvedYotsubaConfig,
+  type YotsubaPreviewPayload,
+  type YotsubaPostNode,
+  type ApiPost,
+  type YotsubaRef,
+} from "../yotsuba/types.js";
+import {
+  extractYotsubaRefs,
+  stripYotsubaUrls,
+} from "../yotsuba/url.js";
+import { convertComment } from "../yotsuba/markup.js";
+import { boardLabel, ftsDescription } from "../yotsuba/format.js";
+import { buildStoryboard } from "../media/storyboard.js";
 
 export interface EnrichmentLogger {
   info(msg: string, data?: Record<string, unknown>): void;
@@ -78,6 +94,26 @@ export interface EnrichmentWorkerOptions {
    * (hardlinks, dedup). Absent or not-ready = byte-identical pre-Phase-5d behaviour.
    */
   store?: AttachmentStore;
+  /**
+   * Yotsuba (4chan) T1 enrichment (ARCHITECTURE.md §7f). When set and enabled,
+   * recognized 4chan URLs are partitioned away from the generic preview path and
+   * enriched here (one fetch per ref, headline-file download, stored capture).
+   * Unset = 4chan URLs ride the Synapse path (no structured enrichment).
+   */
+  yotsuba?: {
+    client: YotsubaClient;
+    config: ResolvedYotsubaConfig;
+    /**
+     * Mirror of `caption_all` from captioning config: when true, headline files
+     * get caption_status "pending" regardless of event role.
+     */
+    captionAll: boolean;
+    /**
+     * Mirror of `caption_assistant_messages` from captioning config: when true,
+     * assistant messages' headline files get caption_status "pending".
+     */
+    captionAssistant: boolean;
+  };
   logger: EnrichmentLogger;
 }
 
@@ -99,6 +135,12 @@ export class EnrichmentWorker {
    * generic linked media).
    */
   private readonly ytUrlExclusions = new Set<string>();
+
+  /**
+   * Raw 4chan URL matches seen by the yotsuba enrichment partition (message +
+   * reply bodies). `processLinkedMedia` excludes these (already partitioned).
+   */
+  private readonly yotsubaUrlExclusions = new Set<string>();
 
   constructor(private readonly options: EnrichmentWorkerOptions) {}
 
@@ -554,6 +596,20 @@ export class EnrichmentWorker {
       }
     }
 
+    // Partition (ARCHITECTURE.md §7f): Yotsuba (4chan) URL refs are stripped
+    // from filteredBody and enriched here when the yotsuba subsystem is enabled.
+    // No eligibility gate: every message body with 4chan links is enriched.
+    const yot = this.options.yotsuba;
+    let yotsubaRefs: YotsubaRef[] = [];
+    if (yot && yot.config.enrichment.enabled) {
+      const allYotRefs = extractYotsubaRefs(filteredBody, yot.config.extraHosts, yot.config.siteBase);
+      if (allYotRefs.length > 0) {
+        yotsubaRefs = allYotRefs;
+        filteredBody = stripYotsubaUrls(filteredBody, yot.config.extraHosts);
+        for (const ref of yotsubaRefs) this.yotsubaUrlExclusions.add(ref.rawUrl);
+      }
+    }
+
     type PreviewSources = Array<{
       url: string;
       sourceKind: string;
@@ -616,10 +672,12 @@ export class EnrichmentWorker {
     type Candidate =
       | { kind: "x"; order: number; ref: XStatusRef }
       | { kind: "yt"; order: number; ref: YouTubeVideoUrlMatch }
+      | { kind: "yotsuba"; order: number; ref: YotsubaRef }
       | { kind: "synapse"; order: number; sourceIndex: number };
     const candidates: Candidate[] = [
       ...xRefs.map((ref) => ({ kind: "x" as const, order: ref.bodyIndex, ref })),
       ...ytRefs.map((ref) => ({ kind: "yt" as const, order: ref.bodyIndex, ref })),
+      ...yotsubaRefs.map((ref) => ({ kind: "yotsuba" as const, order: ref.bodyIndex, ref })),
       ...sources.map((source, sourceIndex) => {
         const at = bodyText.indexOf(source.url);
         return { kind: "synapse" as const, order: at >= 0 ? at : Number.MAX_SAFE_INTEGER, sourceIndex };
@@ -631,6 +689,7 @@ export class EnrichmentWorker {
     const now = Date.now();
     const fxTasks: Promise<void>[] = [];
     const ytTasks: Promise<void>[] = [];
+    const yotsubaTasks: Promise<void>[] = [];
     for (let i = 0; i < candidates.length; i++) {
       const candidate = candidates[i];
       if (candidate.kind === "synapse") {
@@ -652,8 +711,10 @@ export class EnrichmentWorker {
         result.linkPreviews.push(preview);
       } else if (candidate.kind === "x") {
         fxTasks.push(this.enrichXStatus(candidate.ref, context, eventId, i, result));
-      } else {
+      } else if (candidate.kind === "yt") {
         ytTasks.push(this.enrichYouTubeVideo(candidate.ref, context, eventId, i, result));
+      } else {
+        yotsubaTasks.push(this.enrichYotsubaRef(candidate.ref, context, eventId, i, result));
       }
     }
 
@@ -703,7 +764,7 @@ export class EnrichmentWorker {
       }
     }
 
-    await Promise.allSettled([...fxTasks, ...ytTasks]);
+    await Promise.allSettled([...fxTasks, ...ytTasks, ...yotsubaTasks]);
   }
 
   /**
@@ -999,6 +1060,616 @@ export class EnrichmentWorker {
     result.mediaAssets.push(asset);
   }
 
+  // ---------------------------------------------------------------------------
+  // Yotsuba (4chan) enrichment stage (ARCHITECTURE.md §7f)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Enrich one recognized 4chan URL ref. Stores one `link_previews` row with
+   * `source_kind = "yotsuba"` and downloads the headline post's file. Makes
+   * one API call (thread or board page 1), or zero when the reply context
+   * reuses an already-stored capture.
+   *
+   * Failure policy: 404 → "gone" row; other failure → bare URL row. Neither
+   * triggers the event-level retry machinery (same as FxTwitter policy).
+   */
+  private async enrichYotsubaRef(
+    ref: YotsubaRef,
+    context: "message" | "reply",
+    eventId: string,
+    previewIndex: number,
+    result: EnrichmentResult,
+  ): Promise<void> {
+    const yot = this.options.yotsuba!;
+    const { client, config: cfg } = yot;
+    const now = Date.now();
+    const previewId = nanoid();
+    const mediaRole = context === "message" ? "preview_media" : "reply_preview_media";
+    const canonicalUrl = ref.canonicalUrl;
+
+    // Determine caption status for files created in this enrichment step.
+    // Headline files follow normal captioning rules; all other yotsuba files
+    // created here start as "deferred" (upgraded later by the trigger upgrade).
+    const captionFields = this.options.storage.getEventCaptionEligibilityFields(eventId);
+    const captionImmediately =
+      yot.captionAll ||
+      (yot.captionAssistant && captionFields?.role === "assistant");
+
+    // Reply context reuse: if another event already has a yotsuba row for this
+    // URL, copy its payload and reference its already-downloaded files rather
+    // than making another API call.
+    if (context === "reply") {
+      const existing = this.options.storage.getYotsubaPreviewByUrl(canonicalUrl);
+      if (existing) {
+        const copiedRow: LinkPreviewRow = {
+          ...existing.row,
+          id: previewId,
+          event_id: eventId,
+          context,
+          preview_index: previewIndex,
+          created_at: now,
+        };
+        result.linkPreviews.push(copiedRow);
+        // Reference existing assets with new rows for the new event/preview.
+        for (const asset of existing.assets) {
+          result.mediaAssets.push({
+            ...asset,
+            id: nanoid(),
+            event_id: eventId,
+            role: mediaRole,
+            link_preview_id: previewId,
+            // Keep existing caption_status but apply immediacy rule to the copy.
+            caption_status: captionImmediately ? "pending" : asset.caption_status,
+            created_at: now,
+            updated_at: now,
+          });
+        }
+        return;
+      }
+    }
+
+    if (ref.kind === "board") {
+      await this.enrichYotsubaBoardRef(ref, context, eventId, previewIndex, result, previewId, now, client, cfg);
+      return;
+    }
+
+    // Thread ref (kind === "thread")
+    await this.enrichYotsubaThreadRef(
+      ref, context, eventId, previewIndex, result, previewId, now,
+      client, cfg, mediaRole, captionImmediately,
+    );
+  }
+
+  private async enrichYotsubaBoardRef(
+    ref: YotsubaRef & { kind: "board" },
+    context: "message" | "reply",
+    eventId: string,
+    previewIndex: number,
+    result: EnrichmentResult,
+    previewId: string,
+    now: number,
+    client: YotsubaClient,
+    cfg: ResolvedYotsubaConfig,
+  ): Promise<void> {
+    const board = ref.board;
+    // Fetch board list for title/worksafe (24 h cached).
+    const [boardsResult, pageResult] = await Promise.allSettled([
+      client.boards("background"),
+      client.page(board, 1, "background"),
+    ]);
+    const boardEntry = boardsResult.status === "fulfilled"
+      ? boardsResult.value.body.find((b) => b.board === board)
+      : undefined;
+    const boardTitle = boardEntry?.title;
+    const worksafe = boardEntry?.ws_board === 1;
+
+    if (pageResult.status === "rejected") {
+      const err = pageResult.reason as { status?: number };
+      if (err?.status === 404) {
+        // Board doesn't exist (or not accessible).
+        result.linkPreviews.push({
+          id: previewId, event_id: eventId, context, url: ref.canonicalUrl,
+          site_name: "4chan", source_kind: YOTSUBA_SOURCE_KIND,
+          preview_index: previewIndex, fetched_at: now, fetch_status: "failed",
+          error: "gone", created_at: now,
+        });
+        return;
+      }
+      // Other failure → bare row.
+      const msg = pageResult.reason instanceof Error ? pageResult.reason.message : String(pageResult.reason);
+      this.options.logger.warn("enrichment_yotsuba_failed", { eventId, url: ref.canonicalUrl, error: msg });
+      result.linkPreviews.push({
+        id: previewId, event_id: eventId, context, url: ref.canonicalUrl,
+        site_name: "4chan", source_kind: YOTSUBA_SOURCE_KIND,
+        preview_index: previewIndex, fetched_at: now, fetch_status: "failed",
+        error: msg, created_at: now,
+      });
+      return;
+    }
+
+    const page = pageResult.value.body;
+    const maxThreads = cfg.preview.boardThreads;
+    const threads: YotsubaPreviewPayload["threads"] = [];
+    for (const threadContainer of page.threads ?? []) {
+      for (const post of threadContainer.posts ?? []) {
+        // Only use OP posts (resto = 0) and skip stickies.
+        if ((post.resto ?? 0) !== 0) continue;
+        if (post.sticky === 1) continue;
+        if (threads.length >= maxThreads) break;
+        const { text } = convertComment(post.com ?? "");
+        const subject = post.sub?.trim() || undefined;
+        const opExcerpt = !subject
+          ? buildOpExcerpt(text, cfg.preview.opExcerptWords)
+          : undefined;
+        threads.push({
+          no: post.no!,
+          subject,
+          opExcerpt,
+          replies: post.replies ?? 0,
+          files: (post.images ?? 0) + (post.tim ? 1 : 0),
+          time: (post.time ?? 0) * 1000,
+        });
+        if (threads.length >= maxThreads) break;
+      }
+      if (threads.length >= maxThreads) break;
+    }
+
+    const payload: YotsubaPreviewPayload = {
+      v: 1,
+      kind: "board",
+      board,
+      boardTitle,
+      worksafe,
+      asOf: now,
+      threads,
+    };
+
+    const label = boardLabel(board, boardTitle);
+    result.linkPreviews.push({
+      id: previewId,
+      event_id: eventId,
+      context,
+      url: ref.canonicalUrl,
+      title: `/${board}/ - ${boardTitle ?? board}`,
+      description: `/${board}/ board: ${threads.length} threads`,
+      site_name: "4chan",
+      source_kind: YOTSUBA_SOURCE_KIND,
+      preview_index: previewIndex,
+      fetched_at: now,
+      fetch_status: "complete",
+      payload_json: JSON.stringify(payload),
+      created_at: now,
+    });
+    void label; // used in rendering
+  }
+
+  private async enrichYotsubaThreadRef(
+    ref: YotsubaRef & { kind: "thread" },
+    context: "message" | "reply",
+    eventId: string,
+    previewIndex: number,
+    result: EnrichmentResult,
+    previewId: string,
+    now: number,
+    client: YotsubaClient,
+    cfg: ResolvedYotsubaConfig,
+    mediaRole: "preview_media" | "reply_preview_media",
+    captionImmediately: boolean,
+  ): Promise<void> {
+    const board = ref.board;
+    const threadNo = ref.threadNo;
+    const linkedPostNo = ref.postNo;
+
+    // Fetch board list and thread in parallel.
+    const [boardsResult, threadResult] = await Promise.allSettled([
+      client.boards("background"),
+      client.thread(board, threadNo, "background"),
+    ]);
+    const boardEntry = boardsResult.status === "fulfilled"
+      ? boardsResult.value.body.find((b) => b.board === board)
+      : undefined;
+    const boardTitle = boardEntry?.title;
+    const worksafe = boardEntry?.ws_board === 1;
+    const canDownloadFiles =
+      cfg.enrichment.mediaBoards === "all" || worksafe;
+
+    // Thread fetch failed?
+    if (threadResult.status === "rejected") {
+      const err = threadResult.reason as { status?: number };
+      const isGone = err?.status === 404;
+      if (isGone) {
+        result.linkPreviews.push({
+          id: previewId, event_id: eventId, context, url: ref.canonicalUrl,
+          title: `/${board}/`, site_name: "4chan", source_kind: YOTSUBA_SOURCE_KIND,
+          preview_index: previewIndex, fetched_at: now, fetch_status: "failed",
+          error: "gone", created_at: now,
+        });
+        return;
+      }
+      const msg = threadResult.reason instanceof Error ? threadResult.reason.message : String(threadResult.reason);
+      this.options.logger.warn("enrichment_yotsuba_failed", { eventId, url: ref.canonicalUrl, error: msg });
+      result.linkPreviews.push({
+        id: previewId, event_id: eventId, context, url: ref.canonicalUrl,
+        site_name: "4chan", source_kind: YOTSUBA_SOURCE_KIND,
+        preview_index: previewIndex, fetched_at: now, fetch_status: "failed",
+        error: msg, created_at: now,
+      });
+      return;
+    }
+
+    // Thread 404 (null result means 404, null from .thread() method).
+    if (threadResult.value === null) {
+      result.linkPreviews.push({
+        id: previewId, event_id: eventId, context, url: ref.canonicalUrl,
+        title: `/${board}/`, site_name: "4chan", source_kind: YOTSUBA_SOURCE_KIND,
+        preview_index: previewIndex, fetched_at: now, fetch_status: "failed",
+        error: "gone", created_at: now,
+      });
+      return;
+    }
+
+    const apiThread = threadResult.value.body;
+    const posts = apiThread.posts ?? [];
+    if (posts.length === 0) {
+      result.linkPreviews.push({
+        id: previewId, event_id: eventId, context, url: ref.canonicalUrl,
+        site_name: "4chan", source_kind: YOTSUBA_SOURCE_KIND,
+        preview_index: previewIndex, fetched_at: now, fetch_status: "failed",
+        error: "empty thread", created_at: now,
+      });
+      return;
+    }
+
+    const op = posts[0];
+    const opNo = op.no!;
+    const subject = op.sub?.trim() || undefined;
+    const { text: opText } = convertComment(op.com ?? "");
+    const opExcerpt = buildOpExcerpt(opText, cfg.preview.opExcerptWords);
+    const postCount = (op.replies ?? 0) + 1;
+    const fileCount = (op.images ?? 0) + (op.tim ? 1 : 0);
+    const posters = op.unique_ips;
+
+    const status: string[] = [];
+    if (op.sticky === 1) status.push("sticky");
+    if (op.closed === 1) status.push("closed");
+    if (op.archived === 1) status.push("archived");
+    if (op.bumplimit === 1) status.push("bump limit");
+    if (op.imagelimit === 1) status.push("image limit");
+
+    // Build capture nodes.
+    const captureNodes: YotsubaPostNode[] = [];
+    const captureNos = new Set<number>();
+
+    // Find the headline post.
+    let headlinePost: ApiPost = op;
+    let headlineNo = opNo;
+    let linkedMissing: number | undefined;
+
+    if (linkedPostNo != null && linkedPostNo !== opNo) {
+      const found = posts.find((p) => p.no === linkedPostNo);
+      if (found) {
+        headlinePost = found;
+        headlineNo = linkedPostNo;
+      } else {
+        // Post not found in thread → degrade to thread link.
+        linkedMissing = linkedPostNo;
+      }
+    }
+
+    // Add headline post (role "op" when it IS the OP, "linked" for a specific post link).
+    const headlineIdx = posts.findIndex((p) => p.no === headlineNo);
+    const headlineRole: YotsubaPostNode["role"] = headlineNo === opNo ? "op" : "linked";
+    captureNodes.push(apiPostToNode(headlinePost, headlineIdx, headlineRole));
+    captureNos.add(headlineNo);
+
+    if (linkedMissing == null && headlineNo === opNo) {
+      // Thread link: latest replies + posts they answer.
+      const nonOpPosts = posts.slice(1);
+      const latestCount = cfg.preview.latestReplies;
+      const latestPosts = nonOpPosts.slice(-latestCount);
+      const alreadyCaptured = new Set<number>([opNo]);
+
+      // Collect posts answered by latest replies (replied-to candidates).
+      const answeredNos = new Set<number>();
+      for (const lp of latestPosts) {
+        const { quotes } = convertComment(lp.com ?? "");
+        for (const qno of quotes) {
+          if (!alreadyCaptured.has(qno) && !answeredNos.has(qno)) {
+            answeredNos.add(qno);
+          }
+        }
+      }
+
+      // Add replied-to candidates (newest first, up to repliedToMax).
+      const repliedToCandidates = posts
+        .filter((p) => p.no != null && answeredNos.has(p.no!))
+        .sort((a, b) => (b.no ?? 0) - (a.no ?? 0))
+        .slice(0, cfg.preview.repliedToMax);
+
+      for (const p of repliedToCandidates) {
+        if (!captureNos.has(p.no!)) {
+          const idx = posts.findIndex((pp) => pp.no === p.no);
+          captureNodes.push(apiPostToNode(p, idx, "replied_to"));
+          captureNos.add(p.no!);
+        }
+      }
+
+      // Add latest replies.
+      for (const p of latestPosts) {
+        if (!captureNos.has(p.no!)) {
+          const idx = posts.findIndex((pp) => pp.no === p.no);
+          captureNodes.push(apiPostToNode(p, idx, "latest"));
+          captureNos.add(p.no!);
+        }
+      }
+    } else if (linkedMissing == null && headlineNo !== opNo) {
+      // Post link: posts the linked post answers + first N replies.
+      const { quotes: headlineQuotes } = convertComment(headlinePost.com ?? "");
+
+      // Posts the linked post answers (replied-to, newest first).
+      const repliedToCandidates = posts
+        .filter((p) => p.no != null && headlineQuotes.includes(p.no!) && p.no !== headlineNo)
+        .sort((a, b) => (b.no ?? 0) - (a.no ?? 0))
+        .slice(0, cfg.preview.repliedToMax);
+
+      for (const p of repliedToCandidates) {
+        if (!captureNos.has(p.no!)) {
+          const idx = posts.findIndex((pp) => pp.no === p.no);
+          captureNodes.push(apiPostToNode(p, idx, "replied_to"));
+          captureNos.add(p.no!);
+        }
+      }
+
+      // First N replies to the linked post.
+      const headlineBacklinks = posts
+        .filter((p) => {
+          if (!p.com) return false;
+          const { quotes } = convertComment(p.com);
+          return quotes.includes(headlineNo);
+        })
+        .slice(0, cfg.preview.repliesMax);
+
+      for (const p of headlineBacklinks) {
+        if (!captureNos.has(p.no!)) {
+          const idx = posts.findIndex((pp) => pp.no === p.no);
+          captureNodes.push(apiPostToNode(p, idx, "reply"));
+          captureNos.add(p.no!);
+        }
+      }
+    }
+
+    // Sort nodes by thread index for the capture.
+    captureNodes.sort((a, b) => a.index - b.index);
+
+    // Build payload (before file download).
+    const payload: YotsubaPreviewPayload = {
+      v: 1,
+      kind: "thread",
+      board,
+      boardTitle,
+      worksafe,
+      asOf: now,
+      threadNo,
+      subject,
+      opExcerpt: !subject ? opExcerpt : (linkedMissing != null || headlineNo !== opNo ? opExcerpt : undefined),
+      postCount,
+      fileCount,
+      posters,
+      status: status.length > 0 ? status : undefined,
+      linkedNo: linkedMissing == null && linkedPostNo != null && linkedPostNo !== opNo ? linkedPostNo : undefined,
+      linkedMissing,
+      headlineNo,
+      posts: captureNodes,
+    };
+
+    // Build the title and description for FTS.
+    const titleLabel = subject ?? opExcerpt ?? `thread ${threadNo}`;
+    const headlineText = captureNodes.find((n) => n.no === headlineNo)?.text ?? "";
+    const title = `/${board}/ - ${titleLabel}`;
+    const description = ftsDescription({
+      subject,
+      opExcerpt: !subject ? opExcerpt : undefined,
+      headlineText,
+      maxChars: 500,
+    });
+
+    // Download headline post's file (if any, if workspace available, if allowed).
+    if (headlinePost.tim && this.options.workspaceRoot !== null && canDownloadFiles) {
+      const file = headlinePost;
+      const ext = (file.ext ?? "").toLowerCase();
+      const isPdf = ext === ".pdf";
+      const isVideo = ext === ".webm" || ext === ".mp4";
+      const isAnimated = ext === ".gif";
+      const tim = file.tim!;
+
+      // For PDF: download the thumbnail (page 1 preview).
+      // For video/animated: download original + build storyboard.
+      // For image: download original.
+      if (isPdf) {
+        await this.downloadYotsubaFile({
+          board, tim, ext: "s.jpg", mediaType: "image",
+          mimeType: "image/jpeg", eventId, previewId,
+          mediaRole, captionStatus: captionImmediately ? "pending" : "deferred",
+          result, headlinePost, cfg,
+          storeInPayload: (assetId) => {
+            const headlineNode = payload.posts?.find((n) => n.no === headlineNo);
+            if (headlineNode?.file) headlineNode.file.assetId = assetId;
+          },
+        });
+      } else if (isVideo || isAnimated) {
+        // Download original as video asset.
+        const originalAsset = await this.downloadYotsubaFile({
+          board, tim, ext: file.ext!, mediaType: "video",
+          mimeType: inferMimeTypeFromExt(ext), eventId, previewId,
+          mediaRole, captionStatus: captionImmediately ? "pending" : "deferred",
+          result, headlinePost, cfg,
+          storeInPayload: (assetId) => {
+            const headlineNode = payload.posts?.find((n) => n.no === headlineNo);
+            if (headlineNode?.file) headlineNode.file.assetId = assetId;
+          },
+        });
+        // Attempt storyboard from the original file.
+        if (originalAsset?.local_path) {
+          const absPath = originalAsset.local_path.startsWith("/")
+            ? originalAsset.local_path
+            : path.join(this.options.workspaceRoot, originalAsset.local_path);
+          let storyboardBuilt = false;
+          try {
+            const storyboard = await buildStoryboard(absPath);
+            if (storyboard) {
+              const saved = await moveFileToWorkspace({
+                sourcePath: storyboard.path,
+                workspaceRoot: this.options.workspaceRoot,
+                originalFilename: `storyboard_${tim}.jpg`,
+                contentType: "image/jpeg",
+                attachSubdir: this.options.attachSubdir,
+                store: this.options.store,
+              });
+              const sbAsset: MediaAssetRow = {
+                id: nanoid(),
+                event_id: eventId,
+                role: mediaRole,
+                link_preview_id: previewId,
+                local_path: saved.localPath,
+                content_hash: saved.contentHash,
+                mime_type: "image/jpeg",
+                media_type: "image",
+                size_bytes: undefined,
+                caption_status: "deferred",  // storyboard never captioned
+                download_status: "complete",
+                created_at: now,
+              };
+              result.mediaAssets.push(sbAsset);
+              const headlineNode = payload.posts?.find((n) => n.no === headlineNo);
+              if (headlineNode?.file) headlineNode.file.storyboardAssetId = sbAsset.id;
+              storyboardBuilt = true;
+            }
+          } catch {
+            // storyboard failure — fall through to thumbnail fallback
+          }
+          if (!storyboardBuilt) {
+            // Download 4chan thumbnail as storyboard fallback.
+            await this.downloadYotsubaFile({
+              board, tim, ext: "s.jpg", mediaType: "image",
+              mimeType: "image/jpeg", eventId, previewId,
+              mediaRole, captionStatus: "deferred",
+              result, headlinePost, cfg,
+              storeInPayload: (assetId) => {
+                const headlineNode = payload.posts?.find((n) => n.no === headlineNo);
+                if (headlineNode?.file) headlineNode.file.storyboardAssetId = assetId;
+              },
+            });
+          }
+        }
+      } else {
+        // Regular image.
+        await this.downloadYotsubaFile({
+          board, tim, ext: file.ext!, mediaType: "image",
+          mimeType: inferMimeTypeFromExt(ext), eventId, previewId,
+          mediaRole, captionStatus: captionImmediately ? "pending" : "deferred",
+          result, headlinePost, cfg,
+          storeInPayload: (assetId) => {
+            const headlineNode = payload.posts?.find((n) => n.no === headlineNo);
+            if (headlineNode?.file) headlineNode.file.assetId = assetId;
+          },
+        });
+      }
+    }
+
+    result.linkPreviews.push({
+      id: previewId,
+      event_id: eventId,
+      context,
+      url: ref.canonicalUrl,
+      title,
+      description,
+      site_name: "4chan",
+      source_kind: YOTSUBA_SOURCE_KIND,
+      preview_index: previewIndex,
+      fetched_at: now,
+      fetch_status: "complete",
+      payload_json: JSON.stringify(payload),
+      created_at: now,
+    });
+  }
+
+  /**
+   * Download one yotsuba file via the media lane and move it to workspace.
+   * Returns the created MediaAssetRow, or undefined on failure (failure is
+   * logged but non-fatal). The row is pushed to `result.mediaAssets`.
+   */
+  private async downloadYotsubaFile(opts: {
+    board: string;
+    tim: number;
+    ext: string;         // includes leading dot, OR "s.jpg" for thumbnail
+    mediaType: string;
+    mimeType?: string;
+    eventId: string;
+    previewId: string;
+    mediaRole: string;
+    captionStatus: string;
+    result: EnrichmentResult;
+    headlinePost: ApiPost;
+    cfg: ResolvedYotsubaConfig;
+    storeInPayload: (assetId: string) => void;
+  }): Promise<MediaAssetRow | undefined> {
+    const { board, tim, ext, mediaType, mimeType, eventId, previewId, mediaRole, captionStatus, result, cfg } = opts;
+    const fileRef = ext === "s.jpg" ? `${tim}s.jpg` : `${tim}${ext}`;
+    const now = Date.now();
+    const asset: MediaAssetRow = {
+      id: nanoid(),
+      event_id: eventId,
+      role: mediaRole,
+      link_preview_id: previewId,
+      media_type: mediaType,
+      mime_type: mimeType ?? null,
+      download_status: "pending",
+      caption_status: captionStatus,
+      original_filename: `${tim}${ext === "s.jpg" ? "s.jpg" : ext}`,
+      created_at: now,
+    };
+
+    let fetchedPath: string | undefined;
+    try {
+      // Use the client's fetchFilePath method via the options yotsuba client.
+      const yotClient = this.options.yotsuba!.client;
+      const fetched = await yotClient.fetchFilePath(board, fileRef, "background");
+      fetchedPath = fetched.path;
+      if (fetched.statusCode < 200 || fetched.statusCode >= 300) {
+        await unlink(fetched.path).catch(() => {});
+        fetchedPath = undefined;
+        asset.download_status = "failed";
+        asset.download_error = `HTTP ${fetched.statusCode}`;
+      } else {
+        const saved = await moveFileToWorkspace({
+          sourcePath: fetched.path,
+          workspaceRoot: this.options.workspaceRoot!,
+          originalFilename: fileRef,
+          contentType: fetched.contentType ?? mimeType,
+          attachSubdir: this.options.attachSubdir,
+          store: this.options.store,
+        });
+        fetchedPath = undefined;
+        asset.local_path = saved.localPath;
+        asset.content_hash = saved.contentHash;
+        asset.mime_type = fetched.contentType ?? mimeType ?? null;
+        asset.size_bytes = fetched.sizeBytes;
+        asset.download_status = "complete";
+        if (fetched.contentType) {
+          asset.media_type = inferMediaType(fetched.contentType);
+        }
+        opts.storeInPayload(asset.id);
+      }
+    } catch (error) {
+      if (fetchedPath) await unlink(fetchedPath).catch(() => {});
+      asset.download_status = "failed";
+      asset.download_error = error instanceof Error ? error.message : String(error);
+    }
+
+    result.mediaAssets.push(asset);
+    return asset.download_status === "complete" ? asset : undefined;
+  }
+
   /**
    * Media rules per tweet node, main and quote alike (§7a): one photo
    * downloads as-is; two or more collapse into the mosaic collage (one image
@@ -1147,12 +1818,13 @@ export class EnrichmentWorker {
     // Workspace is required for file writes; skip entirely when unavailable (§4.3).
     if (this.options.workspaceRoot === null) return;
 
-    // Persisted preview URLs plus the raw X/YouTube URL matches (preview rows
-    // store CANONICAL URLs, which may differ from the body text).
+    // Persisted preview URLs plus the raw X/YouTube/yotsuba URL matches (preview
+    // rows store CANONICAL URLs, which may differ from the body text).
     const previewUrls = new Set([
       ...result.linkPreviews.map((lp) => lp.url),
       ...this.xUrlExclusions,
       ...this.ytUrlExclusions,
+      ...this.yotsubaUrlExclusions,
     ]);
     const urls = extractLinkedMediaUrls(bodyText, previewUrls);
     if (urls.length === 0) return;
@@ -1259,6 +1931,88 @@ function urlFilename(url: string): string | undefined {
     return basename || undefined;
   } catch {
     return undefined;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Yotsuba helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Truncate text to at most `wordLimit` words, appending "…" when truncated.
+ */
+function buildOpExcerpt(text: string, wordLimit: number): string {
+  const words = text.trim().split(/\s+/).filter(Boolean);
+  if (words.length <= wordLimit) return words.join(" ");
+  return words.slice(0, wordLimit).join(" ") + "…";
+}
+
+/**
+ * Convert a raw `ApiPost` + thread position to a `YotsubaPostNode`. Uses
+ * `convertComment` from the markup module to turn the HTML comment into plain
+ * text, quotes, and dead/cross quote sets.
+ */
+function apiPostToNode(
+  post: import("../yotsuba/types.js").ApiPost,
+  index: number,
+  role: import("../yotsuba/types.js").YotsubaPostNode["role"],
+): import("../yotsuba/types.js").YotsubaPostNode {
+  const { text, quotes, deadQuotes, crossQuotes } = convertComment(post.com ?? "");
+  const node: import("../yotsuba/types.js").YotsubaPostNode = {
+    no: post.no!,
+    index,
+    role,
+    time: (post.time ?? 0) * 1000,
+    text,
+    quotes,
+    replies: 0,  // backlink count not known at capture time
+  };
+  if (post.name && post.name !== "Anonymous") node.name = post.name;
+  if (post.trip) node.trip = post.trip;
+  if (post.id) node.posterId = post.id;
+  if (post.capcode) node.capcode = post.capcode;
+  if (post.board_flag) node.flag = post.board_flag;
+  if (deadQuotes && deadQuotes.length > 0) node.deadQuotes = deadQuotes;
+  if (crossQuotes && crossQuotes.length > 0) node.crossQuotes = crossQuotes;
+  if (post.tim) {
+    node.file = {
+      name: post.filename ?? String(post.tim),
+      ext: post.ext ?? ".jpg",
+      w: post.w,
+      h: post.h,
+      bytes: post.fsize,
+      spoiler: post.spoiler === 1,
+      deleted: post.filedeleted === 1,
+      tim: post.tim,
+    };
+  }
+  return node;
+}
+
+/**
+ * Infer a MIME type from a 4chan file extension (includes leading dot).
+ * Returns `undefined` for unknown/unsupported types.
+ */
+function inferMimeTypeFromExt(ext: string): string | undefined {
+  const e = ext.toLowerCase();
+  switch (e) {
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".png":
+      return "image/png";
+    case ".gif":
+      return "image/gif";
+    case ".webp":
+      return "image/webp";
+    case ".webm":
+      return "video/webm";
+    case ".mp4":
+      return "video/mp4";
+    case ".pdf":
+      return "application/pdf";
+    default:
+      return undefined;
   }
 }
 

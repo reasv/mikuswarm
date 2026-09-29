@@ -130,8 +130,9 @@ import { EnrichmentWorkerPool, FetchClient } from "./enrichment/index.js";
 import { AttachmentStore } from "./enrichment/attachment-store.js";
 import { FxTwitterClient, resolveFxTwitterConfig } from "./fxtwitter/index.js";
 import { resolveYouTubeConfig } from "./youtube/config.js";
-import { resolveYotsubaConfig, type ResolvedYotsubaConfig } from "./yotsuba/types.js";
+import { resolveYotsubaConfig, parseYotsubaPreviewPayload, type ResolvedYotsubaConfig } from "./yotsuba/types.js";
 import { YotsubaClient } from "./yotsuba/client.js";
+import { selectUpgradePosts, fileAllocationOrder, computeRefCost } from "./yotsuba/upgrade.js";
 import { CaptionWorkerPool, InferenceClient, type MediaModality } from "./captioning/index.js";
 import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools, type McpServerEntry } from "./mcp/index.js";
@@ -1124,6 +1125,19 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   }
   startupPhase("youtube");
 
+  // Yotsuba (4chan) enrichment subsystem (ARCHITECTURE.md §7f). Synchronous —
+  // no binary probing needed. Returns undefined when the feature gate is off or
+  // enrichment is disabled. The returned object is shared between the enrichment
+  // pool and every session's tool registry.
+  const yotsubaSubsystem = createYotsubaSubsystem(config, fetchClient);
+  if (yotsubaSubsystem) {
+    logger.info("yotsuba_subsystem_ready", {
+      apiBase: yotsubaSubsystem.config.apiBase,
+      enrichmentEnabled: yotsubaSubsystem.config.enrichment.enabled,
+    });
+  }
+  startupPhase("yotsuba");
+
   // Shared, cross-session Grok-result cache for x_search: one
   // instance so a reactive and a proactive session hitting the same topic in a
   // busy channel dampen to a single Grok call. Only the expensive synthesis is
@@ -1409,6 +1423,17 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             captionAssistant:
               (config.captioning?.caption_all ?? false) ||
               (config.captioning?.caption_assistant_messages ?? false),
+          }
+        : undefined,
+    // Yotsuba enrichment partition (ARCHITECTURE.md §7f): only passed when the
+    // feature gate is on AND [yotsuba.enrichment].enabled is true.
+    yotsuba:
+      yotsubaSubsystem && yotsubaSubsystem.config.enrichment.enabled
+        ? {
+            client: yotsubaSubsystem.client,
+            config: yotsubaSubsystem.config,
+            captionAll: config.captioning?.caption_all ?? false,
+            captionAssistant: config.captioning?.caption_assistant_messages ?? false,
           }
         : undefined,
     store: attachmentStore,
@@ -3247,7 +3272,332 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     await Promise.all(
       eventIds.map((eventId) => awaitEnrichmentComplete(eventId, enrichmentTimeoutMs)),
     );
+
+    // Yotsuba trigger upgrade (ARCHITECTURE.md §7f, spec §6.4-§6.5): between
+    // enrichment wait and caption wait so every capture is stored when the
+    // upgrade runs. Makes no API calls. Bounded by enrichmentTimeoutMs.
+    if (yotsubaSubsystem && yotsubaSubsystem.config.enrichment.enabled) {
+      const triggerEventId = inbound.event.id;
+      const upgradePromise = performYotsubaTriggerUpgrade(triggerEventId);
+      const timeoutPromise = new Promise<void>((resolve) => {
+        setTimeout(() => {
+          logger.warn("yotsuba_upgrade_timeout", { triggerEventId, timeoutMs: enrichmentTimeoutMs });
+          resolve();
+        }, enrichmentTimeoutMs);
+      });
+      await Promise.race([upgradePromise, timeoutPromise]);
+    }
+
     await awaitCaptionsComplete(eventIds, captionTimeoutMs);
+  }
+
+  /**
+   * Yotsuba trigger upgrade (spec §6.4-§6.5).
+   *
+   * For every yotsuba link_previews row whose event_id is in the trigger
+   * group, selects posts from the stored capture, downloads their files,
+   * marks processed files as `pending`, and writes the upgrade record.
+   * Idempotent: rows that already have an upgrade record are skipped.
+   * No API calls.
+   */
+  async function performYotsubaTriggerUpgrade(triggerEventId: string): Promise<void> {
+    if (!yotsubaSubsystem) return;
+    const { client, config: yotCfg } = yotsubaSubsystem;
+
+    const previews = storage.getYotsubaPreviewsForTriggerGroup(triggerEventId);
+    if (previews.length === 0) return;
+
+    // Caption allowance per processed file (tokens = chars / 4).
+    const captionMaxChars = (config.captioning?.image as { max_chars?: number } | undefined)?.max_chars ?? 500;
+    const captionAllowanceTokens = Math.ceil(captionMaxChars / 4);
+
+    // Per-ref token budget and group token budget.
+    const linkTokenBudget = yotCfg.preview.triggerLinkTokens;   // 900
+    const groupTokenBudget = yotCfg.preview.triggerGroupTokens; // 1800
+    const groupFileBudget = yotCfg.preview.triggerGroupFiles;   // 4
+    const headlineCharCap = yotCfg.preview.triggerHeadlineChars; // 800
+
+    // Partition refs into already-upgraded (skip) and fresh ones.
+    const freshPreviews = previews.filter((p) => {
+      const payload = parseYotsubaPreviewPayload(p.row.payload_json ?? null);
+      return !payload?.upgrade;
+    });
+    if (freshPreviews.length === 0) return;
+
+    // Import helpers not in scope at the top of startMikuAgent.
+    const { nanoid: newId } = await import("nanoid");
+    const { moveFileToWorkspace: moveFn } = await import("./enrichment/media.js");
+    const parsePay = parseYotsubaPreviewPayload;
+
+    // Determine the effective workspace root for file downloads.
+    // Use the trigger event's timeline_key to resolve the agent workspace.
+    const triggerEvent = storage.getTimelineEventById(triggerEventId);
+    const effectiveWorkspaceRoot = triggerEvent
+      ? (resolveWorkspaceForTimeline(triggerEvent.timelineKey)?.workspaceRoot ?? workspaceRoot)
+      : workspaceRoot;
+    const attachSubdirForUpgrade: string | undefined = (() => {
+      if (!triggerEvent) return undefined;
+      const parsed = parseTimelineKey(triggerEvent.timelineKey);
+      if (!parsed) return undefined;
+      const candidate = `${parsed.provider}.${parsed.accountId}`;
+      if (candidate.includes("/") || candidate.includes("\\") || candidate.includes("..")) return undefined;
+      return candidate;
+    })();
+
+    // Group-level file slot counter.
+    let groupFilesUsed = 0;
+    let groupTokensUsed = 0;
+
+    // Collect all writes to perform atomically at the end.
+    const payloadUpdates: Array<{ previewId: string; newPayloadJson: string }> = [];
+    const newAssets: import("./storage/database.js").MediaAssetRow[] = [];
+    const flipAssetIds: string[] = [];
+
+    for (const { row, assets } of freshPreviews) {
+      const payload = parsePay(row.payload_json ?? null);
+      if (!payload || payload.kind !== "thread") {
+        // Board refs and failed rows: mark with an empty upgrade so they're
+        // not retried on every trigger.
+        const emptyUpgrade = payload ? { ...payload, upgrade: { triggerGroupId: triggerEventId, includedNos: [], processedAssetIds: [] } } : null;
+        if (emptyUpgrade) {
+          payloadUpdates.push({ previewId: row.id, newPayloadJson: JSON.stringify(emptyUpgrade) });
+        }
+        continue;
+      }
+
+      const board = payload.board;
+      const canDownload = yotCfg.enrichment.mediaBoards === "all" || (payload.worksafe === true);
+
+      // Start with all captured posts; the headline is always kept.
+      const headlineNo = payload.headlineNo ?? payload.threadNo ?? 0;
+      const allPosts = payload.posts ?? [];
+      const headlinePost = allPosts.find((p) => p.no === headlineNo);
+      if (!headlinePost) {
+        // No headline — skip.
+        payloadUpdates.push({
+          previewId: row.id,
+          newPayloadJson: JSON.stringify({
+            ...payload,
+            upgrade: { triggerGroupId: triggerEventId, includedNos: [], processedAssetIds: [] },
+          }),
+        });
+        continue;
+      }
+
+      // Drop order for thread links: replied_to (oldest first), then latest (oldest first).
+      // Drop order for post links: reply (newest first), then replied_to (oldest first).
+      const isPostLink = payload.linkedNo != null;
+
+      // Select included posts and apply budgets (src/yotsuba/upgrade.ts).
+      const selection = selectUpgradePosts({
+        posts: allPosts,
+        headlineNo,
+        isPostLink,
+        budgets: {
+          linkTokenBudget,
+          remainingGroupTokenBudget: groupTokenBudget - groupTokensUsed,
+          captionAllowanceTokens,
+          headlineCharCap,
+        },
+        remainingGroupFileBudget: groupFileBudget - groupFilesUsed,
+        canDownload,
+      });
+
+      if (selection.staysAmbient) {
+        payloadUpdates.push({
+          previewId: row.id,
+          newPayloadJson: JSON.stringify({
+            ...payload,
+            upgrade: { triggerGroupId: triggerEventId, includedNos: [], processedAssetIds: [] },
+          }),
+        });
+        continue;
+      }
+
+      const headlineText = selection.headlineText;
+      const headlinePostCapped = { ...headlinePost, text: headlineText };
+      const includedPosts = selection.includedPosts;
+      const allIncluded = [headlinePostCapped, ...includedPosts];
+      const includedNos = allIncluded.map((p) => p.no);
+
+      // Track cost for group token accounting.
+      const countDownloadable = (inc: typeof allPosts) =>
+        inc.filter((p) => p.file?.assetId || (p.file && canDownload)).length + (headlinePost.file ? 1 : 0);
+      const refCost = computeRefCost({
+        includedPosts,
+        headlineTextLen: headlineText.length,
+        filesInRef: Math.min(countDownloadable(includedPosts), groupFileBudget - groupFilesUsed),
+        captionAllowanceTokens,
+      });
+
+      // Build file allocation order per spec §6.5.
+      const fileOrderPosts = fileAllocationOrder({
+        headlinePost: headlinePostCapped,
+        includedPosts,
+        isPostLink,
+      });
+
+      // Assign processed vs stored slots.
+      const processedPostNos = new Set<number>();
+      const processedAssetIds: string[] = [];
+
+      for (const post of fileOrderPosts) {
+        if (!post.file || post.file.deleted) continue;
+        if (groupFilesUsed >= groupFileBudget) break;
+        processedPostNos.add(post.no);
+        groupFilesUsed++;
+      }
+
+      // Download files for all included posts (if not already in assets list).
+      const existingAssetsByPreviewId = new Map<string, string>();
+      for (const a of assets) {
+        // Map link_preview_id → assetId for files already downloaded.
+        if (a.download_status === "complete" && a.local_path) {
+          existingAssetsByPreviewId.set(`${a.link_preview_id}:${a.original_filename ?? ""}`, a.id);
+        }
+      }
+
+      const now = Date.now();
+      const updatedPayloadPosts = payload.posts ? [...payload.posts] : [];
+
+      for (const post of allIncluded) {
+        if (!post.file || post.file.deleted || !canDownload) continue;
+        const { file } = post;
+        const tim = file.tim;
+        const ext = file.ext;
+        const isProcessed = processedPostNos.has(post.no);
+        const captionStatus = isProcessed ? "pending" : "deferred";
+        const mediaRole: string = row.context === "reply" ? "reply_preview_media" : "preview_media";
+
+        // Skip if already downloaded (assetId already set in payload).
+        if (file.assetId) {
+          // File already stored; flip caption_status if processed.
+          if (isProcessed) {
+            flipAssetIds.push(file.assetId);
+            processedAssetIds.push(file.assetId);
+          }
+          continue;
+        }
+
+        // Determine file ref (original vs thumbnail for PDF).
+        const isPdf = ext?.toLowerCase() === ".pdf";
+        const isVideo = ext?.toLowerCase() === ".webm" || ext?.toLowerCase() === ".mp4";
+        const isAnimated = ext?.toLowerCase() === ".gif";
+        const fileRef = isPdf ? `${tim}s.jpg` : `${tim}${ext}`;
+        const mimeType = isPdf ? "image/jpeg" : (ext === ".jpg" || ext === ".jpeg" ? "image/jpeg"
+          : ext === ".png" ? "image/png" : ext === ".gif" ? "image/gif"
+          : ext === ".webm" ? "video/webm" : ext === ".mp4" ? "video/mp4"
+          : undefined);
+        const mediaType = isPdf ? "image" : (isVideo || isAnimated) ? "video" : "image";
+
+        let assetId: string | undefined;
+        try {
+          const fetched = await client.fetchFilePath(board, fileRef, "interactive");
+          if (fetched.statusCode >= 200 && fetched.statusCode < 300) {
+            const saved = await moveFn({
+              sourcePath: fetched.path,
+              workspaceRoot: effectiveWorkspaceRoot,
+              originalFilename: fileRef,
+              contentType: fetched.contentType ?? mimeType,
+              attachSubdir: attachSubdirForUpgrade,
+              store: attachmentStore,
+            });
+            assetId = newId();
+            const asset: import("./storage/database.js").MediaAssetRow = {
+              id: assetId,
+              event_id: row.event_id,
+              role: mediaRole,
+              link_preview_id: row.id,
+              local_path: saved.localPath,
+              content_hash: saved.contentHash,
+              mime_type: fetched.contentType ?? mimeType ?? null,
+              media_type: mediaType,
+              size_bytes: fetched.sizeBytes,
+              original_filename: fileRef,
+              caption_status: captionStatus,
+              download_status: "complete",
+              created_at: now,
+              updated_at: now,
+            };
+            newAssets.push(asset);
+            // Update payload node with assetId.
+            const payloadNode = updatedPayloadPosts.find((n) => n.no === post.no);
+            if (payloadNode?.file) {
+              payloadNode.file.assetId = assetId;
+            }
+            if (isProcessed) processedAssetIds.push(assetId);
+          } else {
+            await import("node:fs/promises").then(({ unlink }) => unlink(fetched.path).catch(() => {}));
+          }
+        } catch {
+          // Download failure — file stays missing.
+        }
+
+        // For videos: attempt storyboard.
+        if (assetId && (isVideo || isAnimated)) {
+          try {
+            const assetRow = newAssets.find((a) => a.id === assetId);
+            if (assetRow?.local_path) {
+              const absPath = assetRow.local_path.startsWith("/")
+                ? assetRow.local_path
+                : (await import("node:path")).default.join(effectiveWorkspaceRoot, assetRow.local_path);
+              const { buildStoryboard: bs } = await import("./media/storyboard.js");
+              const storyboard = await bs(absPath);
+              if (storyboard) {
+                const sbSaved = await moveFn({
+                  sourcePath: storyboard.path,
+                  workspaceRoot: effectiveWorkspaceRoot,
+                  originalFilename: `storyboard_${tim}.jpg`,
+                  contentType: "image/jpeg",
+                  attachSubdir: attachSubdirForUpgrade,
+                  store: attachmentStore,
+                });
+                const sbAssetId = newId();
+                newAssets.push({
+                  id: sbAssetId,
+                  event_id: row.event_id,
+                  role: mediaRole,
+                  link_preview_id: row.id,
+                  local_path: sbSaved.localPath,
+                  content_hash: sbSaved.contentHash,
+                  mime_type: "image/jpeg",
+                  media_type: "image",
+                  caption_status: "deferred",
+                  download_status: "complete",
+                  created_at: now,
+                  updated_at: now,
+                });
+                const payloadNode = updatedPayloadPosts.find((n) => n.no === post.no);
+                if (payloadNode?.file) payloadNode.file.storyboardAssetId = sbAssetId;
+                // Storyboard replaces the original in processedAssetIds for image-block.
+                if (isProcessed) {
+                  const origIdx = processedAssetIds.indexOf(assetId);
+                  if (origIdx >= 0) processedAssetIds[origIdx] = sbAssetId;
+                  else processedAssetIds.push(sbAssetId);
+                }
+              }
+            }
+          } catch { /* storyboard failure is non-fatal */ }
+        }
+      }
+
+      // Update payload with upgrade record and any new assetIds.
+      const updatedPayload = {
+        ...payload,
+        posts: updatedPayloadPosts,
+        upgrade: {
+          triggerGroupId: triggerEventId,
+          includedNos,
+          processedAssetIds,
+        } as import("./yotsuba/types.js").YotsubaUpgradeRecord,
+      };
+      payloadUpdates.push({ previewId: row.id, newPayloadJson: JSON.stringify(updatedPayload) });
+      groupTokensUsed += refCost;
+    }
+
+    if (payloadUpdates.length > 0 || newAssets.length > 0 || flipAssetIds.length > 0) {
+      await storage.writeYotsubaUpgrade(payloadUpdates, newAssets, flipAssetIds);
+    }
   }
 
   function awaitEnrichmentComplete(eventId: string, timeoutMs: number): Promise<void> {

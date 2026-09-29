@@ -16,6 +16,7 @@ import type {
   CurrentIdentity,
 } from "../storage/index.js";
 import { processImageForInference, cleanupProcessedImage, buildInferenceImageOptions } from "../media/index.js";
+import { parseYotsubaPreviewPayload, resolveYotsubaConfig, YOTSUBA_SOURCE_KIND } from "../yotsuba/types.js";
 import { compactTimelineEvents } from "./compaction.js";
 import { renderCompactMessage, renderRichMessage } from "./renderer.js";
 import { hydrateEvents as hydrateEventsShared, mediaAssetToAttachmentMeta } from "./hydrate.js";
@@ -1714,6 +1715,53 @@ export class ContextBuilder {
         continue;
       }
     }
+
+    // Yotsuba image-block lane (ARCHITECTURE.md §7f, spec §6.5): after the
+    // existing cascade, add processed asset ids from this trigger group's
+    // yotsuba upgrade as additional image blocks. Only for multimodal models
+    // (canSeeImages already checked above). At most `trigger_group_files` per
+    // session. These are the files the trigger upgrade selected; the cascade
+    // is unchanged.
+    if (this.config.features?.yotsuba === true) {
+      const yotCfg = resolveYotsubaConfig(this.config.yotsuba);
+      const maxYotsubaBlocks = yotCfg.preview.triggerGroupFiles;
+      const yotPreviews = this.storage.getYotsubaPreviewsForTriggerGroup(trigger.id);
+      let yotsubaBlocksAdded = 0;
+      for (const { row, assets } of yotPreviews) {
+        if (yotsubaBlocksAdded >= maxYotsubaBlocks) break;
+        if (row.fetch_status !== "complete") continue;
+        const payload = parseYotsubaPreviewPayload(row.payload_json ?? null);
+        if (!payload?.upgrade?.processedAssetIds?.length) continue;
+        for (const assetId of payload.upgrade.processedAssetIds) {
+          if (yotsubaBlocksAdded >= maxYotsubaBlocks) break;
+          // Skip if already in blocks (idempotent).
+          if (blocks.some((b) => b.attachmentId === assetId)) continue;
+          const asset = assets.find((a) => a.id === assetId);
+          if (!asset?.local_path) continue;
+          // Only image-type assets become image blocks (storyboards for video).
+          if (asset.media_type !== "image") continue;
+          const absPath = asset.local_path.startsWith("/")
+            ? asset.local_path
+            : path.join(workspaceRoot, asset.local_path);
+          try {
+            const processed = await processImageForInference(absPath, imageOpts);
+            const data = await readFile(processed.path);
+            const mimeType = processed.mimeType;
+            await cleanupProcessedImage(processed);
+            blocks.push({
+              eventId: asset.event_id,
+              attachmentId: asset.id,
+              mediaType: mimeType,
+              dataBase64: data.toString("base64"),
+            });
+            yotsubaBlocksAdded++;
+          } catch {
+            continue;
+          }
+        }
+      }
+    }
+
     return blocks;
   }
 

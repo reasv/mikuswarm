@@ -301,6 +301,23 @@ export interface ResolvedYotsubaToolConfig {
   maxDownloadFiles: number;
 }
 
+/**
+ * Parse a `YotsubaPreviewPayload` from a nullable JSON string. Returns null when
+ * the string is absent, empty, or not a valid payload.
+ */
+export function parseYotsubaPreviewPayload(
+  payloadJson: string | null | undefined,
+): YotsubaPreviewPayload | null {
+  if (!payloadJson) return null;
+  try {
+    const obj = JSON.parse(payloadJson);
+    if (!obj || typeof obj !== "object" || obj.v !== 1) return null;
+    return obj as YotsubaPreviewPayload;
+  } catch {
+    return null;
+  }
+}
+
 /** Resolve raw config to a fully defaulted config object. */
 export function resolveYotsubaConfig(raw?: RawYotsubaConfig): ResolvedYotsubaConfig {
   const r = raw ?? {};

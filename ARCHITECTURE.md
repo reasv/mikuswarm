@@ -347,7 +347,7 @@ seeding?:           { mode?,             // "reconcile" (default) | "first-run" 
 
 - `character_card` → the `character_card_create` / `character_card_read` / `character_card_edit` tools
 - `danbooru` → the `danbooru` search tool
-- `yotsuba` → the `yotsuba` 4chan browsing tool (Phase 1 foundations in `src/yotsuba/`; Phase 2 enrichment and Phase 3 tool pending; see §7f)
+- `yotsuba` → the `yotsuba` 4chan browsing tool; also gates Phase 2 enrichment (link previews, trigger upgrade, image-block lane) when `[yotsuba.enrichment].enabled = true`; Phase 3 tool pending (see §7f)
 
 The feature → tools mapping is a single source of truth (`FEATURE_TOOLS` in `src/app.ts`). At startup `gatedOutFeatureTools(config.features)` collects every tool whose owning feature is not strictly `true`, and those names are folded into the same `disabledTools` set that `agent.disabled_tools` populates. `buildSessionTools` applies that combined set in its one tool-list filter, so a tool excluded by **either** mechanism (an explicit `disabled_tools` entry **or** an off feature gate) is unavailable — and because the gate lives in that single global filter (not in any per-session-type allowlist), it applies uniformly to chat and every generation session type. Turning a flag on (e.g. `[features]\ncharacter_card = true`) re-registers its tools, still subject to `disabled_tools`.
 
@@ -1892,9 +1892,21 @@ Cross-field validation at app wiring: `[youtube.enrichment].enabled = true` requ
 
 ---
 
-## 7f. 4chan (Yotsuba) Support — Phase 1 Foundations
+## 7f. 4chan (Yotsuba) Support — Phases 1 and 2
 
-The `src/yotsuba/` module provides the shared foundations for 4chan support — URL recognition, API types, comment parsing, thread graph, post-view engine, rendering vocabulary, and the HTTP client. Phases 2 and 3 (enrichment stage and tool, respectively) build on these; see `spec/YOTSUBA-SUPPORT.md` for their design.
+The `src/yotsuba/` module provides shared foundations for 4chan support — URL recognition, API types, comment parsing, thread graph, post-view engine, rendering vocabulary, and the HTTP client. Phase 2 (enrichment stage: link preview capture, trigger upgrade, image-block lane, context rendering) is also implemented. Phase 3 (the `yotsuba` tool) is pending; see `spec/YOTSUBA-SUPPORT.md`.
+
+**Phase 2 overview.** When `[features].yotsuba = true` and `[yotsuba.enrichment].enabled = true`:
+
+- **Enrichment partition** (`src/enrichment/worker.ts`): after the X and YouTube partitions, recognized 4chan URLs are stripped from `filteredBody` (suppressing generic Synapse previews), their raw matches join the linked-media exclusions, and one `enrichYotsubaRef` call per ref fetches thread or board data at `background` priority and stores a `link_previews` row with `source_kind = "yotsuba"` and `payload_json = YotsubaPreviewPayload`. Reply-context refs reuse an existing row for the same URL (zero API calls). Failed/404 threads store `fetch_status = "failed"` with `error = "gone"`. All headline files are created with `caption_status = "deferred"` unless `caption_all` or the assistant-message caption rule fires.
+
+- **Trigger upgrade** (`src/app.ts` → `performYotsubaTriggerUpgrade`): runs in `awaitTriggerReadiness` between the enrichment wait and the caption wait. Makes no API calls. For every fresh yotsuba row in the trigger group, selects posts from the stored capture, applies per-ref (`trigger_link_tokens` = 900) and group (`trigger_group_tokens` = 1800) token budgets, downloads selected posts' files via the media lane at `interactive` priority, allocates up to `trigger_group_files` (4) processed files group-wide, flips processed files from `deferred` → `pending`, and writes the `upgrade` record plus new asset rows atomically via `storage.writeYotsubaUpgrade`. Idempotent: rows with an existing `upgrade` are skipped.
+
+- **Image-block lane** (`src/context/builder.ts` → `selectImageBlocks`): after the existing priority cascade, reads `payload.upgrade.processedAssetIds` from the trigger group's yotsuba rows and conditions those assets as additional image blocks, up to `trigger_group_files` per session. Only for multimodal reply models (`canSeeImages`). The cascade itself is unchanged.
+
+- **Rendering** (`src/context/renderer.ts`): `renderYotsubaPreview` (rich zone) and `compactYotsubaPreview` (compact zone) branch on `source_kind = "yotsuba"`. Ambient rendering shows the headline post (thread/board snapshot); trigger rendering shows included posts from the upgrade with `image_block="true"` on processed files and `auto="off"` on stored files. Board links render identically in both tiers. `discord_embed` rows are suppressed when the same event has a yotsuba row for the same canonical URL (`filterYotsubaSupersededPreviews`). Gone rows render as a self-closing `<link_preview kind="4chan" status="gone" .../>`.
+
+- **Persistence.** No new tables. One `link_previews` row per ref: `source_kind = "yotsuba"`, `site_name = "4chan"`, canonical URL, `payload_json = YotsubaPreviewPayload` (v1). Associated files go in `media_assets` with `role = "preview_media"` or `"reply_preview_media"`, `link_preview_id` set. Storage helpers: `getYotsubaPreviewByUrl` (reply reuse), `getYotsubaPreviewsForTriggerGroup` (upgrade/builder), `writeYotsubaUpgrade` (atomic write).
 
 **Code name.** "Yotsuba" is the internal and code name; prose-facing surfaces say "4chan". No identifier in the codebase uses "fourchan" or "4chan" — all symbols, filenames, config keys, and log labels use "yotsuba".
 
@@ -2670,6 +2682,8 @@ The `AssistantMessage` type in pi-ai requires metadata fields (`api`, `provider`
 At most one tier's images per session (the first non-empty tier). All other images in context exist as text references with workspace-relative local paths — the agent can use the `media` tool to analyze any of them.
 
 If no trigger group exists in the DB (e.g. for events persisted before the enrichment pipeline), a fallback cascade checks the event's in-memory attachments, reply attachments, and hold-grouped events directly.
+
+**Yotsuba image-block lane** (§7f): after the cascade, `selectImageBlocks` checks the trigger group's yotsuba `link_previews` rows for `payload.upgrade.processedAssetIds`. These are the files the trigger upgrade allocated for this session; they are added as additional image blocks (storyboards for video/GIF, thumbnails for PDF, originals for images) up to `trigger_group_files` (4) per session. Only image-type assets are eligible for image blocks. The cascade itself is unchanged; the yotsuba lane only fires when `[features].yotsuba = true`.
 
 **Image block marking**: selected images are marked with `isImageBlock = true` on their `AttachmentMeta` before rendering. This produces an `image_block="true"` attribute in the rich XML output, letting the model know which text-referenced attachment also has an accompanying multimodal image block. Marking traverses all media locations on trigger group events: direct attachments, linked media, link preview media, and all equivalent fields on reply contexts.
 

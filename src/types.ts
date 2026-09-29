@@ -174,6 +174,13 @@ export interface LinkPreviewMeta {
    * `description` when absent/malformed.
    */
   ytPayload?: import("./youtube/payload.js").YouTubePreviewPayload;
+  /**
+   * Structured Yotsuba (4chan) payload for `sourceKind === "yotsuba"` previews
+   * (ARCHITECTURE.md §7f). Parsed from `link_previews.payload_json` at hydrate
+   * time; the rich renderer branches on it, falling back to the flat
+   * `description` when absent/malformed.
+   */
+  yotsubaPayload?: import("./yotsuba/types.js").YotsubaPreviewPayload;
 }
 
 export interface MentionInfo {

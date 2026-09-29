@@ -7,6 +7,8 @@ import type { EnrichmentCapabilities, EnrichmentConfig } from "./types.js";
 import type { FetchClient } from "./fetch-client.js";
 import type { FxTwitterClient } from "../fxtwitter/client.js";
 import type { FxTwitterConfig } from "../fxtwitter/types.js";
+import type { YotsubaClient } from "../yotsuba/client.js";
+import type { ResolvedYotsubaConfig } from "../yotsuba/types.js";
 import type { PipelineActivityBus, PipelineActivityKind, PipelineStats } from "../observability/pipelines.js";
 import { EnrichmentWorker } from "./worker.js";
 import { parseTimelineKey } from "../storage/timeline-key.js";
@@ -50,6 +52,18 @@ export interface EnrichmentWorkerPoolOptions {
    */
   youtube?: {
     config: import("../youtube/config.js").YouTubeEnrichmentConfig;
+    captionAssistant: boolean;
+  };
+  /**
+   * 4chan (Yotsuba) enrichment (ARCHITECTURE.md §7f). When set and the feature
+   * gate is on, recognized 4chan URLs are partitioned away from the generic
+   * Synapse path and enriched here (one fetch per ref, headline-file download,
+   * stored capture). Unset = 4chan URLs ride the Synapse path unchanged.
+   */
+  yotsuba?: {
+    client: YotsubaClient;
+    config: ResolvedYotsubaConfig;
+    captionAll: boolean;
     captionAssistant: boolean;
   };
   /**
@@ -275,6 +289,7 @@ export class EnrichmentWorkerPool {
       downloadSizeLimit: this.options.downloadSizeLimit,
       fxtwitter: this.options.fxtwitter,
       youtube: this.options.youtube,
+      yotsuba: this.options.yotsuba,
       store: this.options.store,
       logger: this.options.logger,
     });
