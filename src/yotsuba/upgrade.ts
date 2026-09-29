@@ -213,3 +213,69 @@ export function fileAllocationOrder(opts: {
   }
   return result;
 }
+
+// ---------------------------------------------------------------------------
+// allocateGroupFiles
+// ---------------------------------------------------------------------------
+
+/**
+ * Allocate processed file slots across all refs in the group, in §6.5 tier
+ * order.  Returns a Map<refIndex, Set<postNo>> of posts that receive a
+ * processed slot.
+ *
+ * Tier 1: headline file of each ref, in group order.
+ * Tier 2: per ref in order — thread = latest newest-first; post = replied-to
+ *          newest-first.
+ * Tier 3: per ref in order — thread = replied-to newest-first; post = replies
+ *          newest-first.
+ *
+ * A slot is only granted when the ref's canDownload flag is true.
+ */
+export function allocateGroupFiles(opts: {
+  refs: Array<{
+    headlinePost: YotsubaPostNode;
+    includedPosts: YotsubaPostNode[];
+    isPostLink: boolean;
+    canDownload: boolean;
+  }>;
+  totalFileBudget: number;
+}): Map<number, Set<number>> {
+  const processed = new Map<number, Set<number>>();
+  for (let i = 0; i < opts.refs.length; i++) processed.set(i, new Set());
+
+  let remaining = opts.totalFileBudget;
+
+  function tryAllocate(refIdx: number, post: YotsubaPostNode): boolean {
+    if (remaining <= 0) return false;
+    if (!post.file || post.file.deleted) return false;
+    if (!opts.refs[refIdx]!.canDownload) return false;
+    processed.get(refIdx)!.add(post.no);
+    remaining--;
+    return true;
+  }
+
+  // Tier 1: headline of each ref.
+  for (let i = 0; i < opts.refs.length; i++) {
+    tryAllocate(i, opts.refs[i]!.headlinePost);
+  }
+
+  // Tier 2: per ref in order.
+  for (let i = 0; i < opts.refs.length; i++) {
+    const { includedPosts, isPostLink } = opts.refs[i]!;
+    const tier2 = !isPostLink
+      ? includedPosts.filter((p) => p.role === "latest").sort((a, b) => b.no - a.no)
+      : includedPosts.filter((p) => p.role === "replied_to").sort((a, b) => b.no - a.no);
+    for (const p of tier2) tryAllocate(i, p);
+  }
+
+  // Tier 3: per ref in order.
+  for (let i = 0; i < opts.refs.length; i++) {
+    const { includedPosts, isPostLink } = opts.refs[i]!;
+    const tier3 = !isPostLink
+      ? includedPosts.filter((p) => p.role === "replied_to").sort((a, b) => b.no - a.no)
+      : includedPosts.filter((p) => p.role === "reply").sort((a, b) => b.no - a.no);
+    for (const p of tier3) tryAllocate(i, p);
+  }
+
+  return processed;
+}

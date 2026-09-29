@@ -21,6 +21,7 @@ import {
   computeRefCost,
   selectUpgradePosts,
   fileAllocationOrder,
+  allocateGroupFiles,
   type UpgradeBudgets,
 } from "../src/yotsuba/upgrade.js";
 import { parseYotsubaPreviewPayload, resolveYotsubaConfig } from "../src/yotsuba/types.js";
@@ -379,4 +380,67 @@ test("fileAllocationOrder: thread link with only latest posts", () => {
   assert.equal(order[0]!.no, 1, "headline first");
   assert.equal(order[1]!.no, 5, "newer latest before older");
   assert.equal(order[2]!.no, 3, "older latest last");
+});
+
+// ---------------------------------------------------------------------------
+// allocateGroupFiles — group-wide tier allocation (spec §6.5)
+// Note: the upgrade function itself makes no API calls — no client.thread()
+// or similar; it only processes the stored payload capture.  This is enforced
+// by the upgrade function design: all data comes from the payload, and the
+// only I/O is file downloads via client.fetchFilePath (tested at the app
+// level, not here).
+// ---------------------------------------------------------------------------
+
+test("allocateGroupFiles: five thread links — only first four OPs get processed slots", () => {
+  // Budget = 4.  Each ref has a headline file and no included posts.
+  const refs = Array.from({ length: 5 }, (_, i) => ({
+    headlinePost: makePost(100 + i, "op", "OP", true),
+    includedPosts: [] as YotsubaPostNode[],
+    isPostLink: false,
+    canDownload: true,
+  }));
+
+  const result = allocateGroupFiles({ refs, totalFileBudget: 4 });
+
+  // Refs 0–3 get their headline allocated (tier 1 fills budget).
+  for (let i = 0; i < 4; i++) {
+    assert.ok(result.get(i)!.has(100 + i), `ref ${i} headline allocated`);
+  }
+  // Ref 4 gets nothing (budget exhausted).
+  assert.equal(result.get(4)!.size, 0, "ref 4 gets no slot (budget exhausted)");
+});
+
+test("allocateGroupFiles: tier 2 fills after tier 1 is exhausted", () => {
+  // Budget = 3.  Two refs.
+  // ref0: headline (file) + 1 latest post (file).
+  // ref1: headline (file) + 1 replied_to post (file).
+  // Tier-1 allocation: ref0 headline (slot 1), ref1 headline (slot 2).
+  // Tier-2 allocation: ref0 latest (slot 3 — thread=latest newest-first).
+  // ref1 replied_to cannot get a slot (budget exhausted).
+  const latestPost = makePost(201, "latest", "latest", true);
+  const repliedToPost = makePost(301, "replied_to", "rt", true);
+
+  const refs = [
+    {
+      headlinePost: makePost(200, "op", "OP", true),
+      includedPosts: [latestPost] as YotsubaPostNode[],
+      isPostLink: false,
+      canDownload: true,
+    },
+    {
+      headlinePost: makePost(300, "op", "OP2", true),
+      includedPosts: [repliedToPost] as YotsubaPostNode[],
+      isPostLink: false,
+      canDownload: true,
+    },
+  ];
+
+  const result = allocateGroupFiles({ refs, totalFileBudget: 3 });
+
+  // ref0 gets headline + latest (tier 1 + tier 2).
+  assert.ok(result.get(0)!.has(200), "ref0 headline allocated (tier 1)");
+  assert.ok(result.get(0)!.has(201), "ref0 latest allocated (tier 2)");
+  // ref1 gets only headline (tier 1); its replied_to didn't get a slot.
+  assert.ok(result.get(1)!.has(300), "ref1 headline allocated (tier 1)");
+  assert.equal(result.get(1)!.has(301), false, "ref1 replied_to not allocated (budget exhausted)");
 });
