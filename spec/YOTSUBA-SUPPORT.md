@@ -37,11 +37,13 @@ navigation), and the browser is heavyweight for what is a structured-data proble
 CDN-cached, and has simple published usage rules (§3). This spec adds, as one opt-in
 feature:
 
-1. **T1: link previews in two formats.** Every 4chan link gets a cheap OP-only
-   snapshot. Links the agent is actually being asked about (in the trigger group, or in the
-   message a trigger replies to) get a richer, budgeted snapshot built at trigger time: the
-   OP, the latest replies, and what they answer, with a group-wide budget of 4 processed
-   images (§6, exact renderings in §6.7).
+1. **T1: link previews, one fetch, two renderings.** Every 4chan link is fetched once
+   and rendered cheaply by default: thread metadata plus the linked post (the OP for a
+   thread link), truncated. Links the agent is actually being asked about (in the trigger
+   group, or in the message a trigger replies to) are upgraded at trigger time, from the
+   stored capture and without another API call, to a richer rendering: 900 tokens per link,
+   1800 per trigger group, and 4 processed images per trigger group (§6, exact renderings
+   in §6.6).
 2. **T2: the `yotsuba` tool.** Active browsing: list boards, search a board's catalog, read
    a thread (in order, one post's conversation, the replies to a post, the most-replied
    posts, a keyword search), and inspect or download any attachment (image, video, PDF)
@@ -56,10 +58,11 @@ same vocabulary.
 ### User stories
 
 - A channel trades 4chan links all day. Each costs about as much as an ordinary link preview
-  in the agent's context: board, subject, counts, a short OP excerpt, the OP image stored.
+  in the agent's context: board, subject, counts, a short excerpt of the linked post (the OP
+  for a thread link), its image stored.
 - Someone replies to one of those links with "@miku explain the joke". The agent sees the
-  linked reply in full with its image, the posts it was answering (the setup), the thread's
-  OP, and the first replies to it with a count of the rest.
+  linked post with its image, the posts it was answering (the setup), and the first replies
+  to it with a count of the rest.
 - "What's /lmg/ saying about the new MiMo release?" The agent loads the skill, runs a
   catalog query on /g/ for `lmg`, then a `search` view of the thread for `mimo`, and
   answers with post links.
@@ -122,7 +125,8 @@ Endpoints (JSON, `https://a.4cdn.org`):
 | Endpoint | Use | Freshness we allow |
 |---|---|---|
 | `/boards.json` | board list: `board`, `title`, `ws_board`, `meta_description`, `max_comment_chars`, `is_archived`, … | 24 h |
-| `/{b}/catalog.json` | every live thread's OP + counts + `last_replies` (array of pages) | 10 s |
+| `/{b}/catalog.json` | every live thread's OP + counts + `last_replies` (array of pages); tool only | 10 s |
+| `/{b}/1.json` | board page 1 (bump order, stickies first), about 50 KB; board-link previews | 10 s |
 | `/{b}/thread/{no}.json` | full thread `{ posts: [...] }`; also serves archived threads (`archived: 1`) | 10 s |
 
 Files: `https://i.4cdn.org/{b}/{tim}{ext}` (original) and `https://i.4cdn.org/{b}/{tim}s.jpg`
@@ -173,7 +177,7 @@ Pure TS, no Matrix/native imports (the `src/fxtwitter/` precedent):
 - `format.ts`: preview payload building, flat description (FTS), tool text rendering.
 
 The tool lives in `src/tools/yotsuba.ts`. Two small generic media helpers are added outside
-the module because nothing about them is 4chan-specific: `src/media/storyboard.ts` (§6.4)
+the module because nothing about them is 4chan-specific: `src/media/storyboard.ts` (§6.5)
 and `src/media/pdf.ts` (§7.4).
 
 ### 4.1 URL recognition (`url.ts`)
@@ -203,7 +207,7 @@ The tool accepts the notation and explains the limitation when 123 turns out to 
 One instance, constructed at app wiring when the feature is on, shared by the enrichment
 stage and every session's tool (the `FxTwitterClient` precedent).
 
-- `boards()`, `catalog(board)`, `thread(board, no)` return the parsed body plus
+- `boards()`, `catalog(board)`, `page(board, n)`, `thread(board, no)` return the parsed body plus
   `{ fetchedAt, lastModified, fromCache }`, so every output can state how fresh it is.
 - **Cache**: in-memory, keyed by path, bounded by entry count and total bytes (implementer's
   choice; order of 64 entries / 32 MiB). Inside the freshness window: served from cache;
@@ -273,15 +277,15 @@ for every tool view; only the requested slots and the budget differ.
 - The thread graph: posts in thread order, each with its position (`index`, 0 = OP),
   `quotes` (parents, same thread, existing posts only) and backlinks (replies).
 - A **slot list**: `{ no, role, tier, textCap?, priority }` entries built by the caller
-  (preview rules in §6.3, tool views in §7.2). `tier` is `full` (the post's text up to
+  (preview rules in §6.2 and §6.4, tool views in §7.2). `tier` is `full` (the post's text up to
   `textCap`, or whole when uncapped) or `excerpt` (the first `excerpt_chars` characters,
   default 160, ending in `…`; no file shown).
 - A **budget**: `max_posts`, `max_text_tokens` (estimated with the shared
   `estimateTokens`), `max_files` (attachments shown, §5.3), plus a `contiguous` flag used by
   paged views, a `reserveTokens` amount charged up front (the frame, gap markers, footer, and
   caption allowances, so the budget is all-inclusive), and an `excerptFallback` flag
-  (trigger previews turn it off: their posts are whole or absent). For trigger previews the
-  file budget is group-wide, so finalization allocates files across refs itself (§6.4) and
+  (trigger previews turn it off: their posts are whole or absent). For trigger renderings the
+  file budget is group-wide, so the upgrade allocates files across refs itself (§6.5) and
   runs the engine with no `max_files`.
 
 ### 5.2 Selection
@@ -301,7 +305,7 @@ for every tool view; only the requested slots and the budget differ.
    not fit, so a page never skips a post in the middle and always ends at a clean cursor.
 5. **File pass**: attachments of placed `full` posts are shown in file-priority order (the
    caller's slot priority) up to `max_files`. Shown attachments are the ones downloaded and
-   presented (§6.4, §7.3); the rest are listed with metadata and `status="not shown"`.
+   presented (§6.5, §7.3); the rest are listed with metadata and `status="not shown"`.
 
 Selection happens once, when the snapshot or page is built. Rendering is a pure function of
 the result, so a stored preview renders byte-identically on every context build (the
@@ -312,7 +316,7 @@ deterministic-rendering invariant).
 | Kind (4chan ext) | Shown as | Notes |
 |---|---|---|
 | image (`.jpg .png .gif` still) | the original file | the 250 px thumbnail captions poorly |
-| animated `.gif`, video (`.webm .mp4`) | a **storyboard** image (§6.4) plus the original file | the storyboard is the image-block / caption representation; the original is kept for the `media` tool (audio, full analysis) |
+| animated `.gif`, video (`.webm .mp4`) | a **storyboard** image (§6.5) plus the original file | the storyboard is the image-block / caption representation; the original is kept for the `media` tool (audio, full analysis) |
 | PDF (`.pdf`, e.g. /po/) | 4chan's page-1 thumbnail; the tool's `view` adds extracted text (§7.4) | |
 | anything else (`.swf` on /f/) | listed only | |
 | `filedeleted` | listed as deleted | |
@@ -347,250 +351,196 @@ The same markers appear in previews and tool output:
 
 ## 6. T1: link previews
 
-### 6.1 Two formats
+### 6.1 One fetch, two renderings
 
 A 4chan link in a channel is usually not addressed to the agent: a board-heavy channel can
-carry dozens of links an hour that have nothing to do with it. So a preview has two formats:
+carry dozens of links an hour that have nothing to do with it. So the preview has two
+**renderings** of one stored snapshot:
 
-- **Ambient** (§6.2): OP only. Built by enrichment for **every** 4chan link. It costs
-  about as much as an ordinary link preview, and is what renders everywhere in chat history.
-- **Trigger** (§6.3): the OP, the latest replies, and what they answer. Built only for links
-  that are part of what the agent is being asked to respond to, when it is asked. It renders
-  **only in the final user turn of that session** (§6.6).
+- **Ambient** (§6.3): the default for every 4chan link. Thread metadata plus the **headline
+  post**, truncated; about as much as an ordinary link preview.
+- **Trigger** (§6.4): for links the agent is being asked about. The headline post, the
+  posts around it, and processed images, within a small budget.
 
-A link is **trigger-related** when it is in the body of any event of the session's trigger
+There is exactly **one API fetch per link**, at enrichment time. Enrichment stores a
+bounded **capture** of everything either rendering can use (§6.2). What is deferred to the
+trigger is only the costly part: downloading the extra files, captioning them, and spending
+context tokens on the richer rendering. None of that needs another API call.
+
+The **headline post** is the OP for a thread link, and the linked post for a post link
+(`#p`). A link to a post is a link to *that post*; the OP of its thread matters only as
+thread metadata (the subject line), exactly as a thread link does not show its replies.
+
+A link is **trigger-related** when it is in the body of any event of a session's trigger
 group (the trigger message and the messages grouped with it), or in the body of the message
-a trigger-group event replies to (its `<reply_to>` context).
+a trigger-group event replies to (its `<reply_to>` context). The link may have been enriched
+long before: a link posted a few seconds before "@miku thoughts?" is enriched as an ordinary
+message, and joins the trigger group only when the trigger arrives. That is why the
+upgrade is a separate step at trigger time (§6.4), and why it works from the stored capture.
 
-The trigger format cannot be decided at enrichment time. A link posted a few seconds before
-"@miku thoughts?" is enriched while it is still an ordinary message, and only joins a trigger
-group when the trigger arrives. So enrichment always builds the ambient snapshot, and the
-trigger snapshot is built by a **trigger finalization** step for the whole group at once
-(§6.3). That step is also the only place that can enforce the group-wide image budget
-(§6.4).
+Once a link has been upgraded, **the trigger rendering is its rendering from then on**,
+wherever the event appears in the rich zone of later contexts: the agent keeps seeing what
+it answered about in follow-up conversations. That persistence is why the trigger budget is
+small (§6.4). Image blocks are the one exception: they exist only in the session of the
+trigger that upgraded the link (§6.5); afterwards the files render as captions and paths,
+like all other media in history.
 
-### 6.2 Ambient snapshot (enrichment)
+### 6.2 The capture (enrichment, one API call)
 
-One `thread(board, no)` call (plus the 24 h-cached `boards()` for the board title) per ref.
+Per ref, one `thread(board, no)` call (plus the 24 h-cached `boards()` for the board title).
+Enrichment stores, in the row's payload:
 
-- **Thread header**: board code and title, thread number, subject, post / file / poster
-  counts, status (sticky, closed, archived, bump limit, image limit), `as_of`.
-- **OP**: author fields, time, reply count, text **truncated to `ambient_op_chars`**
-  (default 300) with a `[… N more characters]` marker, and its file.
-- **Post links** (`#p`): the same OP-only snapshot plus `linked="N"` on the thread element,
-  so the model knows which post was linked and can fetch it. The linked post itself is not
-  in the ambient snapshot.
-- **Board links**: board code, title, worksafe flag. No catalog fetch.
-- **Files**: only the OP's file is downloaded (for video: the original plus its storyboard,
-  §6.4; for PDF: 4chan's page-1 thumbnail). It follows the **normal captioning rules**: it
-  is auto-captioned only when the ordinary eligibility applies (`caption_all`, or an
-  assistant message under `caption_assistant_messages`). Otherwise it is stored and
-  referenced by path, exactly like any other preview image the agent may choose to open
-  with `read_image` / `media`.
+- **Thread metadata**: board code and title, thread number, subject (or, when the thread has
+  none, the first `untitled_words` (8) words of the OP as `op_excerpt`), post / file / poster
+  counts, status (sticky, closed, archived, bump limit, image limit), and `as_of`.
+- **Candidate posts**, full text and file metadata (not the files):
 
-Cost: about 100 to 180 tokens rendered, plus a caption only where the normal rules produce
-one.
+| Link | Headline | Candidates |
+|---|---|---|
+| thread | the OP | the last `latest_replies` (3) replies; up to `replied_to_max` (3) posts those answer, the newest first (the OP and posts already captured don't count) |
+| post (`#p`) | the linked post | up to `replied_to_max` (3) posts it answers, the newest first; its first `replies_max` (3) replies |
 
-### 6.3 Trigger snapshot (trigger finalization)
+At most 7 posts of at most `max_comment_chars` each, so a capture is bounded (a few KB
+typically, about 15 KB worst case). A `#p` number that is not in the thread degrades to a
+thread link with `linked_missing="N"`.
+
+- **Files**: only the **headline post's file** is downloaded at enrichment (video: the
+  original plus its storyboard, §6.5; PDF: 4chan's page-1 thumbnail). Its captioning follows
+  the **normal rules** (`caption_all`, or an assistant message under
+  `caption_assistant_messages`); otherwise it is stored and referenced by path, like any
+  other preview image the agent may open with `read_image` / `media`.
+
+The snapshot is the thread as it was when the link was posted. A trigger that arrives much
+later (a reply to a week-old link) renders that snapshot with its `as_of`; the tool shows the
+thread's current state.
+
+**Reply contexts reuse the capture.** A trigger that replies to a message containing a 4chan
+link makes enrichment process that message's body again, as the trigger's reply context. When
+the replied-to event already has a stored `yotsuba` row for the same ref, the reply-context
+row copies its payload and references the already-downloaded files instead of fetching
+anything. Only a replied-to message that was never enriched (older than the feature, for
+example) costs a fetch.
+
+**Board links** fetch page 1 (`/{b}/1.json`, about 50 KB for /g/, CDN-cached) and store the
+first `board_threads` (3) non-sticky threads in bump order: number, subject (or the first
+`untitled_words` words of the OP), reply and file counts, creation time. Board previews have
+one rendering (§6.6 H) whatever the context; no files.
+
+### 6.3 Ambient rendering
+
+Thread metadata, the headline post truncated to `ambient_chars` (300) with a
+`[… N more characters]` marker, its file element, and a one-line footer pointing at the
+tool. About 100 to 180 tokens, plus a caption only where the normal rules produced one.
+
+### 6.4 Trigger upgrade
 
 **Where it runs.** `awaitTriggerReadiness` (`src/app.ts`) today waits for the group's
-enrichment, then for its captions. Trigger finalization runs **between the two waits**:
-enrichment has produced every ambient row and the reply contexts are resolved, and nothing
-the finalization adds has been captioned yet. It collects the trigger-related refs (the
-group events' message-context `yotsuba` rows and the trigger events' reply-context rows),
-fetches each thread fresh (the snapshot is "the thread at that time"; the 10 s cache makes
-repeats free), selects posts, applies the budgets, downloads files, and stores the result on
-the same `link_previews` rows (§6.5). API and file requests run at `interactive` priority:
-someone is waiting for the reply.
+enrichment, then for its captions. The upgrade runs **between the two waits**: every capture
+is stored and the reply contexts are resolved, and nothing it adds has been captioned yet.
+It makes **no API calls**. For every trigger-related ref it selects posts from the capture,
+applies the budgets, downloads the chosen posts' files through the media lane at
+`interactive` priority, flips the processed files to `pending`, and records the result on the
+row (§6.7). It is idempotent (a re-dispatched or resumed session finds the upgrade already
+recorded; a later trigger on an already-upgraded link reuses it) and bounded by
+`enrichment.trigger_wait_timeout_ms`: a ref not upgraded in time stays ambient for that
+session and is retried by the next trigger that includes it.
 
-Finalization is idempotent per trigger group (a re-dispatched or resumed session reuses the
-stored trigger snapshot) and bounded by the existing `enrichment.trigger_wait_timeout_ms`:
-a ref not finalized in time renders in the ambient format, and the session proceeds.
+**Content, before budgeting:**
 
-**Thread link.** Posts are always whole (no truncation):
-
-| Keep priority | Content | Limit |
+| Link | Pinned | Then, in keep order |
 |---|---|---|
-| pinned | the OP, full text | |
-| 1 | the last replies of the thread, the newest first | `latest_replies` (3) |
-| 2 | posts those replies answer (their `>>` quotes, same thread), the newest first; the OP and posts already shown don't count | `replied_to_max` (3) |
+| thread | the OP, up to `trigger_headline_chars` (800) | 1. the latest replies; 2. the posts they answer |
+| post | the linked post, up to `trigger_headline_chars` (800) | 1. the posts it answers; 2. its replies |
 
-**Post link** (`#p` targets a reply): the linked post is the point of the link, so it
-replaces "latest" as the centre:
+Non-headline posts are always whole (a comment is at most `max_comment_chars`) or absent.
 
-| Keep priority | Content | Limit |
-|---|---|---|
-| pinned | the linked post, full text | |
-| pinned | the OP, truncated to `ambient_op_chars` (thread context) | |
-| 1 | posts the linked post answers, the newest first | `replied_to_max` (3) |
-| 2 | replies to the linked post, the oldest first | `replies_max` (3) |
+**Budgets**, counted on the rendered output **including** the frame (thread element, gap
+markers, footer) and a caption allowance of `captioning.image.max_chars / 4` tokens for each
+processed file:
 
-A `#p` number not in the thread degrades to the thread-link selection with
-`linked_missing="N"`.
+- `trigger_link_tokens` = **900** per ref;
+- `trigger_group_tokens` = **1800** across all trigger-related refs of the group;
+- `trigger_group_files` = **4** processed files across the group (§6.5).
 
-**Board link**: board header, description, and the first `board_threads` (5) non-sticky
-threads in bump order (subject or OP excerpt, reply count). One catalog call. No files.
+**Drop order** when a ref is over its budget: for a thread link, the replied-to posts first
+(the oldest first), then the latest replies (the oldest first); for a post link, its replies
+first (the newest first), then the posts it answers (the oldest first). The headline is never
+dropped. Refs are budgeted in **group order**: the trigger message's own refs in order of
+appearance, then its reply context's, then the other grouped events (chronological) with
+their reply contexts. A ref that no longer fits even its headline in the remaining group
+budget stays ambient.
 
-**Text budget.** `trigger_link_tokens` (default 1500) per ref, counted on the rendered
-output **including** the frame (thread element, gap markers, footer) and a caption
-allowance of `captioning.image.max_chars / 4` tokens for each file that will be captioned.
-When a ref is over, posts are dropped in reverse keep order: for a thread link the
-replied-to posts go first (oldest first), then the latest replies (oldest first); for a post
-link the replies to it go first (newest first), then the posts it answers (oldest first).
-Pinned posts are never dropped (a 4chan comment is at most `max_comment_chars`, so the pinned
-set is bounded).
+**Selection is one deterministic loop**: allocate processed files over the currently
+included posts (§6.5 order), compute every ref's cost with those caption allowances, drop the
+next post of any ref over budget, repeat until everything fits. Posts only ever decrease, so
+the loop ends, and a slot freed by a dropped post goes to the next file in order.
 
-A group-wide `trigger_group_tokens` (default 3000) bounds the sum across refs, taken in
-**group order**: the trigger message's own refs in order of appearance, then its reply
-context's refs, then the other grouped events (chronological) with their reply contexts.
-A ref that no longer fits even its pinned posts renders in the ambient format.
+The 800-character headline cap in this rendering is what keeps a long OP (an /lmg/-style
+general OP is around 2,000 characters) from consuming the whole 900; the tool always has the
+full text.
 
-### 6.4 Files and the group image budget
+### 6.5 Files and the group image budget
 
-**Download rule.** Every file of every post included in a trigger snapshot is downloaded and
-stored (`preview_media` for message-context rows, `reply_preview_media` for reply-context
-rows), and rendered with its workspace path, so the agent can always open it with
-`read_image` / `media` or post it with `send_message`. Posts dropped by the text budget are
-not in the snapshot and their files are not downloaded.
+**Download rule.** Every file of every post included in a trigger rendering is downloaded
+(`preview_media`, or `reply_preview_media` for reply-context rows) and rendered with its
+workspace path, so the agent can always open it with `read_image` / `media` or post it with
+`send_message`. Files of posts not included are not downloaded.
 
-**Image budget.** Of those files, at most `trigger_group_files` (default **4**) **for the
-whole trigger group**, shared across every trigger-related 4chan ref, are *processed*:
-captioned and given to a vision reply model as image blocks. The rest are stored and
-referenced only. Allocation order:
+**Processing budget.** Of those files, at most `trigger_group_files` (**4**) for the whole
+trigger group, shared by every trigger-related ref, are **processed**: captioned, and passed
+to a vision reply model as image blocks. The rest are **stored**: downloaded and referenced
+only. Allocation order:
 
-1. every ref's headline file, in group order: the OP's file for a thread link; the linked
-   post's file for a post link;
-2. the OP's file of each post link, in group order;
-3. the latest replies' files (thread links) and the files of posts a linked post answers
-   (post links): per ref in group order, the newest post first;
-4. the replied-to posts' files (thread links) and replies-to-the-linked-post files (post
-   links): per ref in group order, the newest post first.
+1. each ref's headline file, in group order;
+2. thread links: the latest replies' files; post links: the files of the posts it answers.
+   Per ref in group order, the newest post first;
+3. thread links: the replied-to posts' files; post links: its replies' files. Per ref in
+   group order, the newest post first.
 
-So with five thread links in one message, the first four OP images are processed and the
-fifth OP image is stored only, and nothing further down the list is processed at all.
+With five thread links in one message, the first four OP images are processed, the fifth
+OP's is stored only, and nothing further down is processed.
 
-**States.** A file is one of:
-
-| State | Captioning | Image block | How it renders |
+| State | Captioning | Image block | Renders as |
 |---|---|---|---|
-| processed (in budget) | `caption_status = 'pending'`, captioned before the context build (the existing caption wait) | yes, for a vision reply model | `path`, `image_block="true"` for a vision model, `[caption: …]` |
-| stored (over budget) | `caption_status = 'deferred'` (never auto-captioned) | no | `path` and `auto="off"` |
+| processed | `caption_status = 'pending'`, captioned before the context build (the existing caption wait) | in the upgrading trigger's session, for a vision reply model | `path`, `image_block="true"` (that session only), `[caption: …]` |
+| stored | `caption_status = 'deferred'`, never auto-captioned | never | `path` and `auto="off"` |
 
 `deferred` already exists (§7d backfetch: downloaded, held back from automatic captioning,
-retroactively promotable). Its only promotion path is scoped to backfetched events, so
-yotsuba's held files are never picked up by it. To keep the budget race-free, **enrichment
-creates every yotsuba file as `deferred` unless the ordinary ambient rule captions it right
-away** (`caption_all`, or the assistant-message rule), and finalization flips exactly the
-in-budget files to `pending`. Nothing can be captioned before the budget is decided.
-(Under `caption_all`, ambient OP images are captioned by that rule regardless of the trigger
-budget: the budget governs what a trigger adds on top of the normal rules.)
+retroactively promotable); its only promotion path is scoped to backfetched events, so it
+never touches these files. To keep the budget race-free, **every yotsuba file is created
+`deferred` unless the ordinary rule captions it immediately** (`caption_all` or the
+assistant-message rule), and the upgrade flips exactly the processed files to `pending`.
+Nothing can be captioned before the budget is decided. (Under `caption_all`, a headline file
+is captioned by that rule regardless of the trigger budget: the budget governs what a
+trigger adds.)
 
-**Image blocks.** The existing conservative cascade (§9 "Image block handling") takes one
-tier only, and never considers `reply_preview_media`, so it would drop exactly the cases
-this feature is for (a reply to a thread link; a thread link next to an attachment). Yotsuba
-trigger files therefore get **their own lane**: the context builder adds the in-budget asset
-ids recorded in the group's trigger snapshots (§6.5) as image blocks after the cascade's own
-selection, marked `image_block="true"` in place. The lane is bounded by
-`trigger_group_files`, so it adds at most 4 blocks per session. The cascade itself is
-unchanged.
+**Image blocks.** The existing conservative cascade (§9 "Image block handling") uses one
+priority tier only, and never considers `reply_preview_media`, so it would drop exactly the
+cases this feature is for (a reply to a link; a link next to an attachment). Processed
+yotsuba files therefore get **their own lane**: the context builder adds the processed asset
+ids recorded by *this* trigger group's upgrade (§6.7) as image blocks after the cascade's
+own selection, and marks them `image_block="true"` in place. At most 4 per session; the
+cascade itself is unchanged.
 
-**Per kind** (the §5.3 table): images download the original. Videos and animated GIFs
-download the original (`video` asset) and a **storyboard** (`src/media/storyboard.ts`:
-ffmpeg samples 4 frames at 12/37/62/87% of the duration into one 2×2 JPEG, stored as an
-`image` asset). The storyboard is the image block. The caption comes from the original
-through the video caption lane (motion and audio), so each file is captioned once; the
-storyboard itself is never captioned. On ffmpeg or download failure, 4chan's thumbnail
-replaces the storyboard. PDFs store 4chan's page-1 thumbnail (the block and the caption
-source) and the original; text extraction is a tool feature (§7.4). Other types are listed
-only. A file counts as one unit of the budget whatever its kind.
+**Per kind.** Images: the original. Videos and animated GIFs: the original (`video` asset)
+plus a **storyboard** (`src/media/storyboard.ts`: ffmpeg samples 4 frames at 12/37/62/87% of
+the duration into one 2×2 JPEG, an `image` asset). The storyboard is the image block; the
+caption comes from the original through the video caption lane (motion and audio), so each
+file is captioned once and the storyboard is never captioned itself. On ffmpeg or download
+failure, 4chan's thumbnail replaces the storyboard. PDFs: 4chan's page-1 thumbnail (block and
+caption source) and the original; text extraction is a tool feature (§7.4). Other types:
+listed only. A file is one unit of the budget whatever its kind. A file deleted from 4chan
+between the capture and the upgrade renders as `status="gone"`.
 
-`media_boards = "worksafe"` (default `"all"`) stops downloads on non-worksafe boards in
-both formats: files there are listed, never downloaded, processed, or shown.
+`media_boards = "worksafe"` (default `"all"`) stops all yotsuba downloads on non-worksafe
+boards: files there are listed, never downloaded.
 
-### 6.5 Persistence
+### 6.6 Exact renderings
 
-No new tables, no migration. One `link_previews` row per ref (the X precedent):
+Illustrative data, real layout. Times use `compactAgentTimestamp` (agent timezone). Absent
+attributes are omitted; `Anonymous` without a trip is not printed; text is escaped as usual.
 
-- `source_kind = "yotsuba"`, `site_name = "4chan"`, canonical `url`.
-- `title`: `"/{b}/ - {subject or OP excerpt}"`; board refs `"/{b}/ - {board title}"`.
-- `description`: the ambient snapshot's flat text (subject + truncated OP). This is what
-  chat search indexes; it is not changed by finalization.
-- `payload_json`:
-
-```ts
-interface YotsubaPreviewPayload {
-  v: 1;
-  kind: "thread" | "board";
-  board: string; boardTitle?: string; worksafe?: boolean;
-  ambient: YotsubaSnapshot;            // always present (§6.2)
-  trigger?: YotsubaSnapshot & {        // present once finalized (§6.3)
-    triggerGroupId: string;
-    processedAssetIds: string[];       // in-budget files: the image-block lane reads this
-    droppedForBudget?: { replies?: number; repliedTo?: number };
-    ambientFallback?: boolean;         // over the group text budget
-  };
-}
-interface YotsubaSnapshot {
-  asOf: number;                        // epoch ms of the fetch
-  threadNo?: number; subject?: string;
-  postCount?: number; fileCount?: number; posters?: number;
-  status?: string[];                   // "sticky" | "closed" | "archived" | "bump limit" | "image limit"
-  linkedNo?: number; linkedMissing?: number;
-  posts?: YotsubaPostNode[];           // included posts, thread order
-  description?: string;                // board kind
-  threads?: { no: number; subject?: string; excerpt: string; replies: number }[];
-}
-interface YotsubaPostNode {
-  no: number; index: number;           // position in thread (gap counts)
-  role: "op" | "linked" | "latest" | "replied_to" | "reply";
-  name?: string; trip?: string; posterId?: string; capcode?: string; flag?: string;
-  time: number;
-  text: string; moreChars?: number;
-  quotes: number[]; deadQuotes?: number[]; crossQuotes?: string[];
-  replies: number; shownReplies?: number[];
-  file?: {
-    name: string; ext: string; w?: number; h?: number; bytes?: number; durationSec?: number;
-    spoiler?: boolean; deleted?: boolean;
-    assetId?: string; storyboardAssetId?: string;   // absent: not downloaded
-  };
-}
-```
-
-Gap counts come from consecutive `index` values (plus `postCount` for the trailing gap).
-Finalization writes through the single-writer queue in one transaction per group: the
-`trigger` payload sections, the new `media_assets` rows, and the `deferred → pending` flips.
-
-**Failures** (logged `enrichment_yotsuba_failed`; the event-level retry is not triggered,
-the X/YouTube policy): a 404 stores `fetch_status: "failed"` with error `"gone"`, which
-renders as an explicit "already gone" preview; any other failure renders as the bare URL. A
-finalization fetch failure keeps the ambient snapshot (logged
-`yotsuba_trigger_finalize_failed`).
-
-### 6.6 Where each format renders
-
-Rendering is a pure function of the stored payload and one flag: **is this event (or reply
-context) part of the trigger group of the session being built?**
-
-- **In the final user turn** (the session's own trigger group, including the trigger's
-  `<reply_to>`): the trigger snapshot, when present; the ambient one otherwise.
-- **Everywhere else** (chat history in the rich zone, other sessions, the same message
-  after its session is over): the ambient format, even when a trigger snapshot is stored.
-  The rich view was for answering that trigger; later sessions get the cheap form and can
-  use the tool. Each historical event always renders the same way from then on, so the
-  prompt-cache prefix stays stable.
-- **Compact zone** (older history, generation sessions): the one-line form (§6.7 F).
-
-The existing preview-media hydration attaches every stored asset to its row. The renderer
-places each asset inside its `<post>` by id, and renders only the assets of the posts in the
-format being shown.
-
-### 6.7 Exact renderings
-
-Illustrative data, real layout. Times use `compactAgentTimestamp` (agent timezone).
-Absent attributes are omitted, and `Anonymous` with no trip is not printed. Text is escaped
-as usual.
-
-**A. Ambient, thread link** (someone posts a link; nobody asks the agent anything).
+**A. Ambient, thread link.** Someone posts a link; nobody asks the agent anything.
 
 ```xml
 <link_preview url="https://boards.4chan.org/g/thread/109930292" kind="4chan">
@@ -610,18 +560,27 @@ Previous threads: &gt;&gt;&gt;/g/109925219 (other thread) &amp; &gt;&gt;&gt;/g/1
 </link_preview>
 ```
 
-About 170 tokens. The image is stored and referenced; with `caption_all` on it would also
-carry a caption.
+About 170 tokens. The image is stored; with `caption_all` on it would also carry a caption.
 
-**B. Ambient, post link.** Same as A with `linked="109931450"` on `<thread>` and the footer
-`[4chan: opening post only; the linked post >>109931450 and the rest of the thread are
-available with the yotsuba tool.]`
+**B. Ambient, post link**, in an untitled thread:
 
-**C. Trigger, thread link.** Alice posts the link and "@miku is this general worth
-reading?". Finalization at 02:10 fetches the thread: the last 3 replies are 109935841,
-109935870, 109935902. They quote 109935650, 109935841 (already shown), and 109934410, so the
-replied-to candidates are 109935650 and 109934410. Both fit; they are shown newest first in
-priority, but everything renders in thread order.
+```xml
+<link_preview url="https://boards.4chan.org/g/thread/109933629#p109934102" kind="4chan">
+<thread board="/g/ - Technology" no="109933629" op_excerpt="why does every linux distro installer still" posts="54" files="7" as_of="2026-09-29 02:10">
+<post no="109934102" role="linked" time="2026-09-29 01:40" replies="5">
+&gt;&gt;109934055 (not shown)
+because the people who write installers are not the people who use installers
+<file name="calamares.png" type="image/png" dims="800x600" size="96 KB" path="msg-attach/c7v2n9m1qx4ke.png"/>
+</post>
+[4chan: the linked post only. The yotsuba tool reads the thread and the conversation around this post.]
+</thread>
+</link_preview>
+```
+
+**C. Trigger, thread link.** Alice posts the link together with "@miku is this general worth
+reading?". The capture (taken when the message was enriched) holds the OP, the last three
+replies (109935841, 109935870, 109935902) and the two posts they answer (109935650,
+109934410). Everything fits in 900 tokens:
 
 ```xml
 <link_preview url="https://boards.4chan.org/g/thread/109930292" kind="4chan">
@@ -632,7 +591,10 @@ priority, but everything renders in thread order.
 Previous threads: &gt;&gt;&gt;/g/109925219 (other thread) &amp; &gt;&gt;&gt;/g/109921422 (other thread)
 
 ►News
-…the full OP (about 2,000 characters)…
+&gt;(09/26) koboldcpp-1.122 + bundled harness
+&gt;(09/26) exllamav3 v1.5.2 with Turing support
+&gt;(09/25) MiMo-V2.6-RL training dataset released
+[… 1,190 more characters]
 <file name="lmg.png" type="image/png" dims="1024x1024" size="1.1 MB" path="msg-attach/k2m9x0q1zab3d.png" image_block="true">
 [caption: An anime girl with teal twintails sitting at a desk with three GPUs and a llama plush.]
 </file>
@@ -670,49 +632,43 @@ moe for chat, dense if you need it to remember what happened 20k tokens ago
 </link_preview>
 ```
 
-About 1,300 tokens with the full OP and three captions, plus 3 image blocks. (The video's image block is its
-storyboard; its caption came from the video itself.)
+About 850 tokens including the three captions, plus three image blocks in this session only.
+In later contexts the same element renders without the `image_block` attributes.
 
-**D. Trigger, the same link with a tight group.** The same message also contained four other
-thread links, in front of this one. The group image budget went to the four earlier OPs, so
-nothing in this ref is processed, and the group text budget left room only for the pinned OP
-and the newest replies:
+**D. Trigger, the same link in a crowded group.** The message also carried four other thread
+links in front of this one: the file budget went to their four OPs, and the group text
+budget left this ref room for its OP and the two newest replies only.
 
 ```xml
 <post no="109930292" role="op" time="2026-09-28 10:31" replies="3">
-…
+…the OP, up to 800 characters…
 <file name="lmg.png" type="image/png" dims="1024x1024" size="1.1 MB" path="msg-attach/k2m9x0q1zab3d.png" auto="off"/>
 </post>
 <omitted posts="432" files="86"/>
-<post no="109935870" role="latest" …>…</post>
-<post no="109935902" role="latest" …>
+<post no="109935870" role="latest" time="2026-09-29 02:07">
+&gt;&gt;109935841 (not shown)
+source: my ass
+</post>
+<post no="109935902" role="latest" time="2026-09-29 02:09">
 &gt;&gt;109935650 (not shown)
 &gt;&gt;109934410 (not shown)
-…
-<file name="1790650140221.webm" … path="msg-attach/w4n7s2k9dq0le.webm" storyboard_path="msg-attach/b8r1c5m3xz7aa.jpg" auto="off"/>
+moe for chat, dense if you need it to remember what happened 20k tokens ago
+<file name="1790650140221.webm" type="video/webm" dims="720x720" duration="0:14" audio="yes" size="2.9 MB" path="msg-attach/w4n7s2k9dq0le.webm" storyboard_path="msg-attach/b8r1c5m3xz7aa.jpg" auto="off"/>
 </post>
-[4chan thread snapshot as of 2026-09-29 02:10: the opening post and the last 2 replies (3 of 435); 1 more latest reply and 2 replied-to posts dropped for length. Files marked auto="off" were saved but not captioned or shown (image budget); open them by path with read_image or media. Read more with the yotsuba tool.]
+[4chan thread snapshot as of 2026-09-29 02:10: the opening post and the last 2 replies (3 of 435); 1 more latest reply and 2 replied-to posts left out for length. Files marked auto="off" were saved but not captioned or shown (image budget); open them by path with read_image or media. Read more with the yotsuba tool.]
 ```
 
-**E. Trigger, post link.** Bob replies to a message containing
-`https://boards.4chan.org/g/thread/109930292#p109931450` with "@miku explain the joke".
-The link is in the trigger's reply context, so it renders inside `<reply_to>` in the final
-user turn. (The original message, further up in history, still renders ambient, form B.)
+**E. Trigger, post link, in a reply context.** Bob replies to a message containing
+`https://boards.4chan.org/g/thread/109930292#p109931450` with "@miku explain the joke". The
+reply context reuses the replied-to message's capture (no fetch); the upgrade renders it inside
+the trigger's `<reply_to>`, and the original message further up in history renders the same
+upgraded element from now on.
 
 ```xml
 <reply_to sender="…" time="…" external_id="…">
 lmao look at this
 <link_preview url="https://boards.4chan.org/g/thread/109930292#p109931450" kind="4chan">
-<thread board="/g/ - Technology" no="109930292" subject="/lmg/ - Local Models General" posts="435" files="88" posters="121" status="bump limit" as_of="2026-09-29 02:10" linked="109931450">
-<post no="109930292" role="op" time="2026-09-28 10:31" replies="3">
-/lmg/ - a general dedicated to the discussion and development of local language models.
-
-Previous threads: &gt;&gt;&gt;/g/109925219 (other thread) &amp; …
-[… 1,690 more characters]
-<file name="lmg.png" type="image/png" dims="1024x1024" size="1.1 MB" path="msg-attach/k2m9x0q1zab3d.png" image_block="true">
-[caption: …]
-</file>
-</post>
+<thread board="/g/ - Technology" no="109930292" subject="/lmg/ - Local Models General" posts="435" files="88" posters="121" status="bump limit" as_of="2026-09-28 12:20" linked="109931450">
 <omitted posts="101" files="20"/>
 <post no="109931388" role="replied_to" time="2026-09-28 11:59" replies="4">
 benchmarks mean nothing, show me it holding a coherent story past 8k
@@ -751,27 +707,26 @@ it's over
 &gt;&gt;109931455 (not shown)
 nta but his template is fine, the repetition penalty is off in the default preset
 <file name="preset.png" type="image/png" dims="640x480" size="52 KB" path="msg-attach/z9q2w8e7r6t5y.png" image_block="true">
-[caption: …]
+[caption: A settings panel with the repetition penalty slider set to 1.0.]
 </file>
 </post>
 <omitted posts="314" files="64"/>
-[4chan post snapshot as of 2026-09-29 02:10: the linked post, the 2 posts it answers, its first 3 replies, and the opening post (7 of 435). Read more with the yotsuba tool: the other 23 replies, or the conversation around any post.]
+[4chan post snapshot as of 2026-09-28 12:20: the linked post, the 2 posts it answers and its first 3 replies (6 of 435). Read more with the yotsuba tool: the other 23 replies, or the conversation around any post.]
 </thread>
 </link_preview>
 </reply_to>
 ```
 
-Budget allocation here: linked post's file (tier 1), the OP's (tier 2), then the replied-to
-posts (no files), then replies newest first: 109931502's file is the 3rd processed file. The
-4th slot is free for the rest of the group.
+About 700 tokens. Files: the linked post's (tier 1), then the posts it answers (no files),
+then its replies newest first: 109931502's is the second processed file, leaving two for the
+rest of the group.
 
-**F. Compact zone**, the same one-line form whichever snapshot is stored (built from the
-ambient one):
+**F. Compact zone** (older history, generation sessions), built from the headline post:
 
 ```
  [4chan /g/ "/lmg/ - Local Models General" (435 posts): /lmg/ - a general dedicated to the discussion and development of local…]
- [4chan /g/ "/lmg/ - Local Models General" (435 posts), link to post >>109931450]
- [4chan /g/ board: Technology]
+ [4chan /g/ "why does every linux distro installer still…" (54 posts), post >>109934102: because the people who write installers are not the people who…]
+ [4chan /g/ board: 3 threads]
  [4chan /g/ thread 109800000: already gone when linked]
 ```
 
@@ -781,10 +736,84 @@ ambient one):
 <link_preview url="https://boards.4chan.org/g/thread/109800000" kind="4chan" status="gone" checked="2026-09-29 02:10"/>
 ```
 
-**H. Board link**, ambient: `<link_preview url="https://boards.4chan.org/g/" kind="4chan"><board code="/g/" title="Technology" worksafe="true"/></link_preview>`.
-Trigger: the same element with the board description and 5 `<thread no replies>` subject
-lines, ending `[4chan board snapshot: the 5 most recently bumped threads. The yotsuba tool
-can search this board's catalog.]`
+**H. Board link** (one rendering, trigger or not; stickies skipped):
+
+```xml
+<link_preview url="https://boards.4chan.org/g/" kind="4chan">
+<board code="/g/" title="Technology" worksafe="true" as_of="2026-09-29 02:10">
+<thread no="109934266" replies="97" files="13" started="2026-09-28 22:40">/lmg/ - Local Models General</thread>
+<thread no="109934884" replies="0" started="2026-09-29 02:08" op_excerpt="true">is it worth upgrading from a 3080 to</thread>
+<thread no="109933660" replies="3" files="2" started="2026-09-28 20:15">Autumn Dive/g/rass</thread>
+[4chan board: the top 3 threads on page 1. The yotsuba tool can search the catalog.]
+</board>
+</link_preview>
+```
+
+About 120 tokens.
+
+### 6.7 Persistence
+
+No new tables, no migration. One `link_previews` row per ref (the X precedent):
+
+- `source_kind = "yotsuba"`, `site_name = "4chan"`, canonical `url`.
+- `title`: `"/{b}/ - {subject or OP excerpt}"`; board refs `"/{b}/ - {board title}"`.
+- `description`: the ambient rendering's flat text (subject + headline excerpt). This is what
+  chat search indexes; the upgrade does not change it.
+- `payload_json`:
+
+```ts
+interface YotsubaPreviewPayload {
+  v: 1;
+  kind: "thread" | "board";
+  board: string; boardTitle?: string; worksafe?: boolean;
+  asOf: number;                        // epoch ms of the one fetch
+  // thread kind: the capture (§6.2)
+  threadNo?: number; subject?: string; opExcerpt?: string;
+  postCount?: number; fileCount?: number; posters?: number;
+  status?: string[];                   // "sticky" | "closed" | "archived" | "bump limit" | "image limit"
+  linkedNo?: number; linkedMissing?: number;
+  headlineNo?: number;                 // OP (thread link) or linked post (post link)
+  posts?: YotsubaPostNode[];           // headline + candidates, thread order, full text
+  upgrade?: {                          // present once a trigger upgraded this row (§6.4)
+    triggerGroupId: string;            // the upgrading group: only its session gets image blocks
+    includedNos: number[];
+    processedAssetIds: string[];
+    left?: { latest?: number; repliedTo?: number; replies?: number };  // dropped for budget
+    headlineChars?: number;            // the trigger_headline_chars in force
+  };
+  // board kind
+  threads?: { no: number; subject?: string; opExcerpt?: string; replies: number; files: number; time: number }[];
+}
+interface YotsubaPostNode {
+  no: number; index: number;           // position in thread (gap counts)
+  role: "op" | "linked" | "latest" | "replied_to" | "reply";
+  name?: string; trip?: string; posterId?: string; capcode?: string; flag?: string;
+  time: number;
+  text: string;                        // full comment text
+  quotes: number[]; deadQuotes?: number[]; crossQuotes?: string[];
+  replies: number; replyNos?: number[];
+  file?: {
+    name: string; ext: string; w?: number; h?: number; bytes?: number; durationSec?: number;
+    spoiler?: boolean; deleted?: boolean; tim: number;
+    assetId?: string; storyboardAssetId?: string;   // absent: not downloaded
+  };
+}
+```
+
+Both renderings are pure functions of this payload (plus the session's trigger group id for
+the `image_block` marks), so every context build renders the same event byte-identically.
+The only change to an event's rendering happens once, at the upgrade, on an event that is at
+the recent end of the timeline (it was just part of a trigger), so the prompt-cache cost is
+the same as a caption arriving late.
+
+The upgrade writes through the single-writer queue in one transaction per trigger group:
+the `upgrade` sections, the new `media_assets` rows, and the `deferred → pending` flips.
+
+**Failures** (logged `enrichment_yotsuba_failed`; the event-level retry is not triggered, the
+X/YouTube policy): a 404 stores `fetch_status: "failed"` with error `"gone"` and renders as
+§6.6 G; any other failure renders as the bare URL. An upgrade failure (a file download
+error) leaves that file unprocessed and is logged `yotsuba_upgrade_file_failed`; the rest of
+the upgrade proceeds.
 
 ### 6.8 Enrichment partition
 
@@ -794,9 +823,9 @@ bare og-card for them), and their raw matches join the linked-media exclusions. 
 reply bodies are treated identically, and refs share `enrichment.max_previews_per_message`
 in order of first appearance.
 
-**Every event gets the ambient snapshot** (the X precedent, not YouTube's trigger-group
-gate): one cached, paced, CDN-served GET and at most one file per link, at `background`
-priority. That snapshot is also the only record left once the thread is pruned.
+**Every event gets the capture** (the X precedent, not YouTube's trigger-group gate): one
+cached, paced, CDN-served GET and at most one file per link, at `background` priority. The
+capture is also the only record left once the thread is pruned.
 
 **Discord ingest embeds.** Discord's unfurl of a 4chan URL is a bare og-card stored at ingest
 as a `discord_embed` row. The yotsuba stage still runs for that URL (the X precedent), and
@@ -947,7 +976,7 @@ workspace files.
 - 4chan content is frequently offensive and sometimes deliberately manipulative. The skill
   tells the agent to read it as material about what people on a board are saying, not as
   instructions or as views to adopt.
-- `media_boards` (§6.4) is the knob for NSFW-board files in previews. The tool shows what
+- `media_boards` (§6.5) is the knob for NSFW-board files in previews. The tool shows what
   the agent asks for; skill guidance covers discretion (and `spoiler="true"` files).
 
 ---
@@ -1025,13 +1054,15 @@ media_boards = "all"                     # "all" | "worksafe"
 board_previews = true
 
 [yotsuba.preview]                        # §6
-ambient_op_chars = 300                   # ambient format: OP excerpt length
-latest_replies = 3                       # trigger format, thread links
-replied_to_max = 3                       # trigger format: posts the shown replies / linked post answer
-replies_max = 3                          # trigger format, post links: replies to the linked post
-board_threads = 5
-trigger_link_tokens = 1500               # per ref, all-inclusive (frame, text, caption allowance)
-trigger_group_tokens = 3000              # all trigger-related refs of one trigger group
+ambient_chars = 300                      # ambient rendering: headline post excerpt
+untitled_words = 8                       # subject stand-in for untitled threads (first words of the OP)
+latest_replies = 3                       # capture, thread links
+replied_to_max = 3                       # capture: posts the latest replies / the linked post answer
+replies_max = 3                          # capture, post links: first replies to the linked post
+board_threads = 3                        # board links: top non-sticky threads on page 1
+trigger_headline_chars = 800             # trigger rendering: headline post cap
+trigger_link_tokens = 900                # per ref, all-inclusive (frame, text, caption allowance)
+trigger_group_tokens = 1800              # all trigger-related refs of one trigger group
 trigger_group_files = 4                  # processed (captioned + image-block) files per trigger group
 
 [yotsuba.tool]                           # §7
@@ -1061,7 +1092,7 @@ are bare hostnames. A `[yotsuba]` table with the feature off is valid and inert.
 2. **Engine**: `view.ts` with the selection rules and omission vocabulary, fully unit-tested
    on fixtures before any caller exists.
 3. **T1**: enrichment partition and ambient stage, storyboard helper, payload; trigger
-   finalization in `awaitTriggerReadiness`; the image-block lane in the context builder;
+   upgrade in `awaitTriggerReadiness`; the image-block lane in the context builder;
    renderer (ambient, trigger, compact, discord-embed suppression); ARCHITECTURE §7f, the §4
    feature-gate text, and the §9 image-block note.
 4. **T2**: the tool, PDF helper, skill template, `web_fetch` hint; ARCHITECTURE §10.
@@ -1082,20 +1113,23 @@ IMPLEMENTED at the end.
 - Client with stubbed fetch and injected clock: freshness window, `If-Modified-Since` / 304,
   negative cache, single-flight, pacing, interactive overtaking background.
 - `PacedLimiter`: the moved Danbooru tests plus priority tests.
-- Worker: partition strips refs from the generic stage; ambient rows for post / thread /
-  board / gone / other-failure; files created `deferred` unless the ambient caption rule
-  applies; `media_boards`; feature off leaves URLs on the generic path.
-- Trigger finalization: grouped events enriched before the trigger; reply-context refs;
-  selection and drop order for thread and post links (OP never repeated, a latest reply that
-  is also a replied-to post counted once); per-ref and group text budgets with ambient
-  fallback; the group file budget and its allocation order (five links: the fifth OP stays
-  `deferred`); exactly the in-budget files flipped to `pending`; idempotence on re-dispatch
-  and resume; timeout fallback to ambient.
+- Worker: partition strips refs from the generic stage; captures for thread / post / board
+  / missing-post / gone / other-failure; only the headline file downloaded, created
+  `deferred` unless the ordinary caption rule applies; reply contexts copy the replied-to
+  event's capture with no fetch (and fetch when there is none); `media_boards`; feature off
+  leaves URLs on the generic path.
+- Trigger upgrade: makes no API calls (assert on the stubbed client); grouped events
+  enriched before the trigger; reply-context refs; drop order for thread and post links (no
+  post twice; a latest reply that is also a replied-to post counted once); the headline cap;
+  per-ref (900) and group (1800) budgets including frame and caption allowances, with ambient
+  fallback; the selection loop's convergence; the group file allocation (five links: the
+  fifth OP stays `deferred`); exactly the processed files flipped to `pending`; idempotence;
+  a later trigger reusing an upgrade; timeout leaves the ref ambient.
 - Context builder: the yotsuba image-block lane adds exactly the recorded in-budget assets,
   alongside an unchanged cascade; nothing added for non-vision models.
-- Renderer: golden outputs for §6.7 A-H; the trigger format only in the final user turn of
-  its own session, ambient everywhere else; escaping; per-post file placement,
-  `image_block` and `auto="off"`; `discord_embed` suppression.
+- Renderer: golden outputs for §6.6 A-H; an upgraded row renders the trigger rendering in
+  every later context, with `image_block` only in the upgrading group's session; escaping;
+  per-post file placement and `auto="off"`; `discord_embed` suppression.
 - Tool: every action and view against fixtures; footers contain valid, literal next calls
   (parse them back and execute them in the test); naive-call tolerance; every §7.5 error;
   vision vs non-vision file handling; storyboard and PDF paths.

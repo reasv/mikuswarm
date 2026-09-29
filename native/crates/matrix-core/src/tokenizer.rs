@@ -37,12 +37,17 @@ impl NativeTokenizer {
     /// rather than silently degrading — matching the explicit-config philosophy.
     #[napi(factory)]
     pub fn from_file(path: String) -> Result<Self> {
-        let tokenizer = Tokenizer::from_file(&path).map_err(|err| {
-            napi::Error::from_reason(format!("failed to load tokenizer.json from {path}: {err}"))
-        })?;
         Ok(Self {
-            inner: Arc::new(tokenizer),
+            inner: Arc::new(load_tokenizer(&path)?),
         })
+    }
+
+    /// `fromFile` on a libuv worker thread. Parsing a large vocabulary's
+    /// `tokenizer.json` takes seconds; off the JS thread, startup can overlap it
+    /// with other work instead of stalling the event loop.
+    #[napi(js_name = "fromFileAsync")]
+    pub fn from_file_async(path: String) -> AsyncTask<LoadTask> {
+        AsyncTask::new(LoadTask { path })
     }
 
     /// Encode `text` to token ids. `add_special_tokens` defaults to **false**
@@ -94,6 +99,32 @@ impl NativeTokenizer {
             tokenizer: Arc::clone(&self.inner),
             text,
             add_special_tokens: add_special_tokens.unwrap_or(false),
+        })
+    }
+}
+
+fn load_tokenizer(path: &str) -> Result<Tokenizer> {
+    Tokenizer::from_file(path).map_err(|err| {
+        napi::Error::from_reason(format!("failed to load tokenizer.json from {path}: {err}"))
+    })
+}
+
+/// libuv-threadpool load task (`NativeTokenizer::fromFileAsync`).
+pub struct LoadTask {
+    path: String,
+}
+
+impl Task for LoadTask {
+    type Output = Tokenizer;
+    type JsValue = NativeTokenizer;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        load_tokenizer(&self.path)
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(NativeTokenizer {
+            inner: Arc::new(output),
         })
     }
 }
