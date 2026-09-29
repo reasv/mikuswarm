@@ -2,8 +2,9 @@
 #
 # MikuSwarm image. Encapsulates the full build: native npm modules
 # (better-sqlite3, sharp, onnxruntime-node/fastembed) AND the Rust NAPI matrix
-# module (native/crates/matrix-core → npm/). Runs the app via tsx (no JS emit,
-# matching the project's no-build-step convention).
+# module (native/crates/matrix-core → npm/). The TypeScript is compiled to
+# dist/ in the builder and the runtime runs it with plain node, so a fresh
+# container never transpiles the codebase at boot (dev runs keep using tsx).
 #
 # Two stages on the SAME Debian/glibc base — the compiled .node artifacts are
 # ABI-specific, so builder and runtime must share libc and the Node major.
@@ -88,7 +89,7 @@ COPY docker/95-docker.toml ./docker/95-docker.toml
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ripgrep \
   && rm -rf /var/lib/apt/lists/* \
-  && npx tsc --noEmit \
+  && npx tsc --declaration false \
   && npm test
 
 # -----------------------------------------------------------------------------
@@ -141,9 +142,11 @@ COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/npm ./npm
 COPY npm/index.js npm/package.json ./npm/
 
-# App sources + manifests (tsx reads tsconfig.json; lockfile kept for parity).
-COPY package.json pnpm-lock.yaml tsconfig.json ./
-COPY src ./src
+# Compiled app (tsc → dist/ in the builder, type-checked by the same pass; source
+# maps map stack traces back to the .ts sources) + manifests ("type": "module"
+# makes dist/*.js ESM; lockfile kept for parity).
+COPY package.json pnpm-lock.yaml ./
+COPY --from=builder /app/dist ./dist
 
 # First-run seeding templates (ARCHITECTURE.md §4): seedWorkspace/seedFeatureSkills
 # resolve <cwd>/templates at runtime. Without this, seeding is a silent no-op in
@@ -171,4 +174,4 @@ COPY docker/95-docker.toml ./config/95-docker.toml
 # needs no writable paths of its own (all state lives under the binds; HOME is
 # pointed at /tmp by compose since the arbitrary uid has no passwd entry).
 ENTRYPOINT ["tini", "--"]
-CMD ["node_modules/.bin/tsx", "src/index.ts"]
+CMD ["node", "--enable-source-maps", "dist/index.js"]

@@ -2,7 +2,7 @@
 
 ## What this is
 
-MikuSwarm is a Matrix chatbot built on `@earendil-works/pi-agent-core`. TypeScript (ESM, run via `tsx`) + Rust NAPI module for the Matrix native client (E2EE, media, link previews).
+MikuSwarm is a Matrix chatbot built on `@earendil-works/pi-agent-core`. TypeScript (ESM; `tsx` in development, compiled to `dist/` in the image) + Rust NAPI module for the Matrix native client (E2EE, media, link previews).
 
 See **ARCHITECTURE.md** for full design documentation — data flow, invariants, context assembly, enrichment pipeline, configuration schema, and all design decisions.
 
@@ -95,7 +95,7 @@ console/            SvelteKit observability console — separate BFF process, bu
 
 ## Key conventions
 
-- No build step for TS — run directly via `tsx`, type-check only via `tsc --noEmit`
+- Development runs TS directly via `tsx` and type-checks with `tsc --noEmit`; the Docker image compiles `src/` to `dist/` (`tsc`, source maps) and runs it with plain `node`, so a container never transpiles at boot
 - All SQLite writes go through the single-writer microtask queue (see `src/storage/`)
 - Config is TOML with lexicographic file merge, env var substitution, and TypeBox validation
 - Logs are structured JSON, one object per line, with automatic secret redaction

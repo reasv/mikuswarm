@@ -184,6 +184,28 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   setEgressGuardEnabled(egressGuardEnabled);
   logger.info("egress_guard_configured", { enabled: egressGuardEnabled });
 
+  // Startup phase timings: one `startup_phase` log per milestone (time since the
+  // previous one + since process start), so a slow boot shows where it went.
+  let phaseMark = performance.now();
+  const startupPhase = (phase: string): void => {
+    const now = performance.now();
+    logger.info("startup_phase", {
+      phase,
+      ms: Math.round(now - phaseMark),
+      sinceProcessStartMs: Math.round(process.uptime() * 1000),
+    });
+    phaseMark = now;
+  };
+  startupPhase("modules_loaded");
+
+  // Probe the yt-dlp binary now (a subprocess, seconds for the standalone build) so
+  // it overlaps the rest of startup; awaited where the YouTube subsystem is wired.
+  const ytConfig = resolveYouTubeConfig(config.youtube);
+  const ytProbe = ytConfig.enabled
+    ? import("./youtube/ytdlp.js").then(async (ytdlp) => ({ ytdlp, version: await ytdlp.probeYtDlpBinary() }))
+    : undefined;
+  ytProbe?.catch(() => {}); // settled where awaited; this only marks it handled meanwhile
+
   // Per-host HTTP egress limiter (spec Design D), enforced at the guardedFetch
   // chokepoint: generous per-host admission + a high global backstop + unconditional
   // 429/503 backoff. Replaces the old cross-domain fetch-concurrency cap.
@@ -307,11 +329,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // registry (the retrieval subsystem below selects the retrieval tokenizer) and
   // long before the first context build.
   validateTokenizerConfig(config);
-  await initTokenizers({
+  // A native tokenizer's asset parses on a worker thread; opening storage below
+  // runs meanwhile, and nothing reads the registry until it is awaited after that.
+  const tokenizersReady = initTokenizers({
     primary: config.tokenizer?.primary,
     retrieval: config.tokenizer?.retrieval,
     glmTokenizerPath: config.tokenizer?.glm_tokenizer_path,
   });
+  tokenizersReady.catch(() => {}); // settled where awaited; this only marks it handled meanwhile
   const llmScheduler = new LlmScheduler({
     groups: llmGroups,
     // Per-model health (spec LLM-FAILURE-HANDLING §5): global thresholds —
@@ -334,6 +359,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     mmapSizeMb: config.storage.mmap_size_mb,
     logger: logger.child("storage"),
   });
+  await tokenizersReady;
+  startupPhase("storage_and_tokenizers");
   const timeline = new TimelineStore(storage);
   const router = new TimelineRouter(timeline);
   const triggerCoordinator = new TriggerCoordinator(config.agent.sessions);
@@ -740,6 +767,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     },
   };
 
+  startupPhase("retrieval_and_setup");
+
   // Docker sandbox (ARCHITECTURE.md §11a). When enabled, ensure the container is
   // up before anything else connects — a failure here aborts startup (fail-fast).
   // The sandbox handle is closed over by the per-session tools builder below.
@@ -756,59 +785,72 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   if (config.agents && Object.keys(config.agents).length > 0) {
     // ── Agents mode sandbox setup (§10) ─────────────────────────────────────
     // Strict agents: each with [agents.<name>.sandbox] gets its own container.
-    for (const [agentName, block] of Object.entries(config.agents)) {
-      if (!block.sandbox?.enabled) continue;
-      const sb = block.sandbox;
-      const manager = await SandboxManager.ensure({
-        image: sb.image,
-        containerName: sb.container_name,
-        network: sb.network,
-        dns: sb.dns,
-        workspaceHostDir: path.resolve(block.workspace_root),
-        workspaceBindSource: sb.workspace_bind_source,
-        workspaceMount: sb.workspace_mount,
-        uid: process.getuid?.() ?? 0,
-        gid: process.getgid?.() ?? 0,
-        memory: sb.memory,
-        cpus: sb.cpus,
-        pidsLimit: sb.pids_limit,
-        readOnlyRoot: sb.read_only_root,
-        env: { TZ: getConfiguredTimezone(), ...sb.env },
-        binds: sb.binds,
-        execTimeoutMs: sb.exec_timeout_ms,
-        maxOutputBytes: sb.max_output_bytes,
-        logger: logger.child(`sandbox:${agentName}`),
-      });
-      allSandboxManagers.push({ manager, stopOnShutdown: sb.stop_on_shutdown ?? false });
-      agentSandboxMap.set(agentName, manager);
-    }
     // Shared-mode agents: agents without a per-agent sandbox block share [sandbox].
+    // The containers are independent, so they come up concurrently (each is a few
+    // docker CLI round trips); results are registered in config order below.
+    const strictAgentEntries = Object.entries(config.agents).filter(([, b]) => b.sandbox?.enabled);
     const sharedAgentEntries = Object.entries(config.agents).filter(([, b]) => !b.sandbox);
-    if (sharedAgentEntries.length > 0 && config.sandbox?.enabled) {
-      const sharedRoots = sharedAgentEntries.map(([, b]) => path.resolve(b.workspace_root));
-      // Mount the common ancestor of all shared agents' workspace roots so the
-      // container sees every participating workspace under one bind source.
-      const commonAncestor = computeCommonAncestor(sharedRoots);
-      const sharedManager = await SandboxManager.ensure({
-        image: config.sandbox.image,
-        containerName: config.sandbox.container_name,
-        network: config.sandbox.network,
-        dns: config.sandbox.dns,
-        workspaceHostDir: commonAncestor,
-        workspaceBindSource: config.sandbox.workspace_bind_source,
-        workspaceMount: config.sandbox.workspace_mount,
-        uid: process.getuid?.() ?? 0,
-        gid: process.getgid?.() ?? 0,
-        memory: config.sandbox.memory,
-        cpus: config.sandbox.cpus,
-        pidsLimit: config.sandbox.pids_limit,
-        readOnlyRoot: config.sandbox.read_only_root,
-        env: { TZ: getConfiguredTimezone(), ...config.sandbox.env },
-        binds: config.sandbox.binds,
-        execTimeoutMs: config.sandbox.exec_timeout_ms,
-        maxOutputBytes: config.sandbox.max_output_bytes,
-        logger: logger.child("sandbox"),
-      });
+    const sharedSandboxEnabled = sharedAgentEntries.length > 0 && config.sandbox?.enabled === true;
+    // Mount the common ancestor of all shared agents' workspace roots so the
+    // container sees every participating workspace under one bind source.
+    const commonAncestor = sharedSandboxEnabled
+      ? computeCommonAncestor(sharedAgentEntries.map(([, b]) => path.resolve(b.workspace_root)))
+      : "";
+    const [strictManagers, sharedManager] = await Promise.all([
+      Promise.all(
+        strictAgentEntries.map(([agentName, block]) => {
+          const sb = block.sandbox!;
+          return SandboxManager.ensure({
+            image: sb.image,
+            containerName: sb.container_name,
+            network: sb.network,
+            dns: sb.dns,
+            workspaceHostDir: path.resolve(block.workspace_root),
+            workspaceBindSource: sb.workspace_bind_source,
+            workspaceMount: sb.workspace_mount,
+            uid: process.getuid?.() ?? 0,
+            gid: process.getgid?.() ?? 0,
+            memory: sb.memory,
+            cpus: sb.cpus,
+            pidsLimit: sb.pids_limit,
+            readOnlyRoot: sb.read_only_root,
+            env: { TZ: getConfiguredTimezone(), ...sb.env },
+            binds: sb.binds,
+            execTimeoutMs: sb.exec_timeout_ms,
+            maxOutputBytes: sb.max_output_bytes,
+            logger: logger.child(`sandbox:${agentName}`),
+          });
+        }),
+      ),
+      sharedSandboxEnabled && config.sandbox
+        ? SandboxManager.ensure({
+            image: config.sandbox.image,
+            containerName: config.sandbox.container_name,
+            network: config.sandbox.network,
+            dns: config.sandbox.dns,
+            workspaceHostDir: commonAncestor,
+            workspaceBindSource: config.sandbox.workspace_bind_source,
+            workspaceMount: config.sandbox.workspace_mount,
+            uid: process.getuid?.() ?? 0,
+            gid: process.getgid?.() ?? 0,
+            memory: config.sandbox.memory,
+            cpus: config.sandbox.cpus,
+            pidsLimit: config.sandbox.pids_limit,
+            readOnlyRoot: config.sandbox.read_only_root,
+            env: { TZ: getConfiguredTimezone(), ...config.sandbox.env },
+            binds: config.sandbox.binds,
+            execTimeoutMs: config.sandbox.exec_timeout_ms,
+            maxOutputBytes: config.sandbox.max_output_bytes,
+            logger: logger.child("sandbox"),
+          })
+        : Promise.resolve(undefined),
+    ]);
+    strictAgentEntries.forEach(([agentName, block], i) => {
+      const manager = strictManagers[i]!;
+      allSandboxManagers.push({ manager, stopOnShutdown: block.sandbox!.stop_on_shutdown ?? false });
+      agentSandboxMap.set(agentName, manager);
+    });
+    if (sharedManager && config.sandbox) {
       allSandboxManagers.push({ manager: sharedManager, stopOnShutdown: config.sandbox.stop_on_shutdown ?? false });
       // Wire each shared-mode agent with a cwd-routing wrapper that prefixes
       // the agent's subdir (relative to commonAncestor) onto every exec cwd.
@@ -848,6 +890,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
 
   // Shared media size cap — applied to automatic media downloads, tool fetches,
   // and browser downloads alike.
+  startupPhase("sandboxes");
   const downloadSizeLimit = config.media?.download_size_limit ?? 1_073_741_824;
 
   // Browser-use backend (spec/BROWSER-USE.md). Unlike the sandbox, this does NOT
@@ -1018,12 +1061,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // log ONE structured warning and mark the subsystem unavailable; the enrichment
   // partition and future tool registrations consult this flag before doing anything.
   // enabled=false skips the probe entirely and marks the subsystem unavailable.
-  const ytConfig = resolveYouTubeConfig(config.youtube);
   let youtubeSubsystemAvailable = false;
-  if (ytConfig.enabled) {
+  if (ytProbe) {
     try {
-      const { probeYtDlpBinary, configureYtDlp } = await import("./youtube/ytdlp.js");
-      const version = await probeYtDlpBinary();
+      const {
+        ytdlp: { configureYtDlp },
+        version,
+      } = await ytProbe;
       configureYtDlp({
         ytDlpPath: ytConfig.ytDlpPath,
         timeoutMs: ytConfig.timeoutMs,
@@ -1046,6 +1090,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   } else {
     logger.info("youtube_subsystem_disabled", { reason: "[youtube].enabled = false" });
   }
+  startupPhase("youtube");
 
   // Shared, cross-session Grok-result cache for x_search: one
   // instance so a reactive and a proactive session hitting the same topic in a
@@ -2520,6 +2565,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   for (const entry of mcpPool.getEntries()) {
     registerMcpServerTools(entry);
   }
+  startupPhase("mcp");
   // Per-agent MCP scoping observability (spec PER-AGENT-MCP-SCOPING §5):
   // one info log per agent with an explicit mcp_servers allowlist.
   if (config.agents) {
@@ -6651,14 +6697,93 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     },
   };
 
-  // Start every registered provider with the appropriate host.
+  let providersStarted = false;
+  // Observability console (ARCHITECTURE.md §11). Read-only HTTP + SSE
+  // over the live storage/factory/session state; gated by config, off by default.
+  // Started as soon as its dependencies exist, before the chat providers and
+  // worker pools, so it answers while the rest of startup finishes.
+  let consoleServer: ConsoleServer | undefined;
+  if (config.observability?.server?.enabled) {
+    consoleServer = createObservabilityServer({
+      config: config.observability.server,
+      storage,
+      factory,
+      sessions,
+      // Pipeline monitor stat seam (ARCHITECTURE.md §11). `stats()` returns objects
+      // whose `inFlight()` closes over the live pool, so this is captured once.
+      // Summarization/diary are null when disabled by config.
+      pipelines: {
+        enrichment: enrichmentPool.stats(),
+        captioning: captionPool.stats(),
+        summarization: summarizationPool?.stats() ?? null,
+        diary: diaryPool?.stats() ?? null,
+      },
+      activityBus: pipelineActivityBus,
+      // Tentative-token merge for the session SSE (spec LLM-FAILURE-HANDLING §4.2).
+      liveEvents,
+      // Scheduler snapshot + request ring (spec §9.1/§9.2).
+      scheduler: llmScheduler,
+      // Health-key → logical id(s) + has-fallback map (spec MODEL-FALLBACK §8): lets
+      // the scheduler view show the config name and label a fallback-bearing model's
+      // probe window as the canary. Built from config.models (multiple logical ids
+      // can share one health key via inheritance/rename).
+      modelHealthAnnotations: buildModelHealthAnnotations(config.models),
+      llmRequestRing,
+      workspaceRoot,
+      // Static agents meta snapshot for GET /api/agents (spec CONSOLE-MULTI-AGENT §2).
+      agentsSnapshot,
+      // Per-asset workspace resolver for GET /api/media/:ref (spec
+      // MULTI-AGENT-SUPPORT §7.4): in agents mode the BFF resolves the owning
+      // agent's workspace from the asset's timeline_key. Absent = legacy mode.
+      resolveWorkspaceRoot: agentWorkspaces.length > 0
+        ? (timelineKey) => resolveWorkspaceForTimeline(timelineKey)?.workspaceRoot
+        : undefined,
+      // Manual resume of a parked failed-resumable session (spec §6.2) — the
+      // console's second mutating action, next to abort.
+      // Refused until the chat providers are up: the console now starts before
+      // them, and a resumed session has nowhere to send until then.
+      resumeSession: async (sessionId) =>
+        providersStarted
+          ? manualResumeSession(sessionId)
+          : {
+              ok: false,
+              status: storage.getAgentSession(sessionId)?.status ?? "unknown",
+              reason: "The agent is still starting up; try again in a few seconds.",
+            },
+      // Startup gap-backfetch status panel (ARCHITECTURE.md §7c §11).
+      gapBackfetch: () => gapBackfetch.snapshot(),
+      // Message-only history backfetch jobs surface (ARCHITECTURE.md §7d): list +
+      // start/pause/resume/cancel + retroactive caption promote.
+      backfetch: {
+        enabled: messageBackfetch.enabled,
+        list: (limit?: number) => messageBackfetch.snapshot(limit),
+        start: (input) => messageBackfetch.startJob(input),
+        pause: (id) => messageBackfetch.pauseJob(id),
+        resume: (id) => messageBackfetch.resumeJob(id),
+        cancel: (id) => messageBackfetch.cancelJob(id),
+        promoteCaptions: (timelineKey, range) => messageBackfetch.promoteCaptions(timelineKey, range),
+      },
+      // Period-budget rule statuses for the Usage & Cost page (spec USAGE-COST-LIMITS §7).
+      budgetEngine: budgetHooks.engine,
+      // Per-user limits meters for the Usage & Cost page (spec PER-USER-LIMITS §14).
+      userLimitEngine,
+      logger: logger.child("console"),
+    });
+    await consoleServer.start();
+  }
+  startupPhase("console");
+
+  // Start every registered provider with the appropriate host, concurrently:
+  // each connects to its own network, and cross-provider state (the sibling
+  // self-id set) is pre-seeded or filled by each provider's own start().
   // Runtime guard: MatrixProvider MUST receive buildMatrixHost() (not genericHost)
   // so that the Matrix-specific onNativeEvent/onReaction/onDiagnostics casts
   // documented in buildMatrixHost() are valid.
-  for (const [id, p] of providers) {
-    const host = id === "matrix" ? buildMatrixHost() : genericHost;
-    await p.start(host);
-  }
+  await Promise.all(
+    [...providers].map(([id, p]) => p.start(id === "matrix" ? buildMatrixHost() : genericHost)),
+  );
+  providersStarted = true;
+  startupPhase("providers");
 
   // Discord self-id resolution is now done INSIDE DiscordProvider.start() — each
   // account's self-id is resolved via REST before attachListeners()/client.login()
@@ -6703,6 +6828,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   if (retrieval) await retrieval.start();
   redecryptionSweeper.start();
   proactiveScheduler.start();
+  startupPhase("worker_pools");
 
   // Gap-backfetch fill (ARCHITECTURE.md §7c §8 step 5): launch the per-room
   // fill→commit→unfreeze workers AFTER the scan-driven pools are up (so committed
@@ -6742,68 +6868,6 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     retentionTimer.unref?.();
   }
 
-  // Observability console (ARCHITECTURE.md §11). Read-only HTTP + SSE
-  // over the live storage/factory/session state; gated by config, off by default.
-  let consoleServer: ConsoleServer | undefined;
-  if (config.observability?.server?.enabled) {
-    consoleServer = createObservabilityServer({
-      config: config.observability.server,
-      storage,
-      factory,
-      sessions,
-      // Pipeline monitor stat seam (ARCHITECTURE.md §11). `stats()` returns objects
-      // whose `inFlight()` closes over the live pool, so this is captured once.
-      // Summarization/diary are null when disabled by config.
-      pipelines: {
-        enrichment: enrichmentPool.stats(),
-        captioning: captionPool.stats(),
-        summarization: summarizationPool?.stats() ?? null,
-        diary: diaryPool?.stats() ?? null,
-      },
-      activityBus: pipelineActivityBus,
-      // Tentative-token merge for the session SSE (spec LLM-FAILURE-HANDLING §4.2).
-      liveEvents,
-      // Scheduler snapshot + request ring (spec §9.1/§9.2).
-      scheduler: llmScheduler,
-      // Health-key → logical id(s) + has-fallback map (spec MODEL-FALLBACK §8): lets
-      // the scheduler view show the config name and label a fallback-bearing model's
-      // probe window as the canary. Built from config.models (multiple logical ids
-      // can share one health key via inheritance/rename).
-      modelHealthAnnotations: buildModelHealthAnnotations(config.models),
-      llmRequestRing,
-      workspaceRoot,
-      // Static agents meta snapshot for GET /api/agents (spec CONSOLE-MULTI-AGENT §2).
-      agentsSnapshot,
-      // Per-asset workspace resolver for GET /api/media/:ref (spec
-      // MULTI-AGENT-SUPPORT §7.4): in agents mode the BFF resolves the owning
-      // agent's workspace from the asset's timeline_key. Absent = legacy mode.
-      resolveWorkspaceRoot: agentWorkspaces.length > 0
-        ? (timelineKey) => resolveWorkspaceForTimeline(timelineKey)?.workspaceRoot
-        : undefined,
-      // Manual resume of a parked failed-resumable session (spec §6.2) — the
-      // console's second mutating action, next to abort.
-      resumeSession: manualResumeSession,
-      // Startup gap-backfetch status panel (ARCHITECTURE.md §7c §11).
-      gapBackfetch: () => gapBackfetch.snapshot(),
-      // Message-only history backfetch jobs surface (ARCHITECTURE.md §7d): list +
-      // start/pause/resume/cancel + retroactive caption promote.
-      backfetch: {
-        enabled: messageBackfetch.enabled,
-        list: (limit?: number) => messageBackfetch.snapshot(limit),
-        start: (input) => messageBackfetch.startJob(input),
-        pause: (id) => messageBackfetch.pauseJob(id),
-        resume: (id) => messageBackfetch.resumeJob(id),
-        cancel: (id) => messageBackfetch.cancelJob(id),
-        promoteCaptions: (timelineKey, range) => messageBackfetch.promoteCaptions(timelineKey, range),
-      },
-      // Period-budget rule statuses for the Usage & Cost page (spec USAGE-COST-LIMITS §7).
-      budgetEngine: budgetHooks.engine,
-      // Per-user limits meters for the Usage & Cost page (spec PER-USER-LIMITS §14).
-      userLimitEngine,
-      logger: logger.child("console"),
-    });
-    await consoleServer.start();
-  }
 
   logger.info("runtime_started", { matrixEnabled: config.matrix.enabled });
   return {

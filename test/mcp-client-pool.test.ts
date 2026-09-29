@@ -366,3 +366,34 @@ test("a retry that connects after stop() is discarded and closed", async () => {
   assert.equal(pool.getEntries().length, 0);
   assert.equal(lateEntries.length, 0);
 });
+
+test("start connects servers concurrently but registers them in config order", async () => {
+  const logger = createRecordingLogger();
+  const delays: Record<string, number> = { "http://slow.invalid": 60, "http://fast.invalid": 5, "http://down.invalid": 1 };
+  let inFlight = 0;
+  let maxInFlight = 0;
+  class DelayedPool extends McpClientPool {
+    protected override async connectServer(config: McpServerConfig): Promise<{ client: Client; tools: McpToolDef[] }> {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await sleep(delays[config.url] ?? 0);
+      inFlight--;
+      if (config.url === "http://down.invalid") throw new Error("fetch failed");
+      return fakeConnection([`${new URL(config.url).hostname.split(".")[0]}_tool`]);
+    }
+  }
+  const pool = new DelayedPool({
+    servers: {
+      slow: { url: "http://slow.invalid" },
+      down: { url: "http://down.invalid" },
+      fast: { url: "http://fast.invalid" },
+    },
+    retry: { maxAttempts: 0 },
+    logger,
+  });
+  await pool.start();
+  assert.equal(maxInFlight, 3, "all servers connect at once");
+  // The fast server finished first, but entry (and so tool) order follows config.
+  assert.deepEqual(pool.getEntries().map((e) => e.name), ["slow", "fast"]);
+  await pool.stop();
+});

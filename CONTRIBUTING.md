@@ -51,8 +51,8 @@ without a daemon.
 
 ## Key conventions
 
-- **No JS build step.** TS runs via `tsx`; we only type-check with
-  `tsc --noEmit`.
+- **TS runs via `tsx` in development**; type-check with `tsc --noEmit`. The
+  Docker image compiles `src/` to `dist/` with `tsc` and runs plain `node`.
 - **All SQLite writes go through the single-writer queue** (see `src/storage/`).
   Don't open your own write path to the database.
 - **Config is TOML** with deep-merge across config files, environment-variable

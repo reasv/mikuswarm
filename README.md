@@ -287,7 +287,7 @@ docker/            Sandbox + browser images & lifecycle scripts
 
 ## Contributing
 
-Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, the type-check/test workflow, and conventions. In short: TypeScript runs directly via `tsx` (no build step; type-check with `tsc --noEmit`), tests use the Node test runner (`npm test`), and the Rust native module builds with `cargo`.
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, the type-check/test workflow, and conventions. In short: TypeScript runs directly via `tsx` in development (type-check with `tsc --noEmit`; the Docker image compiles it to JS), tests use the Node test runner (`npm test`), and the Rust native module builds with `cargo`.
 
 ## License
 

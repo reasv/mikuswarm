@@ -117,6 +117,7 @@ export class McpClientPool {
   }
 
   async start(): Promise<void> {
+    const servers: Array<[string, McpServerConfig]> = [];
     for (const [name, config] of Object.entries(this.options.servers)) {
       if (!McpClientPool.VALID_KEY.test(name)) {
         this.logger.error("mcp_server_invalid_key", {
@@ -132,9 +133,18 @@ export class McpClientPool {
           registerSecret(value);
         }
       }
+      servers.push([name, config]);
+    }
 
+    // Connect every server concurrently, then record the results in config order:
+    // entry order decides tool order in every session's prompt, so it must not
+    // depend on which server answered first.
+    const connects = await Promise.allSettled(servers.map(([, config]) => this.connectServer(config)));
+    for (const [i, [name, config]] of servers.entries()) {
+      const outcome = connects[i]!;
       try {
-        const { client, tools } = await this.connectServer(config);
+        if (outcome.status === "rejected") throw outcome.reason;
+        const { client, tools } = outcome.value;
         this.entries.set(name, { name, config, client, tools });
         this.logger.info("mcp_server_connected", {
           server: name,

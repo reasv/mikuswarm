@@ -15,6 +15,17 @@ Accumulate user-visible changes here as they land, under any of:
 
   ### Added
   ### Changed
+
+- **Faster startup.** The Docker image now compiles the TypeScript to `dist/` at
+  build time and runs it with plain `node` (with source maps), instead of
+  transpiling the whole codebase through `tsx` on every container start.
+  Independent startup work now overlaps: the native tokenizer asset loads on a
+  worker thread while storage opens, sandbox containers and MCP servers come up
+  concurrently (MCP tools still register in config order, so prompts are
+  unchanged), the yt-dlp probe runs in the background, and chat providers start
+  concurrently. The observability console starts before the providers and worker
+  pools, so it answers while the rest of startup finishes. Each startup milestone
+  logs `startup_phase` with its duration.
   ### Fixed
   ### Removed
 

@@ -687,7 +687,7 @@ The Rust NAPI module (`native/crates/matrix-core/`) wraps `matrix-sdk` for:
 
 Most NAPI methods are async (`#[napi] pub async fn`) — the Rust side runs on a Tokio runtime and returns `JsPromise`s, avoiding blocking the Node.js event loop. This includes `download_media`, `message_summary`, `resolve_link_previews`, and `member_info` which are used by enrichment workers. NAPI methods exchange JSON strings; the TS layer handles typed serialization.
 
-The same NAPI module also exports the **GLM tokenizer** (`NativeTokenizer`, `native/crates/matrix-core/src/tokenizer.rs`) — the Hugging Face `tokenizers` Rust crate (inference only, `onig` regex backend for pretokenizer parity) loaded from a `tokenizer.json` and surfaced as the `glm` `Tokenizer` (§9 "Tokenization"). It exposes sync `encode` / `decode` / `countTokens` (`add_special_tokens = false`, so per-string counts carry no BOS/`[gMASK]`/`<sop>` overhead) plus `encodeAsync` on the libuv threadpool. The re-export list in `npm/index.js` and the TS declarations in `src/context/tokenizer/native-binding.ts` are hand-maintained (the crate does not enable napi's `typedef` feature, so `napi build` regenerates neither). **Build caveat:** `build:native` builds the debug/dev profile, where an un-optimized BPE loop runs 10–30× slower and could end up slower than the JS it replaces; `native/Cargo.toml` carries `[profile.dev.package."*"] opt-level = 3` to optimize all dependencies (incl. `tokenizers`) under that profile while leaving the workspace crate at default for fast iteration. The `test/tok-bench.ts` perf gate confirms the override took effect.
+The same NAPI module also exports the **GLM tokenizer** (`NativeTokenizer`, `native/crates/matrix-core/src/tokenizer.rs`) — the Hugging Face `tokenizers` Rust crate (inference only, `onig` regex backend for pretokenizer parity) loaded from a `tokenizer.json` and surfaced as the `glm` `Tokenizer` (§9 "Tokenization"). It exposes sync `encode` / `decode` / `countTokens` (`add_special_tokens = false`, so per-string counts carry no BOS/`[gMASK]`/`<sop>` overhead) plus `encodeAsync` on the libuv threadpool, and a `fromFileAsync` factory that parses the asset on the threadpool too (seconds for a GLM-size vocabulary; startup overlaps it with opening storage, and falls back to the sync `fromFile` on an artifact that predates it). The re-export list in `npm/index.js` and the TS declarations in `src/context/tokenizer/native-binding.ts` are hand-maintained (the crate does not enable napi's `typedef` feature, so `napi build` regenerates neither). **Build caveat:** `build:native` builds the debug/dev profile, where an un-optimized BPE loop runs 10–30× slower and could end up slower than the JS it replaces; `native/Cargo.toml` carries `[profile.dev.package."*"] opt-level = 3` to optimize all dependencies (incl. `tokenizers`) under that profile while leaving the workspace crate at default for fast iteration. The `test/tok-bench.ts` perf gate confirms the override took effect.
 
 ### Inbound processing
 
@@ -4070,7 +4070,7 @@ The agent, its native build, and the console ship as container images brought up
 
 ### Two images
 
-- **Agent** (`Dockerfile`, multi-stage on the official `node:24-trixie` → `-slim`; Node 24 is the current LTS and trixie is Debian 13, the newest Debian the official Node image ships, matching the dev host). The builder installs Rust (pinned `1.93.0` via `rust-toolchain.toml`) and pnpm (`10.11.0`), runs `pnpm install` (compiling the native npm modules — `better-sqlite3`, `sharp`, `onnxruntime-node`) and `pnpm build:native` (the Rust NAPI matrix module → `npm/`). The runtime stage carries only `ffmpeg`, `ripgrep`, the `docker` CLI (`docker-ce-cli` — no daemon; it talks to the mounted socket), and `tini`, plus the compiled artifacts. Builder and runtime share the same Debian/glibc base and Node major so the `.node` ABI matches — **not** Alpine/musl. The app runs via `tsx` (no JS emit), matching the project convention; no `playwright` browser is installed (the agent is a CDP client only, §11b).
+- **Agent** (`Dockerfile`, multi-stage on the official `node:24-trixie` → `-slim`; Node 24 is the current LTS and trixie is Debian 13, the newest Debian the official Node image ships, matching the dev host). The builder installs Rust (pinned `1.93.0` via `rust-toolchain.toml`) and pnpm (`10.11.0`), runs `pnpm install` (compiling the native npm modules — `better-sqlite3`, `sharp`, `onnxruntime-node`) and `pnpm build:native` (the Rust NAPI matrix module → `npm/`). The runtime stage carries only `ffmpeg`, `ripgrep`, the `docker` CLI (`docker-ce-cli` — no daemon; it talks to the mounted socket), and `tini`, plus the compiled artifacts. Builder and runtime share the same Debian/glibc base and Node major so the `.node` ABI matches — **not** Alpine/musl. The builder's `tsc --declaration false` pass both type-checks and compiles `src/` to `dist/` (with source maps); the runtime stage ships only `dist/` and runs `node --enable-source-maps dist/index.js`, so a fresh container starts without transpiling the codebase (running through `tsx` cost 8–20 s per container start). Development keeps running `src/` through `tsx`; no `playwright` browser is installed (the agent is a CDP client only, §11b).
 - **Console** (`console/Dockerfile`). Builds the SvelteKit BFF (`adapter-node`) and serves `node build/index.js`, bound `0.0.0.0:5173`. It is the **single externally published surface** (token-gated); the agent's read API (8799) is reachable only over the compose network, never published.
 
 ### Config merge in the container
@@ -4113,20 +4113,22 @@ The bridge egress rules (`docker/egress-rules.sh`) live in the **host kernel's**
 1. Load `.env` (via dotenv)
 2. Load and merge TOML config, substitute env vars, validate schema, register secrets
 3. `startMikuAgent(config)`:
-   - Open SQLite storage
+   - Kick off the yt-dlp binary probe (a subprocess) in the background; it is awaited where the YouTube subsystem is wired, so it overlaps everything in between
+   - Load the tokenizers (a native `glm` asset parses on a libuv worker thread via `fromFileAsync`) **while** opening SQLite storage; both are awaited before anything reads the tokenizer registry
    - Create timeline store, router, trigger coordinator, session manager
-   - Ensure the workspace dir, then — if `[sandbox].enabled` — ensure the Docker sandbox container is up (fail-fast before any connection; §11a)
+   - Ensure the workspace dir, then — if sandboxes are enabled — ensure every Docker sandbox container is up, **concurrently** (agents mode: each strict agent's container and the shared one; registered in config order; fail-fast before any connection; §11a)
    - If `[browser].enabled`, construct the `BrowserSession` singleton (no I/O — it connects lazily on first browser-tool use, degrading gracefully if the Manager is down; §11b)
    - Create assistant echo resolver, context builder
    - Create shared clients: `FetchClient`, `InferenceClient`
    - Create enrichment and caption worker pools with event emitters for trigger-path awaiting
-   - Create and start MCP client pool (connect to remote servers, discover tools; a server that fails keeps retrying in the background with bounded backoff — § MCP remote tools)
-   - Create Matrix provider with logging callbacks
-   - Subscribe to inbound events
-   - Start Matrix provider (connects to homeserver, begins sync loop)
+   - Create and start MCP client pool (connect to every remote server **concurrently**, then register them in config order so tool order — and the prompt prefix — never depends on which answered first; a server that fails keeps retrying in the background with bounded backoff — § MCP remote tools)
+   - Create the chat providers with logging callbacks; subscribe to inbound events
+   - Start the observability console server if `[observability.server].enabled` (§11) — **before** the providers and worker pools, so it answers while they come up; until the providers have started, its manual-resume action is refused with a retry-shortly 409
+   - Start every chat provider **concurrently** (each connects to its own network; the sibling self-id set is pre-seeded from config or filled by each provider's own `start()`)
    - Register provider enrichment capabilities (per account)
    - Start enrichment and caption worker pools (reset stale claims, begin polling)
-   - Start the observability console server if `[observability.server].enabled` (§11)
+
+Each milestone logs `startup_phase` (`phase`, `ms` since the previous milestone, `sinceProcessStartMs`), so a slow boot shows where its time went.
 
 ### Shutdown
 

@@ -18,6 +18,7 @@ var
 workspaces
 debug
 tmp
+dist
 *.db
 *.db-shm
 *.db-wal

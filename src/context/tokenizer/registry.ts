@@ -30,7 +30,7 @@ export interface TokenizerSelection {
   glmTokenizerPath?: string;
 }
 
-function createTokenizer(kind: TokenizerKind, glmTokenizerPath?: string): Tokenizer {
+async function createTokenizer(kind: TokenizerKind, glmTokenizerPath?: string): Promise<Tokenizer> {
   switch (kind) {
     case "gpt-tokenizer":
       return new GptTokenizer();
@@ -43,7 +43,7 @@ function createTokenizer(kind: TokenizerKind, glmTokenizerPath?: string): Tokeni
           "[tokenizer]: 'glm' selected but glm_tokenizer_path is not set — point it at the GLM tokenizer.json",
         );
       }
-      return GlmTokenizer.fromFile(glmTokenizerPath);
+      return GlmTokenizer.fromFileAsync(glmTokenizerPath);
     default: {
       const exhaustive: never = kind;
       throw new Error(`[tokenizer]: unknown tokenizer '${String(exhaustive)}'`);
@@ -58,17 +58,17 @@ function createTokenizer(kind: TokenizerKind, glmTokenizerPath?: string): Tokeni
  * already captured a reference (e.g. the retrieval chunker, which takes its
  * tokenizer injected) keep the old instance, so a late re-init won't propagate.
  *
- * The `async` signature is forward-compat for a future off-thread asset load; the
- * load performed today is fully **synchronous** — constructing the `glm` tokenizer
- * parses the ~20 MB `tokenizer.json` on the calling (event-loop) thread. A single
- * backend instance is shared when both selections name it (the default → one shared
- * `gpt-tokenizer`; or both `glm` from one path).
+ * Constructing the `glm` tokenizer parses the ~20 MB `tokenizer.json` on a libuv
+ * worker thread (seconds), so the caller can overlap it with other startup work;
+ * the singletons are bound only once both are loaded. A single backend instance is
+ * shared when both selections name it (the default → one shared `gpt-tokenizer`;
+ * or both `glm` from one path).
  */
 export async function initTokenizers(selection: TokenizerSelection): Promise<void> {
   const primaryKind = selection.primary ?? "gpt-tokenizer";
   const retrievalKind = selection.retrieval ?? "gpt-tokenizer";
-  const cache = new Map<TokenizerKind, Tokenizer>();
-  const build = (kind: TokenizerKind): Tokenizer => {
+  const cache = new Map<TokenizerKind, Promise<Tokenizer>>();
+  const build = (kind: TokenizerKind): Promise<Tokenizer> => {
     let existing = cache.get(kind);
     if (!existing) {
       existing = createTokenizer(kind, selection.glmTokenizerPath);
@@ -76,8 +76,9 @@ export async function initTokenizers(selection: TokenizerSelection): Promise<voi
     }
     return existing;
   };
-  primaryTokenizer = build(primaryKind);
-  retrievalTokenizer = build(retrievalKind);
+  const [primary, retrieval] = await Promise.all([build(primaryKind), build(retrievalKind)]);
+  primaryTokenizer = primary;
+  retrievalTokenizer = retrieval;
 }
 
 /**

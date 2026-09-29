@@ -11,6 +11,8 @@ export declare class NativeTokenizer {
   /** Load a Hugging Face `tokenizer.json` from disk. Throws (path included) on a
    *  missing/invalid file so a misconfigured `glm` asset fail-fasts at startup. */
   static fromFile(path: string): NativeTokenizer;
+  /** `fromFile` on a libuv worker thread (absent on artifacts built before it). */
+  static fromFileAsync?(path: string): Promise<NativeTokenizer>;
   /** Encode to token ids; `addSpecialTokens` defaults to false. */
   encode(text: string, addSpecialTokens?: boolean): Uint32Array;
   /** Decode ids back to text (special tokens not skipped → lossless round-trip

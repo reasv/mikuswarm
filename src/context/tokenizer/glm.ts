@@ -23,6 +23,15 @@ export class GlmTokenizer implements Tokenizer {
     return new GlmTokenizer(loadNativeTokenizerBinding().fromFile(path));
   }
 
+  /** {@link fromFile} with the parse off the JS thread (seconds for a large
+   *  vocabulary), so startup can overlap it with other work. Falls back to the
+   *  synchronous load on a native artifact that predates `fromFileAsync`. */
+  static async fromFileAsync(path: string): Promise<GlmTokenizer> {
+    const binding = loadNativeTokenizerBinding();
+    if (typeof binding.fromFileAsync !== "function") return new GlmTokenizer(binding.fromFile(path));
+    return new GlmTokenizer(await binding.fromFileAsync(path));
+  }
+
   count(text: string): number {
     if (!text) return 0;
     return this.native.countTokens(text);
