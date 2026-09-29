@@ -133,7 +133,7 @@ import { FxTwitterClient, resolveFxTwitterConfig } from "./fxtwitter/index.js";
 import { resolveYouTubeConfig } from "./youtube/config.js";
 import { resolveYotsubaConfig, parseYotsubaPreviewPayload, type ResolvedYotsubaConfig, type YotsubaPostNode } from "./yotsuba/types.js";
 import { YotsubaClient } from "./yotsuba/client.js";
-import { computeRefCost, allocateGroupFiles } from "./yotsuba/upgrade.js";
+import { planYotsubaUpgrade } from "./yotsuba/upgrade.js";
 import { CaptionWorkerPool, InferenceClient, type MediaModality } from "./captioning/index.js";
 import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools, type McpServerEntry } from "./mcp/index.js";
@@ -3369,329 +3369,200 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     const newAssets: import("./storage/database.js").MediaAssetRow[] = [];
     const flipAssetIds: string[] = [];
 
-    // ── Phase 1: Build refData ──────────────────────────────────────────────
+    // ── Plan: build planner input (filter board refs and null payloads) ────────
     // Board refs, null payloads, and failed/gone rows (no headline post) are
     // skipped WITHOUT writing an upgrade record — they stay ambient and may be
     // upgraded by a later trigger.
-    const refData: Array<{
+    const refMappings: Array<{
       row: (typeof freshPreviews)[0]["row"];
       assets: (typeof freshPreviews)[0]["assets"];
       payload: NonNullable<ReturnType<typeof parsePay>>;
-      headlinePost: YotsubaPostNode;
-      includedPosts: YotsubaPostNode[];
-      isPostLink: boolean;
-      canDownload: boolean;
-      headlineText: string;
-      droppedLatest: number;
-      droppedRepliedTo: number;
-      droppedReplies: number;
-      staysAmbient: boolean;
-      updatedPayloadPosts: YotsubaPostNode[];
     }> = [];
+    const plannerRefs: Array<{ payload: NonNullable<ReturnType<typeof parsePay>>; canDownload: boolean }> = [];
 
     for (const { row, assets } of freshPreviews) {
       const payload = parsePay(row.payload_json ?? null);
       // Board refs (kind !== "thread") and null payloads: skip, no upgrade record.
       if (!payload || payload.kind !== "thread") continue;
-
-      const headlineNo = payload.headlineNo ?? payload.threadNo ?? 0;
-      const allPosts = payload.posts ?? [];
-      const headlinePost = allPosts.find((p) => p.no === headlineNo);
-      // Failed/gone rows with no posts: skip, no upgrade record.
-      if (!headlinePost) continue;
-
-      const isPostLink = payload.linkedNo != null;
       const canDownload = yotCfg.enrichment.mediaBoards === "all" || (payload.worksafe === true);
-      const headlineText = headlinePost.text.slice(0, headlineCharCap);
-
-      refData.push({
-        row,
-        assets,
-        payload,
-        headlinePost: { ...headlinePost, text: headlineText },
-        includedPosts: allPosts.filter((p) => p.no !== headlineNo),
-        isPostLink,
-        canDownload,
-        headlineText,
-        droppedLatest: 0,
-        droppedRepliedTo: 0,
-        droppedReplies: 0,
-        staysAmbient: false,
-        updatedPayloadPosts: payload.posts ? [...payload.posts] : [],
-      });
+      refMappings.push({ row, assets, payload });
+      plannerRefs.push({ payload, canDownload });
     }
 
-    if (refData.length === 0) return;
+    if (plannerRefs.length === 0) return;
 
-    // ── Phase 2: Group-wide deterministic selection loop (spec §6.4-§6.5) ──
-    // Allocate file slots across all refs in tier order, then drop posts
-    // ref-by-ref until all refs fit within per-ref and group-token budgets.
-    let changed = true;
-    while (changed) {
-      changed = false;
-
-      const fileAlloc = allocateGroupFiles({
-        refs: refData.map((r) => ({
-          headlinePost: r.headlinePost,
-          includedPosts: r.includedPosts,
-          isPostLink: r.isPostLink,
-          canDownload: r.canDownload,
-        })),
-        totalFileBudget: groupFileBudget,
-      });
-
-      let groupTokensAccum = 0;
-      for (let i = 0; i < refData.length; i++) {
-        const r = refData[i]!;
-        if (r.staysAmbient) continue;
-
-        const processedNosForRef = fileAlloc.get(i) ?? new Set<number>();
-        const filesInRef =
-          (processedNosForRef.has(r.headlinePost.no) ? 1 : 0) +
-          r.includedPosts.filter((p) => processedNosForRef.has(p.no)).length;
-
-        const refCost = computeRefCost({
-          includedPosts: r.includedPosts,
-          headlineTextLen: r.headlineText.length,
-          filesInRef,
-          captionAllowanceTokens,
-        });
-
-        const effectiveBudget = Math.min(linkTokenBudget, groupTokenBudget - groupTokensAccum);
-
-        if (refCost > effectiveBudget) {
-          // Drop the next post per drop order.
-          let dropped = false;
-          if (!r.isPostLink) {
-            // Thread link: drop replied_to (oldest first), then latest (oldest first).
-            const rtIdx = r.includedPosts.findIndex((p) => p.role === "replied_to");
-            if (rtIdx >= 0) {
-              r.includedPosts.splice(rtIdx, 1);
-              r.droppedRepliedTo++;
-              dropped = true;
-            } else {
-              const latIdx = r.includedPosts.findIndex((p) => p.role === "latest");
-              if (latIdx >= 0) {
-                r.includedPosts.splice(latIdx, 1);
-                r.droppedLatest++;
-                dropped = true;
-              }
-            }
-          } else {
-            // Post link: drop reply (newest first), then replied_to (oldest first).
-            const replyIndices = r.includedPosts.reduce<number[]>((acc, p, idx) => {
-              if (p.role === "reply") acc.push(idx);
-              return acc;
-            }, []);
-            if (replyIndices.length > 0) {
-              r.includedPosts.splice(replyIndices[replyIndices.length - 1]!, 1);
-              r.droppedReplies++;
-              dropped = true;
-            } else {
-              const rtIdx = r.includedPosts.findIndex((p) => p.role === "replied_to");
-              if (rtIdx >= 0) {
-                r.includedPosts.splice(rtIdx, 1);
-                r.droppedRepliedTo++;
-                dropped = true;
-              }
-            }
-          }
-          if (dropped) {
-            changed = true;
-            continue;
-          }
-
-          // No more posts to drop — check if headline alone fits the group budget.
-          const headlineFilesInRef = processedNosForRef.has(r.headlinePost.no) ? 1 : 0;
-          const headlineCost = computeRefCost({
-            includedPosts: [],
-            headlineTextLen: r.headlineText.length,
-            filesInRef: headlineFilesInRef,
-            captionAllowanceTokens,
-          });
-          if (headlineCost > groupTokenBudget - groupTokensAccum) {
-            // Even the headline doesn't fit — this ref stays ambient; no upgrade record.
-            r.staysAmbient = true;
-            changed = true;
-            continue;
-          }
-        }
-
-        groupTokensAccum += refCost;
-      }
-    }
-
-    // ── Phase 3: Download files ─────────────────────────────────────────────
-    // Compute final file allocation after the selection loop has converged.
-    const finalFileAlloc = allocateGroupFiles({
-      refs: refData.map((r) => ({
-        headlinePost: r.headlinePost,
-        includedPosts: r.includedPosts,
-        isPostLink: r.isPostLink,
-        canDownload: r.canDownload,
-      })),
-      totalFileBudget: groupFileBudget,
+    const plan = planYotsubaUpgrade({
+      refs: plannerRefs,
+      budgets: {
+        linkTokenBudget,
+        groupTokenBudget,
+        groupFileBudget,
+        headlineCharCap,
+        captionAllowanceTokens,
+      },
     });
 
+    // ── Phase 3: Download files ─────────────────────────────────────────────
     const now = Date.now();
 
-    for (let i = 0; i < refData.length; i++) {
-      const r = refData[i]!;
-      // Ambient refs (didn't fit, board refs, failed/gone) get no upgrade record.
-      if (r.staysAmbient) continue;
+    for (let i = 0; i < refMappings.length; i++) {
+      const planRef = plan.refs[i]!;
+      const { row, payload } = refMappings[i]!;
 
-      const processedNosForRef = finalFileAlloc.get(i) ?? new Set<number>();
+      // Excluded (no headline post) or stays-ambient refs get no upgrade record.
+      if (planRef.excluded || planRef.staysAmbient) continue;
+
       const processedAssetIds: string[] = [];
-      const board = r.payload.board;
-      const mediaRole: string = r.row.context === "reply" ? "reply_preview_media" : "preview_media";
-      const allIncluded = [r.headlinePost, ...r.includedPosts];
+      const board = payload.board;
+      const mediaRole: string = row.context === "reply" ? "reply_preview_media" : "preview_media";
+      const updatedPayloadPosts: YotsubaPostNode[] = payload.posts ? [...payload.posts] : [];
+      const allIncluded = [planRef.headlinePost, ...planRef.includedPosts];
 
-      for (const post of allIncluded) {
-        if (!post.file || post.file.deleted || !r.canDownload) continue;
-        const { file } = post;
-        const tim = file.tim;
-        const ext = file.ext;
-        const isProcessed = processedNosForRef.has(post.no);
-        const isPdf = ext?.toLowerCase() === ".pdf";
-        const isVideo = ext?.toLowerCase() === ".webm" || ext?.toLowerCase() === ".mp4";
-        const isAnimated = ext?.toLowerCase() === ".gif";
-        const isVideoOrAnimated = isVideo || isAnimated;
-        const fileRef = isPdf ? `${tim}s.jpg` : `${tim}${ext}`;
-        const mimeType = isPdf ? "image/jpeg" : (ext === ".jpg" || ext === ".jpeg" ? "image/jpeg"
-          : ext === ".png" ? "image/png" : ext === ".gif" ? "image/gif"
-          : ext === ".webm" ? "video/webm" : ext === ".mp4" ? "video/mp4"
-          : undefined);
-        const mediaType = isPdf ? "image" : isVideoOrAnimated ? "video" : "image";
-        // Videos/animated GIFs are always created as deferred and flipped to
-        // pending via flipAssetIds so the original video is captioned via the
-        // video lane.  The storyboard (image-block asset) stays deferred.
-        const captionStatus = isVideoOrAnimated ? "deferred" : (isProcessed ? "pending" : "deferred");
+      if (planRef.canDownload) {
+        for (const fi of planRef.files) {
+          const post = allIncluded.find((p) => p.no === fi.postNo)!;
+          const { file } = post;
+          if (!file) continue; // planner guarantees this, but narrow for TS
+          const tim = file.tim;
+          const ext = file.ext;
+          const fileRef = fi.isPdf ? `${tim}s.jpg` : `${tim}${ext}`;
+          const mimeType = fi.isPdf ? "image/jpeg" : (ext === ".jpg" || ext === ".jpeg" ? "image/jpeg"
+            : ext === ".png" ? "image/png" : ext === ".gif" ? "image/gif"
+            : ext === ".webm" ? "video/webm" : ext === ".mp4" ? "video/mp4"
+            : undefined);
+          const mediaType = fi.isPdf ? "image" : fi.isVideoOrAnimated ? "video" : "image";
+          // Videos/animated GIFs are always created as deferred and flipped to
+          // pending via flipAssetIds so the original video is captioned via the
+          // video lane.  The storyboard (image-block asset) stays deferred.
+          const captionStatus = fi.isVideoOrAnimated ? "deferred" : (fi.isProcessed ? "pending" : "deferred");
 
-        // Skip if already downloaded (assetId already set in payload).
-        if (file.assetId) {
-          if (isProcessed) {
-            flipAssetIds.push(file.assetId);
-            if (!isVideoOrAnimated) {
-              processedAssetIds.push(file.assetId);
-            } else if (file.storyboardAssetId) {
-              // Use the already-built storyboard as the image-block asset.
-              processedAssetIds.push(file.storyboardAssetId);
-            }
-          }
-          continue;
-        }
-
-        let assetId: string | undefined;
-        try {
-          const fetched = await client.fetchFilePath(board, fileRef, "interactive");
-          if (fetched.statusCode >= 200 && fetched.statusCode < 300) {
-            const saved = await moveFn({
-              sourcePath: fetched.path,
-              workspaceRoot: effectiveWorkspaceRoot,
-              originalFilename: fileRef,
-              contentType: fetched.contentType ?? mimeType,
-              attachSubdir: attachSubdirForUpgrade,
-              store: attachmentStore,
-            });
-            assetId = newId();
-            const asset: import("./storage/database.js").MediaAssetRow = {
-              id: assetId,
-              event_id: r.row.event_id,
-              role: mediaRole,
-              link_preview_id: r.row.id,
-              local_path: saved.localPath,
-              content_hash: saved.contentHash,
-              mime_type: fetched.contentType ?? mimeType ?? null,
-              media_type: mediaType,
-              size_bytes: fetched.sizeBytes,
-              original_filename: fileRef,
-              caption_status: captionStatus,
-              download_status: "complete",
-              created_at: now,
-              updated_at: now,
-            };
-            newAssets.push(asset);
-            const payloadNode = r.updatedPayloadPosts.find((n) => n.no === post.no);
-            if (payloadNode?.file) payloadNode.file.assetId = assetId;
-            if (isProcessed) {
-              if (isVideoOrAnimated) {
-                // Original video gets captioned via the video lane; storyboard
-                // (if built below) will be the image-block asset.
-                flipAssetIds.push(assetId);
-              } else {
-                processedAssetIds.push(assetId);
+          // Skip if already downloaded (assetId already set in payload).
+          if (file.assetId) {
+            if (fi.isProcessed) {
+              flipAssetIds.push(file.assetId);
+              if (!fi.isVideoOrAnimated) {
+                processedAssetIds.push(file.assetId);
+              } else if (file.storyboardAssetId) {
+                // Use the already-built storyboard as the image-block asset.
+                processedAssetIds.push(file.storyboardAssetId);
               }
             }
-          } else {
-            await import("node:fs/promises").then(({ unlink }) => unlink(fetched.path).catch(() => {}));
+            continue;
           }
-        } catch {
-          // Download failure — file stays missing.
-        }
 
-        // For videos/animated GIFs: attempt storyboard.
-        if (assetId && isVideoOrAnimated) {
+          let assetId: string | undefined;
           try {
-            const assetRow = newAssets.find((a) => a.id === assetId);
-            if (assetRow?.local_path) {
-              const absPath = assetRow.local_path.startsWith("/")
-                ? assetRow.local_path
-                : (await import("node:path")).default.join(effectiveWorkspaceRoot, assetRow.local_path);
-              const { buildStoryboard: bs } = await import("./media/storyboard.js");
-              const storyboard = await bs(absPath);
-              if (storyboard) {
-                const sbSaved = await moveFn({
-                  sourcePath: storyboard.path,
-                  workspaceRoot: effectiveWorkspaceRoot,
-                  originalFilename: `storyboard_${tim}.jpg`,
-                  contentType: "image/jpeg",
-                  attachSubdir: attachSubdirForUpgrade,
-                  store: attachmentStore,
-                });
-                const sbAssetId = newId();
-                newAssets.push({
-                  id: sbAssetId,
-                  event_id: r.row.event_id,
-                  role: mediaRole,
-                  link_preview_id: r.row.id,
-                  local_path: sbSaved.localPath,
-                  content_hash: sbSaved.contentHash,
-                  mime_type: "image/jpeg",
-                  media_type: "image",
-                  caption_status: "deferred",
-                  download_status: "complete",
-                  created_at: now,
-                  updated_at: now,
-                });
-                const payloadNode = r.updatedPayloadPosts.find((n) => n.no === post.no);
-                if (payloadNode?.file) payloadNode.file.storyboardAssetId = sbAssetId;
-                // Storyboard is the image-block asset; original video is captioned
-                // via the video lane (already in flipAssetIds above).
-                if (isProcessed) processedAssetIds.push(sbAssetId);
+            const fetched = await client.fetchFilePath(board, fileRef, "interactive");
+            if (fetched.statusCode >= 200 && fetched.statusCode < 300) {
+              const saved = await moveFn({
+                sourcePath: fetched.path,
+                workspaceRoot: effectiveWorkspaceRoot,
+                originalFilename: fileRef,
+                contentType: fetched.contentType ?? mimeType,
+                attachSubdir: attachSubdirForUpgrade,
+                store: attachmentStore,
+              });
+              assetId = newId();
+              const asset: import("./storage/database.js").MediaAssetRow = {
+                id: assetId,
+                event_id: row.event_id,
+                role: mediaRole,
+                link_preview_id: row.id,
+                local_path: saved.localPath,
+                content_hash: saved.contentHash,
+                mime_type: fetched.contentType ?? mimeType ?? null,
+                media_type: mediaType,
+                size_bytes: fetched.sizeBytes,
+                original_filename: fileRef,
+                caption_status: captionStatus,
+                download_status: "complete",
+                created_at: now,
+                updated_at: now,
+              };
+              newAssets.push(asset);
+              const payloadNode = updatedPayloadPosts.find((n) => n.no === fi.postNo);
+              if (payloadNode?.file) payloadNode.file.assetId = assetId;
+              if (fi.isProcessed) {
+                if (fi.isVideoOrAnimated) {
+                  // Original video gets captioned via the video lane; storyboard
+                  // (if built below) will be the image-block asset.
+                  flipAssetIds.push(assetId);
+                } else {
+                  processedAssetIds.push(assetId);
+                }
               }
+            } else {
+              await import("node:fs/promises").then(({ unlink }) => unlink(fetched.path).catch(() => {}));
             }
-          } catch { /* storyboard failure is non-fatal */ }
+          } catch {
+            // Download failure — file stays missing.
+          }
+
+          // For videos/animated GIFs: attempt storyboard.
+          if (assetId && fi.isVideoOrAnimated) {
+            try {
+              const assetRow = newAssets.find((a) => a.id === assetId);
+              if (assetRow?.local_path) {
+                const absPath = assetRow.local_path.startsWith("/")
+                  ? assetRow.local_path
+                  : (await import("node:path")).default.join(effectiveWorkspaceRoot, assetRow.local_path);
+                const { buildStoryboard: bs } = await import("./media/storyboard.js");
+                const storyboard = await bs(absPath);
+                if (storyboard) {
+                  const sbSaved = await moveFn({
+                    sourcePath: storyboard.path,
+                    workspaceRoot: effectiveWorkspaceRoot,
+                    originalFilename: `storyboard_${tim}.jpg`,
+                    contentType: "image/jpeg",
+                    attachSubdir: attachSubdirForUpgrade,
+                    store: attachmentStore,
+                  });
+                  const sbAssetId = newId();
+                  newAssets.push({
+                    id: sbAssetId,
+                    event_id: row.event_id,
+                    role: mediaRole,
+                    link_preview_id: row.id,
+                    local_path: sbSaved.localPath,
+                    content_hash: sbSaved.contentHash,
+                    mime_type: "image/jpeg",
+                    media_type: "image",
+                    caption_status: "deferred",
+                    download_status: "complete",
+                    created_at: now,
+                    updated_at: now,
+                  });
+                  const payloadNode = updatedPayloadPosts.find((n) => n.no === fi.postNo);
+                  if (payloadNode?.file) payloadNode.file.storyboardAssetId = sbAssetId;
+                  // Storyboard is the image-block asset; original video is captioned
+                  // via the video lane (already in flipAssetIds above).
+                  if (fi.isProcessed) processedAssetIds.push(sbAssetId);
+                }
+              }
+            } catch { /* storyboard failure is non-fatal */ }
+          }
         }
       }
 
       // ── Phase 4: Write upgrade record ────────────────────────────────────
       const allIncludedNos = allIncluded.map((p) => p.no);
       const leftCounts: import("./yotsuba/types.js").YotsubaUpgradeRecord["left"] = {};
-      if (r.droppedLatest > 0) leftCounts!.latest = r.droppedLatest;
-      if (r.droppedRepliedTo > 0) leftCounts!.repliedTo = r.droppedRepliedTo;
-      if (r.droppedReplies > 0) leftCounts!.replies = r.droppedReplies;
+      if (planRef.droppedLatest > 0) leftCounts!.latest = planRef.droppedLatest;
+      if (planRef.droppedRepliedTo > 0) leftCounts!.repliedTo = planRef.droppedRepliedTo;
+      if (planRef.droppedReplies > 0) leftCounts!.replies = planRef.droppedReplies;
       const upgradeRecord: import("./yotsuba/types.js").YotsubaUpgradeRecord = {
         triggerGroupId: triggerEventId,
         includedNos: allIncludedNos,
         processedAssetIds,
+        headlineChars: planRef.headlineChars,
         ...(Object.keys(leftCounts!).length > 0 ? { left: leftCounts } : {}),
       };
       const updatedPayload = {
-        ...r.payload,
-        posts: r.updatedPayloadPosts,
+        ...payload,
+        posts: updatedPayloadPosts,
         upgrade: upgradeRecord,
       };
-      payloadUpdates.push({ previewId: r.row.id, newPayloadJson: JSON.stringify(updatedPayload) });
+      payloadUpdates.push({ previewId: row.id, newPayloadJson: JSON.stringify(updatedPayload) });
     }
 
     if (payloadUpdates.length > 0 || newAssets.length > 0 || flipAssetIds.length > 0) {
