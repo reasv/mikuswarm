@@ -89,6 +89,37 @@ test("ensure: single-flight — concurrent calls share one create path", async (
   assert.equal(log.filter((a) => a[0] === "create").length, 1);
 });
 
+test("ensure: concurrent calls for DIFFERENT containers each get their own manager", async () => {
+  const created: string[] = [];
+  const existing = new Set<string>();
+  const { run } = fakeRunner((args) => {
+    const [cmd, sub] = args;
+    if (cmd === "network" && sub === "inspect") return ok();
+    if (cmd === "image" && args[1] === "inspect") return ok(IMAGE_ID);
+    if (cmd === "inspect") {
+      const name = args[args.length - 1]!;
+      if (!existing.has(name)) return fail("No such object", 1);
+      return ok(`true\t${IMAGE_ID}\t/host/workspace`);
+    }
+    if (cmd === "create") {
+      const name = args[args.indexOf("--name") + 1]!;
+      created.push(name);
+      existing.add(name);
+      return ok();
+    }
+    return ok();
+  });
+
+  // Agents mode brings a strict agent's container and the shared one up at once;
+  // a guard keyed on nothing handed the second caller the first one's manager.
+  const [a, b] = await Promise.all([
+    SandboxManager.ensure(baseOptions({ runDocker: run, containerName: "sandbox-a" })),
+    SandboxManager.ensure(baseOptions({ runDocker: run, containerName: "sandbox-b" })),
+  ]);
+  assert.notEqual(a, b, "each container gets its own manager");
+  assert.deepEqual(created.sort(), ["sandbox-a", "sandbox-b"]);
+});
+
 test("ensure: single-flight resets on failure so a later call retries", async () => {
   let attempts = 0;
   const { run } = fakeRunner((args) => {

@@ -182,12 +182,14 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  */
 export class SandboxManager implements ExecBackend {
   /**
-   * Single-flight guard (issue #15): concurrent/repeat `ensure()` calls share one
-   * in-flight promise so they can't race `docker create --name`. Cleared on
-   * failure so a later call can retry, and on success (a settled container needs
-   * no further guarding — the create path is idempotent on subsequent calls).
+   * Single-flight guard (issue #15): concurrent/repeat `ensure()` calls for the
+   * SAME container share one in-flight promise so they can't race `docker create
+   * --name`. Keyed by container name: calls for different containers (agents
+   * mode brings them up concurrently) must each get their own manager. Cleared
+   * on failure so a later call can retry, and on success (a settled container
+   * needs no further guarding — the create path is idempotent on subsequent calls).
    */
-  private static inFlight: Promise<SandboxManager> | undefined;
+  private static readonly inFlight = new Map<string, Promise<SandboxManager>>();
 
   private constructor(
     private readonly options: SandboxManagerOptions,
@@ -199,18 +201,20 @@ export class SandboxManager implements ExecBackend {
   }
 
   static ensure(options: SandboxManagerOptions): Promise<SandboxManager> {
-    if (SandboxManager.inFlight) return SandboxManager.inFlight;
+    const key = options.containerName;
+    const pending = SandboxManager.inFlight.get(key);
+    if (pending) return pending;
     const run = SandboxManager.ensureUnguarded(options).then(
       (manager) => {
-        SandboxManager.inFlight = undefined;
+        SandboxManager.inFlight.delete(key);
         return manager;
       },
       (error) => {
-        SandboxManager.inFlight = undefined;
+        SandboxManager.inFlight.delete(key);
         throw error;
       },
     );
-    SandboxManager.inFlight = run;
+    SandboxManager.inFlight.set(key, run);
     return run;
   }
 
