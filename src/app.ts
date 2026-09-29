@@ -5380,10 +5380,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // drain the coordinator is cleared by stop(), so the helper skips — same as
     // launchSession does.
     releaseTimelineSlot: (timelineKey) => drainNextQueuedTrigger(timelineKey),
-    // §6.3: provider self identity for the resume-reattachment path. The resume runs
+    // §6.3: provider self identity for the resume-reattachment path, resolved on the
+    // timeline key's OWN provider (Matrix, Discord, IRC alike). The resume runs
     // post-start so getSelf is available; falls back to undefined (same handling as
     // "unknown account") when the provider isn't registered.
-    selfUserIdForAccount: (accountId) => matrixProvider?.getSelf(accountId)?.id,
+    selfUserIdForAccount: (provider, accountId) => providers.get(provider)?.getSelf(accountId)?.id,
     runAttempt: (record, inbound) => resumeSessionRun(record, inbound, 0),
     markFailedResumable: (id, error) => sessions.markFailedResumable(id, { error }),
     markDiscarded: (id, error) => sessions.markDiscarded(id, { error }),
