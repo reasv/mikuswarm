@@ -1473,6 +1473,7 @@ export class EnrichmentWorker {
       asOf: now,
       threadNo,
       subject,
+      ambientChars: cfg.preview.ambientChars,
       opExcerpt: !subject ? opExcerpt : (linkedMissing != null || headlineNo !== opNo ? opExcerpt : undefined),
       postCount,
       fileCount,

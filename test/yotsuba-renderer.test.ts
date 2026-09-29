@@ -53,12 +53,17 @@ function yotsubaPreview(
   payload: YotsubaPreviewPayload,
   media: AttachmentMeta[] = [],
   fetchedAt?: number,
+  // Ids the context builder sent as image blocks in this build (it sets
+  // AttachmentMeta.isImageBlock). Default: the upgrade's processed files, i.e.
+  // rendering inside the upgrading trigger's own session.
+  blockIds: readonly string[] = payload.upgrade?.processedAssetIds ?? [],
 ): LinkPreviewMeta {
+  const marked = new Set(blockIds);
   return {
     url,
     sourceKind: YOTSUBA_SOURCE_KIND,
     yotsubaPayload: payload,
-    media,
+    media: media.map((m) => (marked.has(m.id) ? { ...m, isImageBlock: true } : m)),
     fetchedAt,
   };
 }
@@ -123,11 +128,10 @@ test("A: ambient thread link renders metadata and headline post", () => {
   assert.match(out, /status="not shown"/);
 });
 
-test("A: ambient thread link renders OP text from payload (no renderer-level truncation)", () => {
-  // The renderer renders text as stored in payload; ambient_chars limiting is applied
-  // during enrichment capture, not at render time. This test verifies the renderer
-  // faithfully outputs whatever text is in the post node.
-  const storedText = "x".repeat(300); // A realistic capture-limited text
+test("A: ambient rendering caps the headline at the captured ambient_chars", () => {
+  // The capture stores the full comment; the ambient rendering cuts it to the
+  // ambientChars recorded at capture (spec §6.3) with a "more characters" marker.
+  const storedText = "x".repeat(500);
   const payload: YotsubaPreviewPayload = {
     v: 1,
     kind: "thread",
@@ -136,6 +140,7 @@ test("A: ambient thread link renders OP text from payload (no renderer-level tru
     asOf: AS_OF_MS,
     threadNo: 100000,
     headlineNo: 100000,
+    ambientChars: 300,
     postCount: 10,
     posts: [
       { no: 100000, index: 0, role: "op", time: AS_OF_MS - 3600000, text: storedText, quotes: [], replies: 0 },
@@ -145,8 +150,28 @@ test("A: ambient thread link renders OP text from payload (no renderer-level tru
   const out = renderRichMessage(chatEvent({ linkPreviews: [yotsubaPreview("https://boards.4chan.org/g/thread/100000", payload)] }));
   assert.match(out, /no="100000"/);
   assert.match(out, /role="op"/);
-  // Text is present
-  assert.ok(out.includes("x".repeat(100)));
+  assert.ok(out.includes("x".repeat(300)));
+  assert.ok(!out.includes("x".repeat(301)));
+  assert.match(out, /\[… 200 more characters\]/);
+});
+
+test("upgraded file outside its upgrading session: caption and path, no image_block, no auto=off", () => {
+  const assetId = "asset_kept";
+  const payload: YotsubaPreviewPayload = {
+    v: 1, kind: "thread", board: "g", boardTitle: "Technology", asOf: AS_OF_MS,
+    threadNo: 100000, headlineNo: 100000, postCount: 3,
+    posts: [
+      { no: 100000, index: 0, role: "op", time: AS_OF_MS - 3600000, text: "hello", quotes: [], replies: 0,
+        file: { name: "pic", ext: ".png", tim: 1, assetId } },
+    ],
+    upgrade: { triggerGroupId: "old_trigger", includedNos: [100000], processedAssetIds: [assetId], headlineChars: 800 },
+  };
+  const media = [imageAsset(assetId, "msg-attach/pic.png", "A test caption.")];
+  const out = renderRichMessage(chatEvent({ linkPreviews: [yotsubaPreview("https://boards.4chan.org/g/thread/100000", payload, media, undefined, [])] }));
+  assert.match(out, /path="msg-attach\/pic.png"/);
+  assert.match(out, /A test caption\./);
+  assert.doesNotMatch(out, /image_block=/);
+  assert.doesNotMatch(out, /auto="off"/);
 });
 
 // ---------------------------------------------------------------------------
@@ -386,7 +411,7 @@ test("E: trigger post link shows linked post with replies and replied-to posts",
     {
       no: 109931402, index: 102, role: "replied_to",
       time: postMs("2026-09-28T12:00:00"),
-      text: ">>109931377 (not shown)\n>38 t/s\nthat's with spec decoding off? post settings or it didn't happen",
+      text: ">>109931377\n>38 t/s\nthat's with spec decoding off? post settings or it didn't happen",
       quotes: [109931377], deadQuotes: [], replies: 6,
       posterId: "Ab12Cd34", flag: "Finland",
     },

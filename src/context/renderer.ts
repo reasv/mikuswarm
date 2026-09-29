@@ -761,7 +761,9 @@ function renderYotsuba4chanThread(
   let filesUpToLastPost = 0;
   const totalPosts = payload.postCount ?? allPosts.length;
   const headlineNo = payload.headlineNo ?? payload.threadNo;
-  const headlineCharCap = upgrade?.headlineChars;
+  // Upgraded: the trigger headline cap recorded by the upgrade. Ambient: the
+  // ambient cap recorded at capture (spec §6.3), default 300.
+  const headlineCharCap = upgrade ? upgrade.headlineChars : (payload.ambientChars ?? 300);
 
   for (const post of sortedPosts) {
     const gap = post.index - lastIndex - 1;
@@ -885,13 +887,14 @@ function renderYotsubaFileNode(
     status = "stored";
   }
 
-  // Image block flag: set when asset or storyboard is in processedIds.
-  const isImageBlock = !!(assetId && processedIds.has(assetId))
-    || !!(sbAssetId && processedIds.has(sbAssetId));
+  // Image block flag: only when the context builder actually sent this file (or
+  // its storyboard) as a block in THIS build (it marks AttachmentMeta.isImageBlock).
+  // processedIds persist across sessions; blocks do not (spec §6.5).
+  const isImageBlock = !!(asset?.isImageBlock || sbAsset?.isImageBlock);
 
-  // Caption: prefer storyboard for video (storyboard is the image block asset).
-  const captionSource = sbAsset ?? asset;
-  const caption = captionSource?.caption ?? undefined;
+  // Caption: the original file's (a video's caption comes from the video lane);
+  // the storyboard's only as a fallback.
+  const caption = asset?.caption ?? sbAsset?.caption ?? undefined;
 
   const info: FileRenderInfo = {
     name: file.name,

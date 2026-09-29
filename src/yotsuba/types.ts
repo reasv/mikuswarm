@@ -154,6 +154,8 @@ export interface YotsubaPreviewPayload {
   linkedNo?: number;
   linkedMissing?: number;
   headlineNo?: number;
+  /** Ambient-rendering cap on the headline text (`[yotsuba.preview].ambient_chars` at capture). */
+  ambientChars?: number;
   posts?: YotsubaPostNode[];
   upgrade?: YotsubaUpgradeRecord;
   // board kind fields
