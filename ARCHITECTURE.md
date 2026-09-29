@@ -51,6 +51,8 @@ mikuswarm/
     backfill/                   First-trigger initial history backfill (Matrix backward paging)
     enrichment/                 Post-persistence enrichment worker pool (downloads, link previews, reply resolution)
     youtube/                    YouTube video understanding: URL parser (url.ts), yt-dlp subprocess wrapper (ytdlp.ts), config resolution (config.ts)
+    yotsuba/                    4chan support: URL recognition, API types + config resolver, comment HTML→text, thread graph, post-view engine, rendering vocabulary, HTTP client (§7f)
+    net/                        Shared HTTP utilities: PacedLimiter (paced-limiter.ts) — generic paced request limiter with interactive/background priority classes
     captioning/                 Caption worker pool, describeMedia() (image/video/audio), per-modality inference clients, animated image detection + conversion
     summarization/              Hierarchical summarization worker pool + condensation evaluator (§9b)
     diary/                      Diary worker pool, dictated header, recent-memory window (§9c)
@@ -345,6 +347,7 @@ seeding?:           { mode?,             // "reconcile" (default) | "first-run" 
 
 - `character_card` → the `character_card_create` / `character_card_read` / `character_card_edit` tools
 - `danbooru` → the `danbooru` search tool
+- `yotsuba` → the `yotsuba` 4chan browsing tool (Phase 1 foundations in `src/yotsuba/`; Phase 2 enrichment and Phase 3 tool pending; see §7f)
 
 The feature → tools mapping is a single source of truth (`FEATURE_TOOLS` in `src/app.ts`). At startup `gatedOutFeatureTools(config.features)` collects every tool whose owning feature is not strictly `true`, and those names are folded into the same `disabledTools` set that `agent.disabled_tools` populates. `buildSessionTools` applies that combined set in its one tool-list filter, so a tool excluded by **either** mechanism (an explicit `disabled_tools` entry **or** an off feature gate) is unavailable — and because the gate lives in that single global filter (not in any per-session-type allowlist), it applies uniformly to chat and every generation session type. Turning a flag on (e.g. `[features]\ncharacter_card = true`) re-registers its tools, still subject to `disabled_tools`.
 
@@ -1886,6 +1889,38 @@ Bounded by `MAX_COMPACT_MEDIA_CAPTION` (200 chars); absent optional fields are o
 - `thumbnail = true` — download and store the video thumbnail as a `preview_media` asset
 
 Cross-field validation at app wiring: `[youtube.enrichment].enabled = true` requires `[youtube].enabled = true`; `[youtube.tool]` windowing cross-fields (Phase 3+).
+
+---
+
+## 7f. 4chan (Yotsuba) Support — Phase 1 Foundations
+
+The `src/yotsuba/` module provides the shared foundations for 4chan support — URL recognition, API types, comment parsing, thread graph, post-view engine, rendering vocabulary, and the HTTP client. Phases 2 and 3 (enrichment stage and tool, respectively) build on these; see `spec/YOTSUBA-SUPPORT.md` for their design.
+
+**Code name.** "Yotsuba" is the internal and code name; prose-facing surfaces say "4chan". No identifier in the codebase uses "fourchan" or "4chan" — all symbols, filenames, config keys, and log labels use "yotsuba".
+
+**Feature gate.** `[features].yotsuba = true` (default off) gates both the enrichment stage (Phase 2) and the tool (Phase 3). The gate wires through `FEATURE_TOOLS` in `src/app.ts` (`yotsuba → ["yotsuba"]`). `createYotsubaSubsystem()` (also in `app.ts`) returns `undefined` when the feature is off; downstream phases call it and skip initialization on `undefined`.
+
+**`src/net/paced-limiter.ts` — PacedLimiter.** A generic paced request limiter extracted from `DanbooruRateLimiter`. Adds two priority classes (`interactive` / `background`) backed by separate FIFO queues drained in order: interactive first, background second, unclassed (Danbooru compat) last. The core algorithm is unchanged: start instants are reserved **synchronously** at acquire time (concurrent acquirers claim distinct slots, never start at once), and slot release uses **direct handoff** (the freed slot is transferred to the head waiter without decrementing the in-flight count, so no fresh caller can double-grant it). `DanbooruRateLimiter` now `extends PacedLimiter` for full backward compatibility; its unclassed `run()` calls travel the unclassed queue path.
+
+**`src/yotsuba/url.ts` — URL recognition.** `YOTSUBA_BASE_HOSTS` (`boards.4chan.org`, `boards.4channel.org`, `4chan.org`, `www.4chan.org`). `isYotsubaHost(hostname, extras)` base-domain matching with subdomain tolerance and lookalike rejection. `parseYotsubaUrl(input, extras, siteBase)` returns `ParsedYotsubaRef | null` — a distributive union `Omit<YotsubaThreadRef, "bodyIndex"> | Omit<YotsubaBoardRef, "bodyIndex">` that preserves the `kind` discriminant for narrowing; a `#p` anchor equal to the thread number is normalized away. `extractYotsubaRefs(bodyText)` scans a message body for URLs, deduping by `(board, threadNo, postNo)`. `stripYotsubaUrls(bodyText)` removes all recognized 4chan URLs (for Synapse preview suppression). `parseToolInput(input)` accepts bare numbers, `>>N`, `>>>/b/N`, and `/b/` board codes for tool call tolerance.
+
+**`src/yotsuba/types.ts` — API and persisted types.** Tolerant API types (`ApiBoard`, `ApiPost`, `ApiThread`, `ApiCatalogPage`, `ApiBoardPage`). Persisted payload types (`YotsubaPostNode`, `YotsubaPostFile`, `YotsubaPreviewPayload`, `YotsubaPreviewThread`). Raw and resolved config shapes (`RawYotsubaConfig`, `ResolvedYotsubaConfig` with sub-structs for enrichment, preview, and tool). `resolveYotsubaConfig(raw?)` applies defaults (API base `https://a.4cdn.org`, media base `https://i.4cdn.org`, 10 s freshness, 1000 ms pacing, etc.).
+
+**`src/yotsuba/markup.ts` — Comment HTML → plain text.** `convertComment(html)` converts the `com` field from the 4chan API to plain text plus `{ quotes, deadQuotes?, crossQuotes? }`. Tag-by-tag conversion: `<br>` → newline, `<wbr>` removed, same-thread quotelinks (`href="#p123"`) → `>>N` + collected in `quotes`, dead quotelinks → `>>N` + collected in `deadQuotes`, cross-thread quotelinks (`href="/b/thread/456"`) → `>>>/b/456` + collected in `crossQuotes`, greentext → text preserved with `>`, spoilers → `[spoiler]…[/spoiler]`, prettyprint code → fenced ` ``` `, mod text → `[mod: …]`, entities decoded, all other tags stripped. `annotateQuotes(text, shownNos, opNo, deadQuoteNos)` adds render-time annotations: `(OP)`, `(not shown)`, `(deleted)`, `(other thread)`.
+
+**`src/yotsuba/graph.ts` — Thread graph.** `buildThreadGraph(nodes)` assigns sequential `index` values, validates same-thread quotes (only existing posts), builds `backlinks` (reverse map). Helpers: `quotedPosts`, `repliesTo`, `latestReplies` (skips OP), `repliedToPosts`, `mostRepliedPosts` (threshold-based, not a hard cap; excludes OP), `searchPosts` (AND over term array), `ancestorChain` (follows first quote per post, max depth 3), `gapBetween(fromIndex, toIndex)`, `gapToEnd(lastIndex)` — all take 0-based thread indices, not post numbers.
+
+**`src/yotsuba/view.ts` — Post-view engine.** Pure and deterministic: given a `ThreadGraph`, a `Slot[]`, a `ViewBudget`, and a token-cost function, `runView()` returns a `ViewResult` with placed posts in thread order interleaved with `GapMarker` values and trailing-gap metadata. Phase 1 deduplicates slots by post number (highest-precedence role wins). Phase 2 sorts by priority, then thread index. Phase 3 places posts: pinned slots always placed (never budget-limited); non-pinned posts subject to `maxPosts` and `maxTextTokens`; `excerptFallback: true` retries a `full` slot as `excerpt` when it doesn't fit; `contiguous: true` stops at the first non-fitting non-pinned post. Phase 4 allocates `maxFiles` attachment budget. Phase 5 emits items in thread order. Phase 6 computes trailing gap. `ROLE_PRECEDENCE` order: `linked > op > replied_to > reply > most_replied > match > latest > context`.
+
+**`src/yotsuba/format.ts` — Rendering vocabulary.** Shared XML helpers used by both the enrichment context renderer (Phase 2) and the tool (Phase 3): `threadOpenTag`, `postElement`, `fileElement`, `omittedElement`, `backlinksLine`, `renderViewContent` (assembles a full view's inner XML from a `ViewResult`), `compactLine` (flat text for compact zone), `ftsDescription` (flat text for FTS indexing), `boardLabel`.
+
+**`src/yotsuba/client.ts` — HTTP client.** `YotsubaClient` with two `PacedLimiter` instances (API lane: 1000 ms / 1 in-flight; media lane: 250 ms / 2 in-flight). In-memory cache: up to 64 entries / 32 MiB, LRU eviction by insertion order. Freshness windows: boards 24 h; thread/catalog/page 10 s. Conditional GET with `If-Modified-Since` / 304. Negative cache for 404 (10 min TTL). Single-flight via a `Map<path, Promise>` registry: concurrent requests for the same path coalesce. Public API: `boards(cls?)`, `catalog(board, cls?)`, `page(board, n, cls?)`, `thread(board, no, cls?)` (null on 404), `fetchFile(board, fileRef, cls?)`. Factory: `YotsubaClient.create(config, httpProxyUrl?, fetchClient?)`.
+
+**`src/media/storyboard.ts` — Storyboard helper.** `buildStoryboard(inputPath, opts?)` produces a 2×2 JPEG tile sampling frames at 12%, 37%, 62%, 87% of a video's duration. Uses `loadFfmpeg()` and `ffprobe` from `src/media/video.ts`. Multi-input ffmpeg approach: four separate `-ss` inputs, complex filtergraph scales each cell to `cellPx × cellPx` (with black padding to preserve aspect), tiles 2×2. Returns null when ffmpeg is absent, ffprobe fails, or the command times out.
+
+**Config schema.** `FeaturesSchema` gains `yotsuba: Type.Optional(Type.Boolean())`. A `YotsubaSchema` TypeBox block covers `[yotsuba]`, `[yotsuba.enrichment]`, `[yotsuba.preview]`, and `[yotsuba.tool]`. `AppConfigSchema` gains `yotsuba: Type.Optional(YotsubaSchema)`. `config/00-defaults.toml` documents all defaults (the resolved values for every omitted key). Cross-field validation in `app.ts`: `page_tokens <= page_tokens_max`, `catalog_default_limit <= catalog_max_limit`, HTTPS `api_base`/`media_base`/`site_base`, bare-hostname `extra_hosts`.
+
+**Skill.** `templates/features/yotsuba/skills/yotsuba/SKILL.md` (tools: `["yotsuba"]`). Trigger-first description: fires on boards.4chan.org links, or requests mentioning boards or generals.
 
 ---
 
