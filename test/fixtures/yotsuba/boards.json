@@ -1,0 +1,201 @@
+{
+  "boards": [
+    {
+      "board": "a",
+      "title": "Anime & Manga",
+      "ws_board": 1,
+      "per_page": 15,
+      "pages": 10,
+      "max_filesize": 4194304,
+      "max_webm_filesize": 4194304,
+      "max_comment_chars": 2000,
+      "max_webm_duration": 120,
+      "bump_limit": 500,
+      "image_limit": 300,
+      "cooldowns": {
+        "threads": 600,
+        "replies": 60,
+        "images": 60
+      },
+      "meta_description": "&quot;/a/ - Anime &amp; Manga&quot; is 4chan's imageboard dedicated to the discussion of Japanese animation and manga.",
+      "spoilers": 1,
+      "custom_spoilers": 1,
+      "is_archived": 1
+    },
+    {
+      "board": "biz",
+      "title": "Business & Finance",
+      "ws_board": 1,
+      "per_page": 20,
+      "pages": 10,
+      "max_filesize": 4194304,
+      "max_webm_filesize": 4194304,
+      "max_comment_chars": 2000,
+      "max_webm_duration": 120,
+      "bump_limit": 310,
+      "image_limit": 150,
+      "cooldowns": {
+        "threads": 600,
+        "replies": 60,
+        "images": 60
+      },
+      "meta_description": "&quot;/biz/ - Business &amp; Finance&quot; is 4chan's imageboard for the discussion of business and finance, and cryptocurrencies such as Bitcoin and Dogecoin.",
+      "user_ids": 1,
+      "is_archived": 1
+    },
+    {
+      "board": "g",
+      "title": "Technology",
+      "ws_board": 1,
+      "per_page": 15,
+      "pages": 10,
+      "max_filesize": 4194304,
+      "max_webm_filesize": 4194304,
+      "max_comment_chars": 2000,
+      "max_webm_duration": 120,
+      "bump_limit": 310,
+      "image_limit": 150,
+      "cooldowns": {
+        "threads": 600,
+        "replies": 60,
+        "images": 60
+      },
+      "meta_description": "&quot;/g/ - Technology&quot; is 4chan's imageboard for discussing computer hardware and software, programming, and general technology.",
+      "is_archived": 1,
+      "code_tags": 1
+    },
+    {
+      "board": "po",
+      "title": "Papercraft & Origami",
+      "ws_board": 1,
+      "per_page": 15,
+      "pages": 10,
+      "max_filesize": 8388608,
+      "max_webm_filesize": 4194304,
+      "max_comment_chars": 2000,
+      "max_webm_duration": 120,
+      "bump_limit": 310,
+      "image_limit": 150,
+      "cooldowns": {
+        "threads": 600,
+        "replies": 60,
+        "images": 60
+      },
+      "meta_description": "&quot;/po/ - Papercraft &amp; Origami&quot; is 4chan's imageboard for posting papercraft and origami templates and instructions.",
+      "is_archived": 1
+    },
+    {
+      "board": "pol",
+      "title": "Politically Incorrect",
+      "ws_board": 0,
+      "per_page": 20,
+      "pages": 10,
+      "max_filesize": 4194304,
+      "max_webm_filesize": 4194304,
+      "max_comment_chars": 2000,
+      "max_webm_duration": 120,
+      "bump_limit": 300,
+      "image_limit": 300,
+      "cooldowns": {
+        "threads": 90,
+        "replies": 30,
+        "images": 30
+      },
+      "meta_description": "&quot;/pol/ - Politically Incorrect&quot; is 4chan's board for discussing and debating politics and current events.",
+      "user_ids": 1,
+      "is_archived": 1,
+      "country_flags": 1,
+      "board_flags": {
+        "AC": "Anarcho-Capitalist",
+        "AN": "Anarchist",
+        "BL": "Black Nationalist",
+        "CF": "Confederate",
+        "CM": "Communist",
+        "CT": "Catalonia",
+        "DM": "Democrat",
+        "EU": "European",
+        "FC": "Fascist",
+        "GN": "Gadsden",
+        "GY": "Gay",
+        "JH": "Jihadi",
+        "KN": "Kekistani",
+        "MF": "Muslim",
+        "NB": "National Bolshevik",
+        "NT": "NATO",
+        "NZ": "Nazi",
+        "PC": "Hippie",
+        "PR": "Pirate",
+        "RE": "Republican",
+        "MZ": "Task Force Z",
+        "TM": "Templar",
+        "TR": "Tree Hugger",
+        "UN": "United Nations",
+        "WP": "White Supremacist"
+      }
+    },
+    {
+      "board": "sci",
+      "title": "Science & Math",
+      "ws_board": 1,
+      "per_page": 15,
+      "pages": 10,
+      "max_filesize": 4194304,
+      "max_webm_filesize": 4194304,
+      "max_comment_chars": 2000,
+      "max_webm_duration": 120,
+      "bump_limit": 310,
+      "image_limit": 250,
+      "cooldowns": {
+        "threads": 600,
+        "replies": 60,
+        "images": 60
+      },
+      "meta_description": "&quot;/sci/ - Science &amp; Math&quot; is 4chan's board for the discussion of science and math.",
+      "is_archived": 1,
+      "math_tags": 1
+    },
+    {
+      "board": "v",
+      "title": "Video Games",
+      "ws_board": 1,
+      "per_page": 20,
+      "pages": 10,
+      "max_filesize": 4194304,
+      "max_webm_filesize": 4194304,
+      "max_comment_chars": 2000,
+      "max_webm_duration": 120,
+      "bump_limit": 500,
+      "image_limit": 300,
+      "cooldowns": {
+        "threads": 600,
+        "replies": 60,
+        "images": 60
+      },
+      "meta_description": "&quot;/v/ - Video Games&quot; is 4chan's imageboard dedicated to the discussion of PC and console video games.",
+      "spoilers": 1,
+      "custom_spoilers": 1,
+      "is_archived": 1
+    },
+    {
+      "board": "wsg",
+      "title": "Worksafe GIF",
+      "ws_board": 1,
+      "per_page": 15,
+      "pages": 10,
+      "max_filesize": 6291456,
+      "max_webm_filesize": 6291456,
+      "max_comment_chars": 2000,
+      "max_webm_duration": 400,
+      "bump_limit": 310,
+      "image_limit": 150,
+      "cooldowns": {
+        "threads": 600,
+        "replies": 60,
+        "images": 60
+      },
+      "meta_description": "&quot;/wsg/ - Worksafe GIF&quot; is 4chan's imageboard dedicated to sharing worksafe animated GIFs and WEBMs.",
+      "is_archived": 1,
+      "webm_audio": 1
+    }
+  ]
+}
