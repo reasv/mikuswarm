@@ -916,3 +916,32 @@ test("headline text capped at headlineChars with ellipsis marker", () => {
   // Must not contain the full 1000-char string
   assert.ok(!out.includes("a".repeat(201)), "text must not exceed cap");
 });
+
+test("upgraded post link: linked post carries the replies line; cross-thread refs annotated once", () => {
+  const payload: YotsubaPreviewPayload = {
+    v: 1, kind: "thread", board: "g", boardTitle: "Technology", asOf: AS_OF_MS,
+    threadNo: 500, headlineNo: 510, linkedNo: 510, postCount: 40,
+    posts: [
+      { no: 510, index: 10, role: "linked", time: AS_OF_MS - 60000, text: "see >>>/v/777 for context", quotes: [], crossQuotes: [">>>/v/777"],
+        replies: 5, replyNos: [511, 512, 520, 530, 539] },
+      { no: 511, index: 11, role: "reply", time: AS_OF_MS - 50000, text: ">>510\nnice", quotes: [510], replies: 0 },
+    ],
+    upgrade: { triggerGroupId: "tg_bl", includedNos: [510, 511], processedAssetIds: [], headlineChars: 800 },
+  };
+  const out = renderRichMessage(chatEvent({ linkPreviews: [yotsubaPreview("https://boards.4chan.org/g/thread/500#p510", payload)] }));
+  assert.match(out, /\[5 replies: &gt;&gt;511 shown; 4 more not shown\]/);
+  assert.equal((out.match(/&gt;&gt;&gt;\/v\/777/g) ?? []).length, 1);
+  assert.match(out, /&gt;&gt;&gt;\/v\/777 \(other thread\)/);
+});
+
+test("ambient headline file renders as a plain stored file (no auto=off)", () => {
+  const assetId = "amb_file";
+  const payload: YotsubaPreviewPayload = {
+    v: 1, kind: "thread", board: "g", asOf: AS_OF_MS, threadNo: 600, headlineNo: 600, postCount: 2,
+    posts: [{ no: 600, index: 0, role: "op", time: AS_OF_MS - 60000, text: "op", quotes: [], replies: 0,
+      file: { name: "pic", ext: ".png", tim: 7, assetId } }],
+  };
+  const out = renderRichMessage(chatEvent({ linkPreviews: [yotsubaPreview("https://boards.4chan.org/g/thread/600", payload, [imageAsset(assetId, "msg-attach/amb.png")])] }));
+  assert.match(out, /path="msg-attach\/amb.png"/);
+  assert.doesNotMatch(out, /auto="off"/);
+});

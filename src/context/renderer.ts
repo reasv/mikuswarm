@@ -12,7 +12,7 @@ import { YOUTUBE_SOURCE_KIND, formatDuration, formatChapterTimestamp, formatUplo
 import type { YouTubePreviewPayload } from "../youtube/payload.js";
 import { YOTSUBA_SOURCE_KIND } from "../yotsuba/types.js";
 import type { YotsubaPreviewPayload, YotsubaPostNode, YotsubaPostFile } from "../yotsuba/types.js";
-import { fileElement, omittedElement, threadOpenTag, boardLabel } from "../yotsuba/format.js";
+import { backlinksLine, fileElement, omittedElement, threadOpenTag, boardLabel } from "../yotsuba/format.js";
 import type { FileRenderInfo } from "../yotsuba/format.js";
 import { escapeAttr, escapeXml } from "./xml.js";
 import { compactAgentTimestamp, formatAgentTimestamp } from "../time/index.js";
@@ -784,6 +784,10 @@ function renderYotsuba4chanThread(
     parts.push(renderYotsubaPostNode(
       post, shownNos, opNo, assetById, processedIds, preview,
       isHeadline ? headlineCharCap : undefined,
+      upgrade !== undefined,
+      // §5.4: the replies line belongs to the post the view is about, i.e. the
+      // linked post of an upgraded post-link rendering.
+      upgrade !== undefined && post.role === "linked",
     ));
     lastIndex = post.index;
     lastPost = post;
@@ -819,6 +823,10 @@ function renderYotsubaPostNode(
   preview: LinkPreviewMeta,
   /** When set, cap the post text at this many characters and append an ellipsis note. */
   charCap?: number,
+  /** Trigger (upgraded) rendering: unprocessed downloaded files render `auto="off"`. */
+  upgraded = false,
+  /** Append the "[N replies: … shown; M more not shown]" line from `replyNos`. */
+  showBacklinks = false,
 ): string {
   const attrs: string[] = [];
   attrs.push(`no="${post.no}"`);
@@ -841,11 +849,11 @@ function renderYotsubaPostNode(
     : 0;
   const deadNos = new Set(post.deadQuotes ?? []);
   const annotated = annotateYotsubaQuotes(rawText, post.quotes, shownNos, opNo, deadNos);
-  // Cross-board quotes.
-  let textWithCross = annotated;
-  if (post.crossQuotes?.length) {
-    textWithCross = textWithCross + "\n" + post.crossQuotes.join(" ");
-  }
+  // Cross-thread quotes are already inline in the converted text (markup.ts
+  // writes `>>>/b/N` in place); annotate them there instead of repeating them.
+  let textWithCross = post.crossQuotes?.length
+    ? annotated.replace(/>>>\/[a-z0-9]{1,10}\/\d*/g, (m) => `${m} (other thread)`)
+    : annotated;
   if (overflow > 0) {
     textWithCross = textWithCross + `\n[… ${overflow} more characters]`;
   }
@@ -853,7 +861,11 @@ function renderYotsubaPostNode(
 
   // File element.
   if (post.file) {
-    parts.push(renderYotsubaFileNode(post.file, assetById, processedIds));
+    parts.push(renderYotsubaFileNode(post.file, assetById, processedIds, upgraded));
+  }
+
+  if (showBacklinks && post.replyNos?.length) {
+    parts.push(backlinksLine(post.replyNos, shownNos));
   }
 
   parts.push("</post>");
@@ -864,6 +876,7 @@ function renderYotsubaFileNode(
   file: YotsubaPostFile,
   assetById: Map<string, import("../types.js").AttachmentMeta>,
   processedIds: ReadonlySet<string>,
+  upgraded = false,
 ): string {
   if (file.deleted) {
     const info: FileRenderInfo = {
@@ -881,7 +894,9 @@ function renderYotsubaFileNode(
   let status: FileRenderInfo["status"];
   if (!assetId) {
     status = "not shown";
-  } else if (processedIds.has(assetId) || (sbAssetId && processedIds.has(sbAssetId))) {
+  } else if (!upgraded || processedIds.has(assetId) || (sbAssetId && processedIds.has(sbAssetId))) {
+    // Ambient: the headline file follows the normal caption rules (spec §6.2),
+    // so it is a plain stored file. Upgraded: processed files are "shown".
     status = "shown";
   } else {
     status = "stored";
