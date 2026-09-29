@@ -121,6 +121,7 @@ import {
   IRC_TERMINOLOGY,
   type ToolUsageRecord,
 } from "./tools/index.js";
+import { createYotsubaTool } from "./tools/yotsuba.js";
 import { createNoReplyTool } from "./tools/no-reply.js";
 import { SauceNaoRateLimiter } from "./saucenao/rate-limiter.js";
 import { setEgressGuardEnabled } from "./tools/ssrf.js";
@@ -315,6 +316,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   if (yotsubaCfg.tool.catalogDefaultLimit > yotsubaCfg.tool.catalogMaxLimit) {
     throw new Error(
       `yotsuba.tool: catalog_default_limit (${yotsubaCfg.tool.catalogDefaultLimit}) must be <= catalog_max_limit (${yotsubaCfg.tool.catalogMaxLimit})`,
+    );
+  }
+  const globalResultMaxTokens = config.agent?.tools?.result_max_tokens;
+  if (globalResultMaxTokens != null && globalResultMaxTokens > 0 &&
+      yotsubaCfg.tool.pageTokensMax > globalResultMaxTokens) {
+    throw new Error(
+      `yotsuba.tool: page_tokens_max (${yotsubaCfg.tool.pageTokensMax}) must be <= agent.tools.result_max_tokens (${globalResultMaxTokens}) — otherwise thread pages will always be truncated`,
     );
   }
   // Bases must be https:// URLs (when set).
@@ -5177,7 +5185,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       ...(sessionProvider.setProfile && target.accountId
         ? [createSetProfileTool({ provider: sessionProvider, accountId: target.accountId, workspaceRoot: sessionWsRoot })]
         : []),
-      createWebFetchTool(),
+      createWebFetchTool({
+        yotsubaEnabled: config.features?.yotsuba === true,
+        yotsubaExtraHosts: yotsubaSubsystem?.config.extraHosts,
+      }),
       createWebSearchTool(),
       // Per-session browser tool (§10a): use the per-agent session in agents mode
       // or the global legacy session. config.browser provides connection settings /
@@ -5375,6 +5386,22 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         ? [createYoutubeFetchTool({
             workspaceRoot: sessionWsRoot,
             config: ytConfig.tool,
+          })]
+        : []),
+      // yotsuba: 4chan browsing tool (spec/YOTSUBA-SUPPORT.md §7, §10).
+      // Gated on the feature flag and subsystem availability.
+      ...(yotsubaSubsystem && config.features?.yotsuba === true
+        ? [createYotsubaTool({
+            client: yotsubaSubsystem.client,
+            config: yotsubaSubsystem.config,
+            workspaceRoot: sessionWsRoot,
+            modelHasVision: replyModelSeesImages,
+            maxImageBytes: resolveReadImageMaxBytes(config, replyModelConfig.image_input_bytes),
+            inferenceImageOptions,
+            imageCaptionClient: resolveAgentCaptionClient(sessionAgentName, "image"),
+            agentSessionId: sessionId,
+            recordToolUsage,
+            fetchClient,
           })]
         : []),
       createUserProfileReadTool({

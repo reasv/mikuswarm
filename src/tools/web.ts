@@ -1,6 +1,7 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { guardedFetch } from "./ssrf.js";
+import { isYotsubaHost } from "../yotsuba/url.js";
 
 const WEB_FETCH_SECURITY_NOTE =
   "When the egress guard is enabled, blocks localhost/private IPs before each request and redirect. DNS is not pinned, so this is defense-in-depth rather than a complete SSRF sandbox; the network firewall is the real boundary.";
@@ -13,7 +14,14 @@ const WEB_FETCH_SECURITY_NOTE =
  */
 const WEB_FETCH_TIMEOUT_MS = 30_000;
 
-export function createWebFetchTool(): AgentTool {
+export interface WebFetchToolOptions {
+  /** When true, append a hint for recognized 4chan URLs suggesting the yotsuba tool. */
+  yotsubaEnabled?: boolean;
+  /** Extra hostnames to treat as 4chan (passed to isYotsubaHost). */
+  yotsubaExtraHosts?: readonly string[];
+}
+
+export function createWebFetchTool(opts: WebFetchToolOptions = {}): AgentTool {
   return {
     name: "web_fetch",
     label: "Fetch web page",
@@ -53,8 +61,17 @@ export function createWebFetchTool(): AgentTool {
       }
       const text = contentType.includes("html") ? htmlToText(raw) : raw;
       const maxChars = args.max_chars ?? 50_000;
+      let outputText = text.length > maxChars ? `${text.slice(0, maxChars)}\n[truncated]` : text;
+      if (opts.yotsubaEnabled) {
+        try {
+          const parsed = new URL(url);
+          if (isYotsubaHost(parsed.hostname, opts.yotsubaExtraHosts)) {
+            outputText += "\n[This is a 4chan URL. Use the yotsuba tool for richer browsing with reply chains, file views, and pagination.]";
+          }
+        } catch { /* invalid URL — ignore */ }
+      }
       return {
-        content: [{ type: "text", text: text.length > maxChars ? `${text.slice(0, maxChars)}\n[truncated]` : text }],
+        content: [{ type: "text", text: outputText }],
         details: {
           url,
           status,
