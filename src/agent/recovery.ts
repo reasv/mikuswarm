@@ -527,8 +527,8 @@ export interface ManualResumeDeps {
    * next queued trigger, mirroring `launchSession`'s `.finally` (app-side).
    */
   releaseTimelineSlot: (timelineKey: string) => void;
-  /** Bot user id for a Matrix account (config.matrix.accounts[id].user_id). */
-  selfUserIdForAccount: (accountId: string) => string | undefined;
+  /** Bot user id for a provider account (the provider's post-start `getSelf`). */
+  selfUserIdForAccount: (provider: string, accountId: string) => string | undefined;
   /** One resume attempt (app.ts `resumeSessionRun`, attempt 0). */
   runAttempt: (
     record: AgentSessionRecord,
@@ -635,7 +635,7 @@ export function createManualResumeSession(
         };
       }
       const parsed = parseTimelineKey(row.timeline_key);
-      const selfUserId = parsed ? deps.selfUserIdForAccount(parsed.accountId) : undefined;
+      const selfUserId = parsed ? deps.selfUserIdForAccount(parsed.provider, parsed.accountId) : undefined;
       if (!parsed || !selfUserId) {
         return {
           ok: false,

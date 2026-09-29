@@ -684,6 +684,9 @@ export class AgentSessionFactory {
         // and always receive undefined → fits skipped, preserving their behavior.
         getObservedContextTokens: () =>
           ctxCounter.seenMsgs < 0 ? undefined : ctxCounter.running,
+        // One pass per request + out-of-band recovery (ARCHITECTURE.md §8a).
+        primaryAttemptsPerRequest: recovery?.llm_primary_attempts_per_request,
+        backgroundProbe: true,
       });
       builtFallbacks.set(logicalId, built);
       return built;

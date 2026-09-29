@@ -253,6 +253,14 @@ llm_request_max_wait_ms = 120000    # interactive-class wall-clock budget (~the 
 llm_unhealthy_threshold = 3
 llm_probe_backoff_base_ms = 10000
 llm_probe_backoff_max_ms = 300000
+# Agent-loop models re-test out of band: while unhealthy, the scheduler probes
+# them with a tiny synthetic request on the backoff above, and no live request is
+# routed to an unhealthy model while any other chain member can serve.
+# A model with a fallback chain: within ONE request the head gets this many
+# attempts (one retry absorbs a blip), then the request moves down the chain,
+# one attempt per remaining member, with no backoff between members. A zero-token
+# attempt cut off by llm_request_max_wait_ms counts as a failure of its model.
+llm_primary_attempts_per_request = 2
 # Optional static phrase sent to the room when a user-triggered session gives
 # up (parks failed-resumable / build-wait timeout). Empty = silent (default).
 # The actual error is never included. Proactive/synthetic sessions never send it.

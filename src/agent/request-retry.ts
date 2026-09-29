@@ -46,6 +46,43 @@ import type { PriorityClass } from "./scheduler.js";
 // unconditional invariant).
 // =============================================================================
 
+/**
+ * Abort reason Layer 0 attaches when the wall-clock budget cuts short an
+ * attempt that was IN FLIGHT and had produced zero tokens (a stall). The
+ * admission wrapper reads it off the attempt signal and counts the attempt as an
+ * ENVIRONMENTAL failure of that model: a silent hang is an outage, not a neutral
+ * teardown. The caller's own abort (drain / Stop) never carries it.
+ */
+export const LLM_STALL_ABORT_REASON = "mikuswarm:llm-stall";
+
+/** True when `signal` was aborted by Layer 0's wall-clock budget (a stall). */
+export function isStallAbort(signal: AbortSignal | undefined): boolean {
+  return signal?.aborted === true && signal.reason === LLM_STALL_ABORT_REASON;
+}
+
+/**
+ * Per-REQUEST attempt bookkeeping shared between Layer 0 and the fallback
+ * resolver (ARCHITECTURE.md §8a "One pass per request"). Layer 0 creates one per request and
+ * threads it to every attempt under {@link REQUEST_ATTEMPT_STATE} on the stream
+ * options; the resolver records each dispatch per failure domain so one request
+ * walks the chain instead of re-hitting a member it already watched fail, and
+ * flags when a failure will move to a different member (no local backoff then).
+ */
+export interface RequestAttemptState {
+  /** Dispatches per model health key in the current pass over the chain. */
+  attempts: Map<string, number>;
+  /** Set at dispatch: should THIS attempt fail, the next goes to another member. */
+  failoverOnFailure: boolean;
+}
+
+export const REQUEST_ATTEMPT_STATE: unique symbol = Symbol("mikuswarm.requestAttemptState");
+
+/** Read the per-request attempt state off stream options (undefined outside Layer 0). */
+export function getRequestAttemptState(streamOptions: unknown): RequestAttemptState | undefined {
+  if (!streamOptions || typeof streamOptions !== "object") return undefined;
+  return (streamOptions as { [REQUEST_ATTEMPT_STATE]?: RequestAttemptState })[REQUEST_ATTEMPT_STATE];
+}
+
 export interface RequestRetryOptions {
   /**
    * Wall-clock budget for environmental retries (spec LLM-FAILURE-HANDLING
@@ -552,6 +589,8 @@ export function withRequestRetry(
         // realistic per-user model set degrades more times than this.
         let budgetReselects = 0;
         const maxBudgetReselects = 16;
+        // One per request: the fallback resolver's per-request pass over the chain.
+        const attemptState: RequestAttemptState = { attempts: new Map(), failoverOnFailure: false };
         for (let attempt = 0; ; attempt++) {
           // Reset per-attempt served-model tracking so a stale value from a
           // prior attempt is never read at this attempt's settle (§ served-model
@@ -573,13 +612,16 @@ export function withRequestRetry(
           // (the one wait the spec sanctioned cutting short).
           const attemptCtrl = new AbortController();
           const onCallerAbort = () => attemptCtrl.abort();
-          const onBudgetAbort = () => attemptCtrl.abort();
+          // The budget's abort carries the stall marker: it only ever reaches an
+          // attempt that has produced no tokens (see below), so the admission
+          // wrapper counts an in-flight one as a failure of its model.
+          const onBudgetAbort = () => attemptCtrl.abort(LLM_STALL_ABORT_REASON);
           if (callerSignal) {
             if (callerSignal.aborted) attemptCtrl.abort();
             else callerSignal.addEventListener("abort", onCallerAbort, { once: true });
           }
           if (budgetSignal) {
-            if (budgetSignal.aborted) attemptCtrl.abort();
+            if (budgetSignal.aborted) attemptCtrl.abort(LLM_STALL_ABORT_REASON);
             else budgetSignal.addEventListener("abort", onBudgetAbort, { once: true });
           }
           const detachBudget = () => {
@@ -588,9 +630,11 @@ export function withRequestRetry(
           const detachCaller = () => {
             callerSignal?.removeEventListener("abort", onCallerAbort);
           };
+          attemptState.failoverOnFailure = false;
           const attemptOptions = {
             ...((streamOptions as object | undefined) ?? {}),
             signal: attemptCtrl.signal,
+            [REQUEST_ATTEMPT_STATE]: attemptState,
           } as typeof streamOptions;
 
           try {
@@ -769,7 +813,13 @@ export function withRequestRetry(
             // Local backoff applies only while the admission queue is NOT the
             // wait point (§4.3) — an unhealthy model / throttled group already
             // paces re-admission, and double-waiting would slow recovery.
-            let delay = ctx.isQueueWaitPoint?.() ? 0 : backoffDelayMs(attempt, options.backoffBaseMs, options.backoffMaxMs);
+            // Nor when the next attempt fails over to a DIFFERENT chain member:
+            // backoff paces re-hitting the same upstream, and moving on to a
+            // working member must never wait (ARCHITECTURE.md §8a "One pass per request").
+            let delay =
+              attemptState.failoverOnFailure || ctx.isQueueWaitPoint?.()
+                ? 0
+                : backoffDelayMs(attempt, options.backoffBaseMs, options.backoffMaxMs);
             if (Number.isFinite(deadline)) delay = Math.min(delay, Math.max(0, deadline - Date.now()));
             try {
               await sleep(delay, sleepSignal);

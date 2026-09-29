@@ -6,8 +6,10 @@ import {
   modelHealthKey,
   withSchedulerAdmission,
   type LlmScheduler,
+  type ModelProber,
   type PriorityClass,
 } from "./scheduler.js";
+import { extractStatus, getRequestAttemptState } from "./request-retry.js";
 
 // =============================================================================
 // Transparent model fallback (spec MODEL-FALLBACK).
@@ -24,8 +26,25 @@ import {
 // per-candidate dispatch pipelines), and the returned `streamFn` chooses one
 // member per attempt. It builds NO new circuit breaker — it consumes §8a's
 // per-model health (the breaker) via the two read-only methods `modelHealth` /
-// `isProbeDue` and adds model SELECTION in front of it plus the canary policy.
+// `isProbeDue` and adds model SELECTION in front of it plus the recovery policy.
+//
+// Two rules keep a longer chain from ever meaning MORE downtime (ARCHITECTURE.md §8a):
+//   - One pass per request: within a Layer-0 request the head gets
+//     `primaryAttemptsPerRequest` attempts (one retry absorbs a blip) and every
+//     other member ONE; a member that failed is not re-hit while an untried
+//     member remains, and a failure that moves to another member skips the
+//     local backoff. Only when every usable member has failed does a new pass
+//     start.
+//   - Out-of-band recovery: a model with a registered background prober is
+//     re-tested by the scheduler with a tiny synthetic request; live traffic is
+//     never routed to it as a canary while any other member can serve.
 // =============================================================================
+
+/** Default attempts on the chain head within one request before failing over (§8a one pass per request). */
+export const DEFAULT_PRIMARY_ATTEMPTS_PER_REQUEST = 2;
+
+/** Output cap of the background probe request (§8a background probes) — enough for any model's minimum. */
+const PROBE_MAX_TOKENS = 64;
 
 type ModelConfig = AppConfig["models"]["default"];
 
@@ -47,6 +66,8 @@ export type FallbackReason =
    * a larger downstream member serves (spec PER-MEMBER-CONTEXT-FITS §4).
    */
   | "context-fallback"
+  /** Head healthy but it already used its attempts in THIS request (§8a one pass per request). */
+  | "failover"
   | "all-unhealthy";
 
 export interface BuildModelFallbackOptions {
@@ -109,6 +130,20 @@ export interface BuildModelFallbackOptions {
    * fits skipped).
    */
   getObservedContextTokens?: () => number | undefined;
+  /**
+   * Attempts on the chain head within one Layer-0 request before that request
+   * fails over (§8a one pass per request; `recovery.llm_primary_attempts_per_request`). Every
+   * other member gets one attempt per pass. Default
+   * {@link DEFAULT_PRIMARY_ATTEMPTS_PER_REQUEST}.
+   */
+  primaryAttemptsPerRequest?: number;
+  /**
+   * Register a background prober for every member with the scheduler (spec
+   * §8a background probes), so an unhealthy member recovers out of band instead of through a
+   * live canary. The agent path enables it; consumers that leave it off keep
+   * the live-canary recovery.
+   */
+  backgroundProbe?: boolean;
 }
 
 export interface BuiltModelFallback {
@@ -154,6 +189,8 @@ interface Candidate {
   apiKey: string;
   healthKey: string;
   supportsThinking: boolean;
+  /** The bare (unadmitted) stream fn — used by the background prober. */
+  base: StreamFn;
   dispatch: StreamFn;
   /** Member's own operative window for the fits predicate (spec PER-MEMBER-CONTEXT-FITS §2.1). */
   operativeWindow: number;
@@ -245,10 +282,20 @@ export function buildModelFallback(
       apiKey: entry.config.api_key,
       healthKey: modelHealthKey(model),
       supportsThinking: entry.config.reasoning ?? true,
+      base,
       dispatch,
       operativeWindow: memberWindow,
     };
   });
+
+  // Out-of-band recovery (§8a background probes): every member is re-tested by the scheduler while
+  // unhealthy. Stateless per member (config-derived model + key), so re-registration
+  // by every session's build is idempotent.
+  if (options.backgroundProbe && options.scheduler) {
+    for (const candidate of candidates) {
+      options.scheduler.registerProber(candidate.healthKey, makeProber(candidate));
+    }
+  }
 
   const survivorLogicalIds = candidates.map((c) => c.logicalId);
   const survivorMembers = candidates.map((c) => ({
@@ -276,15 +323,42 @@ export function buildModelFallback(
 
   let warnedThinking = false;
 
+  const primaryAttemptsPerRequest =
+    options.primaryAttemptsPerRequest ?? DEFAULT_PRIMARY_ATTEMPTS_PER_REQUEST;
+
   const streamFn: StreamFn = (model, context, streamOptions) => {
-    const { index, reason } = chooseChainMember(candidates, {
+    const baseDeps = {
       scheduler: options.scheduler,
       isModelAvailable: options.isModelAvailable,
       // Per-attempt observed context size for fits gating (§2.1). Fed from
       // factory.create's §5.3 running counter; fetch consumers omit it → fits skipped.
       observedContextTokens: options.getObservedContextTokens?.(),
-    });
+    };
+    // The request's pass over the chain (§8a), threaded by Layer 0. Absent when
+    // this stream fn is driven outside withRequestRetry (tests) → no pass rule.
+    const pass = getRequestAttemptState(streamOptions);
+    const passDeps = pass
+      ? { ...baseDeps, requestAttempts: pass.attempts, primaryAttemptsPerRequest }
+      : baseDeps;
+    let { index, reason } = chooseChainMember(candidates, passDeps);
+    if (pass && pass.attempts.size > 0 && reason === "all-unhealthy") {
+      // Every member this pass could use has already failed in this request:
+      // start a new pass (Layer 0's backoff already ran before this attempt).
+      const fresh = chooseChainMember(candidates, baseDeps);
+      if (fresh.reason !== "all-unhealthy") {
+        pass.attempts.clear();
+        ({ index, reason } = fresh);
+      }
+    }
     const candidate = candidates[index]!;
+    if (pass) {
+      pass.attempts.set(candidate.healthKey, (pass.attempts.get(candidate.healthKey) ?? 0) + 1);
+      // Should this attempt fail, will the next one go to a DIFFERENT member?
+      // Then Layer 0 skips its local backoff — failing over never waits.
+      const next = chooseChainMember(candidates, passDeps);
+      pass.failoverOnFailure =
+        next.reason !== "all-unhealthy" && candidates[next.index]!.healthKey !== candidate.healthKey;
+    }
     options.onResolve?.(candidate.logicalId, reason);
     if (reason !== "primary" && (!options.rateLimitLog || options.rateLimitLog())) {
       options.logger?.info("model_fallback_resolved", {
@@ -331,6 +405,35 @@ export function buildModelFallback(
     survivorMembers,
     memberWindows,
     maxOperativeContextWindow,
+  };
+}
+
+/**
+ * Background prober for one member (spec §4.2): a minimal synthetic request —
+ * no tools, no thinking, a tiny output cap — through the member's BARE stream
+ * fn (outside admission: the scheduler owns the probe slot itself). Any clean
+ * `done` (including a `length` stop) is a healthy answer.
+ */
+function makeProber(candidate: Candidate): ModelProber {
+  return async (signal) => {
+    const context = {
+      systemPrompt: "Reply with OK.",
+      messages: [{ role: "user", content: "ping", timestamp: Date.now() }],
+    };
+    const probeOptions = { apiKey: candidate.apiKey, signal, maxTokens: PROBE_MAX_TOKENS };
+    const stream = await candidate.base(
+      candidate.model,
+      context as Parameters<StreamFn>[1],
+      probeOptions as Parameters<StreamFn>[2],
+    );
+    for await (const event of stream) {
+      if (event.type === "done") return { ok: true };
+      if (event.type === "error") {
+        const message = event.error?.errorMessage ?? "probe failed";
+        return { ok: false, status: extractStatus(message.toLowerCase()), message };
+      }
+    }
+    return { ok: false, message: "probe stream ended without a terminal event" };
   };
 }
 
@@ -402,12 +505,28 @@ export function chooseChainMember(
      * existing behavior. Step 2 wires this from the §5.3 running counter.
      */
     observedContextTokens?: number;
+    /**
+     * Dispatches per member health key in the current request's pass (spec
+     * §8a, the agent path via Layer 0's RequestAttemptState). A member is
+     * exhausted for the pass once it reached its quota — the head
+     * `primaryAttemptsPerRequest`, every other member one — and is skipped
+     * while a non-exhausted member is viable.
+     */
+    requestAttempts?: Map<string, number>;
+    primaryAttemptsPerRequest?: number;
   },
 ): { index: number; reason: FallbackReason } {
   const scheduler = deps.scheduler;
   const tried = deps.tried;
   const observed = deps.observedContextTokens;
   const head = members[0]!;
+  const requestAttempts = deps.requestAttempts;
+  const primaryQuota = deps.primaryAttemptsPerRequest ?? DEFAULT_PRIMARY_ATTEMPTS_PER_REQUEST;
+
+  /** Has this member used up its attempts in the current request's pass? */
+  const exhausted = (m: ChooseMember, i: number): boolean =>
+    requestAttempts !== undefined &&
+    (requestAttempts.get(m.healthKey) ?? 0) >= (i === 0 ? primaryQuota : 1);
 
   /** Fits predicate (§2.1): true when observed is undefined (skip) or within the member's window. */
   const fits = (m: ChooseMember): boolean =>
@@ -417,15 +536,16 @@ export function chooseChainMember(
    * A member is viable iff: not already tried, healthy (§8a), fits its own
    * operative window (§2.1; skipped when observed is undefined), and in-budget.
    */
-  const viable = (m: ChooseMember): boolean => {
+  const viable = (m: ChooseMember, i: number): boolean => {
     if (tried?.has(m.logicalId)) return false;
+    if (exhausted(m, i)) return false;
     const healthy = !scheduler || scheduler.modelHealth(m.healthKey) === "healthy";
     if (!healthy) return false;
     if (!fits(m)) return false;
     return !deps.isModelAvailable || deps.isModelAvailable(m.logicalId);
   };
 
-  if (viable(head)) return { index: 0, reason: "primary" };
+  if (viable(head, 0)) return { index: 0, reason: "primary" };
 
   // Compute head predicates individually to name the fallback reason and to gate
   // the canary (which requires healthy + in-budget + fits all hold separately).
@@ -433,7 +553,11 @@ export function chooseChainMember(
   const headInBudget = !deps.isModelAvailable || deps.isModelAvailable(head.logicalId);
   const headFits = fits(head);
 
-  // Head unhealthy with an open probe window → this attempt is the canary (§4).
+  // Head unhealthy with an open probe window → this attempt is the canary (§4) —
+  // ONLY for a model without a background prober. A probed model recovers out of
+  // band (§8a background probes) and live traffic never pays for re-testing it while any other
+  // member can serve; with nothing else viable it still gets the request as
+  // `all-unhealthy` below (the admission queue admits it as the half-open probe).
   // Gated on budget: an over-budget head must not be canaried — a successful probe
   // can't lead to use while over budget (`viable()` requires in-budget), so the
   // probe would be wasted spend on a model deliberately shut off for cost.
@@ -443,6 +567,8 @@ export function chooseChainMember(
   // a probe fires, so the head is probe-due again when a fitting request arrives.
   if (
     !tried?.has(head.logicalId) &&
+    !exhausted(head, 0) &&
+    !scheduler?.hasProber(head.healthKey) &&
     headState === "unhealthy" &&
     scheduler?.isProbeDue(head.healthKey) &&
     headInBudget &&
@@ -452,8 +578,8 @@ export function chooseChainMember(
   }
 
   for (let i = 0; i < members.length; i++) {
-    if (viable(members[i]!)) {
-      // Name the reason by WHY the head wasn't used (priority: health > budget > context > tried).
+    if (viable(members[i]!, i)) {
+      // Name the reason by WHY the head wasn't used (priority: health > budget > context > pass > tried).
       const reason: FallbackReason =
         headState === "unhealthy"
           ? "health-fallback"
@@ -461,6 +587,8 @@ export function chooseChainMember(
           ? "budget-fallback"
           : !headFits
           ? "context-fallback" // healthy + in-budget, but context exceeds head's window
+          : exhausted(head, 0)
+          ? "failover" // head used its attempts in this request (§8a)
           : "budget-fallback"; // head excluded by `tried` (environmental retry below unhealthy threshold); "budget-fallback" is imprecise but preserves the pre-change reason for this case
       return { index: i, reason };
     }

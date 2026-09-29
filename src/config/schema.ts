@@ -1595,6 +1595,10 @@ const RecoverySchema = StrictObject({
   // via its own `models.*.llm_probe_backoff_max_ms`.
   llm_probe_backoff_base_ms: Type.Optional(Type.Number({ minimum: 1 })),
   llm_probe_backoff_max_ms: Type.Optional(Type.Number({ minimum: 1 })),
+  // Model fallback, one pass per request (ARCHITECTURE.md §8a "One pass per request"): attempts
+  // on a chain's head within one request before that request moves down the
+  // chain (1 retry absorbs a blip). Every other member gets one attempt per pass.
+  llm_primary_attempts_per_request: Type.Optional(Type.Integer({ minimum: 1 })),
   // User-facing failure notice (spec §8.3): when non-empty, sent verbatim to
   // the session's room when a USER-TRIGGERED chat session stops trying on its
   // own (parked failed-resumable, or its build timed out waiting on summary

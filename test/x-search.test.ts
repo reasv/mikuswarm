@@ -641,7 +641,7 @@ interface StubScheduler {
 
 /**
  * Minimal scheduler stub covering just what `runFetchWithFallback` calls:
- * `modelHealth` / `isProbeDue` / `acquire` / `noteOutcome`. `unhealthy` lists
+ * `modelHealth` / `isProbeDue` / `hasProber` / `acquire` / `noteOutcome`. `unhealthy` lists
  * health keys reported unhealthy so selection falls over; `noteCalls` records
  * every health-feed so a test can assert content/abort did NOT feed the streak.
  */
@@ -653,6 +653,7 @@ function makeStubScheduler(opts: { unhealthy?: string[]; probeDue?: string[] } =
   const scheduler = {
     modelHealth: (key: string) => (unhealthy.has(key) ? "unhealthy" : "healthy"),
     isProbeDue: (key: string) => probeDue.has(key),
+    hasProber: () => false,
     async acquire(o: { modelKey?: string }) {
       if (o.modelKey) acquiredKeys.push(o.modelKey);
       return () => {};

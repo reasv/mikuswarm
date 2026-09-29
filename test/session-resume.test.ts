@@ -519,7 +519,12 @@ function manualResumeHarness(overrides: Partial<ManualResumeDeps> = {}): {
       return true;
     },
     releaseTimelineSlot: (key) => rec.slotReleases.push(key),
-    selfUserIdForAccount: (accountId) => (accountId === "miku" ? SELF_USER_ID : undefined),
+    selfUserIdForAccount: (provider, accountId) =>
+      provider === "matrix" && accountId === "miku"
+        ? SELF_USER_ID
+        : provider === "discord" && accountId === "bot"
+          ? "900000000000000001"
+          : undefined,
     runAttempt: async (record, inbound) => {
       rec.attempts.push({ record, inbound });
       return { outcome: "completed" };
@@ -857,6 +862,22 @@ test("manual resume: DM timeline key reconstructs the outbound target", async ()
   assert.equal(rec.attempts[0].inbound.outboundTarget?.accountId, "miku");
   assert.equal(rec.attempts[0].inbound.outboundTarget?.roomId, "!klfGPmhzdKaOinFDgO:example.org");
   assert.equal(rec.attempts[0].inbound.outboundTarget?.threadId, undefined);
+});
+
+test("manual resume: a non-Matrix (Discord) session resolves self on ITS provider and resumes", async () => {
+  const key = "discord:bot:room:1234567890";
+  const { deps, rec } = manualResumeHarness({
+    getSessionRow: () => row({ timeline_key: key, trigger_sender_id: "555" }),
+  });
+  const result = await createManualResumeSession(deps)("s-resume0001");
+  assert.deepEqual(result, { ok: true, status: "completed" });
+  assert.deepEqual(rec.slotAcquires, [key]);
+  const inbound = rec.attempts[0].inbound;
+  assert.equal(inbound.provider, "discord");
+  assert.equal(inbound.outboundTarget?.provider, "discord");
+  assert.equal(inbound.outboundTarget?.accountId, "bot");
+  assert.equal(inbound.outboundTarget?.roomId, "1234567890");
+  assert.equal(inbound.event.sender.id, "555");
 });
 
 test("manual resume: unparseable timeline key / unknown account rejects before the slot", async () => {
