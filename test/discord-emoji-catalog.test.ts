@@ -250,3 +250,33 @@ describe("EmojiCatalog: static helpers", () => {
     assert.equal(EmojiCatalog.normalizedKey("42"), "discord:42");
   });
 });
+
+// ── renderShortcodes ──────────────────────────────────────────────────────────
+
+describe("EmojiCatalog: renderShortcodes", () => {
+  function catalog() {
+    const cat = new EmojiCatalog();
+    cat.setGuildEmoji("g1", [makeEmoji("1", "smug"), makeEmoji("2", "party", true)]);
+    cat.setAppEmoji([makeEmoji("10", "star")]);
+    return cat;
+  }
+
+  it("renders sendable guild and app emoji as Discord markup", () => {
+    assert.equal(
+      catalog().renderShortcodes("hi :smug: :party::star:", "g1"),
+      "hi <:smug:1> <a:party:2><:star:10>",
+    );
+  });
+
+  it("leaves unknown names and other guilds' emoji as plain text", () => {
+    assert.equal(catalog().renderShortcodes(":smile: :nope:", "g1"), ":smile: :nope:");
+    assert.equal(catalog().renderShortcodes(":smug: :star:", "g2"), ":smug: <:star:10>");
+  });
+
+  it("skips code spans, fences, timestamps, and existing markup", () => {
+    const cat = catalog();
+    assert.equal(cat.renderShortcodes("`:smug:` and\n```\n:smug:\n```", "g1"), "`:smug:` and\n```\n:smug:\n```");
+    assert.equal(cat.renderShortcodes("at 12:smug: x", "g1"), "at 12:smug: x");
+    assert.equal(cat.renderShortcodes("<:smug:1> <a:party:2>", "g1"), "<:smug:1> <a:party:2>");
+  });
+});

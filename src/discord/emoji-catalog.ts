@@ -162,6 +162,31 @@ export class EmojiCatalog {
   }
 
   /**
+   * Render `:name:` shortcodes in an outbound message body as Discord custom
+   * emoji markup (`<:name:id>` / `<a:name:id>`). Discord does not resolve
+   * shortcodes server-side for bots, so without this the text arrives literally.
+   *
+   * Only names in the sendable set (same resolution as {@link resolve}) are
+   * rewritten; anything else, including unicode aliases like `:smile:`, passes
+   * through unchanged. Code spans and fenced blocks are left untouched, as are
+   * tokens glued to a word character or `<` (timestamps, existing markup).
+   */
+  renderShortcodes(body: string, guildId: string | undefined): string {
+    if (!body.includes(":")) return body;
+    return body
+      .split(/(```[\s\S]*?```|`[^`\n]*`)/)
+      .map((segment, i) => {
+        if (i % 2 === 1) return segment; // code span / fence
+        return segment.replace(/(?<![\w<]):([A-Za-z0-9_]{2,32}):/g, (token) => {
+          const resolved = this.resolve(token, guildId);
+          if (!resolved || resolved.kind !== "custom") return token;
+          return `<${resolved.animated ? "a" : ""}:${resolved.name}:${resolved.id}>`;
+        });
+      })
+      .join("");
+  }
+
+  /**
    * Find near-matches for an emoji name that is not sendable.
    * Used to generate a helpful error message (spec §10.3).
    * Searches the sendable set (guild + app) for names containing the query string.

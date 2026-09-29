@@ -533,7 +533,7 @@ export class DiscordProvider implements IChatProvider {
   // ── IChatProvider: send / typing ──────────────────────────────────────────
 
   async send(target: OutboundTarget, message: OutboundMessage): Promise<DeliveryReceipt> {
-    const { accountId, client } = this.resolveAccount(target);
+    const { accountId, client, runtime } = this.resolveAccount(target);
     const channelId = target.roomId ?? parseTimelineKey(target.timelineKey)?.channelId;
     if (!channelId) throw new Error("Discord send: cannot resolve channel id from target");
 
@@ -598,10 +598,13 @@ export class DiscordProvider implements IChatProvider {
     // for allowed_mentions. parse stays [] to block @everyone/role pings.
     // repliedUser flag (not users list) controls the reply ping — see below.
     // Spec §7.3, §14.
-    const { body: resolvedBody, userIds: allowedUserIds } = await resolveMentionTokens(
+    const { body: mentionBody, userIds: allowedUserIds } = await resolveMentionTokens(
       message.body ?? "",
       channel as TextChannel | DMChannel,
     );
+    // Render sendable `:name:` shortcodes as <:name:id> custom emoji markup.
+    const guildId = "guildId" in channel ? (channel.guildId ?? undefined) : undefined;
+    const resolvedBody = runtime.emojiCatalog.renderShortcodes(mentionBody, guildId);
 
     // Build message_reference for reply threading (discord.js ReplyOptions shape)
     const replyRef = target.replyToId
@@ -1434,7 +1437,9 @@ export class DiscordProvider implements IChatProvider {
 
   // ── Account resolution ────────────────────────────────────────────────────
 
-  private resolveAccount(target: OutboundTarget): { accountId: string; client: Client } {
+  private resolveAccount(
+    target: OutboundTarget,
+  ): { accountId: string; client: Client; runtime: AccountRuntime } {
     const accountId =
       target.accountId ?? parseTimelineKey(target.timelineKey)?.accountId;
     if (!accountId) {
@@ -1444,7 +1449,7 @@ export class DiscordProvider implements IChatProvider {
     if (!runtime) {
       throw new Error(`Discord send: account "${accountId}" is not running`);
     }
-    return { accountId, client: runtime.client };
+    return { accountId, client: runtime.client, runtime };
   }
 }
 

@@ -169,7 +169,7 @@ export class DiscordChannelClient implements ChannelClient {
 
   async editMessage(externalId: string, body: string): Promise<{ externalId?: string } | void> {
     await this.client.rest.patch(Routes.channelMessage(this.channelId, externalId), {
-      body: { content: body },
+      body: { content: this.emojiCatalog.renderShortcodes(body, this.guildId) },
     });
   }
 

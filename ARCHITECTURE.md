@@ -1000,6 +1000,7 @@ Unresolvable IDs (not in the passed maps) pass through verbatim so no informatio
 
 **Send** (`send(target, message)`):
 - `@username` mention resolution (`resolveMentionTokens`): before chunking, the outbound body is scanned for `@username` tokens (word-boundary; `@everyone`/`@here` always skipped). Each unique token is resolved against the guild member cache first, then via `guild.members.search({ query, limit: 10 })` REST on cache miss. DMs resolve only the DM recipient. Resolved tokens are replaced with `<@id>` Discord mention syntax in the body, and the user ids are added to `allowed_mentions.users`. Unresolved tokens pass through unchanged as plain text.
+- Custom emoji rendering (`EmojiCatalog.renderShortcodes`): `:name:` shortcodes that resolve in the channel's sendable set are rewritten to `<:name:id>` / `<a:name:id>` markup (Discord does not resolve shortcodes for bots). `editMessage` applies the same rendering.
 - Body is chunked at 2000 characters using `chunkMarkdownText` (fence-aware) on the resolved body.
 - `reply: { messageReference: target.replyToId, failIfNotExists: false }` on the first chunk.
 - `allowed_mentions: { parse: [], users: [...resolvedIds], repliedUser: Boolean(replyRef) }` — `parse: []` prevents automatic @everyone/role pings; `users` carries only ids from `@username` resolution above; `repliedUser` controls whether the replied-to user receives a ping.
@@ -1030,6 +1031,8 @@ Four callbacks are injected at `DiscordProvider` construction time (not via `ICh
 **`getSendableEmoji(guildId?)`**: returns guild emoji (for the given guild, alphabetically) followed by app emoji (alphabetically). Observed pairs are excluded.
 
 **`resolve(token, guildId?)`**: parses the token as either a raw Unicode emoji glyph or a `:shortcode:` string. Unicode glyphs pass through directly (`kind: "unicode"`). `:shortcode:` is matched first against the target guild's emoji (priority), then against app emoji; returns `{ kind: "custom", id, name, animated }` on match, `null` on miss. Observed pairs are not resolvable (not sendable).
+
+**`renderShortcodes(body, guildId?)`**: rewrites every `:name:` token (2–32 `[A-Za-z0-9_]` chars) that `resolve` maps to a custom emoji into Discord markup; unresolvable names (including unicode aliases like `:smile:`) pass through. Code spans/fences and tokens preceded by a word character or `<` (timestamps, existing markup) are skipped. Used on the outbound body by `send` and `editMessage`.
 
 **`nearMatches(query, guildId?)`**: substring search over sendable emoji names; returns up to 5 `:shortcode:` strings.
 
