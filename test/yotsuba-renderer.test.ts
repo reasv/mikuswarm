@@ -563,8 +563,8 @@ test("H: board link renders board element with threads", () => {
   const out = renderRichMessage(chatEvent({ linkPreviews: [yotsubaPreview("https://boards.4chan.org/g/", payload)] }));
 
   assert.match(out, /<link_preview url="https:\/\/boards\.4chan\.org\/g\/" kind="4chan">/);
-  // code attribute includes board title: "/g/ - Technology"
-  assert.match(out, /code="\/g\/ - Technology"/);
+  // code attribute is just the board code "/g/"; title is a separate attribute
+  assert.match(out, /code="\/g\/"/);
   assert.match(out, /title="Technology"/);
   assert.match(out, /worksafe="true"/);
   assert.match(out, /no="109934266"/);
@@ -732,4 +732,162 @@ test(">>N to OP when OP not in shownNos gets (OP) annotation", () => {
 
   const out = renderRichMessage(chatEvent({ linkPreviews: [yotsubaPreview("https://boards.4chan.org/g/thread/1#p500", payload)] }));
   assert.match(out, /&gt;&gt;1 \(OP\)/);
+});
+
+// ---------------------------------------------------------------------------
+// Ambient renders only headline (spec §6.4: ambient = headline-only)
+// ---------------------------------------------------------------------------
+
+test("ambient rendering shows only the headline post, not all captured posts", () => {
+  // Payload has OP + 2 extra captured posts; no upgrade record → ambient.
+  // Renderer must show only headlineNo post.
+  const payload: YotsubaPreviewPayload = {
+    v: 1, kind: "thread", board: "g",
+    asOf: AS_OF_MS, threadNo: 200, headlineNo: 200, postCount: 50,
+    posts: [
+      { no: 200, index: 0, role: "op", time: AS_OF_MS - 86400000,
+        text: "this is the headline OP", quotes: [], replies: 3 },
+      { no: 201, index: 1, role: "latest", time: AS_OF_MS - 3600000,
+        text: "extra post one", quotes: [], replies: 0 },
+      { no: 202, index: 2, role: "latest", time: AS_OF_MS - 1800000,
+        text: "extra post two", quotes: [], replies: 0 },
+    ],
+  };
+
+  const out = renderRichMessage(chatEvent({
+    linkPreviews: [yotsubaPreview("https://boards.4chan.org/g/thread/200", payload)],
+  }));
+
+  assert.match(out, /no="200"/);
+  assert.ok(!out.includes('no="201"'), "extra post 201 must not appear in ambient");
+  assert.ok(!out.includes('no="202"'), "extra post 202 must not appear in ambient");
+});
+
+// ---------------------------------------------------------------------------
+// Leading gap marker (spec §5.4: gap before first shown post)
+// ---------------------------------------------------------------------------
+
+test("leading gap marker emitted when first shown post is not at index 0", () => {
+  // Post link: headline is at index 50 — there must be an omitted marker before it.
+  const upgrade = {
+    triggerGroupId: "tg_lead",
+    includedNos: [500],
+    processedAssetIds: [],
+  };
+
+  const posts: YotsubaPostNode[] = [
+    { no: 1, index: 0, role: "op", time: AS_OF_MS - 86400000,
+      text: "OP content", quotes: [], replies: 1 },
+    { no: 500, index: 50, role: "linked", time: AS_OF_MS - 3600000,
+      text: "linked post content", quotes: [], replies: 0 },
+  ];
+
+  const payload: YotsubaPreviewPayload = {
+    v: 1, kind: "thread", board: "g",
+    asOf: AS_OF_MS, threadNo: 1, headlineNo: 500, linkedNo: 500, postCount: 100,
+    posts, upgrade,
+  };
+
+  const out = renderRichMessage(chatEvent({
+    linkPreviews: [yotsubaPreview("https://boards.4chan.org/g/thread/1#p500", payload)],
+  }));
+
+  assert.match(out, /<omitted posts="50"/);
+  assert.match(out, /no="500"/);
+});
+
+// ---------------------------------------------------------------------------
+// Trailing gap (spec §5.4: gap after last shown post)
+// ---------------------------------------------------------------------------
+
+test("trailing gap emitted based on postCount, not captured posts", () => {
+  // Last shown post at index 10; postCount=50 → trailing gap = 50-1-10=39 posts.
+  const upgrade = {
+    triggerGroupId: "tg_trail",
+    includedNos: [1, 11],
+    processedAssetIds: [],
+  };
+
+  const posts: YotsubaPostNode[] = [
+    { no: 1, index: 0, role: "op", time: AS_OF_MS - 86400000, text: "OP", quotes: [], replies: 0 },
+    { no: 11, index: 10, role: "latest", time: AS_OF_MS - 3600000, text: "reply", quotes: [], replies: 0 },
+    // non-included post NOT in includedNos
+    { no: 12, index: 11, role: "latest", time: AS_OF_MS - 1800000, text: "not included", quotes: [], replies: 0 },
+  ];
+
+  const payload: YotsubaPreviewPayload = {
+    v: 1, kind: "thread", board: "g",
+    asOf: AS_OF_MS, threadNo: 1, headlineNo: 1, postCount: 50,
+    posts, upgrade,
+  };
+
+  const out = renderRichMessage(chatEvent({
+    linkPreviews: [yotsubaPreview("https://boards.4chan.org/g/thread/1", payload)],
+  }));
+
+  // trailing gap = (50-1) - 10 = 39 posts
+  assert.match(out, /<omitted posts="39"/);
+});
+
+// ---------------------------------------------------------------------------
+// replies="0" omitted (spec §5.4: replies attr only when > 0)
+// ---------------------------------------------------------------------------
+
+test("replies attribute omitted when replies=0", () => {
+  const upgrade = { triggerGroupId: "tg_rep0", includedNos: [1, 2], processedAssetIds: [] };
+  const posts: YotsubaPostNode[] = [
+    { no: 1, index: 0, role: "op", time: AS_OF_MS - 86400000, text: "OP", quotes: [], replies: 3 },
+    { no: 2, index: 1, role: "latest", time: AS_OF_MS - 3600000, text: "last reply", quotes: [], replies: 0 },
+  ];
+  const payload: YotsubaPreviewPayload = {
+    v: 1, kind: "thread", board: "g",
+    asOf: AS_OF_MS, threadNo: 1, headlineNo: 1, postCount: 2,
+    posts, upgrade,
+  };
+
+  const out = renderRichMessage(chatEvent({
+    linkPreviews: [yotsubaPreview("https://boards.4chan.org/g/thread/1", payload)],
+  }));
+
+  // OP has replies=3 → attribute present
+  assert.match(out, /no="1".*replies="3"/s);
+  // Post 2 has replies=0 → attribute absent
+  assert.ok(!out.includes('no="2".*replies="0"'), 'replies="0" must not appear');
+  // More precise: the <post no="2" ...> element must not contain replies=
+  const post2match = out.match(/<post no="2"[^>]*>/);
+  assert.ok(post2match, "post 2 element present");
+  assert.ok(!post2match![0].includes('replies='), 'post 2 element has no replies attr');
+});
+
+// ---------------------------------------------------------------------------
+// headlineChars cap (spec §6.5: trigger rendering caps headline text)
+// ---------------------------------------------------------------------------
+
+test("headline text capped at headlineChars with ellipsis marker", () => {
+  const longText = "a".repeat(1000);
+  const upgrade = {
+    triggerGroupId: "tg_cap",
+    includedNos: [1],
+    processedAssetIds: [],
+    headlineChars: 200,
+  };
+
+  const posts: YotsubaPostNode[] = [
+    { no: 1, index: 0, role: "op", time: AS_OF_MS - 86400000, text: longText, quotes: [], replies: 0 },
+  ];
+
+  const payload: YotsubaPreviewPayload = {
+    v: 1, kind: "thread", board: "g",
+    asOf: AS_OF_MS, threadNo: 1, headlineNo: 1, postCount: 1,
+    posts, upgrade,
+  };
+
+  const out = renderRichMessage(chatEvent({
+    linkPreviews: [yotsubaPreview("https://boards.4chan.org/g/thread/1", payload)],
+  }));
+
+  // Should contain 200 'a' chars followed by the ellipsis marker
+  assert.match(out, new RegExp("a{200}\\n\\[… 800 more characters\\]"));
+  // Must not contain the full 1000-char string
+  assert.ok(!out.includes("a".repeat(201)), "text must not exceed cap");
 });

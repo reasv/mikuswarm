@@ -1732,6 +1732,7 @@ export class ContextBuilder {
         if (row.fetch_status !== "complete") continue;
         const payload = parseYotsubaPreviewPayload(row.payload_json ?? null);
         if (!payload?.upgrade?.processedAssetIds?.length) continue;
+        if (payload.upgrade.triggerGroupId !== trigger.id) continue;
         for (const assetId of payload.upgrade.processedAssetIds) {
           if (yotsubaBlocksAdded >= maxYotsubaBlocks) break;
           // Skip if already in blocks (idempotent).

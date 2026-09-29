@@ -681,9 +681,8 @@ function renderYotsuba4chanBoard(
 ): string {
   const code = payload.board;
   const title = payload.boardTitle;
-  const label = boardLabel(code, title);
   const attrs: string[] = [];
-  attrs.push(`code="${escapeAttr(label)}"`);
+  attrs.push(`code="/${escapeAttr(code)}/"`);
   if (title) attrs.push(`title="${escapeAttr(title)}"`);
   if (payload.worksafe) attrs.push(`worksafe="true"`);
   attrs.push(`as_of="${escapeAttr(
@@ -740,11 +739,11 @@ function renderYotsuba4chanThread(
   const assetById = new Map<string, import("../types.js").AttachmentMeta>();
   for (const m of preview.media ?? []) assetById.set(m.id, m);
 
-  // Determine which posts to render. If upgraded, use includedNos; else use all posts.
+  // Determine which posts to render. If upgraded, use includedNos; else headline only.
   const allPosts = payload.posts ?? [];
   const includedNos: ReadonlySet<number> = upgrade
     ? new Set(upgrade.includedNos)
-    : new Set(allPosts.map((p) => p.no));
+    : new Set([payload.headlineNo ?? payload.threadNo ?? 0]);
   const includedPosts = allPosts.filter((p) => includedNos.has(p.no));
   const processedIds = new Set(upgrade?.processedAssetIds ?? []);
 
@@ -757,27 +756,49 @@ function renderYotsuba4chanThread(
   const parts: string[] = [];
 
   let lastIndex = -1;
-  let totalPosts = payload.postCount ?? allPosts.length;
+  let lastPost: import("../yotsuba/types.js").YotsubaPostNode | undefined;
+  // filesUpToLastPost = files in posts 0..lastIndex (used for trailing gap file counts).
+  let filesUpToLastPost = 0;
+  const totalPosts = payload.postCount ?? allPosts.length;
+  const headlineNo = payload.headlineNo ?? payload.threadNo;
+  const headlineCharCap = upgrade?.headlineChars;
 
   for (const post of sortedPosts) {
     const gap = post.index - lastIndex - 1;
-    if (gap > 0 && lastIndex >= 0) {
-      // Count files in the gap (approximate).
-      const gapFiles = allPosts.filter((p) => p.index > lastIndex && p.index < post.index && p.file).length;
+    if (gap > 0) {
+      // Count files in the gap using filesBefore when available, else approximate.
+      let gapFiles: number;
+      if (post.filesBefore !== undefined && lastPost !== undefined) {
+        gapFiles = post.filesBefore - filesUpToLastPost;
+      } else if (post.filesBefore !== undefined && lastPost === undefined) {
+        // Leading gap: filesBefore is exactly how many files are before this post.
+        gapFiles = post.filesBefore;
+      } else {
+        gapFiles = allPosts.filter((p) => p.index > lastIndex && p.index < post.index && p.file).length;
+      }
       parts.push(`<omitted posts="${gap}"${gapFiles > 0 ? ` files="${gapFiles}"` : ""}/>` );
     }
-    parts.push(renderYotsubaPostNode(post, shownNos, opNo, assetById, processedIds, preview));
+    const isHeadline = headlineCharCap !== undefined && post.no === headlineNo;
+    parts.push(renderYotsubaPostNode(
+      post, shownNos, opNo, assetById, processedIds, preview,
+      isHeadline ? headlineCharCap : undefined,
+    ));
     lastIndex = post.index;
+    lastPost = post;
+    filesUpToLastPost = (post.filesBefore ?? filesUpToLastPost) + (post.file ? 1 : 0);
   }
 
-  // Trailing gap (posts after the last included post).
-  if (allPosts.length > 0) {
-    const maxIndex = Math.max(...allPosts.map((p) => p.index));
-    if (lastIndex < maxIndex) {
-      const trailingGap = maxIndex - lastIndex;
-      const trailingFiles = allPosts.filter((p) => p.index > lastIndex && p.file).length;
-      parts.push(`<omitted posts="${trailingGap}"${trailingFiles > 0 ? ` files="${trailingFiles}"` : ""}/>` );
+  // Trailing gap (posts after the last shown post, to the end of the thread).
+  const threadEndIndex = totalPosts - 1;
+  if (lastIndex < threadEndIndex) {
+    const trailingGap = threadEndIndex - lastIndex;
+    let trailingFiles: number;
+    if (lastPost !== undefined && payload.fileCount !== undefined && lastPost.filesBefore !== undefined) {
+      trailingFiles = Math.max(0, payload.fileCount - filesUpToLastPost);
+    } else {
+      trailingFiles = allPosts.filter((p) => p.index > lastIndex && p.file).length;
     }
+    parts.push(`<omitted posts="${trailingGap}"${trailingFiles > 0 ? ` files="${trailingFiles}"` : ""}/>` );
   }
 
   // Footer line.
@@ -794,6 +815,8 @@ function renderYotsubaPostNode(
   assetById: Map<string, import("../types.js").AttachmentMeta>,
   processedIds: ReadonlySet<string>,
   preview: LinkPreviewMeta,
+  /** When set, cap the post text at this many characters and append an ellipsis note. */
+  charCap?: number,
 ): string {
   const attrs: string[] = [];
   attrs.push(`no="${post.no}"`);
@@ -803,17 +826,26 @@ function renderYotsubaPostNode(
   if (post.trip) attrs.push(`trip="${escapeAttr(post.trip)}"`);
   if (post.capcode) attrs.push(`capcode="${escapeAttr(post.capcode)}"`);
   attrs.push(`time="${escapeAttr(compactAgentTimestamp(new Date(post.time)))}"`);
-  attrs.push(`replies="${post.replies}"`);
+  if (post.replies > 0) attrs.push(`replies="${post.replies}"`);
 
   const parts: string[] = [`<post ${attrs.join(" ")}>`];
 
-  // Text with quote annotation.
+  // Text with quote annotation; apply char cap first if set.
+  const rawText = (charCap !== undefined && post.text.length > charCap)
+    ? post.text.slice(0, charCap)
+    : post.text;
+  const overflow = (charCap !== undefined && post.text.length > charCap)
+    ? post.text.length - charCap
+    : 0;
   const deadNos = new Set(post.deadQuotes ?? []);
-  const annotated = annotateYotsubaQuotes(post.text, post.quotes, shownNos, opNo, deadNos);
+  const annotated = annotateYotsubaQuotes(rawText, post.quotes, shownNos, opNo, deadNos);
   // Cross-board quotes.
   let textWithCross = annotated;
   if (post.crossQuotes?.length) {
     textWithCross = textWithCross + "\n" + post.crossQuotes.join(" ");
+  }
+  if (overflow > 0) {
+    textWithCross = textWithCross + `\n[… ${overflow} more characters]`;
   }
   parts.push(escapeXml(textWithCross));
 

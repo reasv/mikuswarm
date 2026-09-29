@@ -411,3 +411,97 @@ test("selectImageBlocks: yotsuba lane does nothing when features.yotsuba is not 
     await rm(tmpDir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// triggerGroupId scoping (spec §6.5: image blocks only for the upgrading session)
+// ---------------------------------------------------------------------------
+
+test("selectImageBlocks: yotsuba blocks skipped when triggerGroupId doesn't match trigger", async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "yot-trig-"));
+  try {
+    const assetPath = path.join(tmpDir, "test.jpg");
+    await writeTinyJpeg(assetPath);
+
+    // Payload whose triggerGroupId is "other-trigger" (not "my-trigger").
+    const previewRow: LinkPreviewRow = {
+      id: "prev-trig",
+      event_id: "other-trigger",
+      context: "message",
+      url: "https://boards.4chan.org/g/thread/200000",
+      source_kind: YOTSUBA_SOURCE_KIND,
+      site_name: "4chan",
+      fetch_status: "complete",
+      preview_index: 0,
+      created_at: Date.now(),
+      payload_json: JSON.stringify({
+        v: 1, kind: "thread", board: "g", asOf: Date.now(),
+        upgrade: {
+          triggerGroupId: "other-trigger",   // different from trigger "my-trigger"
+          includedNos: [1],
+          processedAssetIds: ["asset-trig"],
+        },
+      }),
+    };
+    const assetRow: MediaAssetRow = {
+      id: "asset-trig", event_id: "other-trigger", role: "preview_media",
+      link_preview_id: "prev-trig", media_type: "image", mime_type: "image/jpeg",
+      local_path: assetPath, download_status: "complete", caption_status: "pending",
+      created_at: Date.now(),
+    };
+
+    const storage = makeStorage([{ row: previewRow, assets: [assetRow] }]);
+    const cfg = makeConfig({ visionModel: true });
+    const builder = new ContextBuilder(makeStore(), cfg, storage);
+
+    // Trigger id "my-trigger" does NOT match the payload's triggerGroupId "other-trigger".
+    const blocks = await (builder as any).selectImageBlocks(makeTrigger("my-trigger"), true);
+    const yotBlock = blocks.find((b: any) => b.attachmentId === "asset-trig");
+    assert.equal(yotBlock, undefined, "block from a different trigger group must be skipped");
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("selectImageBlocks: yotsuba blocks included when triggerGroupId matches trigger", async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "yot-trigmatch-"));
+  try {
+    const assetPath = path.join(tmpDir, "test.jpg");
+    await writeTinyJpeg(assetPath);
+
+    const previewRow: LinkPreviewRow = {
+      id: "prev-match",
+      event_id: "my-trigger",
+      context: "message",
+      url: "https://boards.4chan.org/g/thread/300000",
+      source_kind: YOTSUBA_SOURCE_KIND,
+      site_name: "4chan",
+      fetch_status: "complete",
+      preview_index: 0,
+      created_at: Date.now(),
+      payload_json: JSON.stringify({
+        v: 1, kind: "thread", board: "g", asOf: Date.now(),
+        upgrade: {
+          triggerGroupId: "my-trigger",
+          includedNos: [1],
+          processedAssetIds: ["asset-match"],
+        },
+      }),
+    };
+    const assetRow: MediaAssetRow = {
+      id: "asset-match", event_id: "my-trigger", role: "preview_media",
+      link_preview_id: "prev-match", media_type: "image", mime_type: "image/jpeg",
+      local_path: assetPath, download_status: "complete", caption_status: "pending",
+      created_at: Date.now(),
+    };
+
+    const storage = makeStorage([{ row: previewRow, assets: [assetRow] }]);
+    const cfg = makeConfig({ visionModel: true });
+    const builder = new ContextBuilder(makeStore(), cfg, storage);
+
+    const blocks = await (builder as any).selectImageBlocks(makeTrigger("my-trigger"), true);
+    const yotBlock = blocks.find((b: any) => b.attachmentId === "asset-match");
+    assert.ok(yotBlock !== undefined, "block from matching trigger group must be included");
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
