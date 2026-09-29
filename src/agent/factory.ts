@@ -1,6 +1,6 @@
 import { Agent } from "@earendil-works/pi-agent-core";
 import type { AgentMessage, AgentTool, PrepareNextTurnContext, StreamFn } from "@earendil-works/pi-agent-core";
-import { createAssistantMessageEventStream, type Api, type Model, type AssistantMessage } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, type Api, type Model, type AssistantMessage, type OpenRouterRouting } from "@earendil-works/pi-ai";
 import { streamSimple, completeSimple } from "@earendil-works/pi-ai/compat";
 import type { AppConfig } from "../config/index.js";
 import type { AgentModelOverrides } from "./agent-model-overrides.js";
@@ -2555,6 +2555,9 @@ export function createModelFromConfig(model: ModelConfig, contextWindow?: number
       // a present-but-empty value. Undefined = leave auto-detection in place.
       requiresReasoningContentOnAssistantMessages:
         model.compat?.requires_reasoning_content_on_assistant_messages,
+      // OpenRouter provider-routing preferences, sent verbatim as `provider` by the
+      // openai-completions driver. Undefined = no `provider` object on the wire.
+      openRouterRouting: model.compat?.openrouter_routing as OpenRouterRouting | undefined,
       // Carry the Bedrock explicit cache_breakpoints preference on the wire Model
       // descriptor so the onPayload injector can gate per serving member (not per
       // chain head).  Only meaningful on openai-responses members backed by Bedrock;

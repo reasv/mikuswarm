@@ -712,6 +712,14 @@ const ModelSchema = StrictObject({
     // on tool-call turns is emitted independently (thinking-signature path) and
     // is unaffected. Unset = keep pi-ai's auto-detection.
     requires_reasoning_content_on_assistant_messages: Type.Optional(Type.Boolean()),
+    // openai-completions only. OpenRouter provider-routing preferences, sent
+    // verbatim as the request's top-level `provider` object (OpenRouter's
+    // `order`, `only`, `ignore`, `allow_fallbacks`, `zdr`, `sort`,
+    // `quantizations`, ...). Pins a model to specific upstream providers or
+    // restricts it to zero-data-retention endpoints. A gateway in front of
+    // OpenRouter must forward the field for it to take effect. Unset = no
+    // `provider` object is sent (OpenRouter's default routing).
+    openrouter_routing: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
   })),
   prefill: Type.Optional(PrefillSchema),
   // openai-responses only. Inject explicit prompt-cache breakpoints at stable

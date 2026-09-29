@@ -399,6 +399,18 @@ test("createModelFromConfig: compat.supportsToolSearch defaults ON (prefix-stabl
   assert.equal(off.compat?.supportsToolSearch, false, "explicit false → opt-out");
 });
 
+test("createModelFromConfig: compat.openrouter_routing → verbatim openRouterRouting; unset → undefined", async () => {
+  const { createModelFromConfig } = await import("../src/agent/factory.js");
+  // pi-ai's openai-completions driver sends `provider = compat.openRouterRouting` only when
+  // the descriptor's value is truthy, so an unset option must stay undefined (no `provider`).
+  const base = { context_window: 1000, max_tokens: 100, input_modalities: ["text"] };
+  const routing = { order: ["a", "b"], allow_fallbacks: false, zdr: true };
+  const pinned = createModelFromConfig({ id: "m", compat: { openrouter_routing: routing }, ...base } as any);
+  assert.deepEqual(pinned.compat?.openRouterRouting, routing);
+  const dflt = createModelFromConfig({ id: "m", ...base } as any);
+  assert.equal(dflt.compat?.openRouterRouting, undefined);
+});
+
 test("agent capability filter: image session drops a text-only fallback; text session keeps it", async () => {
   const { buildModelFallback, resolveModelChain } = await import("../src/agent/model-fallback.js");
   const { rawInputsRequireMultimodal } = await import("../src/agent/factory.js");
