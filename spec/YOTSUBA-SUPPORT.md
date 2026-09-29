@@ -670,7 +670,7 @@ moe for chat, dense if you need it to remember what happened 20k tokens ago
 </link_preview>
 ```
 
-About 1,100 tokens with the full OP, plus 3 image blocks. (The video's image block is its
+About 1,300 tokens with the full OP and three captions, plus 3 image blocks. (The video's image block is its
 storyboard; its caption came from the video itself.)
 
 **D. Trigger, the same link with a tight group.** The same message also contained four other

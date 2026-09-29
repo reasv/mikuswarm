@@ -84,6 +84,9 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
   // fastembed's FlagEmbedding instance, lazily created. Untyped to keep the native
   // dependency out of the type graph (it is dynamically imported).
   private flag: Promise<any> | null = null;
+  // Set once padding is off: every input is then its own length, and fastembed
+  // sizes a batch tensor from its first row, so documents must go one at a time.
+  private unpadded = false;
 
   constructor(options: LocalProviderOptions) {
     this.options = options;
@@ -96,11 +99,21 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
       this.flag = (async () => {
         const fastembed: any = await import("fastembed");
         this.options.logger?.info("embedding_model_init", { model: this.options.model });
-        return fastembed.FlagEmbedding.init({
+        const flag = await fastembed.FlagEmbedding.init({
           model: fastembedModelId(this.options.model),
           cacheDir: this.options.cacheDir,
           showDownloadProgress: false,
         });
+        // fastembed pads every input to the model's full max length (512 tokens),
+        // so a six-word query costs a full-length forward pass: hundreds of ms of
+        // synchronous native work on the event loop. Padded positions are masked
+        // out, so the vectors are the same without it.
+        const tokenizer = flag?.tokenizer;
+        if (typeof tokenizer?.disablePadding === "function") {
+          tokenizer.disablePadding();
+          this.unpadded = true;
+        }
+        return flag;
       })().catch((error) => {
         this.flag = null; // allow retry on a transient init failure
         throw error;
@@ -121,7 +134,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     // passageEmbed yields batches of number[][]; flatten and normalize. The second
     // arg is fastembed's onnxruntime batch size — cap it independently of the
     // remote-oriented `embed_batch_size` knob so local memory stays bounded (#13).
-    const batchSize = Math.min(texts.length, LOCAL_EMBED_BATCH_CAP);
+    const batchSize = this.unpadded ? 1 : Math.min(texts.length, LOCAL_EMBED_BATCH_CAP);
     for await (const batch of flag.passageEmbed(texts, batchSize) as AsyncGenerator<number[][]>) {
       for (const vec of batch) out.push(l2normalize(vec));
     }
@@ -139,7 +152,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
   }
 
   async embedQuery(text: string, signal?: AbortSignal): Promise<Float32Array> {
-    // The local (ONNX) embedder is in-process and fast — there is no network
+    // The local (ONNX) embedder is in-process and fast (unpadded) — there is no network
     // wait to bound — so the `signal` (§9d #7) only short-circuits before the
     // call when already aborted (e.g. the interactive build deadline elapsed
     // during the lexical half). Mirrors the early-abort guard in embedDocuments.

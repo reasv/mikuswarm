@@ -165,3 +165,59 @@ test("listKnownTimelineKeys unions event and session timelines", async () => {
     storage.close();
   }
 });
+
+// ── timeline_counts: trigger-maintained rooms-list counts ───────────────────
+
+function countsSnapshot(storage: Storage): string {
+  return JSON.stringify(
+    storage.read((db) =>
+      db
+        .prepare(
+          `select timeline_key, event_count, last_event_at, session_count from timeline_counts
+            where event_count > 0 or session_count > 0 order by timeline_key`,
+        )
+        .all(),
+    ),
+  );
+}
+
+test("timeline_counts triggers match a from-scratch rebuild across every write path", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const other = "matrix:miku:room:!other:example.org";
+    const thread = `${TK}:thread:$root`;
+    const at = (id: string, key: string, ts: number): CanonicalChatEvent => ({ ...event(id, key), timestamp: ts, receivedAt: ts });
+    await storage.appendTimelineEvent(at("a1", TK, 1_000));
+    await storage.appendTimelineEvent(at("a2", TK, 3_000));
+    await storage.appendTimelineEvent(at("t1", thread, 2_000));
+    await storage.appendTimelineEvent(at("o1", other, 5_000));
+    await storage.insertAgentSession({ id: "s1", timelineKey: TK, sessionType: "default", status: "created", createdAt: 1_000, updatedAt: 1_000 });
+    await storage.insertAgentSession({ id: "s2", timelineKey: "matrix:miku:dm:@bob:example.org", sessionType: "default", status: "created", createdAt: 1_000, updatedAt: 1_000 });
+    await storage.write((db) => {
+      // Delete the newest event: last_event_at must fall back to the next newest.
+      db.prepare(`delete from timeline_events where id = 'a2'`).run();
+      // Move an event across timelines and re-time another in place.
+      db.prepare(`update timeline_events set timeline_key = ? where id = 'o1'`).run(TK);
+      db.prepare(`update timeline_events set timestamp = 9_000 where id = 't1'`).run();
+      // Move a session, then delete one.
+      db.prepare(`update agent_sessions set timeline_key = ? where id = 's1'`).run(other);
+      db.prepare(`delete from agent_sessions where id = 's2'`).run();
+    });
+
+    const maintained = countsSnapshot(storage);
+    await storage.rebuildTimelineCounts();
+    assert.equal(maintained, countsSnapshot(storage));
+
+    const rooms = storage.listConsoleRooms();
+    const room = rooms.find((r) => r.timeline_key === TK);
+    assert.equal(room?.event_count, 3, "a1 + moved o1 + thread t1");
+    assert.equal(room?.last_activity_at, 9_000);
+    assert.equal(room?.session_count, 0);
+    const moved = rooms.find((r) => r.timeline_key === other);
+    assert.equal(moved?.event_count, 0);
+    assert.equal(moved?.session_count, 1, "a session-only room still lists");
+    assert.equal(rooms.some((r) => r.timeline_key.includes("@bob")), false, "an emptied timeline drops out");
+  } finally {
+    storage.close();
+  }
+});

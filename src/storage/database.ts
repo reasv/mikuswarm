@@ -2107,6 +2107,7 @@ export class Storage {
       // Seed/heal the materialized pipeline counts from the base tables (one grouped
       // index-only scan per pool; the triggers keep them exact from here on).
       rebuildPipelineCounts(writer);
+      rebuildTimelineCounts(writer);
     });
     return storage;
   }
@@ -7981,20 +7982,11 @@ export class Storage {
       db
         .prepare(
           `with per_timeline as (
-             select timeline_key,
-                    sum(event_count) as event_count,
-                    sum(session_count) as session_count,
-                    max(last_event_at) as last_event_at
-             from (
-               select timeline_key, count(*) as event_count, 0 as session_count,
-                      max(timestamp) as last_event_at
-                 from timeline_events group by timeline_key
-               union all
-               select timeline_key, 0 as event_count, count(*) as session_count,
-                      null as last_event_at
-                 from agent_sessions group by timeline_key
-             )
-             group by timeline_key
+             -- Trigger-maintained (TIMELINE_COUNTS_SCHEMA): a few hundred rows,
+             -- never a scan of the event/session tables.
+             select timeline_key, event_count, session_count, last_event_at
+               from timeline_counts
+              where event_count > 0 or session_count > 0
            ),
            mapped as (
              select
@@ -8148,6 +8140,15 @@ export class Storage {
    */
   rebuildPipelineCounts(): Promise<void> {
     return this.write((db) => rebuildPipelineCounts(db));
+  }
+
+  /**
+   * Recompute the materialized `timeline_counts` table (see
+   * {@link TIMELINE_COUNTS_SCHEMA}). Runs automatically at every open; exposed for
+   * tests and operator repair.
+   */
+  rebuildTimelineCounts(): Promise<void> {
+    return this.write((db) => rebuildTimelineCounts(db));
   }
 
   /**
@@ -10055,6 +10056,91 @@ function rebuildPipelineCounts(db: Database.Database): void {
   })();
 }
 
+/**
+ * Materialized per-timeline counts behind the console rooms list
+ * ({@link Storage.listConsoleRooms}), which the console polls every few seconds.
+ * Counting `timeline_events` / `agent_sessions` per timeline on read is a full
+ * index scan on the agent's main thread, so, like `pipeline_counts`, the numbers
+ * are kept exact by triggers and recomputed at every open
+ * ({@link rebuildTimelineCounts}); the table is a cache, never a source of truth.
+ * Both tables are written with plain INSERTs (no REPLACE), so the delete triggers
+ * see every removal. `last_event_at` is re-derived by an index seek on the
+ * `(timeline_key, timestamp, …)` index whenever an event leaves a timeline.
+ */
+const TIMELINE_COUNTS_SCHEMA = `
+create table if not exists timeline_counts (
+  timeline_key text primary key,
+  event_count integer not null default 0,
+  last_event_at integer,
+  session_count integer not null default 0
+) without rowid;
+
+create trigger if not exists tc_te_ai after insert on timeline_events begin
+  insert into timeline_counts (timeline_key, event_count, last_event_at)
+    values (new.timeline_key, 1, new.timestamp)
+    on conflict (timeline_key) do update set
+      event_count = event_count + 1,
+      last_event_at = max(coalesce(last_event_at, excluded.last_event_at), excluded.last_event_at);
+end;
+create trigger if not exists tc_te_ad after delete on timeline_events begin
+  update timeline_counts set
+      event_count = event_count - 1,
+      last_event_at = (select max(timestamp) from timeline_events where timeline_key = old.timeline_key)
+    where timeline_key = old.timeline_key;
+end;
+create trigger if not exists tc_te_au after update of timeline_key, timestamp on timeline_events
+  when old.timeline_key is not new.timeline_key or old.timestamp is not new.timestamp begin
+  update timeline_counts set
+      event_count = event_count - 1,
+      last_event_at = (select max(timestamp) from timeline_events where timeline_key = old.timeline_key)
+    where timeline_key = old.timeline_key;
+  insert into timeline_counts (timeline_key, event_count, last_event_at)
+    values (new.timeline_key, 1, new.timestamp)
+    on conflict (timeline_key) do update set
+      event_count = event_count + 1,
+      last_event_at = max(coalesce(last_event_at, excluded.last_event_at), excluded.last_event_at);
+end;
+
+create trigger if not exists tc_as_ai after insert on agent_sessions begin
+  insert into timeline_counts (timeline_key, session_count) values (new.timeline_key, 1)
+    on conflict (timeline_key) do update set session_count = session_count + 1;
+end;
+create trigger if not exists tc_as_ad after delete on agent_sessions begin
+  update timeline_counts set session_count = session_count - 1
+    where timeline_key = old.timeline_key;
+end;
+create trigger if not exists tc_as_au after update of timeline_key on agent_sessions
+  when old.timeline_key is not new.timeline_key begin
+  update timeline_counts set session_count = session_count - 1
+    where timeline_key = old.timeline_key;
+  insert into timeline_counts (timeline_key, session_count) values (new.timeline_key, 1)
+    on conflict (timeline_key) do update set session_count = session_count + 1;
+end;
+`;
+
+/**
+ * Recompute {@link TIMELINE_COUNTS_SCHEMA}'s table from the base tables — the
+ * boot-time seed/heal (every `Storage.open()`), one grouped index-only scan per
+ * table, inside one transaction so a reader never sees a half-rebuilt table.
+ */
+function rebuildTimelineCounts(db: Database.Database): void {
+  db.transaction(() => {
+    db.exec("delete from timeline_counts");
+    db.exec(
+      `insert into timeline_counts (timeline_key, event_count, last_event_at, session_count)
+       select timeline_key, sum(event_count), max(last_event_at), sum(session_count)
+         from (
+           select timeline_key, count(*) as event_count, max(timestamp) as last_event_at,
+                  0 as session_count
+             from timeline_events group by timeline_key
+           union all
+           select timeline_key, 0, null, count(*) from agent_sessions group by timeline_key
+         )
+        group by timeline_key`,
+    );
+  })();
+}
+
 const SCHEMA = `
 create table if not exists timeline_events (
   id text primary key,
@@ -10547,7 +10633,8 @@ ${USER_IDENTITIES_SCHEMA}
 ${DM_OPTOUTS_SCHEMA}
 ${DM_PEERS_SCHEMA}
 ${WORKSPACE_SEED_LEDGER_SCHEMA}
-${PIPELINE_COUNTS_SCHEMA}`;
+${PIPELINE_COUNTS_SCHEMA}
+${TIMELINE_COUNTS_SCHEMA}`;
 
 // SCHEMA above defines the complete current shape with idempotent
 // `create … if not exists` DDL, so a fresh database is built directly at the
