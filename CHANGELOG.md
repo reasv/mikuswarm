@@ -48,6 +48,18 @@ Unreleased section; it is not part of any release's notes.
 
 ### Fixed
 
+- **The local embedder ran every query as a full 512-token forward pass.**
+  fastembed pads each input to the model's maximum length, and onnxruntime-node
+  runs inference synchronously on the main thread, so embedding a short
+  auto-retrieval query blocked the event loop for hundreds of milliseconds (and a
+  document batch for seconds). Padding is now disabled after init; vectors are
+  unchanged because padded positions are masked.
+
+- **The console rooms list re-counted every event on each poll.** Per-room event
+  and session counts are now kept in a trigger-maintained `timeline_counts` table
+  (rebuilt at startup, like the pipeline counts), so the 5-second rooms poll no
+  longer scans the whole event history on the agent's main thread.
+
 - **Every context build re-tokenized the recent diary window dozens of times.**
   Trimming the recent-memory window to its token ceiling re-counted the whole
   remaining text once per dropped entry, so its cost grew quadratically with diary
