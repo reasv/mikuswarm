@@ -684,6 +684,51 @@ max_excerpt_chars = 6000
 # other room members on the requester's behalf.
 allow_cross_user_targets = true
 
+# Yotsuba (4chan) link previews + browsing tool (spec/YOTSUBA-SUPPORT.md).
+# Enabled via [features].yotsuba = true in a local overlay; nothing here
+# turns the feature on. These are tunables only; shipped defaults match the
+# spec §10 values and require no adjustment for typical deployments.
+[yotsuba]
+api_base = "https://a.4cdn.org"
+media_base = "https://i.4cdn.org"
+site_base = "https://boards.4chan.org"   # canonical base for post links in output
+extra_hosts = []                         # additional base-domains recognized as 4chan links
+min_request_interval_ms = 1000           # 4chan API rule: ≤ 1 request/second
+max_in_flight = 1
+media_min_request_interval_ms = 250      # courtesy pace on the media CDN
+media_max_in_flight = 2
+timeout_ms = 15000
+max_response_bytes = 8388608             # 8 MiB; a 750-post thread is ~1–2 MB
+
+[yotsuba.enrichment]
+enabled = true                           # effective only with [features].yotsuba = true
+media_boards = "all"                     # "all" | "worksafe" (worksafe stops downloads on NSFW boards)
+board_previews = true
+
+# T1 link preview parameters (spec §6).
+[yotsuba.preview]
+ambient_chars = 300                      # ambient rendering: headline post excerpt length
+op_excerpt_words = 8                     # short OP marker for post links and untitled thread links
+latest_replies = 3                       # capture: N latest replies stored for thread links
+replied_to_max = 3                       # capture: max posts-they-answer stored per ref
+replies_max = 3                          # capture: max direct replies stored for post links
+board_threads = 3                        # board links: top non-sticky threads from page 1
+trigger_headline_chars = 800             # trigger rendering: headline post char cap
+trigger_link_tokens = 900                # per-ref token budget (frame + text + caption allowance)
+trigger_group_tokens = 1800              # token budget across all trigger-related refs in one group
+trigger_group_files = 4                  # processed (captioned + image-block) files per trigger group
+
+# T2 yotsuba tool parameters (spec §7).
+[yotsuba.tool]
+page_tokens = 6000
+page_tokens_max = 12000
+files_per_page = 4
+view_max_files = 4
+pdf_max_chars = 8000
+catalog_default_limit = 15
+catalog_max_limit = 50
+max_download_files = 50
+
 [danbooru]
 base_url = "https://danbooru.donmai.us"
 max_regular_tags = 2

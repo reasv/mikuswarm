@@ -430,12 +430,16 @@ const FollowUpSchema = StrictObject({
 // true`) restores its tools.
 //   - character_card → character_card_create / character_card_read / character_card_edit
 //   - danbooru       → the `danbooru` search tool
-// NOTE: this phase gates only tool availability. A later change will also drive
-// skill-file seeding off these flags; that behaviour is NOT implemented yet, so do
-// not assume it here.
+//   - yotsuba        → the `yotsuba` 4chan browsing tool AND the T1 link-preview
+//                      enrichment stage (separate from the tool gate; both are
+//                      controlled by this single flag, gated further by
+//                      [yotsuba.enrichment].enabled for the enrichment stage)
+// Skill seeding is implemented: each feature flag seeds its skill templates from
+// templates/features/<flag>/skills/ into the workspace on startup.
 const FeaturesSchema = StrictObject({
   character_card: Type.Optional(Type.Boolean()),
   danbooru: Type.Optional(Type.Boolean()),
+  yotsuba: Type.Optional(Type.Boolean()),
 });
 
 const ResumeSchema = StrictObject({
@@ -1238,6 +1242,58 @@ const YouTubeSchema = StrictObject({
 
 // Unified registry (spec MODEL-FALLBACK §2.3): captioning models are NAMED
 // references into `[models.*]` (connection / provider / cost / rate_limit_group /
+// Yotsuba (4chan) enrichment + browsing tool (spec/YOTSUBA-SUPPORT.md §10).
+// Three sub-tables: [yotsuba] (transport + rate limiting), [yotsuba.enrichment]
+// (T1 link preview enrichment), [yotsuba.preview] (preview parameters),
+// [yotsuba.tool] (T2 tool parameters). Cross-field sanity validated at app wiring:
+// page_tokens <= page_tokens_max; bases are https:// URLs; extra_hosts are bare
+// hostnames. Feature off ([features].yotsuba = false or absent) is valid and inert.
+const YotsubaEnrichmentSchema = StrictObject({
+  enabled: Type.Optional(Type.Boolean()),
+  media_boards: Type.Optional(Type.String({ enum: ["all", "worksafe"] })),
+  board_previews: Type.Optional(Type.Boolean()),
+});
+
+const YotsubaPreviewSchema = StrictObject({
+  ambient_chars: Type.Optional(Type.Integer({ minimum: 1 })),
+  op_excerpt_words: Type.Optional(Type.Integer({ minimum: 1 })),
+  latest_replies: Type.Optional(Type.Integer({ minimum: 0 })),
+  replied_to_max: Type.Optional(Type.Integer({ minimum: 0 })),
+  replies_max: Type.Optional(Type.Integer({ minimum: 0 })),
+  board_threads: Type.Optional(Type.Integer({ minimum: 0 })),
+  trigger_headline_chars: Type.Optional(Type.Integer({ minimum: 1 })),
+  trigger_link_tokens: Type.Optional(Type.Integer({ minimum: 1 })),
+  trigger_group_tokens: Type.Optional(Type.Integer({ minimum: 1 })),
+  trigger_group_files: Type.Optional(Type.Integer({ minimum: 0 })),
+});
+
+const YotsubaToolConfigSchema = StrictObject({
+  page_tokens: Type.Optional(Type.Integer({ minimum: 1 })),
+  page_tokens_max: Type.Optional(Type.Integer({ minimum: 1 })),
+  files_per_page: Type.Optional(Type.Integer({ minimum: 0 })),
+  view_max_files: Type.Optional(Type.Integer({ minimum: 0 })),
+  pdf_max_chars: Type.Optional(Type.Integer({ minimum: 0 })),
+  catalog_default_limit: Type.Optional(Type.Integer({ minimum: 1 })),
+  catalog_max_limit: Type.Optional(Type.Integer({ minimum: 1 })),
+  max_download_files: Type.Optional(Type.Integer({ minimum: 1 })),
+});
+
+const YotsubaSchema = StrictObject({
+  api_base: Type.Optional(Type.String({ minLength: 1 })),
+  media_base: Type.Optional(Type.String({ minLength: 1 })),
+  site_base: Type.Optional(Type.String({ minLength: 1 })),
+  extra_hosts: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  min_request_interval_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  max_in_flight: Type.Optional(Type.Integer({ minimum: 1 })),
+  media_min_request_interval_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  media_max_in_flight: Type.Optional(Type.Integer({ minimum: 1 })),
+  timeout_ms: Type.Optional(Type.Integer({ minimum: 1 })),
+  max_response_bytes: Type.Optional(Type.Integer({ minimum: 1 })),
+  enrichment: Type.Optional(YotsubaEnrichmentSchema),
+  preview: Type.Optional(YotsubaPreviewSchema),
+  tool: Type.Optional(YotsubaToolConfigSchema),
+});
+
 // any `fallback` chain live on the referenced block) — the old inline caption
 // model block (id/endpoint/api_key/provider/cost/rate_limit_group) is gone.
 // NOTE: the per-modality `concurrency` alias (deprecated transitional knob) was
@@ -2000,6 +2056,9 @@ export const AppConfigSchema = StrictObject({
     suggest_on_empty: Type.Optional(Type.Boolean()),
     max_suggestions: Type.Optional(Type.Number({ minimum: 1, maximum: 50 })),
   })),
+  // Yotsuba (4chan) link previews + browsing tool (spec/YOTSUBA-SUPPORT.md §10).
+  // A [yotsuba] table with the feature off is valid and inert.
+  yotsuba: Type.Optional(YotsubaSchema),
   network: Type.Optional(StrictObject({
     http_proxy_url: Type.Optional(Type.String()),
     // App-layer SSRF guard (defense-in-depth). When true (default), outbound
@@ -2060,6 +2119,7 @@ export type BackfetchConfig = Static<typeof BackfetchSchema>;
 export type TokenizerConfig = Static<typeof TokenizerSchema>;
 export type FxTwitterRawConfig = Static<typeof FxTwitterSchema>;
 export type YouTubeRawConfig = Static<typeof YouTubeSchema>;
+export type YotsubaRawConfig = Static<typeof YotsubaSchema>;
 export type ProactiveConfig = Static<typeof ProactiveSchema>;
 export type ProactiveChannelConfig = Static<typeof ProactiveChannelSchema>;
 /** Per-agent workspace config (spec MULTI-AGENT-SUPPORT §4.1, §10, §10a). */

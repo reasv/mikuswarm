@@ -130,6 +130,8 @@ import { EnrichmentWorkerPool, FetchClient } from "./enrichment/index.js";
 import { AttachmentStore } from "./enrichment/attachment-store.js";
 import { FxTwitterClient, resolveFxTwitterConfig } from "./fxtwitter/index.js";
 import { resolveYouTubeConfig } from "./youtube/config.js";
+import { resolveYotsubaConfig, type ResolvedYotsubaConfig } from "./yotsuba/types.js";
+import { YotsubaClient } from "./yotsuba/client.js";
 import { CaptionWorkerPool, InferenceClient, type MediaModality } from "./captioning/index.js";
 import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools, type McpServerEntry } from "./mcp/index.js";
@@ -301,6 +303,36 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     throw new Error(
       "youtube.enrichment.enabled = true requires youtube.enabled = true",
     );
+  }
+  // [yotsuba.tool] cross-field sanity (spec/YOTSUBA-SUPPORT.md §10).
+  const yotsubaCfg = resolveYotsubaConfig(config.yotsuba);
+  if (yotsubaCfg.tool.pageTokens > yotsubaCfg.tool.pageTokensMax) {
+    throw new Error(
+      `yotsuba.tool: page_tokens (${yotsubaCfg.tool.pageTokens}) must be <= page_tokens_max (${yotsubaCfg.tool.pageTokensMax})`,
+    );
+  }
+  if (yotsubaCfg.tool.catalogDefaultLimit > yotsubaCfg.tool.catalogMaxLimit) {
+    throw new Error(
+      `yotsuba.tool: catalog_default_limit (${yotsubaCfg.tool.catalogDefaultLimit}) must be <= catalog_max_limit (${yotsubaCfg.tool.catalogMaxLimit})`,
+    );
+  }
+  // Bases must be https:// URLs (when set).
+  for (const [key, base] of [
+    ["yotsuba.api_base", yotsubaCfg.apiBase],
+    ["yotsuba.media_base", yotsubaCfg.mediaBase],
+    ["yotsuba.site_base", yotsubaCfg.siteBase],
+  ] as const) {
+    if (!base.startsWith("https://") && !base.startsWith("http://")) {
+      throw new Error(`${key}: expected an https:// URL, got "${base}"`);
+    }
+  }
+  // extra_hosts must be bare hostnames (no scheme, no path).
+  for (const host of yotsubaCfg.extraHosts) {
+    if (host.includes("/") || host.includes(":")) {
+      throw new Error(
+        `yotsuba.extra_hosts: "${host}" must be a bare hostname (no scheme or path)`,
+      );
+    }
   }
   // [saucenao] graceful key-gated degrade (spec SAUCENAO-SOURCE-LOOKUP §3.2/§5;
   // app-wiring per the proactive-posting precedent). `enabled = true` is the shipped
@@ -7217,6 +7249,8 @@ export function formatRefusalDurationShort(ms: number): string {
 export const FEATURE_TOOLS: Record<keyof NonNullable<AppConfig["features"]>, readonly string[]> = {
   character_card: ["character_card_create", "character_card_read", "character_card_edit"],
   danbooru: ["danbooru"],
+  // yotsuba: the tool arrives in phase 3; the gate entry is inert until then.
+  yotsuba: ["yotsuba"],
 };
 
 /**
@@ -7228,6 +7262,35 @@ export function enabledFeatureNames(features: AppConfig["features"]): string[] {
   return (Object.keys(FEATURE_TOOLS) as (keyof typeof FEATURE_TOOLS)[]).filter(
     (key) => features?.[key] === true,
   );
+}
+
+/**
+ * Yotsuba wiring result: the shared client and resolved config.
+ * Phases 2 (enrichment) and 3 (tool) consume this.
+ */
+export interface YotsubaSubsystem {
+  client: YotsubaClient;
+  config: ResolvedYotsubaConfig;
+}
+
+/**
+ * Construct the shared YotsubaClient + resolved config when the feature is on.
+ * Returns undefined when `[features].yotsuba !== true` or when
+ * `[yotsuba.enrichment].enabled` is false (for the enrichment-only callers; the
+ * tool caller always checks the feature flag itself).
+ *
+ * This is a pure factory called at startup by `startMikuAgent`. The enrichment
+ * worker and the tool both receive the returned object by reference.
+ */
+export function createYotsubaSubsystem(
+  config: AppConfig,
+  fetchClient: FetchClient,
+): YotsubaSubsystem | undefined {
+  if (config.features?.yotsuba !== true) return undefined;
+  const resolved = resolveYotsubaConfig(config.yotsuba);
+  const httpProxyUrl = config.network?.http_proxy_url;
+  const client = YotsubaClient.create(resolved, httpProxyUrl, fetchClient);
+  return { client, config: resolved };
 }
 
 /**
