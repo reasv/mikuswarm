@@ -70,7 +70,7 @@ export interface ViewBudget {
    * inclusive of `reserveTokens`. Pinned posts may take the budget over this.
    */
   maxTextTokens: number;
-  /** Maximum number of attachments to show (file pass). 0 = no limit. */
+  /** Maximum number of attachments to show (file pass). 0 = no limit; negative = none. */
   maxFiles: number;
   /**
    * Tokens reserved up front for the frame (thread element, gap markers,

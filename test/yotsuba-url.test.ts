@@ -264,3 +264,17 @@ test("yotsubaRefKey: board ref produces stable key", () => {
   const key = yotsubaRefKey({ ...ref, bodyIndex: 0 });
   assert.equal(key, "board:g");
 });
+
+test("safeYotsubaExt: accepts real extensions, rejects path-like values", async () => {
+  const { safeYotsubaExt, safeYotsubaTim } = await import("../src/yotsuba/types.js");
+  assert.equal(safeYotsubaExt(".JPG"), ".jpg");
+  assert.equal(safeYotsubaExt(".webm"), ".webm");
+  assert.equal(safeYotsubaExt("/../../etc/passwd"), undefined);
+  assert.equal(safeYotsubaExt(".jpg/../x"), undefined);
+  assert.equal(safeYotsubaExt("jpg"), undefined);
+  assert.equal(safeYotsubaExt(undefined), undefined);
+  assert.equal(safeYotsubaTim(1790626296534393), 1790626296534393);
+  assert.equal(safeYotsubaTim(-1), undefined);
+  assert.equal(safeYotsubaTim(1.5), undefined);
+  assert.equal(safeYotsubaTim("123"), undefined);
+});

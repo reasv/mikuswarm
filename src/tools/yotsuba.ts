@@ -42,6 +42,7 @@ import {
   type FileRenderInfo,
 } from "../yotsuba/format.js";
 import type { YotsubaPostNode } from "../yotsuba/types.js";
+import { safeYotsubaExt, safeYotsubaTim } from "../yotsuba/types.js";
 import { buildStoryboard } from "../media/storyboard.js";
 import { extractPdfText, parsePageRange } from "../media/pdf.js";
 import {
@@ -180,6 +181,7 @@ function apiPostToNode(p: {
   id?: string;
   capcode?: string;
   country?: string;
+  country_name?: string;
   flag_name?: string;
   time?: number;
   com?: string;
@@ -202,22 +204,22 @@ function apiPostToNode(p: {
     trip: p.trip,
     posterId: p.id,
     capcode: p.capcode,
-    flag: p.flag_name ?? p.country,
+    flag: p.country_name ?? p.flag_name ?? p.country,
     time: (p.time ?? 0) * 1000,
     text: converted.text,
     quotes: converted.quotes,
     deadQuotes: converted.deadQuotes,
     crossQuotes: converted.crossQuotes,
     replies: p.replies ?? 0,
-    file: p.tim ? {
+    file: safeYotsubaTim(p.tim) && safeYotsubaExt(p.ext) ? {
       name: p.filename ?? "",
-      ext: p.ext ?? ".jpg",
+      ext: safeYotsubaExt(p.ext)!,
       w: p.w,
       h: p.h,
       bytes: p.fsize,
       spoiler: p.spoiler === 1,
       deleted: p.filedeleted === 1,
-      tim: p.tim,
+      tim: safeYotsubaTim(p.tim)!,
     } : undefined,
   };
 }
@@ -590,7 +592,9 @@ async function renderThread(
   const toolCfg = config.tool;
 
   const pageTokens = Math.min(opts.maxTokens ?? toolCfg.pageTokens, toolCfg.pageTokensMax);
-  const filesPerPage = opts.filesOff ? 0 : toolCfg.filesPerPage;
+  // -1 = show no files (runView treats 0 as "no limit"); every file then
+  // lands in the footer's "not shown" list with its view call.
+  const filesPerPage = opts.filesOff ? -1 : toolCfg.filesPerPage;
 
   // Build thread nodes.
   const opApiPost = opts.posts[0];
@@ -797,10 +801,13 @@ async function renderThread(
     }
   } else if (view === "most_replied") {
     // After is rank offset
-    hasNextPage = result.unplaced.length > 0;
-    nextAfter = opts.after != null
-      ? opts.after + result.placedCount
-      : result.placedCount;
+    // Advance by the ranked posts shown, not the context excerpts placed
+    // alongside them; more pages exist only while ranked posts remain.
+    const rankedShown = result.items.filter(
+      (it) => isPlacedPost(it) && it.role === "most_replied",
+    ).length;
+    nextAfter = (opts.after ?? 0) + rankedShown;
+    hasNextPage = mostRepliedPosts(graph, 2, nextAfter).length > 0;
   } else if (view === "search") {
     const lastPlaced = [...result.items].reverse().find(isPlacedPost);
     if (lastPlaced && result.unplaced.length > 0) {
@@ -1350,7 +1357,11 @@ export function createYotsubaTool(ctx: YotsubaToolContext): AgentTool {
           }
 
           const tim = apiPost.tim;
-          const ext = apiPost.ext ?? ".jpg";
+          const ext = safeYotsubaExt(apiPost.ext);
+          if (!ext || !safeYotsubaTim(apiPost.tim)) {
+            textParts.push(`>>${postNo}: unrecognized file type.`);
+            continue;
+          }
           const filename = (apiPost.filename ?? "") + ext;
           const mime = extToMime(ext);
           const dims = apiPost.w && apiPost.h ? ` dims="${apiPost.w}x${apiPost.h}"` : "";
@@ -1675,7 +1686,8 @@ export function createYotsubaTool(ctx: YotsubaToolContext): AgentTool {
           }
 
           const tim = apiPost.tim;
-          const ext = apiPost.ext ?? ".jpg";
+          const ext = safeYotsubaExt(apiPost.ext);
+          if (!ext || !safeYotsubaTim(apiPost.tim)) { failed.push({ postNo, reason: "unrecognized file type" }); continue; }
           const filename = `${postNo}-${(apiPost.filename ?? String(tim)).replace(/[^A-Za-z0-9._-]+/g, "-")}${ext}`;
 
           try {

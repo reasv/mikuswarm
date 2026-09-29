@@ -10,6 +10,23 @@
 
 export const YOTSUBA_SOURCE_KIND = "yotsuba" as const;
 
+/**
+ * Validate a file extension from the API before it is used in a URL, a temp
+ * path, or a workspace filename: a leading dot plus 1-5 alphanumerics
+ * (".jpg", ".webm", ".pdf"). Anything else (a compromised or misconfigured
+ * `api_base` sending "/../x") yields undefined and the file is treated as
+ * absent. Lower-cased.
+ */
+export function safeYotsubaExt(ext: string | undefined | null): string | undefined {
+  if (typeof ext !== "string") return undefined;
+  return /^\.[A-Za-z0-9]{1,5}$/.test(ext) ? ext.toLowerCase() : undefined;
+}
+
+/** A 4chan `tim` must be a positive integer to be used in a file URL or path. */
+export function safeYotsubaTim(tim: unknown): number | undefined {
+  return typeof tim === "number" && Number.isSafeInteger(tim) && tim > 0 ? tim : undefined;
+}
+
 // ---------------------------------------------------------------------------
 // 4chan API response types (every field optional — tolerant parsing)
 // ---------------------------------------------------------------------------
