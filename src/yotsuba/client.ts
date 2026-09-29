@@ -101,11 +101,11 @@ export class YotsubaClient {
   constructor(
     private readonly config: ResolvedYotsubaConfig,
     private readonly fetchClient?: FetchClient,
+    httpProxyUrl?: string,
   ) {
-    this.apiDispatcher = buildProxyDispatcher(config.apiBase.includes("proxy") ? undefined : undefined);
-    // Actually build proxy dispatcher from network config — the caller passes config
-    // which has the proxy URL embedded. Re-create from the config as-is.
-    // Note: buildProxyDispatcher takes httpProxyUrl; we expose a factory pattern.
+    // API requests honor [network].http_proxy_url; file downloads ride the
+    // FetchClient, which carries its own proxy dispatcher.
+    this.apiDispatcher = buildProxyDispatcher(httpProxyUrl);
     this.apiLimiter = new PacedLimiter({
       minIntervalMs: config.minRequestIntervalMs,
       maxInFlight: config.maxInFlight,
@@ -121,11 +121,7 @@ export class YotsubaClient {
    * to be built from the http_proxy_url config.
    */
   static create(config: ResolvedYotsubaConfig, httpProxyUrl?: string, fetchClient?: FetchClient): YotsubaClient {
-    const client = new YotsubaClient(config, fetchClient);
-    // Override the dispatcher built in the constructor with the correct proxy.
-    (client as unknown as { _apiDispatcher: Dispatcher | undefined })._apiDispatcher =
-      buildProxyDispatcher(httpProxyUrl);
-    return client;
+    return new YotsubaClient(config, fetchClient, httpProxyUrl);
   }
 
   // ---------------------------------------------------------------------------
