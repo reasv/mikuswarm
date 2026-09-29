@@ -390,9 +390,14 @@ like all other media in history.
 Per ref, one `thread(board, no)` call (plus the 24 h-cached `boards()` for the board title).
 Enrichment stores, in the row's payload:
 
-- **Thread metadata**: board code and title, thread number, subject (or, when the thread has
-  none, the first `untitled_words` (8) words of the OP as `op_excerpt`), post / file / poster
-  counts, status (sticky, closed, archived, bump limit, image limit), and `as_of`.
+- **Thread metadata**: board code and title, thread number, subject, post / file / poster
+  counts, status (sticky, closed, archived, bump limit, image limit), and `as_of`. Plus the
+  same small OP marker a board preview uses: `op_excerpt`, the first `op_excerpt_words` (8)
+  words of the OP's text (`>>` references removed, whitespace collapsed, `…` appended when
+  cut). A thread link stores it only when the thread has no subject, because the OP itself is
+  the headline there. A **post link always stores it**, next to the subject when there is
+  one, since the OP is otherwise absent from a post-link preview. An OP with no text (file
+  only) has no excerpt.
 - **Candidate posts**, full text and file metadata (not the files):
 
 | Link | Headline | Candidates |
@@ -423,7 +428,7 @@ example) costs a fetch.
 
 **Board links** fetch page 1 (`/{b}/1.json`, about 50 KB for /g/, CDN-cached) and store the
 first `board_threads` (3) non-sticky threads in bump order: number, subject (or the first
-`untitled_words` words of the OP), reply and file counts, creation time. Board previews have
+`op_excerpt_words` words of the OP), reply and file counts, creation time. Board previews have
 one rendering (§6.6 H) whatever the context; no files.
 
 ### 6.3 Ambient rendering
@@ -566,7 +571,7 @@ About 170 tokens. The image is stored; with `caption_all` on it would also carry
 
 ```xml
 <link_preview url="https://boards.4chan.org/g/thread/109933629#p109934102" kind="4chan">
-<thread board="/g/ - Technology" no="109933629" op_excerpt="why does every linux distro installer still" posts="54" files="7" as_of="2026-09-29 02:10">
+<thread board="/g/ - Technology" no="109933629" op_excerpt="why does every linux distro installer still ask…" posts="54" files="7" as_of="2026-09-29 02:10">
 <post no="109934102" role="linked" time="2026-09-29 01:40" replies="5">
 &gt;&gt;109934055 (not shown)
 because the people who write installers are not the people who use installers
@@ -668,7 +673,7 @@ upgraded element from now on.
 <reply_to sender="…" time="…" external_id="…">
 lmao look at this
 <link_preview url="https://boards.4chan.org/g/thread/109930292#p109931450" kind="4chan">
-<thread board="/g/ - Technology" no="109930292" subject="/lmg/ - Local Models General" posts="435" files="88" posters="121" status="bump limit" as_of="2026-09-28 12:20" linked="109931450">
+<thread board="/g/ - Technology" no="109930292" subject="/lmg/ - Local Models General" op_excerpt="/lmg/ - a general dedicated to the discussion…" posts="435" files="88" posters="121" status="bump limit" as_of="2026-09-28 12:20" linked="109931450">
 <omitted posts="101" files="20"/>
 <post no="109931388" role="replied_to" time="2026-09-28 11:59" replies="4">
 benchmarks mean nothing, show me it holding a coherent story past 8k
@@ -725,7 +730,7 @@ rest of the group.
 
 ```
  [4chan /g/ "/lmg/ - Local Models General" (435 posts): /lmg/ - a general dedicated to the discussion and development of local…]
- [4chan /g/ "why does every linux distro installer still…" (54 posts), post >>109934102: because the people who write installers are not the people who…]
+ [4chan /g/ "why does every linux distro installer still ask…" (54 posts), post >>109934102: because the people who write installers are not the people who…]
  [4chan /g/ board: 3 threads]
  [4chan /g/ thread 109800000: already gone when linked]
 ```
@@ -742,7 +747,7 @@ rest of the group.
 <link_preview url="https://boards.4chan.org/g/" kind="4chan">
 <board code="/g/" title="Technology" worksafe="true" as_of="2026-09-29 02:10">
 <thread no="109934266" replies="97" files="13" started="2026-09-28 22:40">/lmg/ - Local Models General</thread>
-<thread no="109934884" replies="0" started="2026-09-29 02:08" op_excerpt="true">is it worth upgrading from a 3080 to</thread>
+<thread no="109934884" replies="0" started="2026-09-29 02:08" op_excerpt="true">is it worth upgrading from a 3080 to…</thread>
 <thread no="109933660" replies="3" files="2" started="2026-09-28 20:15">Autumn Dive/g/rass</thread>
 [4chan board: the top 3 threads on page 1. The yotsuba tool can search the catalog.]
 </board>
@@ -757,6 +762,7 @@ No new tables, no migration. One `link_previews` row per ref (the X precedent):
 
 - `source_kind = "yotsuba"`, `site_name = "4chan"`, canonical `url`.
 - `title`: `"/{b}/ - {subject or OP excerpt}"`; board refs `"/{b}/ - {board title}"`.
+  (Post links: the same, so a search hit names the thread the post is in.)
 - `description`: the ambient rendering's flat text (subject + headline excerpt). This is what
   chat search indexes; the upgrade does not change it.
 - `payload_json`:
@@ -1055,7 +1061,7 @@ board_previews = true
 
 [yotsuba.preview]                        # §6
 ambient_chars = 300                      # ambient rendering: headline post excerpt
-untitled_words = 8                       # subject stand-in for untitled threads (first words of the OP)
+op_excerpt_words = 8                     # OP marker: post links always; thread and board links when untitled
 latest_replies = 3                       # capture, thread links
 replied_to_max = 3                       # capture: posts the latest replies / the linked post answer
 replies_max = 3                          # capture, post links: first replies to the linked post
