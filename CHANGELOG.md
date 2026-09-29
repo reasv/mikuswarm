@@ -48,6 +48,16 @@ Unreleased section; it is not part of any release's notes.
 
 ### Fixed
 
+- **Summary coverage selection stalled the agent for seconds at a time on large
+  rooms.** The contiguity probe, the "events after cursor" query, and the summary
+  lineage walk could not use their indexes (the cursor predicate gave SQLite no
+  seek range; the lineage join built an automatic index over all of
+  `summary_events` per call), so each of the hundreds of probes per reconcile
+  scanned the room's entire history on the main thread. On a room with ~300k
+  events and ~2k summaries this blocked the event loop for up to 20+ seconds,
+  delaying replies and making the console unresponsive. All cursor queries now
+  carry an explicit timestamp range bound and the lineage walk seeks primary keys.
+
 - **The browser could not create a new profile on current CloakBrowser-Manager
   images.** The Manager now derives the fingerprint platform from its host runtime
   and rejects a `platform` field on profile create with HTTP 422, so the first

@@ -2323,6 +2323,7 @@ export class Storage {
           `select event_json
            from timeline_events
            where timeline_key = @timelineKey
+             and timestamp >= @timestamp
              and (
                timestamp > @timestamp
                or (timestamp = @timestamp and received_at > @receivedAt)
@@ -5046,6 +5047,7 @@ export class Storage {
           `select event_json
            from timeline_events
            where timeline_key = @timelineKey
+             and timestamp >= @timestamp
              and (
                timestamp > @timestamp
                or (timestamp = @timestamp and received_at > @receivedAt)
@@ -5095,6 +5097,7 @@ export class Storage {
           `select event_json
            from timeline_events
            where timeline_key = @timelineKey
+             and timestamp >= @startTs and timestamp <= @endTs
              and (
                timestamp > @startTs
                or (timestamp = @startTs and received_at > @startRcv)
@@ -5288,6 +5291,7 @@ export class Storage {
           `select * from summaries
            where timeline_key = @timelineKey and status in ('complete', 'truncated')
              ${levelFilter}
+             and earliest_timestamp >= @startTs and earliest_timestamp <= @endTs
              and (
                earliest_timestamp > @startTs
                or (earliest_timestamp = @startTs and id >= @startId)
@@ -5328,9 +5332,13 @@ export class Storage {
                join chain on sp.summary_id = chain.summary_id
               where sp.ordinal = 0
            )
-           select se.event_id as event_id from summary_events se
-             join chain on se.summary_id = chain.summary_id
-            where se.ordinal = 0
+           -- CROSS JOIN pins chain as the outer loop and the unary + keeps
+           -- ordinal off the index choice, so each step seeks the summary_events
+           -- PK; left to itself the planner builds an automatic index over the
+           -- whole table on every call.
+           select se.event_id as event_id from chain
+             cross join summary_events se on se.summary_id = chain.summary_id
+            where +se.ordinal = 0
             limit 1`,
         )
         .get({ summaryId }) as { event_id: string } | undefined,
@@ -5378,8 +5386,14 @@ export class Storage {
     const row = this.read((db) =>
       db
         .prepare(
+          // The plain timestamp bounds are implied by the cursor predicates but
+          // are the only range SQLite can seek on (it does not derive one from
+          // the OR form); without them every probe scans the whole timeline.
+          // The same redundant bound is on every cursor query in this file.
           `select 1 as hit from timeline_events
-           where timeline_key = @timelineKey and ${afterCond} and ${beforeCond}
+           where timeline_key = @timelineKey
+             and timestamp >= @aTs and timestamp <= @bTs
+             and ${afterCond} and ${beforeCond}
            limit 1`,
         )
         .get({
