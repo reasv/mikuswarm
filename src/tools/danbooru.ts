@@ -17,6 +17,7 @@ import {
 } from "../media/index.js";
 import type { InferenceClient } from "../captioning/inference-client.js";
 import type { ToolUsageRecord } from "./image-gen.js";
+import { PacedLimiter } from "../net/paced-limiter.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1053,55 +1054,13 @@ const DANBOORU_DEFAULT_MAX_IN_FLIGHT = 2;
  * It enforces a minimum interval between request *starts* plus a max in-flight
  * count. Danbooru egress still flows through `guardedFetch` for SSRF safety and the
  * unconditional 429/503 backoff (belt-and-suspenders); this limiter sets the pace.
+ *
+ * Implemented as an alias of `PacedLimiter` from `src/net/paced-limiter.ts`,
+ * using the unclassed (single-queue) path for backward-compatible behavior.
  */
-export class DanbooruRateLimiter {
-  private active = 0;
-  /** Next free instant in the pacing schedule (epoch ms). */
-  private nextStartMs = 0;
-  private readonly waiters: Array<() => void> = [];
-
-  constructor(private readonly opts: { minIntervalMs: number; maxInFlight: number }) {}
-
-  async run<T>(fn: () => Promise<T>): Promise<T> {
-    await this.acquire();
-    try {
-      return await fn();
-    } finally {
-      this.release();
-    }
-  }
-
-  private async acquire(): Promise<void> {
-    // Slot admission: FIFO, with DIRECT HANDOFF on release. A caller queues when
-    // the limiter is saturated (or anyone is already queued — no overtaking);
-    // `release` then transfers slot ownership to the head waiter WITHOUT
-    // decrementing `active`, so a fresh caller arriving between the release and
-    // the waiter's resumption can never double-grant the freed slot past
-    // `maxInFlight`.
-    if (this.active >= this.opts.maxInFlight || this.waiters.length > 0) {
-      await new Promise<void>((resolve) => this.waiters.push(resolve));
-      // Slot ownership was handed over in release(); `active` already counts us.
-    } else {
-      this.active += 1;
-    }
-    // Pacing: reserve this request's start instant SYNCHRONOUSLY (before any
-    // await), so concurrent acquirers each claim a distinct slot in the schedule
-    // instead of reading the same stale "last start" and waking together.
-    const now = Date.now();
-    const startAt = Math.max(now, this.nextStartMs);
-    this.nextStartMs = startAt + this.opts.minIntervalMs;
-    if (startAt > now) await new Promise((resolve) => setTimeout(resolve, startAt - now));
-  }
-
-  private release(): void {
-    const next = this.waiters.shift();
-    if (next) {
-      // Direct handoff: the slot stays counted in `active` and now belongs to
-      // the head waiter.
-      next();
-      return;
-    }
-    this.active -= 1;
+export class DanbooruRateLimiter extends PacedLimiter {
+  constructor(opts: { minIntervalMs: number; maxInFlight: number }) {
+    super({ minIntervalMs: opts.minIntervalMs, maxInFlight: opts.maxInFlight });
   }
 }
 
