@@ -540,6 +540,9 @@ function buildSearchSlots(
 // Thread renderer
 // ---------------------------------------------------------------------------
 
+/** Per-post rendering overhead beyond its escaped text (element, attributes, file element, gap marker). */
+const POST_RENDER_OVERHEAD_TOKENS = 45;
+
 type ImageBlock = { type: "image"; data: string; mimeType: string };
 
 async function renderThread(
@@ -594,7 +597,9 @@ async function renderThread(
   const pageTokens = Math.min(opts.maxTokens ?? toolCfg.pageTokens, toolCfg.pageTokensMax);
   // -1 = show no files (runView treats 0 as "no limit"); every file then
   // lands in the footer's "not shown" list with its view call.
-  const filesPerPage = opts.filesOff ? -1 : toolCfg.filesPerPage;
+  // Without vision nothing is sent as an image, so every file counts as not
+  // shown and the footer points at "view" (which captions them).
+  const filesPerPage = opts.filesOff || !ctx.modelHasVision ? -1 : toolCfg.filesPerPage;
 
   // Build thread nodes.
   const opApiPost = opts.posts[0];
@@ -602,6 +607,9 @@ async function renderThread(
     apiPostToNode(p, i, i === 0 ? "op" : "latest"),
   );
   const graph = buildThreadGraph(nodes);
+  // The API's `replies` is the thread-level reply count (OP only); a post's
+  // reply count is its backlinks within the thread.
+  for (const gp of graph.posts) gp.replies = gp.backlinks.length;
 
   const opPost = opts.posts[0];
   const subject = opPost?.sub;
@@ -645,7 +653,7 @@ async function renderThread(
       isContiguous = true;
   }
 
-  const RESERVE_TOKENS = 100; // frame, footer, gap markers
+  const RESERVE_TOKENS = 250; // thread frame, envelope, footer with next calls
   const result = runView(
     graph,
     slots,
@@ -657,7 +665,10 @@ async function renderThread(
       contiguous: isContiguous,
       excerptFallback: true,
     },
-    estimateTokens,
+    // Charge what the page actually renders: the escaped text plus each post's
+    // element, attributes, file element and gap marker (~45 tokens), so a page
+    // stays within max_tokens.
+    (text: string) => estimateTokens(escapeXml(text)) + POST_RENDER_OVERHEAD_TOKENS,
   );
 
   // Collect shown posts with files

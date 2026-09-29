@@ -164,7 +164,7 @@ export function postElement(
   if (post.trip) attrs.push(`trip="${escapeAttr(post.trip)}"`);
   if (post.capcode) attrs.push(`capcode="${escapeAttr(post.capcode)}"`);
   attrs.push(`time="${escapeAttr(compactAgentTimestamp(new Date(post.time)))}"`);
-  attrs.push(`replies="${post.replies}"`);
+  if (post.replies > 0) attrs.push(`replies="${post.replies}"`);
 
   if (pp.tier === "excerpt") attrs.push(`excerpt="true"`);
 

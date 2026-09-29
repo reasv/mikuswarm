@@ -182,25 +182,19 @@ test("latestReplies: returns all replies (non-OP) if n >= reply count", () => {
 // ---------------------------------------------------------------------------
 
 test("mostRepliedPosts: ranks by backlink count, descending (minReplies threshold)", () => {
-  // mostRepliedPosts(graph, minReplies=2, after=0)
-  // Only posts with >= minReplies are included; OP is excluded.
+  // Ranking uses backlinks within the thread; a stored \`replies\` value (the
+  // API's thread-level count on the OP) is ignored. The OP is excluded.
   const g = thread(
     makePost(100),
-    makePost(101, { quotes: [100], replies: 2 }),
-    makePost(102, { quotes: [100], replies: 3 }),
+    makePost(101, { quotes: [100], replies: 50 }),
+    makePost(102, { quotes: [101] }),
     makePost(103, { quotes: [101] }),
+    makePost(104, { quotes: [101, 105] }),
+    makePost(105),
+    makePost(106, { quotes: [105] }),
   );
-  // With minReplies=2: posts 101 (backlinks=0+stored replies=2) and 102 (backlinks=0+3).
-  // Actually mostRepliedPosts uses p.replies ?? p.backlinks.length.
-  // replies field from makePost: 0. backlinks built from quotes. So:
-  // 100 gets backlinks from 101,102 = 2 backlinks. 101 gets backlinks from 103 = 1.
-  // But OP (100) is excluded from mostRepliedPosts.
-  // 101: backlinks=[103] so backlinks.length=1. replies=2 (override). Uses replies=2.
-  // 102: backlinks=[] so backlinks.length=0. replies=3 (override). Uses replies=3.
-  // With minReplies=2: 101 (2) and 102 (3) pass. 102 ranks first.
   const ranked = mostRepliedPosts(g, 2);
-  assert.ok(ranked.length >= 1);
-  assert.equal(ranked[0].no, 102, "102 has 3 stored replies, should rank first");
+  assert.deepEqual(ranked.map((p) => p.no), [101, 105]);
 });
 
 test("mostRepliedPosts: posts below minReplies threshold are excluded", () => {

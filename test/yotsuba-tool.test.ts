@@ -743,3 +743,39 @@ describe("yotsuba tool: catalog sort", () => {
     } finally { await ws.cleanup(); }
   });
 });
+
+describe("yotsuba tool: live API shape (no per-post replies field)", () => {
+  const q = (no: number) => `<a href="#p${no}" class="quotelink">&gt;&gt;${no}</a>`;
+  const apiThread = {
+    posts: [
+      { no: 100, resto: 0, time: 1790000000, sub: "Example General", com: "welcome", replies: 5, images: 1,
+        tim: 1790000000000001, ext: ".png", filename: "op", w: 10, h: 10, fsize: 100 },
+      { no: 101, resto: 100, time: 1790000060, com: "a claim worth arguing about" },
+      { no: 102, resto: 100, time: 1790000120, com: `${q(101)}<br>disagree` },
+      { no: 103, resto: 100, time: 1790000180, com: `${q(101)}<br>agree` },
+      { no: 104, resto: 100, time: 1790000240, com: `${q(101)}<br>source?`,
+        tim: 1790000000000002, ext: ".jpg", filename: "chart", w: 10, h: 10, fsize: 100 },
+      { no: 105, resto: 100, time: 1790000300, com: `${q(102)}<br>same` },
+    ],
+  };
+
+  test("most_replied ranks by in-thread backlinks; OP replies attr is its backlinks", async () => {
+    const ws = await makeTmpWorkspace();
+    try {
+      const ctx = makeCtx(makeMockClient({ threads: { "g:100": apiThread as never } }), ws.root, { modelHasVision: false });
+      const text = textContent(await callTool(ctx, { action: "thread", board: "g", thread: 100, view: "most_replied" }));
+      assert.match(text, /<post no="101" role="most_replied"[^>]*replies="3"/);
+      assert.doesNotMatch(text, /no="100"[^>]*replies="5"/);
+    } finally { await ws.cleanup(); }
+  });
+
+  test("non-vision page reports 0 files as images and offers the view call", async () => {
+    const ws = await makeTmpWorkspace();
+    try {
+      const ctx = makeCtx(makeMockClient({ threads: { "g:100": apiThread as never } }), ws.root, { modelHasVision: false });
+      const text = textContent(await callTool(ctx, { action: "thread", board: "g", thread: 100 }));
+      assert.match(text, /0 of 2 files as images/);
+      assert.match(text, /"action":"view","board":"g","thread":100,"posts":\[100,104\]/);
+    } finally { await ws.cleanup(); }
+  });
+});

@@ -157,11 +157,12 @@ export function mostRepliedPosts(
 ): GraphPost[] {
   const candidates = graph.posts
     .slice(1) // exclude OP
-    .filter((p) => (p.replies ?? p.backlinks.length) >= minReplies);
-  // Sort by reply count desc, then by thread order asc for stability.
+    .filter((p) => p.backlinks.length >= minReplies);
+  // Sort by reply count (backlinks within the thread) desc, then by thread
+  // order asc for stability.
   candidates.sort((a, b) => {
-    const ra = a.replies ?? a.backlinks.length;
-    const rb = b.replies ?? b.backlinks.length;
+    const ra = a.backlinks.length;
+    const rb = b.backlinks.length;
     if (rb !== ra) return rb - ra;
     return a.index - b.index;
   });
