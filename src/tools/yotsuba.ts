@@ -832,7 +832,7 @@ async function renderThread(
   });
 
   const nonVisionFilesHint = !ctx.modelHasVision && fileCount > 0
-    ? `\n[Files listed as metadata only. Use {"action":"view","board":"${opts.board}","thread":${opts.threadNo},"posts":[N]} to inspect a file.]`
+    ? `\n[Files are listed as metadata only (your model has no vision); the footer's "view" call captions them.]`
     : "";
 
   const threadOpenStr = threadOpenTag({
