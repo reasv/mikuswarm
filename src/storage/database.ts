@@ -5021,15 +5021,21 @@ export class Storage {
     return this.read((db) => {
       const rows = db
         .prepare(
+          // Spec §6.4 group order: the trigger message's own refs, then its
+          // reply-context refs, then the other grouped events chronologically,
+          // each with its message refs before its reply-context refs; refs in
+          // order of appearance within a body.
           `select lp.* from link_previews lp
+           join timeline_events te on te.id = lp.event_id
            where lp.source_kind = 'yotsuba'
              and lp.fetch_status = 'complete'
-             and lp.event_id in (
-               select id from timeline_events where trigger_group_id = ?
-             )
-           order by lp.event_id, lp.preview_index`,
+             and te.trigger_group_id = ?
+           order by case when te.id = ? then 0 else 1 end,
+                    te.timestamp, te.received_at, te.id,
+                    case when lp.context = 'message' then 0 else 1 end,
+                    lp.preview_index`,
         )
-        .all(triggerEventId) as LinkPreviewRow[];
+        .all(triggerEventId, triggerEventId) as LinkPreviewRow[];
       if (rows.length === 0) return [];
       const previewIds = rows.map((r) => r.id);
       const placeholders = previewIds.map(() => "?").join(",");
