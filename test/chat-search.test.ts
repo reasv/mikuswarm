@@ -706,3 +706,22 @@ test("a freshly-opened DB has the chat_index -> timeline_events cascade FK activ
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("reconcileAll yields to timers between batches instead of starving the event loop", async () => {
+  const events = Array.from({ length: 12 }, (_, i) => ev({ id: `y${i}`, senderId: "@a:x", body: `m${i}`, timestamp: 1_000 + i }));
+  await withIndexed(events, async (storage) => {
+    const indexer = new ChatSearchIndexer({ storage, batchSize: 3 });
+    let timerFired = false;
+    let sweepDoneWhenTimerFired: boolean | undefined;
+    let sweepDone = false;
+    setTimeout(() => {
+      timerFired = true;
+      sweepDoneWhenTimerFired = sweepDone;
+    }, 0);
+    await indexer.reconcileAll().then(() => {
+      sweepDone = true;
+    });
+    assert.ok(timerFired, "a timer queued before the sweep ran during it");
+    assert.equal(sweepDoneWhenTimerFired, false, "the timer ran mid-sweep, not after");
+  });
+});

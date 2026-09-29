@@ -178,3 +178,18 @@ test("getSummariesBetween with a level filter seeks an earliest_timestamp range"
     assertRangeSeeks(storage, seen, "summaries", "earliest_timestamp");
   });
 });
+
+test("getChatProjectionInputs looks captions up by event, not by caption status", async () => {
+  await withEvents(async (storage) => {
+    let rows: unknown[] = [];
+    const seen = capture(storage, () => {
+      rows = storage.getChatProjectionInputs({ afterRowid: 0, limit: 50 });
+    });
+    assert.equal(rows.length, 20);
+    const projection = seen.filter((c) => c.sql.includes("group_concat(ma.caption"));
+    assert.equal(projection.length, 1);
+    const plan = planOf(storage, projection[0]!);
+    // Seeking by caption_status walks every captioned asset in the DB per event.
+    assert.doesNotMatch(plan, /\(caption_status=\?/, `caption subquery must seek by event_id; got: ${plan}`);
+  });
+});

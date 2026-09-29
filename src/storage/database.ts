@@ -6538,8 +6538,10 @@ export class Storage {
            where ma.event_id = e.id and ma.role = 'attachment') as attachmentTypes,
         (select count(*) from media_assets ma
            where ma.event_id = e.id and ma.role = 'attachment') as attachCount,
+        -- Unary + on caption_status: left to itself the planner seeks the
+        -- (caption_status, ...) index and walks every captioned asset per event.
         (select group_concat(ma.caption, ' ' order by ma.source_index, ma.id) from media_assets ma
-           where ma.event_id = e.id and ma.caption_status = 'complete'
+           where ma.event_id = e.id and +ma.caption_status = 'complete'
              and ma.caption is not null and ma.caption <> '') as captions,
         (select count(*) from link_previews lp where lp.event_id = e.id) as linkCount,
         (select group_concat(

@@ -48,6 +48,20 @@ Unreleased section; it is not part of any release's notes.
 
 ### Fixed
 
+- **Every context build re-tokenized the recent diary window dozens of times.**
+  Trimming the recent-memory window to its token ceiling re-counted the whole
+  remaining text once per dropped entry, so its cost grew quadratically with diary
+  size. With busy multi-day diaries under a native tokenizer this added several
+  seconds of main-thread work to every session start and every console room view.
+  The trim now counts each entry once, and an unchanged window is reused without
+  re-tokenizing.
+
+- **The chat-search startup sweep took minutes and blocked startup.** Its caption
+  lookup could be planned through the caption-status index, walking every captioned
+  attachment for each event, and its batch loop never yielded to timers or I/O, so
+  the console and the bot waited for the whole sweep. The lookup now goes by event
+  and the sweep yields between batches.
+
 - **Summary coverage selection stalled the agent for seconds at a time on large
   rooms.** The contiguity probe, the "events after cursor" query, and the summary
   lineage walk could not use their indexes (the cursor predicate gave SQLite no

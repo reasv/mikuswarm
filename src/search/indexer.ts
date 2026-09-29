@@ -128,6 +128,7 @@ export class ChatSearchIndexer {
       afterRowid = inputs[inputs.length - 1].srcRowid;
       maxRowid = Math.max(maxRowid, afterRowid);
       if (inputs.length < this.batchSize) break;
+      await yieldToEventLoop();
     }
     const pruned = await this.storage.pruneChatIndexOrphans();
     await this.storage.setIndexMeta(CHAT_MAX_ROWID_KEY, String(maxRowid));
@@ -154,10 +155,20 @@ export class ChatSearchIndexer {
       afterRowid = inputs[inputs.length - 1].srcRowid;
       maxRowid = Math.max(maxRowid, afterRowid);
       if (inputs.length < this.batchSize) break;
+      await yieldToEventLoop();
     }
     if (maxRowid > stored) await this.storage.setIndexMeta(CHAT_MAX_ROWID_KEY, String(maxRowid));
     if (inserted || updated) {
       this.logger?.debug("chat_index_caught_up", { inserted, updated, maxRowid });
     }
   }
+}
+
+/**
+ * The batch loops only await the in-process write queue (microtasks), which never
+ * lets timers or I/O run; without a macrotask hop a whole-table sweep starves every
+ * other startup step and request until it finishes.
+ */
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }
