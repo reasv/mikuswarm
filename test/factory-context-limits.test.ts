@@ -1139,3 +1139,41 @@ test("Gate B §2.4 incident shape: preferred head serves when ITS window fits, e
     "must NOT say 'context exceeds' when the head's own window fits the context",
   );
 });
+
+test("createModelFromConfig: adaptive_thinking / id heuristic → forceAdaptiveThinking on anthropic-messages only", async () => {
+  const { createModelFromConfig } = await import("../src/agent/factory.js");
+  // pi-ai's anthropic-messages driver sends `thinking: { type: "adaptive" }` + an effort
+  // level only when the descriptor carries `compat.forceAdaptiveThinking === true`; without
+  // it the request carries a token budget, which adaptive-only models reject with a 400.
+  const base = { context_window: 1000, max_tokens: 100, input_modalities: ["text"] };
+  const flagged = createModelFromConfig({ id: "some-new-model", adaptive_thinking: true, ...base } as any);
+  assert.equal(flagged.compat?.forceAdaptiveThinking, true, "config flag → adaptive wire shape");
+  const heuristic = createModelFromConfig({ id: "claude-opus-4-7", ...base } as any);
+  assert.equal(heuristic.compat?.forceAdaptiveThinking, true, "known adaptive id, flag unset → adaptive");
+  const optedOut = createModelFromConfig({ id: "claude-opus-4-7", adaptive_thinking: false, ...base } as any);
+  assert.equal(optedOut.compat?.forceAdaptiveThinking, undefined, "explicit false is authoritative");
+  const older = createModelFromConfig({ id: "claude-sonnet-4-5", ...base } as any);
+  assert.equal(older.compat?.forceAdaptiveThinking, undefined, "budget-based model stays budget-based");
+  const otherApi = createModelFromConfig({ id: "m", api: "openai-responses", adaptive_thinking: true, ...base } as any);
+  assert.equal(otherApi.compat?.forceAdaptiveThinking, undefined, "inert off the anthropic-messages path");
+});
+
+test("createModelFromConfig: compat.supports_tool_references passes through; unset leaves pi-ai's detection", async () => {
+  const { createModelFromConfig } = await import("../src/agent/factory.js");
+  const base = { context_window: 1000, max_tokens: 100, input_modalities: ["text"] };
+  assert.equal(createModelFromConfig({ id: "m", ...base } as any).compat?.supportsToolReferences, undefined);
+  const off = createModelFromConfig({ id: "m", compat: { supports_tool_references: false }, ...base } as any);
+  assert.equal(off.compat?.supportsToolReferences, false, "explicit false → loaded tools grow `tools` plainly");
+  const on = createModelFromConfig({ id: "m", compat: { supports_tool_references: true }, ...base } as any);
+  assert.equal(on.compat?.supportsToolReferences, true);
+});
+
+test("createModelFromConfig: compat.declare_deferred_tools → descriptor flag and tool references off", async () => {
+  const { createModelFromConfig } = await import("../src/agent/factory.js");
+  const base = { context_window: 1000, max_tokens: 100, input_modalities: ["text"] };
+  const on = createModelFromConfig({ id: "m", compat: { declare_deferred_tools: true, supports_tool_references: true }, ...base } as any);
+  assert.equal((on.compat as any)?.declareDeferredTools, true);
+  assert.equal(on.compat?.supportsToolReferences, false, "the transport replaces the tool_reference block");
+  const off = createModelFromConfig({ id: "m", ...base } as any);
+  assert.equal((off.compat as any)?.declareDeferredTools, undefined);
+});

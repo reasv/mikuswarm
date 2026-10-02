@@ -10,6 +10,8 @@ import { makePrefillInjector, makeDropReasoningInjector, wrapToolWithAnalysisStr
 import type { ContextMessage } from "../context/builder.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import { convertToLlm } from "./convert.js";
+import { withStaleThinkingDropped } from "./stale-thinking.js";
+import { makeDeferLoadingInjector, withDeclaredDeferredTools, type DeclaredToolSet } from "./declared-tools.js";
 import { estimateLiveSliceTokens } from "./live-token-estimate.js";
 import { extractLlmRequestClass, withRequestRetry } from "./request-retry.js";
 import {
@@ -648,13 +650,32 @@ export class AgentSessionFactory {
     // preferred model that equals the default key is not built twice (§4.2 build
     // structure: one BuiltModelFallback per preferred model, ceiling resolved once each).
     const builtFallbacks = new Map<string, BuiltModelFallback>();
+    // The transcript a resumed session starts from (spec RESUMABLE-SESSIONS). Its
+    // turns were produced under a prefix this session no longer sends verbatim
+    // (the system prompt is re-rendered), so members with `drop_stale_thinking`
+    // leave their thinking blocks out. See stale-thinking.ts.
+    // Late-bound: the dynamic-tool registry is built after the model chain. Stays
+    // unset for a session without dynamic loading (the transport is then a no-op).
+    const declaredRef: { set?: DeclaredToolSet } = {};
+    const resumedMessages = new WeakSet<object>(
+      (opts?.resume?.transcript ?? []).filter((m): m is AgentMessage & object => typeof m === "object" && m !== null),
+    );
     const buildFor = (logicalId: string): BuiltModelFallback => {
       const cached = builtFallbacks.get(logicalId);
       if (cached) return cached;
       const built = buildModelFallback(resolveModelChain(logicalId, this.options.config.models), {
         consumer: "agent",
-        makeBase: (cfg) =>
-          withSdkRetriesDisabled((cfg.streaming ?? true) ? streamSimple : wrapCompleteAsStream),
+        makeBase: (cfg) => {
+          const base = withSdkRetriesDisabled((cfg.streaming ?? true) ? streamSimple : wrapCompleteAsStream);
+          // Gated per serving member, like the onPayload injectors below.
+          // `declare_deferred_tools` makes a tool load append-only for the member
+          // (declared-tools.ts), so its prefix then changes only on a resume.
+          const declared = cfg.compat?.declare_deferred_tools === true;
+          const loading = declared ? withDeclaredDeferredTools(base, () => declaredRef.set) : base;
+          return cfg.compat?.drop_stale_thinking
+            ? withStaleThinkingDropped(loading, { resumed: resumedMessages, atToolLoads: !declared })
+            : loading;
+        },
         makeModel: (cfg, cw) => createModelFromConfig(cfg, cw),
         capability: requiresMultimodal ? (cfg) => cfg.input_modalities.includes("image") : undefined,
         contextOverride: sessionTypeConfig?.max_context_tokens,
@@ -1456,6 +1477,7 @@ export class AgentSessionFactory {
       }
       registry = new DynamicToolRegistry(wrappedTools, immediate);
       dynRef.registry = registry;
+      declaredRef.set = { catalog: registry.catalogTools, immediate: registry.immediateNames };
       if (opts?.resume?.transcript?.length) {
         registry.seedFromTranscript(opts.resume.transcript);
       }
@@ -1668,8 +1690,9 @@ export class AgentSessionFactory {
         const breakpoints = makeBreakpointInjector(estimateTokens);
         const prefill = makePrefillInjector();
         const dropReasoning = makeDropReasoningInjector();
+        const deferLoading = makeDeferLoadingInjector(() => declaredRef.set?.immediate);
         return (payload: unknown, model: unknown) =>
-          dropReasoning(prefill(breakpoints(payload, model), model), model);
+          deferLoading(dropReasoning(prefill(breakpoints(payload, model), model), model), model);
       })(),
       steeringMode: "one-at-a-time",
       sessionId: session.timelineKey,
@@ -2403,6 +2426,17 @@ function modelUsesAdaptiveThinking(modelId: string): boolean {
 }
 
 /**
+ * Whether requests to this model use ADAPTIVE thinking on the anthropic-messages
+ * path: the config flag when set (authoritative), else the id heuristic. False on
+ * every other wire API. Feeds both the wire descriptor (`forceAdaptiveThinking`)
+ * and the affordability basis, so the two can never disagree.
+ */
+function anthropicUsesAdaptiveThinking(model: ModelConfig): boolean {
+  if ((model.api ?? "anthropic-messages") !== "anthropic-messages") return false;
+  return model.adaptive_thinking ?? modelUsesAdaptiveThinking(model.id);
+}
+
+/**
  * Gemini's NATIVE per-(model, level) thinking-budget tokens — a faithful mirror of
  * pi-ai's `getGoogleBudget` (`providers/google.js`) (#4). Gemini bills thinking in a
  * SEPARATE lane on top of `maxOutputTokens` (= our base `max_tokens`), and unlike the
@@ -2471,8 +2505,7 @@ export function additiveThinkingBudgetTokens(model: ModelConfig, level: Thinking
   if (api === "anthropic-messages") {
     // The config flag is AUTHORITATIVE when set (operators declare adaptive models
     // explicitly); only the unset case falls back to the drifting id heuristic.
-    const adaptive = model.adaptive_thinking ?? modelUsesAdaptiveThinking(model.id);
-    additive = adaptive ? 0 : budget;
+    additive = anthropicUsesAdaptiveThinking(model) ? 0 : budget;
   } else if (api === "google-generative-ai") {
     // Gemini bills thinking in a separate lane on top of max_tokens, at a
     // MODEL-SPECIFIC budget (pi-ai getGoogleBudget) — not the flat Anthropic map.
@@ -2536,6 +2569,20 @@ export function createModelFromConfig(model: ModelConfig, contextWindow?: number
       supportsCacheControlOnTools: model.compat?.supports_cache_control_on_tools ?? false,
       supportsLongCacheRetention: model.compat?.supports_long_cache_retention ?? false,
       supportsEagerToolInputStreaming: model.compat?.supports_eager_tool_input_streaming,
+      // anthropic-messages only. pi-ai requests adaptive thinking (an effort level,
+      // no token budget) only when this flag is set on the descriptor; otherwise it
+      // sends a budget-based `thinking` block, which adaptive-only models reject.
+      // Same source of truth as the affordability basis: the config's
+      // `adaptive_thinking` flag, else the id heuristic. Undefined elsewhere.
+      forceAdaptiveThinking: anthropicUsesAdaptiveThinking(model) ? true : undefined,
+      // anthropic-messages only. Whether a dynamic tool load is serialized as a
+      // `tool_reference` block (prefix-stable) or as plain growth of `tools`.
+      // Undefined = leave pi-ai's per-model auto-detection in place. The
+      // declared-deferred transport replaces the block, so it turns it off.
+      supportsToolReferences: model.compat?.declare_deferred_tools ? false : model.compat?.supports_tool_references,
+      // Carried on the wire descriptor so the onPayload injector marks deferred
+      // tools only for the member that uses the declared-deferred transport.
+      declareDeferredTools: model.compat?.declare_deferred_tools ? true : undefined,
       sendSessionAffinityHeaders: model.compat?.send_session_affinity_headers,
       // Override pi-ai's auto-detection (false for provider="together") so the
       // reasoning-effort level is forwarded as `reasoning_effort`. Undefined =

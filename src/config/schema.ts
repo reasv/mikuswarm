@@ -594,6 +594,15 @@ const ModelSchema = StrictObject({
   // Anthropic models NEWER than that list (e.g. Opus 4.8+) to avoid a phantom
   // reservation that can spuriously deny a within-budget user. Only consulted on
   // the anthropic-messages path; Gemini/OpenAI budgets are derived separately.
+  //
+  // The same resolved value also selects the WIRE shape on that path: adaptive
+  // models are sent `thinking: { type: "adaptive" }` plus the effort level
+  // `thinking_level` maps to, non-adaptive ones a token budget. Models that
+  // accept ONLY adaptive thinking reject the budget form, so they need
+  // `adaptive_thinking = true`. Some of them also reject an explicit "off": for
+  // those, either set a `thinking_level` or map off away
+  // (`thinking_level_map = { off = null }`), which omits the field and leaves the
+  // model on its own default.
   adaptive_thinking: Type.Optional(Type.Boolean()),
   // Per-level remap of `thinking_level` → the provider's wire value for the
   // reasoning-effort knob (pi-ai `Model.thinkingLevelMap`). Needed when the
@@ -705,6 +714,35 @@ const ModelSchema = StrictObject({
     // the bundled pi-ai patch defaults the replayed namespace to the function
     // name — see ARCHITECTURE.md §10 Transport.)
     supports_tool_search: Type.Optional(Type.Boolean()),
+    // anthropic-messages only. The same trade-off as `supports_tool_search`, for
+    // the Messages API: pi-ai serializes a dynamic tool load as a `tool_reference`
+    // block in the loading tool's result, with the added definitions marked
+    // `defer_loading`, so the request prefix survives the load. Unset = pi-ai's
+    // own per-model detection (on for current first-party Claude models). Set
+    // false for an endpoint or intermediary that rejects `tool_reference` blocks:
+    // loaded tools then join `tools` as ordinary definitions, at the cost of one
+    // full prefix re-write per load event.
+    supports_tool_references: Type.Optional(Type.Boolean()),
+    // anthropic-messages only. Append-only tool loading for an endpoint or
+    // intermediary that rejects `tool_reference` blocks. The session's whole tool
+    // catalog is sent as `tools` on every request: the immediate tools as ordinary
+    // definitions, every other tool with `defer_loading: true` (declared and
+    // callable, its definition not loaded into context). A load is then delivered
+    // as text, the added definitions appended to the loading tool's result. `tools`
+    // never changes, so a load re-writes nothing and stays valid for models that
+    // bind thinking to the request prefix. Implies `supports_tool_references =
+    // false`. Requires an endpoint that accepts `defer_loading` and lets the model
+    // call a declared tool that no `tool_reference` surfaced. Default false.
+    declare_deferred_tools: Type.Optional(Type.Boolean()),
+    // Leave out thinking blocks that were produced before the request prefix last
+    // changed. For models that bind each thinking block to the exact system
+    // prompt, tools and earlier messages it was produced under, and reject a
+    // replay after any of those changed. Two things change the prefix: a session
+    // resume (the system prompt is re-rendered), and a dynamic tool load that
+    // grows `tools` (no native load point and no `declare_deferred_tools`). Blocks
+    // produced after the change are still replayed, and the stored transcript is
+    // untouched. Default false.
+    drop_stale_thinking: Type.Optional(Type.Boolean()),
     // Override pi-ai's "reasoning_content required on every assistant message"
     // safety net (auto-enabled for `provider = "deepseek"`). When on, pi-ai
     // stamps `reasoning_content: ""` on any assistant turn that carried no

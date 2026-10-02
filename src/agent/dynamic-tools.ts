@@ -80,6 +80,13 @@ export class DynamicToolRegistry {
    */
   onChange?: (added: AgentTool[]) => void;
 
+  /**
+   * The catalog names loaded from the first request on. Fixed at construction:
+   * later loads and {@link seedFromTranscript} never change it, so a resumed
+   * session reports the same set as the session it continues.
+   */
+  readonly immediateNames: ReadonlySet<string>;
+
   constructor(
     private readonly catalog: readonly AgentTool[],
     immediateNames: Iterable<string>,
@@ -88,7 +95,13 @@ export class DynamicToolRegistry {
     for (const name of immediateNames) {
       if (this.byName.has(name)) this.loadedNames.add(name);
     }
+    this.immediateNames = new Set(this.loadedNames);
     this.currentArr = this.computeCurrent();
+  }
+
+  /** The whole session catalog, loaded or not, in catalog order. */
+  get catalogTools(): readonly AgentTool[] {
+    return this.catalog;
   }
 
   private computeCurrent(): AgentTool[] {

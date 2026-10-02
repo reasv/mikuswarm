@@ -47,6 +47,28 @@ Unreleased section; it is not part of any release's notes.
   rewriting ~28k tokens at each session start. Default off; ignored on all wire
   APIs other than `openai-responses`.
 
+- **Adaptive-only Claude models.** `adaptive_thinking` (or the built-in id
+  heuristic) now also selects the request shape on the Anthropic Messages path:
+  adaptive models are sent adaptive thinking with the effort level
+  `thinking_level` maps to, instead of a token budget they reject. Models that
+  also reject an explicit "thinking off" can omit the field with
+  `thinking_level_map = { off = null }`.
+- **`compat.declare_deferred_tools`** (Anthropic Messages path, default off):
+  append-only dynamic tool loading for an endpoint or proxy that rejects
+  `tool_reference` blocks. The whole tool catalog is declared on every request,
+  with everything outside the immediate set marked `defer_loading`, and a load
+  arrives as text in the loading tool's result. The `tools` array never
+  changes, so a load keeps the prompt cache and stays valid for models that
+  bind thinking to the request prefix.
+- **`compat.supports_tool_references`** (Anthropic Messages path): set `false`
+  for an endpoint or proxy that rejects `tool_reference` blocks, so dynamically
+  loaded tools are added to `tools` directly. Unset keeps the automatic
+  per-model behaviour.
+- **`compat.drop_stale_thinking`** (default off): for models that bind thinking
+  blocks to the exact request prefix, thinking produced before a session
+  resume, or before a tool load that changed `tools`, is left out of the
+  request so it is not rejected. Later thinking is still replayed.
+
 ### Changed
 
 - **Prefill: past `analysis` arguments are no longer replayed to the model.** They stay in the stored transcript; the wire history is stripped deterministically so prompt caching is unaffected.
