@@ -8,10 +8,9 @@
  * with two exceptions:
  *
  * - a resumed session re-renders the system prompt, and
- * - a dynamic tool load on a transport WITHOUT prefix-stable loading grows the
- *   `tools` array (ARCHITECTURE.md §10 Transport). A member that loads tools
- *   append-only (a native load point, or `declare_deferred_tools`) has no such
- *   change, and passes `atToolLoads: false`.
+ * - a dynamic tool load changes the `tools` array (ARCHITECTURE.md §10
+ *   Transport) unless the member declares its whole catalog up front
+ *   (`declare_deferred_tools`); such a member passes `atToolLoads: false`.
  *
  * For a member that opts in, thinking blocks produced before the latest such
  * change are left out of the outgoing history. Blocks produced after it are

@@ -1168,12 +1168,14 @@ test("createModelFromConfig: compat.supports_tool_references passes through; uns
   assert.equal(on.compat?.supportsToolReferences, true);
 });
 
-test("createModelFromConfig: compat.declare_deferred_tools → descriptor flag and tool references off", async () => {
+test("createModelFromConfig: compat.declare_deferred_tools → descriptor flag; tool references explicit, never auto-detected", async () => {
   const { createModelFromConfig } = await import("../src/agent/factory.js");
   const base = { context_window: 1000, max_tokens: 100, input_modalities: ["text"] };
-  const on = createModelFromConfig({ id: "m", compat: { declare_deferred_tools: true, supports_tool_references: true }, ...base } as any);
-  assert.equal((on.compat as any)?.declareDeferredTools, true);
-  assert.equal(on.compat?.supportsToolReferences, false, "the transport replaces the tool_reference block");
+  const withRefs = createModelFromConfig({ id: "m", compat: { declare_deferred_tools: true, supports_tool_references: true }, ...base } as any);
+  assert.equal((withRefs.compat as any)?.declareDeferredTools, true);
+  assert.equal(withRefs.compat?.supportsToolReferences, true, "load point = tool_reference block");
+  const asText = createModelFromConfig({ id: "m", compat: { declare_deferred_tools: true }, ...base } as any);
+  assert.equal(asText.compat?.supportsToolReferences, false, "unset under the option → text load point, no auto-detection");
   const off = createModelFromConfig({ id: "m", ...base } as any);
   assert.equal((off.compat as any)?.declareDeferredTools, undefined);
 });

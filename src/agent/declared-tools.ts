@@ -2,18 +2,21 @@
  * Declared-deferred tool loading for the Anthropic Messages API (config
  * `[models.<name>.compat] declare_deferred_tools`, ARCHITECTURE.md §10 Transport).
  *
- * The Messages API's own prefix-stable load point is a `tool_reference` block.
- * Where an endpoint or an intermediary rejects that block, the only fallback
- * used to be growing `tools`, which is not an append: `tools` leads the request,
- * so every load re-writes the cached prefix and invalidates anything bound to
- * it. This transport keeps a load append-only without the block:
+ * On the Messages API a tool that is added mid-conversation is meant to be
+ * declared in `tools` from the start with `defer_loading: true` and surfaced
+ * later by a `tool_reference` block. Declaring it only at load time changes
+ * `tools`, which leads the request: the cached prefix is re-written, and a model
+ * that binds its thinking blocks to the request prefix rejects the earlier ones.
+ * This transport keeps `tools` fixed for the whole session:
  *
  * - `tools` is the session's WHOLE catalog on every request, in catalog order.
  *   The immediate tools are ordinary definitions; every other tool carries
  *   `defer_loading: true`, so it is declared (callable) but its definition is
- *   not loaded into the model's context. The array never changes.
- * - A load event is delivered as text: the loading tool's result gets one extra
- *   text block with the definitions of the tools it added. The block is derived
+ *   not loaded into the model's context.
+ * - A load point is the loading tool's result. With tool references on, pi-ai
+ *   puts a `tool_reference` block there. With them off (an endpoint or an
+ *   intermediary that rejects the block), the result gets one extra text block
+ *   with the added definitions instead. Either way the load point is derived
  *   from the transcript's `addedToolNames`, so it is identical on every replay.
  *
  * The agent's own tool table is untouched: a call to a tool that was never
@@ -38,6 +41,15 @@ export interface DeclaredToolSet {
   immediate: ReadonlySet<string>;
 }
 
+export interface DeclaredToolOptions {
+  /**
+   * Whether the member's driver emits `tool_reference` blocks at load points
+   * (the descriptor's `supportsToolReferences`). When false, every load is
+   * delivered as text.
+   */
+  references: boolean;
+}
+
 /** The text that stands in for a `tool_reference` load point. */
 export function renderLoadedToolDefinitions(tools: readonly Tool[]): string {
   const blocks = tools.map(
@@ -54,19 +66,28 @@ function addedToolNames(message: Message): string[] {
 
 /**
  * Rewrite one request context for the declared-deferred transport: the full
- * catalog as `tools`, and the loaded definitions appended to each load point.
+ * catalog as `tools`, and a text load point wherever no `tool_reference` will
+ * be emitted. With references on that is only a tool the model already called
+ * before loading it: pi-ai's `splitDeferredTools` treats such a tool as already
+ * in use and emits no reference for it.
  */
-export function declareDeferredTools(context: Context, set: DeclaredToolSet): Context {
+export function declareDeferredTools(context: Context, set: DeclaredToolSet, options: DeclaredToolOptions): Context {
   const byName = new Map(set.catalog.map((tool) => [tool.name, tool]));
+  const called = new Set<string>();
   const messages = context.messages.map((message) => {
-    const loaded = addedToolNames(message)
-      .filter((name) => !set.immediate.has(name))
+    if (message.role === "assistant") {
+      for (const block of message.content) if (block.type === "toolCall") called.add(block.name);
+      return message;
+    }
+    if (message.role !== "toolResult") return message;
+    const asText = addedToolNames(message)
+      .filter((name) => !set.immediate.has(name) && (!options.references || called.has(name)))
       .map((name) => byName.get(name))
       .filter((tool): tool is Tool => tool !== undefined);
-    if (loaded.length === 0 || message.role !== "toolResult") return message;
+    if (asText.length === 0) return message;
     return {
       ...message,
-      content: [...message.content, { type: "text" as const, text: renderLoadedToolDefinitions(loaded) }],
+      content: [...message.content, { type: "text" as const, text: renderLoadedToolDefinitions(asText) }],
     };
   });
   return { ...context, tools: [...set.catalog], messages };
@@ -78,34 +99,62 @@ export function declareDeferredTools(context: Context, set: DeclaredToolSet): Co
  * chain) and returns undefined for a session without dynamic tool loading,
  * which leaves the request untouched.
  */
-export function withDeclaredDeferredTools(base: StreamFn, getSet: () => DeclaredToolSet | undefined): StreamFn {
-  return (model, context, options) => {
+export function withDeclaredDeferredTools(
+  base: StreamFn,
+  getSet: () => DeclaredToolSet | undefined,
+  options: DeclaredToolOptions,
+): StreamFn {
+  return (model, context, streamOptions) => {
     const set = getSet();
-    return base(model, set ? declareDeferredTools(context, set) : context, options);
+    return base(model, set ? declareDeferredTools(context, set, options) : context, streamOptions);
   };
 }
 
 /**
- * The `onPayload` half: mark every non-immediate tool `defer_loading` on the
- * wire. Gated per serving member on `compat.declareDeferredTools`, so other
- * members of the same chain pass their payloads through unchanged.
+ * The `onPayload` half: put the wire `tools` in catalog order and mark every
+ * non-immediate tool `defer_loading`, so the array is byte-identical on every
+ * request whatever has been loaded (pi-ai moves referenced tools to the end).
+ * A `cache_control` marker pi-ai placed on a tool is kept on the last
+ * non-deferred one. Gated per serving member on `compat.declareDeferredTools`,
+ * so other members of the same chain pass their payloads through unchanged.
  */
 export function makeDeferLoadingInjector(
-  getImmediate: () => ReadonlySet<string> | undefined,
+  getSet: () => DeclaredToolSet | undefined,
 ): (payload: unknown, model: unknown) => unknown {
   return (payload: unknown, model: unknown): unknown => {
     const compat = (model as Record<string, unknown> | undefined)?.["compat"] as Record<string, unknown> | undefined;
     if (compat?.["declareDeferredTools"] !== true) return payload;
-    const immediate = getImmediate();
-    if (!immediate || !payload || typeof payload !== "object") return payload;
+    const set = getSet();
+    if (!set || !payload || typeof payload !== "object") return payload;
     const tools = (payload as Record<string, unknown>)["tools"];
     if (!Array.isArray(tools)) return payload;
-    return {
-      ...(payload as Record<string, unknown>),
-      tools: tools.map((tool) => {
-        const name = (tool as { name?: unknown } | null)?.name;
-        return typeof name === "string" && !immediate.has(name) ? { ...(tool as object), defer_loading: true } : tool;
-      }),
+
+    const order = new Map(set.catalog.map((tool, index) => [tool.name, index]));
+    const nameOf = (tool: unknown) => (tool as { name?: unknown } | null)?.name;
+    const rank = (tool: unknown) => {
+      const name = nameOf(tool);
+      return typeof name === "string" ? (order.get(name) ?? Number.MAX_SAFE_INTEGER) : Number.MAX_SAFE_INTEGER;
     };
+    let cacheControl: unknown;
+    const out = tools
+      .map((tool, index) => ({ tool, index }))
+      .sort((a, b) => rank(a.tool) - rank(b.tool) || a.index - b.index)
+      .map(({ tool }) => {
+        if (!tool || typeof tool !== "object") return tool;
+        const { cache_control, defer_loading: _deferLoading, ...rest } = tool as Record<string, unknown>;
+        if (cache_control !== undefined) cacheControl = cache_control;
+        const name = nameOf(tool);
+        return typeof name === "string" && !set.immediate.has(name) ? { ...rest, defer_loading: true } : rest;
+      });
+    if (cacheControl !== undefined) {
+      for (let i = out.length - 1; i >= 0; i--) {
+        const tool = out[i] as Record<string, unknown> | null;
+        if (tool && typeof tool === "object" && tool["defer_loading"] !== true) {
+          out[i] = { ...tool, cache_control: cacheControl };
+          break;
+        }
+      }
+    }
+    return { ...(payload as Record<string, unknown>), tools: out };
   };
 }

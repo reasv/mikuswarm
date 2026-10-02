@@ -671,7 +671,9 @@ export class AgentSessionFactory {
           // `declare_deferred_tools` makes a tool load append-only for the member
           // (declared-tools.ts), so its prefix then changes only on a resume.
           const declared = cfg.compat?.declare_deferred_tools === true;
-          const loading = declared ? withDeclaredDeferredTools(base, () => declaredRef.set) : base;
+          const loading = declared
+            ? withDeclaredDeferredTools(base, () => declaredRef.set, { references: cfg.compat?.supports_tool_references === true })
+            : base;
           return cfg.compat?.drop_stale_thinking
             ? withStaleThinkingDropped(loading, { resumed: resumedMessages, atToolLoads: !declared })
             : loading;
@@ -1690,7 +1692,7 @@ export class AgentSessionFactory {
         const breakpoints = makeBreakpointInjector(estimateTokens);
         const prefill = makePrefillInjector();
         const dropReasoning = makeDropReasoningInjector();
-        const deferLoading = makeDeferLoadingInjector(() => declaredRef.set?.immediate);
+        const deferLoading = makeDeferLoadingInjector(() => declaredRef.set);
         return (payload: unknown, model: unknown) =>
           deferLoading(dropReasoning(prefill(breakpoints(payload, model), model), model), model);
       })(),
@@ -2577,9 +2579,12 @@ export function createModelFromConfig(model: ModelConfig, contextWindow?: number
       forceAdaptiveThinking: anthropicUsesAdaptiveThinking(model) ? true : undefined,
       // anthropic-messages only. Whether a dynamic tool load is serialized as a
       // `tool_reference` block (prefix-stable) or as plain growth of `tools`.
-      // Undefined = leave pi-ai's per-model auto-detection in place. The
-      // declared-deferred transport replaces the block, so it turns it off.
-      supportsToolReferences: model.compat?.declare_deferred_tools ? false : model.compat?.supports_tool_references,
+      // Undefined = leave pi-ai's per-model auto-detection in place. Under the
+      // declared-deferred transport the choice is explicit (the load point is the
+      // block only when asked for, text otherwise), never auto-detected.
+      supportsToolReferences: model.compat?.declare_deferred_tools
+        ? model.compat.supports_tool_references === true
+        : model.compat?.supports_tool_references,
       // Carried on the wire descriptor so the onPayload injector marks deferred
       // tools only for the member that uses the declared-deferred transport.
       declareDeferredTools: model.compat?.declare_deferred_tools ? true : undefined,

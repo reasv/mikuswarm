@@ -723,23 +723,26 @@ const ModelSchema = StrictObject({
     // loaded tools then join `tools` as ordinary definitions, at the cost of one
     // full prefix re-write per load event.
     supports_tool_references: Type.Optional(Type.Boolean()),
-    // anthropic-messages only. Append-only tool loading for an endpoint or
-    // intermediary that rejects `tool_reference` blocks. The session's whole tool
-    // catalog is sent as `tools` on every request: the immediate tools as ordinary
-    // definitions, every other tool with `defer_loading: true` (declared and
-    // callable, its definition not loaded into context). A load is then delivered
-    // as text, the added definitions appended to the loading tool's result. `tools`
-    // never changes, so a load re-writes nothing and stays valid for models that
-    // bind thinking to the request prefix. Implies `supports_tool_references =
-    // false`. Requires an endpoint that accepts `defer_loading` and lets the model
-    // call a declared tool that no `tool_reference` surfaced. Default false.
+    // anthropic-messages only. Keeps `tools` fixed for the whole session, the way
+    // the Messages API expects mid-conversation tool loading to be set up: the
+    // session's whole tool catalog is sent on every request, the immediate tools
+    // as ordinary definitions and every other tool with `defer_loading: true`
+    // (declared and callable, its definition not loaded into context). Without
+    // this option a loaded tool is only added to `tools` at load time, which
+    // re-writes the cached prefix once and is rejected by models that bind
+    // thinking to the request prefix. The load point itself follows
+    // `supports_tool_references`, which is explicit under this option (no
+    // auto-detection): `true` = a `tool_reference` block in the loading tool's
+    // result; unset/false = the added definitions as text in that result, for an
+    // endpoint or intermediary that rejects the block (this relies on the endpoint
+    // letting the model call a declared tool no reference surfaced). Default false.
     declare_deferred_tools: Type.Optional(Type.Boolean()),
     // Leave out thinking blocks that were produced before the request prefix last
     // changed. For models that bind each thinking block to the exact system
     // prompt, tools and earlier messages it was produced under, and reject a
     // replay after any of those changed. Two things change the prefix: a session
     // resume (the system prompt is re-rendered), and a dynamic tool load that
-    // grows `tools` (no native load point and no `declare_deferred_tools`). Blocks
+    // changes `tools` (any load without `declare_deferred_tools`). Blocks
     // produced after the change are still replayed, and the stored transcript is
     // untouched. Default false.
     drop_stale_thinking: Type.Optional(Type.Boolean()),
