@@ -58,6 +58,14 @@ Unreleased section; it is not part of any release's notes.
   rendered next to the tail instructions, without changing the cached prompt prefix; resumes
   re-apply them. Low confidence or any decision-model failure leaves the session exactly as
   before. Database schema v22 adds `agent_sessions.initial_preloads`.
+- **Decision-model continuation** (`[decisions.continuation]`, off by default): when a running or
+  recently completed session is open in the room, the decision model decides whether a new
+  message (a trigger, an explicit reply, or optionally an untriggered message from a recent human
+  participant) continues one of them, is a new request, or is not for the bot. A continuation
+  of a running session is steered in; a completed one is resumed with the message as its next
+  turn, by any participant (billed to the resuming sender), within `window_ms`. The work gate
+  still applies to every resume. Low confidence or any failure leaves today's reply-resume
+  rules in place.
 - **OpenAI Responses API prefill**: `[models.<name>.prefill]` forces a required `analysis` argument on every tool call via strict JSON schema `pattern`, anchoring persona adherence on GPT-6 Sol/Luna. Includes `no_reply` tool, `drop_reasoning` option, and per-serving-member gating via `onPayload`. See spec/OPENAI-PREFILL.md.
 - **Captioning via OpenAI Responses API**: `[models.*]` with `api = "openai-responses"` can now serve as a caption model for images. Incomplete, refused, and unsupported-modality results are classified as content failures. (Port of MR !1 captioning code by contributor nopm.)
 

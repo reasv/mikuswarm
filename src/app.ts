@@ -62,6 +62,13 @@ import {
 import type { CreateAgentOptions } from "./agent/factory.js";
 import {
   DECISION_POINT_NAMES,
+  ageLabel,
+  clipText,
+  continuationMessageFrom,
+  continuationPoint,
+  senderName,
+  type ContinuationCandidate,
+  type ContinuationVerdict,
   ROUTING_OTHER,
   routingHasQuestions,
   routingInputFrom,
@@ -2991,7 +2998,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // the hold's debounce + same-sender grouping applied). The §7 fork in
     // launchSession then continues that session or gives a fresh response. Nothing
     // to synthesize at this point.
-    if (!inbound.trigger) return;
+    if (!inbound.trigger) {
+      // Decision-model continuation (§8h): an untriggered message from a recent human
+      // participant may still continue an open exchange. Detached — never awaited here.
+      offerUntriggeredContinuation(inbound);
+      return;
+    }
 
     // Bot-chain cap gate (spec MULTI-AGENT-SUPPORT §9, Phase 5b).
     // Applied after trigger confirmation but before accept/claim so capped-out
@@ -6049,6 +6061,409 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     }
   }
 
+
+  // ── Decision-model continuation (ARCHITECTURE.md §8h "Continuation") ──────────
+
+  /** How long an untriggered message waits before continuation looks at it (§8h). */
+  const untriggeredContinuationDelayMs =
+    Math.max(config.matrix?.trigger_hold_ms ?? 0, config.discord?.trigger_hold_ms ?? 0, config.irc?.trigger_hold_ms ?? 0) +
+    (config.matrix?.trigger_group_lookback_ms ?? 0) +
+    1500;
+
+  /** A gathered continuation candidate plus what resuming it needs (completed only). */
+  interface GatheredContinuation {
+    candidate: ContinuationCandidate;
+    resume?: { row: AgentSessionRow; material: ResumeMaterial };
+  }
+
+  /**
+   * The timeline's continuation candidates: running sessions with a live agent, and
+   * completed sessions younger than `window_ms` that pass every mechanical resume
+   * gate, the capability gate, material viability and the WORK GATE (mandatory for
+   * every resume). Completed sessions are offered only where reply-resume is enabled
+   * for the context. Also returns the recent raw events (last replies, participants).
+   */
+  async function gatherContinuationCandidates(
+    inbound: InboundChatEvent,
+    opts: { windowMs: number; maxCandidates: number },
+  ): Promise<{ gathered: GatheredContinuation[]; recent: CanonicalChatEvent[] }> {
+    const now = Date.now();
+    const timelineKey = inbound.timelineKey;
+    const recent = timeline.query({ timelineKey, toTimestamp: inbound.event.timestamp, limit: 80 });
+    const lastReplyOf = (sessionId: string): string | undefined => {
+      for (let i = recent.length - 1; i >= 0; i--) {
+        const event = recent[i]!;
+        if (event.agentSessionId === sessionId && event.role === "assistant") return clipText(event.body ?? "", 300);
+      }
+      return undefined;
+    };
+    const gathered: GatheredContinuation[] = [];
+    for (const session of sessions.activeForTimeline(timelineKey)) {
+      if (gathered.length >= opts.maxCandidates) break;
+      if (session.status !== "running" || !sessions.getAgent(session.id)) continue;
+      if (SYNTHETIC_SESSION_TYPES.has(session.sessionType)) continue;
+      gathered.push({
+        candidate: {
+          sessionId: session.id,
+          status: "running",
+          askedBy: senderName(session.trigger.event.sender),
+          asked: clipText(session.trigger.event.body ?? "", 300),
+          lastReply: lastReplyOf(session.id),
+          age: ageLabel(now, session.startedAt ?? session.createdAt),
+        },
+      });
+    }
+    const ctx = channelTypeOf(inbound);
+    const resumeCfg = config.agent.sessions.resume;
+    if (resumeCfg?.enabled?.[ctx] === true && gathered.length < opts.maxCandidates) {
+      const replyExternalId = inbound.event.replyTo?.externalId;
+      const replyTarget = replyExternalId
+        ? timeline.getByExternalId(inbound.provider, replyExternalId, timelineKey)
+        : undefined;
+      const rows = storage
+        .getAgentSessionsByTimeline(timelineKey, 30)
+        .filter(
+          (row) =>
+            row.timeline_key === timelineKey &&
+            row.status === "completed" &&
+            row.completed_at != null &&
+            now - row.completed_at <= opts.windowMs &&
+            !SYNTHETIC_SESSION_TYPES.has(row.session_type) &&
+            !sessions.get(row.id) &&
+            !resumeClaims.has(row.id),
+        );
+      for (const meta of rows) {
+        if (gathered.length >= opts.maxCandidates) break;
+        const verdict = await evaluateResumeGate({
+          sessionId: meta.id,
+          getSession: () => storage.getAgentSession(meta.id),
+          // An explicit reply keeps the generation gate; other messages have no target.
+          targetEvent: replyTarget?.agentSessionId === meta.id ? replyTarget : undefined,
+          decided: true,
+          inbound,
+          ctx,
+          resumeCfg,
+          exemptToolNames: resumeExemptToolNames(resumeCfg.work_gate?.[ctx]?.extra_exempt_tools ?? []),
+          resolveCeiling: (sessionType, key) => factory.resolveSessionContextCeiling(sessionType, key),
+          loadMaterial: (row) => {
+            const wsEntry = resolveWorkspaceForTimeline(row.timeline_key);
+            if (!wsEntry && config.agents) return Promise.resolve(null);
+            return loadCompletedSessionMaterial(row, {
+              media: storage,
+              workspaceRoot: wsEntry?.workspaceRoot ?? workspaceRoot,
+              logger,
+            });
+          },
+          logger,
+        });
+        if (!verdict.resume) continue;
+        gathered.push({
+          candidate: {
+            sessionId: meta.id,
+            status: "completed",
+            askedBy: verdict.row.trigger_sender_display_name ?? verdict.row.trigger_sender_id ?? "someone",
+            asked: clipText(verdict.row.trigger_body ?? "", 300),
+            lastReply: lastReplyOf(meta.id),
+            age: ageLabel(now, verdict.row.completed_at ?? now),
+          },
+          resume: { row: verdict.row, material: verdict.material },
+        });
+      }
+    }
+    return { gathered, recent };
+  }
+
+  /** Senders who triggered a candidate, or replied to one of its messages (§8h). */
+  function continuationParticipants(gathered: GatheredContinuation[], recent: CanonicalChatEvent[]): Set<string> {
+    const ids = new Set<string>();
+    const sessionIds = new Set(gathered.map((g) => g.candidate.sessionId));
+    for (const g of gathered) {
+      const sender = g.resume?.row.trigger_sender_id ?? sessions.get(g.candidate.sessionId)?.trigger.event.sender.id;
+      if (sender) ids.add(sender);
+    }
+    const botMessages = new Set(
+      recent
+        .filter((event) => event.agentSessionId && sessionIds.has(event.agentSessionId) && event.externalId)
+        .map((event) => event.externalId!),
+    );
+    for (const event of recent) {
+      if (event.replyTo?.externalId && botMessages.has(event.replyTo.externalId)) ids.add(event.sender.id);
+    }
+    return ids;
+  }
+
+  async function evaluateContinuation(
+    inbound: InboundChatEvent,
+    agentName: string | null,
+    gathered: GatheredContinuation[],
+    recent: CanonicalChatEvent[],
+    triggered: boolean,
+  ): Promise<ContinuationVerdict> {
+    const raw = decisionEngine!.raw(agentName).continuation ?? {};
+    const contextMessages = raw.context_messages ?? 6;
+    const contextEvents = hydrateEvents(
+      storage,
+      recent.filter((event) => event.id !== inbound.event.id).slice(-contextMessages),
+    );
+    const [hydrated] = hydrateEvents(storage, [timeline.getById(inbound.event.id) ?? inbound.event]);
+    const { message, context } = continuationMessageFrom({
+      message: hydrated!,
+      context: contextEvents,
+      contextMessages,
+      mentionsBot: inbound.event.mentions?.mentionedSelf ?? false,
+    });
+    const outcome = await decisionEngine!.evaluate(
+      continuationPoint,
+      { message, context, candidates: gathered.map((g) => g.candidate), triggered },
+      {
+        agentName,
+        // Session-less: the verdict decides which session (if any) the message joins.
+        attribution: {
+          sessionType: "default",
+          timelineKey: inbound.timelineKey,
+          triggerSenderId: inbound.event.sender.id,
+        },
+        heuristicVerdict: triggered ? (inbound.event.replyTo?.externalId ? "reply_chain" : "fresh") : "inert",
+        signal: drainAbort.signal,
+      },
+    );
+    return outcome.verdict;
+  }
+
+  function continuationSettings(agentName: string | null): { windowMs: number; maxCandidates: number } | undefined {
+    if (!decisionEngine?.isEnabled("continuation", agentName)) return undefined;
+    const raw = decisionEngine.raw(agentName).continuation ?? {};
+    return { windowMs: raw.window_ms ?? 30 * 60_000, maxCandidates: raw.max_candidates ?? 4 };
+  }
+
+  /** The interjection a continuation steers into a running session (§8h). */
+  function buildContinuationInterjection(inbound: InboundChatEvent, hydrated: CanonicalChatEvent): string {
+    const name = escapeXml(inbound.event.sender.displayName ?? inbound.event.sender.username ?? inbound.event.sender.id);
+    const externalId = inbound.event.externalId;
+    const spawnHint = externalId
+      ? `call spawn_session(message_id="${escapeAttr(externalId)}")`
+      : "handle it separately";
+    return (
+      `<interjection reason="continuation">\n` +
+      `${name} sent this while you are working on this exchange, and it looks like it continues it. ` +
+      `Fold it into your work if it does; if it is a separate ask, ${spawnHint}.\n\n` +
+      `${renderRichMessage(hydrated)}\n</interjection>`
+    );
+  }
+
+  function steerContinuation(inbound: InboundChatEvent, sessionId: string): boolean {
+    const hydrated = followUpHydratedEvent(inbound);
+    const ok = sessions.steer(
+      sessionId,
+      { type: "interjection", content: buildContinuationInterjection(inbound, hydrated) },
+      {
+        eventId: inbound.event.id,
+        externalId: inbound.event.externalId,
+        senderId: inbound.event.sender.id,
+        senderDisplayName: inbound.event.sender.displayName,
+        kind: "follow-up",
+        body: inbound.event.body ?? "",
+      },
+    );
+    if (!ok) return false;
+    markSteered(inbound.event.id);
+    retainFollowUpForSpawn(inbound, sessionId);
+    logger.info("continuation_steered", { sessionId, timelineKey: inbound.timelineKey, eventId: inbound.event.id });
+    return true;
+  }
+
+  /**
+   * Resume a completed candidate with the message as its new turn (§8h). `ownsSlot`:
+   * the caller already holds this timeline's slot (a triggered message inside
+   * `launchSession`); otherwise one is acquired without queuing, like a follow-up
+   * resume. Returns false — with any acquired slot released — when the resume could
+   * not start (slot, single-flight, CAS); past the CAS the resumed run owns the slot.
+   */
+  async function resumeByContinuation(
+    inbound: InboundChatEvent,
+    duplicate: boolean,
+    gathered: GatheredContinuation,
+    opts: { ownsSlot: boolean; triggered: boolean },
+  ): Promise<boolean> {
+    const sessionId = gathered.candidate.sessionId;
+    const target = inbound.outboundTarget;
+    if (!target || !gathered.resume) return false;
+    if (resumeClaims.has(sessionId)) return false;
+    if (!opts.ownsSlot && !triggerCoordinator.tryAcquire(inbound.timelineKey)) return false;
+    resumeClaims.add(sessionId);
+    try {
+      const generation = await storage.acceptResumeGeneration(sessionId);
+      if (generation === undefined) {
+        if (!opts.ownsSlot) drainNextQueuedTrigger(inbound.timelineKey);
+        return false;
+      }
+      const { row, material } = gathered.resume;
+      const ctx = channelTypeOf(inbound);
+      const resumeCfg = config.agent.sessions.resume;
+      const gapCfg = resumeCfg?.gap?.[ctx];
+      const gapActive = !!gapCfg && (gapCfg.max_messages ?? 0) !== 0 && (gapCfg.max_tokens ?? 0) !== 0;
+      const isReply = !!inbound.event.replyTo?.externalId;
+      const name = escapeXml(inbound.event.sender.displayName ?? inbound.event.sender.username ?? inbound.event.sender.id);
+      const triggerPreamble = isReply
+        ? undefined
+        : opts.triggered
+          ? `<continuation>${name} wrote this as a follow-up to your exchange above. Continue the same exchange.</continuation>`
+          : `<continuation>${name} wrote this without addressing you, as a follow-up to your exchange above. ` +
+            `Reply if it calls for one; otherwise answer NO_REPLY.</continuation>`;
+      try {
+        await runResumeSession({
+          inbound,
+          duplicate,
+          target,
+          row,
+          material,
+          generation,
+          continuation: {
+            tail: resumeCfg?.satellite?.tail ?? true,
+            gap: gapActive
+              ? {
+                  maxMessages: gapCfg!.max_messages ?? 0,
+                  maxTokens: gapCfg!.max_tokens ?? 0,
+                  lowerBoundTimestamp: row.chat_upper_bound_ts ?? inbound.event.timestamp,
+                }
+              : undefined,
+            triggerPreamble,
+          },
+          resumeLabel: "continuation",
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (sessions.get(sessionId)) sessions.markDiscarded(sessionId, { error: message });
+        logger.error("continuation_resume_setup_threw", { sessionId, timelineKey: inbound.timelineKey, error: message });
+        drainNextQueuedTrigger(inbound.timelineKey);
+        // Never drop a trigger: re-dispatch it (the row is no longer `completed`, so it
+        // goes fresh). An untriggered message simply stays inert.
+        if (opts.triggered) {
+          void redispatchCoReply(inbound).catch((redispatchError) => {
+            logger.error("continuation_resume_redispatch_failed", {
+              sessionId,
+              error: redispatchError instanceof Error ? redispatchError.message : String(redispatchError),
+            });
+          });
+        }
+      }
+      return true;
+    } finally {
+      resumeClaims.delete(sessionId);
+    }
+  }
+
+  /**
+   * The continuation fork for a TRIGGER (inside `launchSession`, which holds the
+   * timeline slot and the trigger's claim). With the point off for the agent, or
+   * nothing to continue, it is exactly `tryReplyResume`. Returns true when the
+   * message was handed to an existing session (no fresh launch).
+   */
+  async function tryContinuation(inbound: InboundChatEvent, duplicate: boolean): Promise<boolean> {
+    const agentName = agentNameForTimeline(inbound.timelineKey);
+    const settings = continuationSettings(agentName);
+    if (!settings || isBotTriggeredSender(inbound)) return tryReplyResume(inbound, duplicate);
+    let verdict: ContinuationVerdict;
+    let gathered: GatheredContinuation[];
+    try {
+      const found = await gatherContinuationCandidates(inbound, settings);
+      gathered = found.gathered;
+      if (gathered.length === 0) return tryReplyResume(inbound, duplicate);
+      verdict = await evaluateContinuation(inbound, agentName, gathered, found.recent, true);
+    } catch (error) {
+      logger.warn("continuation_failed", {
+        timelineKey: inbound.timelineKey,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return tryReplyResume(inbound, duplicate);
+    }
+    if (verdict.kind === "default") return tryReplyResume(inbound, duplicate);
+    if (verdict.kind !== "continue") return false; // new → fresh
+    const chosen = gathered.find((g) => g.candidate.sessionId === verdict.sessionId);
+    if (!chosen) return false;
+    // Never let a throw escape here (it would unwind `launchSession` and drop the
+    // trigger): until ownership is handed over, any failure degrades to fresh.
+    try {
+      if (verdict.status === "running") {
+        if (!steerContinuation(inbound, verdict.sessionId)) return false; // settled meanwhile → fresh
+        // The running session now handles this trigger: hand it the claim (released when
+        // it settles) and free the slot this trigger held.
+        if (inbound.event.externalId) {
+          sessionClaims.attachSession(inbound.timelineKey, inbound.event.externalId, verdict.sessionId);
+        }
+        drainNextQueuedTrigger(inbound.timelineKey);
+        return true;
+      }
+      return await resumeByContinuation(inbound, duplicate, chosen, { ownsSlot: true, triggered: true });
+    } catch (error) {
+      logger.warn("continuation_delivery_failed", {
+        timelineKey: inbound.timelineKey,
+        sessionId: verdict.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  /**
+   * Offer an UNTRIGGERED group message to the continuation point (§8h,
+   * `untriggered_senders = "recent"`): only from a recent HUMAN participant of a
+   * candidate session (never another agent, so the bot-chain cap cannot be
+   * bypassed), and never a message that will trigger after the hold (a mention, a
+   * DM, a reply to a bot message). Synchronous pre-gates; the evaluation and any
+   * delivery run detached, so `handleInbound` never waits on the model.
+   */
+  function offerUntriggeredContinuation(inbound: InboundChatEvent): void {
+    if (!decisionEngine || inbound.trigger) return;
+    const agentName = agentNameForTimeline(inbound.timelineKey);
+    const settings = continuationSettings(agentName);
+    if (!settings) return;
+    if ((decisionEngine.raw(agentName).continuation?.untriggered_senders ?? "none") !== "recent") return;
+    if (channelTypeOf(inbound) !== "group") return;
+    const sender = inbound.event.sender;
+    if (!sender.id || sender.isSelf || botSelfIdsForLimits.has(sender.id) || (sender.isBot && !sender.isWebhook)) return;
+    if (inbound.event.mentions?.mentionedSelf) return;
+    const replyExternalId = inbound.event.replyTo?.externalId;
+    if (replyExternalId && timeline.getByExternalId(inbound.provider, replyExternalId, inbound.timelineKey)?.agentSessionId) {
+      return; // a reply to a bot message is the reply-trigger path's
+    }
+    if (steeredEventIds.has(inbound.event.id)) return;
+    const timelineKey = inbound.timelineKey;
+    // Cheap mechanical pre-check before any gate work: something must be open here.
+    const now = Date.now();
+    const anyRunning = sessions.activeForTimeline(timelineKey).some((s) => s.status === "running");
+    const anyRecent = storage
+      .getAgentSessionsByTimeline(timelineKey, 5)
+      .some((row) => row.status === "completed" && row.completed_at != null && now - row.completed_at <= settings.windowMs);
+    if (!anyRunning && !anyRecent) return;
+    void (async () => {
+      // Let the trigger hold settle first: an untriggered event can still be grouped
+      // into a trigger (forward hold, or a later trigger's backward lookback), and
+      // then the session handling that trigger owns it. Untriggered continuation is
+      // the slow path by design, so the wait costs nothing that matters.
+      await new Promise((resolve) => setTimeout(resolve, untriggeredContinuationDelayMs));
+      if (draining || steeredEventIds.has(inbound.event.id)) return;
+      if (storage.getEventCaptionEligibilityFields(inbound.event.id)?.triggerGroupId) return;
+      const { gathered, recent } = await gatherContinuationCandidates(inbound, settings);
+      if (gathered.length === 0) return;
+      if (!continuationParticipants(gathered, recent).has(sender.id)) return;
+      const verdict = await evaluateContinuation(inbound, agentName, gathered, recent, false);
+      if (verdict.kind !== "continue") return; // default / new / not_for_bot → inert
+      if (verdict.status === "running") {
+        steerContinuation(inbound, verdict.sessionId);
+        return;
+      }
+      const chosen = gathered.find((g) => g.candidate.sessionId === verdict.sessionId);
+      if (chosen) await resumeByContinuation(inbound, false, chosen, { ownsSlot: false, triggered: false });
+    })().catch((error) => {
+      logger.error("continuation_untriggered_failed", {
+        timelineKey,
+        eventId: inbound.event.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }
+
   /**
    * Adopt the accepted session and run the resumed rollout (spec RESUMABLE-SESSIONS
    * §7/§9/§11; spec FOLLOWUP-FOLDING §5.3). Shared by reply-to-continue (a reply to
@@ -6075,7 +6490,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       triggerPreamble?: string;
     };
     /** Which resume path drove this — used only for log attribution. */
-    resumeLabel: "reply" | "follow-up";
+    resumeLabel: "reply" | "follow-up" | "continuation";
   }): Promise<void> {
     const { inbound, duplicate, target, row, material, generation, continuation, resumeLabel } = args;
     const record: AgentSessionRecord = {
@@ -6379,7 +6794,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // eligible session takes over this trigger's slot and returns true. Any gate
     // failing (or a non-reply/proactive trigger) falls through to the FRESH launch
     // below. This is the ONLY new branch — the trigger pipeline above is unchanged.
-    if (!proactive && (await tryReplyResume(inbound, duplicate))) return;
+    // With decision-model continuation on for the agent (§8h), the fork first asks
+    // which open session (if any) this trigger continues; otherwise it is exactly
+    // the reply-resume fork.
+    if (!proactive && (await tryContinuation(inbound, duplicate))) return;
     const sessionType = proactive ? config.proactive?.session_type ?? "proactive" : "default";
     // Seed the durable row's model at creation (resolveModelId mirrors the diary/
     // summarize workers) so the model is present from the outset; the per-request
@@ -7975,7 +8393,18 @@ export async function evaluateResumeGate(args: {
   /** Reads the durable row INSIDE the gate's try/catch, so a DB-read throw also
    *  degrades to FRESH (issue #2) rather than escaping the caller. */
   getSession: () => AgentSessionRow | undefined;
-  targetEvent: Pick<CanonicalChatEvent, "agentSessionGeneration">;
+  /**
+   * The replied-to bot message, for the generation gate. Omitted for a
+   * continuation that is not an explicit reply (ARCHITECTURE.md §8h): the row's
+   * own `completed` status then stands for "its outputs are current".
+   */
+  targetEvent?: Pick<CanonicalChatEvent, "agentSessionGeneration">;
+  /**
+   * The decision model judged this a follow-up (§8h "Continuation"): skip the intent
+   * heuristics (`same_user_only` and the time window). Every mechanical gate, the
+   * capability gate, material viability and the work gate still apply.
+   */
+  decided?: boolean;
   inbound: Pick<InboundChatEvent, "timelineKey"> & {
     event: { sender: { id: string }; timestamp: number };
   };
@@ -8003,10 +8432,12 @@ export async function evaluateResumeGate(args: {
     if (SYNTHETIC_SESSION_TYPES.has(row.session_type)) return { resume: false };
     // §7.4 generation gate: the target message must carry the session's CURRENT
     // generation (a reply to a superseded output → stale → FRESH).
-    if ((targetEvent.agentSessionGeneration ?? 0) !== row.resume_generation) return { resume: false };
+    if (targetEvent && (targetEvent.agentSessionGeneration ?? 0) !== row.resume_generation) return { resume: false };
     // §7.6 intent heuristics (human reply). Explicit agent delegation would bypass
     // these — but delegation today only targets running sessions, never reaches here.
+    // A decision-model verdict replaces them (§8h): any participant may continue.
     if (
+      !args.decided &&
       (resumeCfg.same_user_only ?? true) &&
       row.trigger_sender_id &&
       inbound.event.sender.id !== row.trigger_sender_id
@@ -8015,6 +8446,7 @@ export async function evaluateResumeGate(args: {
     }
     const windowMs = resumeCfg.window?.[ctx];
     if (
+      !args.decided &&
       windowMs !== undefined &&
       windowMs > 0 &&
       row.completed_at != null &&
