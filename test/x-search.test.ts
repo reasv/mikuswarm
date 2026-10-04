@@ -850,6 +850,29 @@ test("x_search: requests a stream and reads content, citations and usage from SS
   }
 });
 
+test("x_search: the ledger records OpenRouter's reported cost, else the token-rate cost", async () => {
+  const usage = { prompt_tokens: 1000, completion_tokens: 100 };
+  for (const [reported, label] of [[0.256, "reported"], [undefined, "computed"]] as const) {
+    const server = await startOpenRouter(() => ({
+      json: grokResponse("ok", [], reported === undefined ? usage : { ...usage, cost: reported }),
+    }));
+    const h = await makeHarness({ serverUrl: server.url, rawConfig: { caption_top: 0 } });
+    try {
+      await createXSearchTool(h.context).execute("c", { query: `q-${label}` });
+      const row = h.records.find((r) => r.ref === "grok");
+      assert.ok(row, label);
+      if (reported !== undefined) assert.equal(row.cost, reported, "search fees included");
+      else {
+        // The harness model has no cost block, so the token-rate fallback is 0.
+        assert.equal(row.cost, 0, "falls back to the configured rates");
+      }
+    } finally {
+      await server.close();
+      await h.cleanup();
+    }
+  }
+});
+
 test("x_search: a gateway that ignores stream and answers JSON still works", async () => {
   const server = await startOpenRouter(() => ({
     json: grokResponse("Plain JSON answer.", [], { prompt_tokens: 10, completion_tokens: 2 }),

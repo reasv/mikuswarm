@@ -126,6 +126,11 @@ export interface GrokResult {
   /** Citation URLs in Grok's order, deduped. */
   citations: string[];
   usage: RawTokenUsage | null;
+  /**
+   * The USD charge the provider reported for this call (OpenRouter `usage.cost`),
+   * when present. It includes search fees the per-token rates cannot see.
+   */
+  reportedCostUsd?: number;
   model: string;
 }
 
@@ -449,6 +454,7 @@ export function createXSearchTool(context: XSearchToolContext): AgentTool {
             modelId: billed.config.id,
             logicalModelId: billed.logicalId,
             usage: grok.usage,
+            reportedCostUsd: grok.reportedCostUsd,
             costRates: costRatesOf(billed.config),
           });
         }
@@ -603,6 +609,8 @@ interface OpenRouterResponse {
     completion_tokens?: number;
     total_tokens?: number;
     prompt_tokens_details?: { cached_tokens?: number };
+    /** OpenRouter's billed USD for the call, search fees included. */
+    cost?: number;
   };
 }
 
@@ -716,7 +724,16 @@ async function exchangeGrok(
 
   const synthesis = extractSynthesis(parsed);
   const citations = extractCitations(parsed);
-  return { synthesis, citations, usage: parseOpenAiUsage(parsed.usage), model: input.body.model as string };
+  const reportedCost = parsed.usage?.cost;
+  return {
+    synthesis,
+    citations,
+    usage: parseOpenAiUsage(parsed.usage),
+    ...(typeof reportedCost === "number" && Number.isFinite(reportedCost) && reportedCost >= 0
+      ? { reportedCostUsd: reportedCost }
+      : {}),
+    model: input.body.model as string,
+  };
 }
 
 /**
@@ -955,11 +972,15 @@ function recordGrokUsage(
     modelId: string;
     logicalModelId: string;
     usage: RawTokenUsage | null;
+    reportedCostUsd?: number;
     costRates: CostRates;
   },
 ): void {
   if (!input.usage || !context.recordToolUsage) return;
-  const cost = computeUsageCost(input.costRates, input.usage).total;
+  // Prefer the provider's own charge: Grok's server-side searches carry per-search
+  // fees that token rates miss (measured ~30% of a call), and a budget cap fed the
+  // token-rate figure would let real spend run well past its limit.
+  const cost = input.reportedCostUsd ?? computeUsageCost(input.costRates, input.usage).total;
   try {
     context.recordToolUsage({
       agentSessionId: context.agentSessionId ?? null,

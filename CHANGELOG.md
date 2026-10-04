@@ -85,6 +85,10 @@ Unreleased section; it is not part of any release's notes.
   reading the response, and a timed-out search tells the model not to retry it in
   the same turn. A gateway that answers the streamed request with plain JSON is
   still accepted.
+- **`x_search` records the provider's reported charge.** When OpenRouter returns
+  `usage.cost`, the Grok ledger row uses it, since it includes the per-search fees
+  that token rates cannot see. Budget caps on the Grok model now track real spend.
+  Without a reported cost the configured rates are used, as before.
 
 ### Fixed
 
