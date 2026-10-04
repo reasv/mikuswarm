@@ -366,9 +366,9 @@ export function createXSearchTool(context: XSearchToolContext): AgentTool {
         // tried in order, the chosen member's endpoint/id/key/cost used per attempt.
         let live: GrokResult;
         let billed: FetchChainMember | undefined;
-        // Set when any attempt hit the wall-clock timeout. A timed-out request is
-        // not cancelled upstream: the provider finishes it and bills it, so the
-        // error below tells the model not to pay for the same search again.
+        // Set when any attempt hit the wall-clock timeout. Hanging up cancels the
+        // streamed request, but the part of the search that already ran is billed,
+        // so the error below tells the model not to pay for the same search again.
         let timedOut = false;
         try {
           live = await runFetchWithFallback<GrokResult>(
@@ -576,6 +576,12 @@ export function buildGrokRequestBody(input: {
     ],
     plugins: [{ id: "web" }],
     x_search_filter: filter,
+    // Streamed so that hanging up actually stops the search: OpenRouter cancels a
+    // streamed request when the connection closes (for providers that support it,
+    // xAI included) and stops billing, while a non-streamed one runs to completion
+    // and is billed in full. Usage arrives on the final chunk.
+    stream: true,
+    stream_options: { include_usage: true },
   };
 }
 
@@ -598,6 +604,14 @@ interface OpenRouterResponse {
     total_tokens?: number;
     prompt_tokens_details?: { cached_tokens?: number };
   };
+}
+
+/** One OpenRouter chat-completions SSE chunk (only the fields we read). */
+interface OpenRouterStreamChunk {
+  choices?: Array<{ delta?: { content?: string | null; annotations?: unknown[] } }>;
+  citations?: unknown[];
+  usage?: OpenRouterResponse["usage"];
+  error?: { code?: number | string; message?: string };
 }
 
 /**
@@ -634,6 +648,20 @@ async function postGrok(input: {
     if (input.signal.aborted) controller.abort();
     else input.signal.addEventListener("abort", onAgentAbort, { once: true });
   }
+  // Both stay armed until the body is fully read, not just the headers: a stream
+  // sends its headers at once, so disarming there would leave the search unbounded.
+  try {
+    return await exchangeGrok(input, controller);
+  } finally {
+    clearTimeout(timer);
+    if (input.signal) input.signal.removeEventListener("abort", onAgentAbort);
+  }
+}
+
+async function exchangeGrok(
+  input: { url: string; apiKey: string; body: Record<string, unknown>; dispatcher: Dispatcher | undefined; timeoutMs: number; signal?: AbortSignal },
+  controller: AbortController,
+): Promise<GrokResult | GrokPostError> {
   let response: Response;
   try {
     // Routes through the shared egress chokepoint (per-host limiter + 429/503
@@ -644,7 +672,7 @@ async function postGrok(input: {
       signal: controller.signal,
       headers: {
         "content-type": "application/json",
-        accept: "application/json",
+        accept: "text/event-stream, application/json",
         "user-agent": X_SEARCH_USER_AGENT,
         authorization: `Bearer ${input.apiKey}`,
       },
@@ -661,9 +689,6 @@ async function postGrok(input: {
       return { error: `timed out after ${input.timeoutMs}ms`, timedOut: true };
     }
     return { error: errMessage(error) };
-  } finally {
-    clearTimeout(timer);
-    if (input.signal) input.signal.removeEventListener("abort", onAgentAbort);
   }
 
   if (!response.ok) {
@@ -676,12 +701,16 @@ async function postGrok(input: {
   }
   let parsed: OpenRouterResponse;
   try {
-    parsed = (await readJsonCapped(response, controller)) as OpenRouterResponse;
+    // A gateway that ignores `stream` answers with plain JSON; accept either.
+    parsed = isJsonResponse(response)
+      ? ((await readJsonCapped(response, controller)) as OpenRouterResponse)
+      : await readGrokStream(response, controller);
   } catch (error) {
     if ((error as { name?: string })?.name === "AbortError") {
       if (input.signal?.aborted) throw abortError();
       return { error: `timed out after ${input.timeoutMs}ms`, timedOut: true };
     }
+    if (error instanceof GrokStreamError) return { error: error.message, status: error.status };
     return { error: `unreadable response: ${errMessage(error)}` };
   }
 
@@ -691,14 +720,14 @@ async function postGrok(input: {
 }
 
 /**
- * The agent-facing result of a timed-out search. Hanging up does not stop the
- * provider: it finishes the search and bills it, so an immediate retry pays for
- * the same expensive search again and usually times out the same way.
+ * The agent-facing result of a timed-out search. The search that ran before the
+ * timeout is still billed, and an immediate retry usually pays for the same slow
+ * search again and times out the same way.
  */
 export function timeoutErrorText(model: string, timeoutMs: number): string {
   return (
     `X search timed out after ${Math.round(timeoutMs / 1000)}s (model ${model}). ` +
-    "The search was probably still charged in full even though no result came back. " +
+    "The part of the search that ran before the timeout was still charged. " +
     "Do not retry this search or a reworded version of it in this turn; " +
     "answer without it and tell the user the search timed out."
   );
@@ -1142,6 +1171,91 @@ async function readJsonCapped(response: Response, controller: AbortController): 
     chunks.push(value);
   }
   return JSON.parse(Buffer.concat(chunks.map((c) => Buffer.from(c))).toString("utf8"));
+}
+
+function isJsonResponse(response: Response): boolean {
+  return (response.headers.get("content-type") ?? "").toLowerCase().includes("application/json");
+}
+
+/** An error the provider reported inside an already-open stream. */
+class GrokStreamError extends Error {
+  constructor(
+    message: string,
+    readonly status?: number,
+  ) {
+    super(message);
+    this.name = "GrokStreamError";
+  }
+}
+
+/**
+ * Read an OpenRouter chat-completions SSE stream into the same shape as a
+ * non-streamed response: the content deltas joined, `url_citation` annotations
+ * and top-level `citations` collected, and `usage` taken from the final chunk.
+ * Comment lines (OpenRouter's keep-alive while the search runs) are skipped. An
+ * `error` object in a chunk ends the read with a {@link GrokStreamError}.
+ */
+async function readGrokStream(response: Response, controller: AbortController): Promise<OpenRouterResponse> {
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("empty response body");
+  const decoder = new TextDecoder();
+  let content = "";
+  const annotations: unknown[] = [];
+  let citations: unknown[] | undefined;
+  let usage: OpenRouterResponse["usage"];
+  let buffered = "";
+  let total = 0;
+  let done = false;
+
+  const handleLine = (rawLine: string): void => {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    if (!line.startsWith("data:")) return; // comments, event:/id: fields, blank separators
+    const data = line.slice(5).trim();
+    if (data === "") return;
+    if (data === "[DONE]") {
+      done = true;
+      return;
+    }
+    const chunk = JSON.parse(data) as OpenRouterStreamChunk;
+    if (chunk.error) {
+      const code = typeof chunk.error.code === "number" ? chunk.error.code : undefined;
+      throw new GrokStreamError(`stream error${code ? ` ${code}` : ""}: ${chunk.error.message ?? "unknown"}`, code);
+    }
+    const delta = chunk.choices?.[0]?.delta;
+    if (typeof delta?.content === "string") content += delta.content;
+    if (Array.isArray(delta?.annotations)) annotations.push(...delta.annotations);
+    if (Array.isArray(chunk.citations)) citations = chunk.citations;
+    if (chunk.usage) usage = chunk.usage;
+  };
+
+  while (!done) {
+    const { value, done: ended } = await reader.read();
+    if (ended) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (total > RESPONSE_MAX_BYTES) {
+      controller.abort();
+      throw new Error(`response exceeded ${RESPONSE_MAX_BYTES} bytes`);
+    }
+    buffered += decoder.decode(value, { stream: true });
+    let newline = buffered.indexOf("\n");
+    while (newline !== -1 && !done) {
+      handleLine(buffered.slice(0, newline));
+      buffered = buffered.slice(newline + 1);
+      newline = buffered.indexOf("\n");
+    }
+  }
+  if (!done) {
+    buffered += decoder.decode();
+    if (buffered.length > 0) handleLine(buffered);
+  }
+  // Nothing more to read once [DONE] arrives; release the connection.
+  await reader.cancel().catch(() => {});
+  return {
+    choices: [{ message: { content, annotations } }],
+    ...(citations ? { citations } : {}),
+    ...(usage ? { usage } : {}),
+  };
 }
 
 async function safeReadText(response: Response): Promise<string> {

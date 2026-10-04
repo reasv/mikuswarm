@@ -196,8 +196,27 @@ function tweet(id: string, overrides: Partial<FxApiTweet> = {}): FxApiTweet {
   };
 }
 
+/**
+ * Turn a non-streamed chat-completions body into the SSE frames OpenRouter sends
+ * for `stream: true`: a keep-alive comment, the content split across two deltas
+ * (annotations on the second), then a final chunk with usage/citations and [DONE].
+ */
+function toSseFrames(json: any): string[] {
+  const message = json?.choices?.[0]?.message ?? {};
+  const text: string = typeof message.content === "string" ? message.content : "";
+  const half = Math.ceil(text.length / 2);
+  const frames = [": OPENROUTER PROCESSING\n\n"];
+  frames.push(`data: ${JSON.stringify({ id: "gen-1", choices: [{ delta: { role: "assistant", content: text.slice(0, half) } }] })}\n\n`);
+  frames.push(`data: ${JSON.stringify({ id: "gen-1", choices: [{ delta: { content: text.slice(half), annotations: message.annotations ?? [] } }] })}\n\n`);
+  const final: any = { id: "gen-1", choices: [{ delta: {}, finish_reason: "stop" }] };
+  if (json?.usage) final.usage = json.usage;
+  if (json?.citations) final.citations = json.citations;
+  frames.push(`data: ${JSON.stringify(final)}\n\n`, "data: [DONE]\n\n");
+  return frames;
+}
+
 async function startOpenRouter(
-  responder: (body: any) => { status?: number; json: unknown },
+  responder: (body: any) => { status?: number; json: unknown; forceJson?: boolean; frames?: string[] },
 ): Promise<{ url: string; lastBody: () => any; count: () => number; close: () => Promise<void> }> {
   let last: any;
   let calls = 0;
@@ -207,8 +226,19 @@ async function startOpenRouter(
     req.on("end", () => {
       calls += 1;
       last = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
-      const { status = 200, json } = responder(last);
+      const { status = 200, json, forceJson, frames } = responder(last);
       res.statusCode = status;
+      // Like OpenRouter: a successful `stream: true` request is answered as SSE.
+      if (status === 200 && last.stream === true && !forceJson) {
+        res.setHeader("content-type", "text/event-stream");
+        // One write per byte-run boundary that cuts frames mid-line, to exercise
+        // reassembly of lines split across network chunks.
+        const sse = (frames ?? toSseFrames(json)).join("");
+        const cut = Math.floor(sse.length / 3);
+        res.write(sse.slice(0, cut));
+        res.end(sse.slice(cut));
+        return;
+      }
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify(json));
     });
@@ -783,11 +813,135 @@ test("x_search: a wall-clock timeout tells the model not to retry the search", a
     const result: any = await tool.execute("c", { query: "q" });
     const text: string = result.content[0].text;
     assert.match(text, /timed out after 0s/);
-    assert.match(text, /charged/);
+    assert.match(text, /still charged/);
     assert.match(text, /Do not retry this search/);
     assert.equal(h.records.length, 0, "no usage row: the response never arrived");
   } finally {
     hangRes?.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await h.cleanup();
+  }
+});
+
+test("x_search: requests a stream and reads content, citations and usage from SSE", async () => {
+  const server = await startOpenRouter(() => ({
+    json: grokResponse("Streamed answer here.", ["https://x.com/a/status/1"], {
+      prompt_tokens: 500,
+      completion_tokens: 40,
+    }),
+  }));
+  const h = await makeHarness({ serverUrl: server.url, rawConfig: { caption_top: 0 } });
+  try {
+    const tool = createXSearchTool(h.context);
+    const result: any = await tool.execute("c", { query: "q" });
+    assert.equal(server.lastBody().stream, true);
+    assert.deepEqual(server.lastBody().stream_options, { include_usage: true });
+    assert.match(result.content[0].text, /Streamed answer here\./);
+    assert.match(result.content[0].text, /Grok cited 1 post/, "the annotation on the second delta is read");
+    const grokRow = h.records.find((r) => r.ref === "grok");
+    assert.deepEqual(
+      grokRow?.usage,
+      { input: 500, output: 40, cacheRead: 0, cacheWrite: 0 },
+      "usage from the final chunk reaches the ledger",
+    );
+  } finally {
+    await server.close();
+    await h.cleanup();
+  }
+});
+
+test("x_search: a gateway that ignores stream and answers JSON still works", async () => {
+  const server = await startOpenRouter(() => ({
+    json: grokResponse("Plain JSON answer.", [], { prompt_tokens: 10, completion_tokens: 2 }),
+    forceJson: true,
+  }));
+  const h = await makeHarness({ serverUrl: server.url, rawConfig: { caption_top: 0 } });
+  try {
+    const result: any = await createXSearchTool(h.context).execute("c", { query: "q" });
+    assert.match(result.content[0].text, /Plain JSON answer\./);
+  } finally {
+    await server.close();
+    await h.cleanup();
+  }
+});
+
+test("x_search: an error inside the stream fails the search with the provider's message", async () => {
+  const server = await startOpenRouter(() => ({
+    json: {},
+    frames: [
+      `data: ${JSON.stringify({ choices: [{ delta: { content: "partial" } }] })}\n\n`,
+      `data: ${JSON.stringify({ error: { code: 502, message: "Provider disconnected" }, choices: [{ delta: {}, finish_reason: "error" }] })}\n\n`,
+    ],
+  }));
+  const h = await makeHarness({ serverUrl: server.url, rawConfig: { caption_top: 0 } });
+  try {
+    const result: any = await createXSearchTool(h.context).execute("c", { query: "q" });
+    assert.match(result.content[0].text, /X search failed .*stream error 502: Provider disconnected/);
+    assert.equal(h.records.length, 0);
+  } finally {
+    await server.close();
+    await h.cleanup();
+  }
+});
+
+test("x_search: a timeout mid-stream closes the connection (which cancels upstream billing)", async () => {
+  let closed = false;
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.setHeader("content-type", "text/event-stream");
+      res.write(": OPENROUTER PROCESSING\n\n"); // keep-alive, then nothing more
+    });
+    res.on("close", () => {
+      closed = true;
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const addr = server.address();
+  if (!addr || typeof addr === "string") throw new Error("no address");
+  const h = await makeHarness({ serverUrl: `http://127.0.0.1:${addr.port}`, rawConfig: { timeout_ms: 150 } });
+  h.context.scheduler = makeStubScheduler().scheduler;
+  try {
+    const result: any = await createXSearchTool(h.context).execute("c", { query: "q" });
+    assert.match(result.content[0].text, /timed out/);
+    for (let i = 0; i < 50 && !closed; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.equal(closed, true, "the client hung up instead of leaving the stream running");
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await h.cleanup();
+  }
+});
+
+test("x_search: cancelling the turn mid-stream aborts neutrally and hangs up", async () => {
+  let closed = false;
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.setHeader("content-type", "text/event-stream");
+      res.write(": OPENROUTER PROCESSING\n\n");
+    });
+    res.on("close", () => {
+      closed = true;
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const addr = server.address();
+  if (!addr || typeof addr === "string") throw new Error("no address");
+  const stub = makeStubScheduler();
+  const h = await makeHarness({ serverUrl: `http://127.0.0.1:${addr.port}` });
+  h.context.scheduler = stub.scheduler;
+  try {
+    const controller = new AbortController();
+    const p = createXSearchTool(h.context).execute("c", { query: "q" }, controller.signal);
+    await new Promise((r) => setTimeout(r, 80)); // headers + keep-alive have arrived
+    controller.abort();
+    await assert.rejects(() => p as Promise<unknown>, (err: any) => err?.name === "AbortError");
+    for (let i = 0; i < 50 && !closed; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.equal(closed, true);
+    assert.equal(stub.noteCalls.length, 0, "a cancelled turn is not a health signal");
+  } finally {
+    server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await h.cleanup();
   }

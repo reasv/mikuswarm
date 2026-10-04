@@ -78,8 +78,20 @@ Unreleased section; it is not part of any release's notes.
   templates, proactive kickoff, and forced-completion messages now say "call
   `no_reply`" instead of "output `NO_REPLY`". The text marker is still accepted for
   compatibility.
+- **`x_search` streams its Grok request.** OpenRouter cancels a streamed request
+  when the client hangs up, and stops billing for providers that support it
+  (xAI does). A non-streamed request keeps running after a timeout and is billed
+  in full, with no usage ever coming back to record. The timeout now also covers
+  reading the response, and a timed-out search tells the model not to retry it in
+  the same turn. A gateway that answers the streamed request with plain JSON is
+  still accepted.
 
 ### Fixed
+
+- **Agent- and account-scoped `[[limits]]` rules never applied to paid tool
+  calls.** The `image_generate` and `x_search` budget gate checked spend without
+  the calling session's timeline, so a scoped rule could not match and a
+  per-agent tool cap never blocked anything.
 
 - **The local embedder ran every query as a full 512-token forward pass.**
   fastembed pads each input to the model's maximum length, and onnxruntime-node
