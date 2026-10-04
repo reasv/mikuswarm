@@ -298,6 +298,37 @@ test("breakpoint (c): trigger identified by <retrieved_memory> prefix", () => {
   assert.equal(getBreakpoint(result.input[4]), undefined, "no breakpoint on trigger");
 });
 
+test("breakpoint (c): trigger identified by <retrieved_memory note=…> (rendered form)", () => {
+  const inject = makeBreakpointInjector(estimateTokens);
+  const payload = {
+    input: [
+      devItem("A".repeat(4100)),
+      userItem("<conversation_summary>" + "S".repeat(9000) + "</conversation_summary>"),
+      userItem("chat1" + "X".repeat(2000)),
+      userItem("chat2" + "Y".repeat(2000)),
+      userItem('<retrieved_memory note="Possibly-relevant">\nm\n</retrieved_memory>\n<system>\nx\n</system>'),
+    ],
+  };
+  const result = inject(payload, bedrockModel) as any;
+  assert.deepEqual(getBreakpoint(result.input[2]), { mode: "explicit" });
+  assert.equal(getBreakpoint(result.input[4]), undefined);
+});
+
+test("trigger match needs the whole tag name", () => {
+  const inject = makeBreakpointInjector(estimateTokens);
+  const payload = {
+    input: [
+      devItem("A".repeat(4100)),
+      userItem("<conversation_summary>" + "S".repeat(9000) + "</conversation_summary>"),
+      userItem("chat1" + "X".repeat(2000)),
+      userItem("chat2" + "Y".repeat(2000)),
+      userItem("<systematic>not a tail</systematic>"),
+    ],
+  };
+  const result = inject(payload, bedrockModel) as any;
+  assert.equal(getBreakpoint(result.input[2]), undefined);
+});
+
 // ── original items are not mutated ────────────────────────────────────────────
 
 test("injection does not mutate the original payload", () => {
@@ -431,4 +462,124 @@ test("makeBreakpointInjector: non-responses model (no compat.cacheBreakpoints) �
   const inject = makeBreakpointInjector(estimateTokens);
   const payload = { input: [devItem("instructions")] };
   assert.strictEqual(inject(payload, directModel), payload, "non-Bedrock model: identity passthrough");
+});
+
+// ---------------------------------------------------------------------------
+// Anthropic Messages API: `cache_control` markers on the timeline (c) and the
+// conversation summary (b), next to pi-ai's own system + last-user markers.
+// ---------------------------------------------------------------------------
+
+const anthropicModel = { api: "anthropic-messages", compat: { cacheBreakpoints: "explicit" as const } };
+const CC = { type: "ephemeral" };
+
+function aUser(text: string, cc = false) {
+  return { role: "user", content: [{ type: "text", text, ...(cc ? { cache_control: CC } : {}) }] };
+}
+function aAssistant(text: string) {
+  return { role: "assistant", content: [{ type: "text", text }] };
+}
+/** A session-start payload as pi-ai builds it: system + last user message marked. */
+function anthropicPayload(messages: object[]) {
+  return {
+    model: "claude-test",
+    system: [{ type: "text", text: "instructions", cache_control: CC }],
+    tools: [{ name: "t", input_schema: { type: "object" } }],
+    messages,
+  };
+}
+const markedIndexes = (payload: any) =>
+  payload.messages.flatMap((m: any, i: number) =>
+    Array.isArray(m.content) && m.content.some((b: any) => b.cache_control) ? [i] : [],
+  );
+
+test("anthropic: marks the summary and the item before the last pre-trigger user item", () => {
+  const inject = makeBreakpointInjector(estimateTokens);
+  const payload = anthropicPayload([
+    aUser("<recent_memory>diary</recent_memory>"),
+    aUser("<conversation_summary>S</conversation_summary>"),
+    aUser("m1"),
+    aAssistant("r1"),
+    aUser("m2"),
+    aAssistant("r2"),
+    aUser("m3 (may still grow)"),
+    aUser('<retrieved_memory note="Possibly-relevant">\nR\n</retrieved_memory>\n<system>\ntail\n</system>', true),
+  ]);
+  const out = inject(payload, anthropicModel) as any;
+  assert.deepEqual(markedIndexes(out), [1, 5, 7]);
+  assert.deepEqual(out.messages[5].content[0].cache_control, CC);
+  // input untouched
+  assert.deepEqual(markedIndexes(payload), [7]);
+});
+
+test("anthropic: within-session request keeps the same markers before the trigger", () => {
+  const inject = makeBreakpointInjector(estimateTokens);
+  const payload = anthropicPayload([
+    aUser("<conversation_summary>S</conversation_summary>"),
+    aUser("m1"),
+    aAssistant("r1"),
+    aUser("m2"),
+    aUser("<system>tail</system>"),
+    { role: "assistant", content: [{ type: "thinking", thinking: "x", signature: "s" }, { type: "tool_use", id: "a", name: "t", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "a", content: "ok", cache_control: CC }] },
+  ]);
+  const out = inject(payload, anthropicModel) as any;
+  assert.deepEqual(markedIndexes(out), [0, 2, 6]);
+});
+
+test("anthropic: never exceeds four markers; the timeline marker wins a single slot", () => {
+  const inject = makeBreakpointInjector(estimateTokens);
+  const payload = anthropicPayload([
+    aUser("<conversation_summary>S</conversation_summary>"),
+    aAssistant("r0"),
+    aUser("m1"),
+    aAssistant("r1"),
+    aUser("m2"),
+    aUser("<system>tail</system>", true),
+  ]) as any;
+  payload.tools[0].cache_control = CC;
+  const out = inject(payload, anthropicModel) as any;
+  assert.deepEqual(markedIndexes(out), [3, 5]);
+});
+
+test("anthropic: no markers when pi-ai placed none (caching off)", () => {
+  const inject = makeBreakpointInjector(estimateTokens);
+  const payload = {
+    system: [{ type: "text", text: "instructions" }],
+    messages: [aUser("<conversation_summary>S</conversation_summary>"), aAssistant("r"), aUser("m"), aUser("<system>t</system>")],
+  };
+  assert.equal(inject(payload, anthropicModel), payload);
+});
+
+test("anthropic: no trigger item marks only the summary; thinking-only items are skipped", () => {
+  const inject = makeBreakpointInjector(estimateTokens);
+  const noTrigger = anthropicPayload([aUser("<conversation_summary>S</conversation_summary>"), aAssistant("r"), aUser("m", true)]);
+  assert.deepEqual(markedIndexes(inject(noTrigger, anthropicModel)), [0, 2]);
+
+  const thinkingOnly = anthropicPayload([
+    aUser("m0"),
+    { role: "assistant", content: [{ type: "thinking", thinking: "x", signature: "s" }] },
+    aUser("m1"),
+    aUser("<system>t</system>", true),
+  ]);
+  assert.deepEqual(markedIndexes(inject(thinkingOnly, anthropicModel)), [3]);
+});
+
+test("anthropic: string content is converted to a marked text block", () => {
+  const inject = makeBreakpointInjector(estimateTokens);
+  const payload = anthropicPayload([
+    { role: "user", content: "m0" },
+    { role: "assistant", content: "r0" },
+    { role: "user", content: "m1" },
+    aUser("<system>t</system>", true),
+  ]);
+  const out = inject(payload, anthropicModel) as any;
+  assert.deepEqual(out.messages[1].content, [{ type: "text", text: "r0", cache_control: CC }]);
+});
+
+test("anthropic: option off or other API leaves the payload alone", () => {
+  const inject = makeBreakpointInjector(estimateTokens);
+  const payload = anthropicPayload([aUser("<conversation_summary>S</conversation_summary>"), aAssistant("r"), aUser("m"), aUser("<system>t</system>", true)]);
+  assert.equal(inject(payload, { api: "anthropic-messages", compat: {} }), payload);
+  // An openai-responses member with the option sees no `input` array → identity.
+  assert.equal(inject(payload, { api: "openai-responses", compat: { cacheBreakpoints: "explicit" } }), payload);
 });

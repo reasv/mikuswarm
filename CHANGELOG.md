@@ -36,6 +36,13 @@ Unreleased section; it is not part of any release's notes.
 
 ### Added
 
+- **`cache_breakpoints = "explicit"` works on Anthropic models** (`api =
+  "anthropic-messages"`, off by default). Two more `cache_control` markers go on
+  the conversation summary and on the stable end of the room timeline, so a new
+  session in the same room reads the previous session's timeline from the cache
+  instead of writing it again. Before, only the system prompt and tools were
+  shared between sessions.
+
 - **Decision models** (off by default): `[models.*]` blocks with `api = "system-one"` call a
   decision model (TypeSafe Jev and drop-in alternatives, e.g. through OpenRouter's decisions
   endpoint) with typed `choice`/`score`/`noul` questions. Chains fall back member to member
@@ -135,6 +142,11 @@ Unreleased section; it is not part of any release's notes.
   Without a reported cost the configured rates are used, as before.
 
 ### Fixed
+
+- **Explicit cache breakpoints missed the timeline whenever auto-retrieval ran.**
+  The per-session tail was recognised only by a bare `<retrieved_memory>` tag,
+  but the block is rendered with a `note` attribute, so the last-stable-timeline
+  breakpoint on Bedrock Responses models was skipped in those sessions.
 
 - **Agent- and account-scoped `[[limits]]` rules never applied to paid tool
   calls.** The `image_generate` and `x_search` budget gate checked spend without

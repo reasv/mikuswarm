@@ -1,5 +1,6 @@
 /**
- * Explicit prompt-cache breakpoint injection for the OpenAI Responses API.
+ * Explicit prompt-cache breakpoint injection for the OpenAI Responses API on
+ * Amazon Bedrock and for the Anthropic Messages API (see the end of this header).
  *
  * Amazon Bedrock's prompt cache for OpenAI models (GPT-5.6, GPT-6) is
  * checkpoint-based: a breakpoint on a content block tells the provider "the
@@ -23,8 +24,8 @@
  *       excluding the trailing batched user message that grows as new messages
  *       arrive.
  *
- * Trigger item identification: the first user item whose text starts with
- * "<system>" or "<retrieved_memory>" is the per-session dynamic tail
+ * Trigger item identification: the first user item whose text opens a
+ * `<system>` or `<retrieved_memory …>` tag is the per-session dynamic tail
  * (satellite block + optional auto-retrieval, see ARCHITECTURE.md §8).
  * NOTE: this heuristic identifies boundaries by wire-text prefix.  The context
  * builder (src/context/) is the authoritative source for these block kinds; a
@@ -42,6 +43,23 @@
  * between developer and lastStable are counted twice (once in the gap-fill
  * loop, once via lastStable's own token count) — this only affects the 1024
  * floor check and cannot produce false negatives at real session sizes.
+
+ *
+ * Anthropic Messages API (`api = "anthropic-messages"`, same option): Anthropic
+ * caches block prefixes up to each `cache_control` marker, and a later request
+ * reads the longest stored prefix ending at a block within about 20 blocks
+ * before one of its own markers.  pi-ai marks the system prompt (which, with the
+ * tools rendered ahead of it, is the agent-wide prefix) and the last user
+ * message, so a new session in the same room re-writes the whole timeline.
+ * {@link injectAnthropicBreakpoints} adds up to two markers, within Anthropic's
+ * limit of four per request:
+ *   (c) the last cache-markable block of the item just before the last user
+ *       item preceding the trigger item: the timeline up to there is reproduced
+ *       verbatim by the next session in the room, while that last user item may
+ *       still grow (a message batched into it).
+ *   (b) the conversation-summary user item (fallback when (c) has moved on).
+ * The marker reuses pi-ai's own `cache_control` value from the request (so the
+ * TTL matches); when pi-ai placed none (caching off) nothing is added.
  */
 
 // Augment pi-ai's OpenAIResponsesCompat so createModelFromConfig can carry the
@@ -58,6 +76,12 @@ declare module "@earendil-works/pi-ai" {
     cacheBreakpoints?: "explicit";
   }
 }
+
+/**
+ * Opening of the per-session tail: the satellite `<system>` block or the
+ * auto-retrieval `<retrieved_memory note="…">` block, with or without attributes.
+ */
+const TRIGGER_OPEN = /^<(?:system|retrieved_memory)[\s>]/;
 
 /** Explicit prompt-cache breakpoint marker, as required by Bedrock's Responses API. */
 const PROMPT_CACHE_BREAKPOINT = { prompt_cache_breakpoint: { mode: "explicit" } } as const;
@@ -155,6 +179,7 @@ export function makeBreakpointInjector(
 
     if (!payload || typeof payload !== "object") return payload;
     const p = payload as Record<string, unknown>;
+    if ((model as Record<string, unknown>)["api"] === "anthropic-messages") return injectAnthropicBreakpoints(p);
     if (!Array.isArray(p["input"]) || p["input"].length === 0) return payload;
 
     const input = p["input"] as unknown[];
@@ -184,13 +209,13 @@ export function makeBreakpointInjector(
       }
     }
 
-    // Trigger item: first user item that begins with "<system>" or "<retrieved_memory>"
+    // Trigger item: first user item that opens a <system> or <retrieved_memory> tag
     let triggerIdx = -1;
     for (let i = 0; i < input.length; i++) {
       const item = input[i];
       if (isInputRoleItem(item) && (item as Record<string, unknown>)["role"] === "user") {
         const text = getItemText(item);
-        if (text.startsWith("<system>") || text.startsWith("<retrieved_memory>")) {
+        if (TRIGGER_OPEN.test(text)) {
           triggerIdx = i;
           break;
         }
@@ -262,4 +287,121 @@ export function makeBreakpointInjector(
 
     return { ...p, input: newInput };
   };
+}
+
+// ── Anthropic Messages API ──────────────────────────────────────────────────
+
+/** Anthropic's per-request limit on `cache_control` markers. */
+const ANTHROPIC_MAX_BREAKPOINTS = 4;
+
+/** Content block types that may carry `cache_control` (thinking blocks may not). */
+const ANTHROPIC_MARKABLE_BLOCKS = new Set(["text", "image", "document", "tool_use", "tool_result"]);
+
+/** Text of an Anthropic message's first text block (or its string content). */
+function anthropicLeadingText(message: unknown): string {
+  if (!message || typeof message !== "object") return "";
+  const content = (message as Record<string, unknown>)["content"];
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const first = content.find((b) => !!b && typeof b === "object" && (b as Record<string, unknown>)["type"] === "text");
+  const text = (first as Record<string, unknown> | undefined)?.["text"];
+  return typeof text === "string" ? text : "";
+}
+
+function isAnthropicUser(message: unknown): boolean {
+  return !!message && typeof message === "object" && (message as Record<string, unknown>)["role"] === "user";
+}
+
+/** Blocks carrying `cache_control` in a block array (non-arrays count zero). */
+function markedBlocks(blocks: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(blocks)) return [];
+  return blocks.filter(
+    (b): b is Record<string, unknown> =>
+      !!b && typeof b === "object" && (b as Record<string, unknown>)["cache_control"] !== undefined,
+  );
+}
+
+/**
+ * Return a copy of `message` with `cacheControl` on its last markable block, or
+ * `undefined` when it has none (or that block is already marked). String
+ * content becomes a one-block text array.
+ */
+function markAnthropicMessage(message: unknown, cacheControl: unknown): Record<string, unknown> | undefined {
+  if (!message || typeof message !== "object") return undefined;
+  const m = message as Record<string, unknown>;
+  const content = m["content"];
+  if (typeof content === "string") {
+    if (content.length === 0) return undefined;
+    return { ...m, content: [{ type: "text", text: content, cache_control: cacheControl }] };
+  }
+  if (!Array.isArray(content)) return undefined;
+  for (let i = content.length - 1; i >= 0; i--) {
+    const block = content[i] as Record<string, unknown> | null;
+    if (!block || typeof block !== "object") continue;
+    const type = block["type"];
+    if (typeof type !== "string" || !ANTHROPIC_MARKABLE_BLOCKS.has(type)) continue;
+    if (type === "text" && (typeof block["text"] !== "string" || block["text"].length === 0)) continue;
+    if (block["cache_control"] !== undefined) return undefined;
+    const next = [...content];
+    next[i] = { ...block, cache_control: cacheControl };
+    return { ...m, content: next };
+  }
+  return undefined;
+}
+
+/**
+ * Add the timeline (c) and summary (b) `cache_control` markers to an
+ * anthropic-messages payload (see the module header). Pure: returns a new
+ * payload, or the input unchanged when nothing qualifies.
+ */
+export function injectAnthropicBreakpoints(p: Record<string, unknown>): Record<string, unknown> {
+  const messages = p["messages"];
+  if (!Array.isArray(messages) || messages.length === 0) return p;
+
+  const existing = [
+    ...markedBlocks(p["system"]),
+    ...markedBlocks(p["tools"]),
+    ...messages.flatMap((m) => markedBlocks((m as Record<string, unknown> | null)?.["content"])),
+  ];
+  let slots = ANTHROPIC_MAX_BREAKPOINTS - existing.length;
+  if (slots <= 0) return p;
+  // Follow pi-ai's marker (its TTL); none means caching is off for this request.
+  const cacheControl = existing[0]?.["cache_control"];
+  if (cacheControl === undefined) return p;
+
+  let summaryIdx = -1;
+  let triggerIdx = -1;
+  for (let i = 0; i < messages.length; i++) {
+    if (!isAnthropicUser(messages[i])) continue;
+    const text = anthropicLeadingText(messages[i]);
+    if (summaryIdx < 0 && text.startsWith("<conversation_summary")) summaryIdx = i;
+    if (TRIGGER_OPEN.test(text)) {
+      triggerIdx = i;
+      break;
+    }
+  }
+
+  let stableIdx = -1;
+  if (triggerIdx > 0) {
+    let lastUser = -1;
+    for (let i = triggerIdx - 1; i >= 0; i--) {
+      if (isAnthropicUser(messages[i])) {
+        lastUser = i;
+        break;
+      }
+    }
+    if (lastUser - 1 > summaryIdx) stableIdx = lastUser - 1;
+  }
+
+  const out = [...messages];
+  let changed = false;
+  for (const idx of [stableIdx, summaryIdx]) {
+    if (idx < 0 || slots <= 0) continue;
+    const marked = markAnthropicMessage(out[idx], cacheControl);
+    if (!marked) continue;
+    out[idx] = marked;
+    slots--;
+    changed = true;
+  }
+  return changed ? { ...p, messages: out } : p;
 }

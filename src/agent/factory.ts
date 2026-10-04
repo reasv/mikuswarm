@@ -1843,8 +1843,9 @@ export class AgentSessionFactory {
       convertToLlm,
       streamFn,
       getApiKey: () => modelConfig.api_key,
-      // Explicit prompt-cache breakpoints for Bedrock's checkpoint-based cache
-      // (OpenAI models via amazon-bedrock).  The injector is installed for every
+      // Explicit prompt-cache breakpoints (Bedrock's checkpoint-based cache for
+      // OpenAI models; extra Anthropic cache_control markers on the stable
+      // timeline).  The injector is installed for every
       // session; it gates on the serving member's Model descriptor
       // (compat.cacheBreakpoints === "explicit", set in createModelFromConfig) so
       // fallback members without the option — e.g. a direct-OpenAI model in the
@@ -2881,9 +2882,9 @@ export function createModelFromConfig(model: ModelConfig, contextWindow?: number
       // OpenRouter provider-routing preferences, sent verbatim as `provider` by the
       // openai-completions driver. Undefined = no `provider` object on the wire.
       openRouterRouting: model.compat?.openrouter_routing as OpenRouterRouting | undefined,
-      // Carry the Bedrock explicit cache_breakpoints preference on the wire Model
+      // Carry the explicit cache_breakpoints preference on the wire Model
       // descriptor so the onPayload injector can gate per serving member (not per
-      // chain head).  Only meaningful on openai-responses members backed by Bedrock;
+      // chain head).  Read for openai-responses and anthropic-messages members;
       // undefined on all other models so the injector passes their payloads through.
       cacheBreakpoints: model.cache_breakpoints,
       // Carry the prefill text on the wire Model descriptor so the onPayload
