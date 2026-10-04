@@ -833,7 +833,59 @@ function sessionDetailFixture(id: string, now: number): unknown {
 			tokenEstimate: 24,
 			timestamp: now - 6 * MIN
 		},
-		// rollout begins
+		// rollout begins — harness injection: read_session_record for the prior session
+		{
+			role: 'assistant',
+			content: [
+				{
+					type: 'toolCall',
+					id: 'call_h_inject_1',
+					name: 'read_session_record',
+					arguments: { session_id: DEMO_RECORD_SESSION_B }
+				}
+			],
+			stopReason: 'toolUse',
+			harness: { kind: 'injection', decisionGroup: DEMO_DG_RECORDS }
+		},
+		{
+			role: 'toolResult',
+			toolCallId: 'call_h_inject_1',
+			toolName: 'read_session_record',
+			content: [
+				{
+					type: 'text',
+					text:
+						'Session ses_v8n2ke — Searched for color palette decisions in #general. ' +
+						'Found: warm earth tones (Ada) vs. cool pastels (Grace); no final vote taken. ' +
+						'Sent a summary with both options.\n\nBuilds on: none.'
+				}
+			],
+			isError: false,
+			harness: { kind: 'injection', decisionGroup: DEMO_DG_RECORDS }
+		},
+		// harness injection: load_skill for routing preload (no decisionGroup)
+		{
+			role: 'assistant',
+			content: [
+				{
+					type: 'toolCall',
+					id: 'call_h_inject_2',
+					name: 'load_skill',
+					arguments: { name: 'image-generation' }
+				}
+			],
+			stopReason: 'toolUse',
+			harness: { kind: 'injection' }
+		},
+		{
+			role: 'toolResult',
+			toolCallId: 'call_h_inject_2',
+			toolName: 'load_skill',
+			content: [{ type: 'text', text: 'Loaded skill: image-generation. Tools added: image_generate.' }],
+			isError: false,
+			harness: { kind: 'injection' }
+		},
+		// first real model turn
 		{
 			role: 'assistant',
 			content: [
@@ -946,6 +998,89 @@ function sessionDetailFixture(id: string, now: number): unknown {
 				}
 			],
 			usage: usage(70900, 260, 0.024)
+		},
+		// harness record turn — shown as a distinct "Session record" section
+		{
+			role: 'user',
+			content: [
+				{
+					type: 'text',
+					text:
+						'A later session will see only the chat and this record. Write what it needs to answer ' +
+						'questions about this work and continue it. Focus on: sources behind what you said, ' +
+						'artifacts made (paths, message ids), anything left open. Anchor to the messages you sent.'
+				}
+			],
+			harness: { kind: 'record_turn' }
+		},
+		// harness record_load — the synthetic load of session_record_tool
+		{
+			role: 'assistant',
+			content: [
+				{
+					type: 'toolCall',
+					id: 'call_h_rec_load',
+					name: 'load_skill',
+					arguments: { name: 'session_record_tool' }
+				}
+			],
+			stopReason: 'toolUse',
+			harness: { kind: 'record_load' }
+		},
+		{
+			role: 'toolResult',
+			toolCallId: 'call_h_rec_load',
+			toolName: 'load_skill',
+			content: [{ type: 'text', text: 'Tool loaded: session_record_tool.' }],
+			isError: false,
+			harness: { kind: 'record_load' }
+		},
+		// model writes the record with session_record_tool
+		{
+			role: 'assistant',
+			content: [
+				{
+					type: 'toolCall',
+					id: 'call_rec_1',
+					name: 'session_record_tool',
+					arguments: {
+						action: 'create',
+						text:
+							'Found the summer meetup details: third weekend of August, community hall on Elm St, ' +
+							'2pm potluck-style (from messages by Ada, Grace and Linus in #general). ' +
+							'Generated two images — att_9f2a (portrait) then att_9f2b (landscape at user request). ' +
+							'Sent att_9f2b. Meetup date/venue confirmed.'
+					}
+				}
+			],
+			usage: usage(71400, 120, 0.011)
+		},
+		{
+			role: 'toolResult',
+			toolCallId: 'call_rec_1',
+			toolName: 'session_record_tool',
+			content: [{ type: 'text', text: 'Draft created (68 tokens). Call finalize to commit.' }],
+			isError: false
+		},
+		{
+			role: 'assistant',
+			content: [
+				{
+					type: 'toolCall',
+					id: 'call_rec_2',
+					name: 'session_record_tool',
+					arguments: { action: 'finalize' }
+				}
+			],
+			usage: usage(71600, 30, 0.003)
+		},
+		{
+			role: 'toolResult',
+			toolCallId: 'call_rec_2',
+			toolName: 'session_record_tool',
+			content: [{ type: 'text', text: 'Record finalized (68 tokens). Session complete.' }],
+			isError: false,
+			terminate: true
 		}
 	];
 
@@ -1139,6 +1274,139 @@ function costOverviewFixture(): unknown {
 	return { agentLoopCost: 128.4, toolCost: 6.2, captioningCost: 1.79 };
 }
 
+// ── Session records (spec SESSION-RECORDS §8) ────────────────────────────────
+
+const DEMO_RECORD_SESSION_B = 'ses_v8n2ke'; // the session whose record was injected
+
+/** Demo fixture for GET /api/sessions/:id/record */
+function sessionRecordFixture(id: string, now: number): unknown {
+	// Only the featured session (the "poster" one) has a record; others return null.
+	if (id !== FEATURED_ID) return { sessionRecord: null };
+	return {
+		sessionRecord: {
+			sessionId: id,
+			timelineKey: ROOMS[0].key,
+			agent: 'aria',
+			text:
+				'Found the summer meetup details: third weekend of August, community hall on Elm St, ' +
+				'2pm potluck-style (from messages by Ada, Grace and Linus in #general). ' +
+				'Generated two images — att_9f2a (portrait) then att_9f2b (landscape at user request). ' +
+				'Sent att_9f2b. Meetup date/venue confirmed.',
+			tokenCount: 68,
+			buildsOn: [DEMO_RECORD_SESSION_B],
+			modelId: 'anthropic/claude-sonnet-4',
+			createdAt: now - 4 * MIN
+		}
+	};
+}
+
+/** Invented decision group UUIDs used in demo evaluations. */
+const DEMO_DG_ROUTING = 'dg-00000000-routing-demo';
+const DEMO_DG_RECORDS = 'dg-11111111-records-demo';
+
+/** Demo fixture for GET /api/sessions/:id/decisions */
+function sessionDecisionsFixture(id: string, now: number): unknown {
+	if (id !== FEATURED_ID) return { evaluations: [] };
+	const ts = now - 6 * MIN;
+	return {
+		evaluations: [
+			// Routing decision: model selected opus55_aws
+			{
+				id: 1,
+				ts,
+				decisionGroup: DEMO_DG_ROUTING,
+				point: 'routing',
+				agent: 'aria',
+				timelineKey: ROOMS[0].key,
+				agentSessionId: id,
+				triggerEventId: '$trigger:example.org',
+				candidateSessionId: null,
+				source: 'model',
+				reason: null,
+				verdictJson: JSON.stringify({ model: 'anthropic/claude-sonnet-4', cascade: false }),
+				answersJson: JSON.stringify([
+					{ label: 'opus55_aws', probability: 0.78 },
+					{ label: 'sol61_aws', probability: 0.22 }
+				]),
+				stateJson: JSON.stringify({
+					request: { from: '@ada:example.org', text: 'Hey Miku, can you find the summer meetup and make a poster?' },
+					recent_chat: [
+						{ from: '@grace:example.org', text: 'Ada, did you ask miku about the poster yet?' }
+					]
+				}),
+				questionsJson: JSON.stringify([
+					{ key: 'heavy', label: 'This task needs image generation and search — pick the capable model.' }
+				]),
+				servedModel: 'anthropic/claude-sonnet-4',
+				servedVersion: '20250219',
+				latencyMs: 312,
+				inputTokens: 1840,
+				costUsd: 0.0024
+			},
+			// Records decision: candidate ses_v8n2ke above threshold → injected
+			{
+				id: 2,
+				ts: ts + 50,
+				decisionGroup: DEMO_DG_RECORDS,
+				point: 'records',
+				agent: 'aria',
+				timelineKey: ROOMS[0].key,
+				agentSessionId: id,
+				triggerEventId: '$trigger:example.org',
+				candidateSessionId: DEMO_RECORD_SESSION_B,
+				source: 'model',
+				reason: null,
+				verdictJson: JSON.stringify({ inject: true }),
+				answersJson: JSON.stringify([{ label: 'relevant', probability: 0.83 }]),
+				stateJson: JSON.stringify({
+					request: { from: '@ada:example.org', text: 'Hey Miku, can you find the summer meetup and make a poster?' },
+					reply_to: { from: '<bot>', text: 'remind me what we decided about the color palette' },
+					record: 'Searched for color palette decisions in #general. Found: warm earth tones (Ada) vs. cool pastels (Grace); no final vote taken. Sent a summary with both options.'
+				}),
+				questionsJson: JSON.stringify([
+					{ key: 'relevant', label: 'Does the request refer to or continue the work in this record?' }
+				]),
+				servedModel: 'anthropic/claude-haiku-4',
+				servedVersion: '20250307',
+				latencyMs: 194,
+				inputTokens: 920,
+				costUsd: 0.00081
+			},
+			// Records decision: another candidate below threshold → not injected
+			{
+				id: 3,
+				ts: ts + 55,
+				decisionGroup: DEMO_DG_RECORDS,
+				point: 'records',
+				agent: 'aria',
+				timelineKey: ROOMS[0].key,
+				agentSessionId: id,
+				triggerEventId: '$trigger:example.org',
+				candidateSessionId: 'ses_k2f8ra',
+				source: 'model',
+				reason: null,
+				verdictJson: JSON.stringify({ inject: false }),
+				answersJson: JSON.stringify([{ label: 'relevant', probability: 0.18 }]),
+				stateJson: JSON.stringify({
+					request: { from: '@ada:example.org', text: 'Hey Miku, can you find the summer meetup and make a poster?' },
+					recent_chat: [
+						{ from: '@linus:example.org', text: 'lol did you see the game last night' }
+					],
+					record: 'Linus asked about last night\'s game. Replied with the score and highlights.'
+				}),
+				questionsJson: JSON.stringify([
+					{ key: 'relevant', label: 'Does the request refer to or continue the work in this record?' }
+				]),
+				servedModel: 'anthropic/claude-haiku-4',
+				servedVersion: '20250307',
+				latencyMs: 181,
+				inputTokens: 860,
+				costUsd: 0.00076
+			}
+		]
+	};
+}
+
 // ── Routing ─────────────────────────────────────────────────────────────────
 
 /** The featured session id the demo observability screenshot should deep-link to. */
@@ -1193,6 +1461,10 @@ export function resolveFixture(pathname: string, params: URLSearchParams): unkno
 		return roomContextFixture(decodeURIComponent(m[1]));
 	if ((m = pathname.match(/^\/api\/sessions\/([^/]+)$/)))
 		return sessionDetailFixture(decodeURIComponent(m[1]), now);
+	if ((m = pathname.match(/^\/api\/sessions\/([^/]+)\/record$/)))
+		return sessionRecordFixture(decodeURIComponent(m[1]), now);
+	if ((m = pathname.match(/^\/api\/sessions\/([^/]+)\/decisions$/)))
+		return sessionDecisionsFixture(decodeURIComponent(m[1]), now);
 	if ((m = pathname.match(/^\/api\/pipelines\/([^/]+)\/items\/([^/]+)$/)))
 		return pipelineItemDetailFixture(m[1], decodeURIComponent(m[2]), now);
 	if ((m = pathname.match(/^\/api\/pipelines\/([^/]+)\/items$/)))

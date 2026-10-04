@@ -22,7 +22,11 @@ import {
 	UsageToolCalls,
 	UsageEventRow,
 	UsageBudgets,
-	RuleStatus
+	RuleStatus,
+	SessionRecord,
+	SessionRecordResponse,
+	DecisionEvaluation,
+	SessionDecisionsResponse
 } from './schemas';
 
 const decode = <A, I>(s: Schema.Schema<A, I>, v: unknown) => Schema.decodeUnknownSync(s)(v);
@@ -711,5 +715,169 @@ describe('usage & cost schemas', () => {
 				scope: {}
 			})
 		).toThrow();
+	});
+});
+
+/**
+ * Session-records wire shapes (spec SESSION-RECORDS §3, §8, CONTRACT.md).
+ * Pins the decode contract for the new `session_records` and
+ * `decision_evaluations` table shapes (migration v24).
+ */
+describe('session records schemas', () => {
+	it('decodes a full SessionRecord row', () => {
+		const out = decode(SessionRecord, {
+			sessionId: 'ses_abc123',
+			timelineKey: 'matrix:aria:room:!general:example.org',
+			agent: 'aria',
+			text: 'Found meetup details and generated a poster.',
+			tokenCount: 42,
+			buildsOn: ['ses_xyz789'],
+			modelId: 'anthropic/claude-sonnet-4',
+			createdAt: 1_700_000_000_000
+		});
+		expect(out.sessionId).toBe('ses_abc123');
+		expect(out.buildsOn).toEqual(['ses_xyz789']);
+		expect(out.tokenCount).toBe(42);
+	});
+
+	it('decodes a SessionRecord with null agent and null modelId', () => {
+		const out = decode(SessionRecord, {
+			sessionId: 'ses_def456',
+			timelineKey: 'matrix:aria:room:!off:example.org',
+			agent: null,
+			text: 'Did some work.',
+			tokenCount: 20,
+			buildsOn: [],
+			modelId: null,
+			createdAt: 9_000
+		});
+		expect(out.agent).toBeNull();
+		expect(out.modelId).toBeNull();
+		expect(out.buildsOn).toHaveLength(0);
+	});
+
+	it('decodes GET /api/sessions/:id/record with a record present', () => {
+		const out = decode(SessionRecordResponse, {
+			sessionRecord: {
+				sessionId: 'ses_abc123',
+				timelineKey: 'matrix:aria:room:!general:example.org',
+				agent: null,
+				text: 'Fetched the data.',
+				tokenCount: 15,
+				buildsOn: [],
+				modelId: 'anthropic/claude-sonnet-4',
+				createdAt: 5_000
+			}
+		});
+		expect(out.sessionRecord?.sessionId).toBe('ses_abc123');
+	});
+
+	it('decodes GET /api/sessions/:id/record when no record exists (null)', () => {
+		const out = decode(SessionRecordResponse, { sessionRecord: null });
+		expect(out.sessionRecord).toBeNull();
+	});
+
+	it('rejects a SessionRecord missing the required text field', () => {
+		expect(() =>
+			decode(SessionRecord, {
+				sessionId: 'ses_x',
+				timelineKey: 'k',
+				agent: null,
+				tokenCount: 5,
+				buildsOn: [],
+				modelId: null,
+				createdAt: 1
+			})
+		).toThrow();
+	});
+
+	it('decodes a full DecisionEvaluation row (routing point)', () => {
+		const out = decode(DecisionEvaluation, {
+			id: 1,
+			ts: 9_000,
+			decisionGroup: 'dg-0001',
+			point: 'routing',
+			agent: 'aria',
+			timelineKey: 'matrix:aria:room:!general:example.org',
+			agentSessionId: 'ses_abc',
+			triggerEventId: '$t:m',
+			candidateSessionId: null,
+			source: 'model',
+			reason: null,
+			verdictJson: '{"model":"sol61_aws"}',
+			answersJson: '[{"label":"sol61_aws","probability":0.9}]',
+			stateJson: '{"request":{"from":"@a:m","text":"hi"}}',
+			questionsJson: '[]',
+			servedModel: 'anthropic/claude-haiku-4',
+			servedVersion: '20250307',
+			latencyMs: 213,
+			inputTokens: 1200,
+			costUsd: 0.00065
+		});
+		expect(out.decisionGroup).toBe('dg-0001');
+		expect(out.point).toBe('routing');
+		expect(out.servedModel).toBe('anthropic/claude-haiku-4');
+	});
+
+	it('decodes a DecisionEvaluation for the records point (candidateSessionId present)', () => {
+		const out = decode(DecisionEvaluation, {
+			id: 2,
+			ts: 9_100,
+			decisionGroup: 'dg-0001',
+			point: 'records',
+			agent: null,
+			timelineKey: null,
+			agentSessionId: 'ses_abc',
+			triggerEventId: null,
+			candidateSessionId: 'ses_prev',
+			source: 'heuristic',
+			reason: 'below threshold',
+			verdictJson: '{"inject":false}',
+			answersJson: null,
+			stateJson: null,
+			questionsJson: null,
+			servedModel: null,
+			servedVersion: null,
+			latencyMs: null,
+			inputTokens: null,
+			costUsd: null
+		});
+		expect(out.candidateSessionId).toBe('ses_prev');
+		expect(out.source).toBe('heuristic');
+		expect(out.reason).toBe('below threshold');
+		expect(out.costUsd).toBeNull();
+	});
+
+	it('decodes GET /api/sessions/:id/decisions with multiple evaluations', () => {
+		const out = decode(SessionDecisionsResponse, {
+			evaluations: [
+				{
+					id: 1, ts: 1, decisionGroup: 'dg-A', point: 'routing',
+					agent: null, timelineKey: null, agentSessionId: 's1',
+					triggerEventId: null, candidateSessionId: null,
+					source: 'model', reason: null, verdictJson: null,
+					answersJson: null, stateJson: null, questionsJson: null,
+					servedModel: null, servedVersion: null,
+					latencyMs: null, inputTokens: null, costUsd: null
+				},
+				{
+					id: 2, ts: 2, decisionGroup: 'dg-B', point: 'records',
+					agent: null, timelineKey: null, agentSessionId: 's1',
+					triggerEventId: null, candidateSessionId: 's-prev',
+					source: 'model', reason: null, verdictJson: '{"inject":true}',
+					answersJson: '[{"label":"relevant","probability":0.85}]',
+					stateJson: null, questionsJson: null,
+					servedModel: 'anthropic/claude-haiku-4', servedVersion: '20250307',
+					latencyMs: 180, inputTokens: 900, costUsd: 0.00045
+				}
+			]
+		});
+		expect(out.evaluations).toHaveLength(2);
+		expect(out.evaluations[1].candidateSessionId).toBe('s-prev');
+	});
+
+	it('decodes GET /api/sessions/:id/decisions with empty array (no decisions / table absent)', () => {
+		const out = decode(SessionDecisionsResponse, { evaluations: [] });
+		expect(out.evaluations).toHaveLength(0);
 	});
 });

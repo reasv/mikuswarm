@@ -13,6 +13,8 @@ export const keys = {
 		['rooms', key, 'sessions', filters] as const,
 	roomSessionFacets: (key: string) => ['rooms', key, 'session-facets'] as const,
 	session: (id: string) => ['sessions', id] as const,
+	sessionRecord: (id: string) => ['sessions', id, 'record'] as const,
+	sessionDecisions: (id: string) => ['sessions', id, 'decisions'] as const,
 	summary: (id: string) => ['summaries', id] as const,
 	// Pipeline monitor (ARCHITECTURE.md §11). `pipelines()` is the dashboard feed;
 	// `pipelineItems(pool, filters)` a filtered list; `pipelineItem(pool, id)` one

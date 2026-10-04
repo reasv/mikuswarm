@@ -1,4 +1,4 @@
-import type { ContextMessageWire, ImageRef } from '$lib/schemas';
+import type { ContextMessageWire, DecisionEvaluation, ImageRef } from '$lib/schemas';
 
 /**
  * Helpers for the rollout renderer (spec §10b). The persisted transcript holds
@@ -201,6 +201,162 @@ function coerceImageRefs(o: RolloutMsg): readonly ImageRef[] | undefined {
 	if (!src) return undefined;
 	const refs = src.map(toImageRef).filter((r): r is ImageRef => r !== null);
 	return refs.length > 0 ? refs : undefined;
+}
+
+// ── Session-records harness helpers (spec SESSION-RECORDS §4, §8) ─────────────
+
+/**
+ * The `harness` marker carried by every harness-made transcript message
+ * (CONTRACT.md decision 5). Persisted in the transcript; pi ignores unknown fields.
+ */
+export type HarnessMarker =
+	| { kind: 'injection'; decisionGroup?: string }
+	| { kind: 'record_turn' }
+	| { kind: 'record_load' };
+
+/**
+ * Extract the harness marker from a transcript message, or null when the message
+ * was made by the model (no `harness` field).
+ */
+export function getHarness(m: RolloutMsg): HarnessMarker | null {
+	const h = m.harness;
+	if (!h || typeof h !== 'object') return null;
+	const kind = (h as { kind?: unknown }).kind;
+	if (kind === 'injection') {
+		const dg = (h as { decisionGroup?: unknown }).decisionGroup;
+		return { kind: 'injection', decisionGroup: typeof dg === 'string' ? dg : undefined };
+	}
+	if (kind === 'record_turn') return { kind: 'record_turn' };
+	if (kind === 'record_load') return { kind: 'record_load' };
+	return null;
+}
+
+/** Whether a message was made by the harness (has any harness marker). */
+export function isHarnessMessage(m: RolloutMsg): boolean {
+	return getHarness(m) !== null;
+}
+
+/**
+ * One item in the flat render plan built by `buildRolloutPlan`. Either a normal
+ * rollout message (by index into the original array) or a decision-group card to
+ * insert inline.
+ */
+export type RenderItem =
+	| { type: 'message'; index: number; msg: RolloutMsg }
+	| { type: 'decision'; decisionGroup: string; evaluations: DecisionEvaluation[] };
+
+/**
+ * Build the flat render plan for a rollout: interleave decision cards at the right
+ * positions (spec SESSION-RECORDS §8 "Inline in the rollout"):
+ *
+ * - A group whose `decisionGroup` matches a harness injection message's
+ *   `harness.decisionGroup` is inserted RIGHT BEFORE that first matching message.
+ * - A group with no matching injections (nothing injected, or a heuristic fallback)
+ *   is inserted before turn 1 — the first message that is not a harness injection
+ *   (spec: "all current points happen before turn 1").
+ *
+ * Decision groups that have already been placed are not repeated.
+ */
+export function buildRolloutPlan(
+	messages: readonly RolloutMsg[],
+	evaluations: readonly DecisionEvaluation[]
+): RenderItem[] {
+	// Group evaluations by decisionGroup.
+	const groupMap = new Map<string, DecisionEvaluation[]>();
+	for (const ev of evaluations) {
+		const arr = groupMap.get(ev.decisionGroup) ?? [];
+		arr.push(ev);
+		groupMap.set(ev.decisionGroup, arr);
+	}
+
+	// Find the index of the first non-harness-injection message ("turn 1").
+	// The record-turn user prompt is NOT turn 1 (it's at the end), so filter
+	// based on the injection kind specifically.
+	let turn1Index = messages.length; // default: no real turns
+	for (let i = 0; i < messages.length; i++) {
+		const h = getHarness(messages[i]);
+		if (!h || h.kind !== 'injection') {
+			turn1Index = i;
+			break;
+		}
+	}
+
+	// Track which groups have been placed.
+	const placed = new Set<string>();
+
+	// Build the plan.
+	const plan: RenderItem[] = [];
+
+	// Before turn 1: insert groups with no matching injection.
+	for (const [dg, evs] of groupMap) {
+		const hasMatch = messages.some((m) => {
+			const h = getHarness(m);
+			return h?.kind === 'injection' && h.decisionGroup === dg;
+		});
+		if (!hasMatch) {
+			plan.push({ type: 'decision', decisionGroup: dg, evaluations: evs });
+			placed.add(dg);
+		}
+	}
+
+	for (let i = 0; i < messages.length; i++) {
+		const msg = messages[i];
+		const h = getHarness(msg);
+
+		// If this is a harness injection with a decisionGroup, and that group has not
+		// been placed yet, insert its card right before this message.
+		if (h?.kind === 'injection' && h.decisionGroup && !placed.has(h.decisionGroup)) {
+			const evs = groupMap.get(h.decisionGroup);
+			if (evs) {
+				plan.push({ type: 'decision', decisionGroup: h.decisionGroup, evaluations: evs });
+				placed.add(h.decisionGroup);
+			}
+		}
+
+		// Before turn 1: insert any groups that weren't placed above (redundant safety).
+		if (i === turn1Index) {
+			for (const [dg, evs] of groupMap) {
+				if (!placed.has(dg)) {
+					plan.push({ type: 'decision', decisionGroup: dg, evaluations: evs });
+					placed.add(dg);
+				}
+			}
+		}
+
+		plan.push({ type: 'message', index: i, msg });
+	}
+
+	return plan;
+}
+
+/**
+ * Extract the records given to a session from its transcript: pairs of
+ * (harness-injection toolCall, toolResult) where the call name is
+ * `read_session_record`. Returns `{ sessionId, text }` for each.
+ */
+export function extractRecordsGiven(
+	transcript: readonly unknown[]
+): Array<{ sessionId: string; text: string }> {
+	const msgs = transcript.map(asMsg);
+	const results = collectToolResults(msgs);
+	const out: Array<{ sessionId: string; text: string }> = [];
+	for (const m of msgs) {
+		const h = getHarness(m);
+		if (h?.kind !== 'injection') continue;
+		if (m.role !== 'assistant') continue;
+		const blocks = assistantBlocks(m.content);
+		for (const block of blocks) {
+			if (block.type !== 'toolCall') continue;
+			if (block.name !== 'read_session_record') continue;
+			const args = block.arguments as Record<string, unknown> | null | undefined;
+			const sessionId = args && typeof args.session_id === 'string' ? args.session_id : null;
+			if (!sessionId) continue;
+			const result = results.get(block.id);
+			const text = result ? contentText(result.content) : '';
+			out.push({ sessionId, text });
+		}
+	}
+	return out;
 }
 
 /**

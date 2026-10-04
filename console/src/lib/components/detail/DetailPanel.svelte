@@ -1,10 +1,12 @@
 <script lang="ts">
 	import { selection } from '$lib/stores/selection.svelte';
 	import { sessionQuery } from '$lib/query/sessions';
+	import { sessionRecordQuery, sessionDecisionsQuery } from '$lib/query/session-record';
 	import { agentsQuery } from '$lib/query/agents';
 	import { formatTokens, formatUsd } from '$lib/format';
 	import { cn } from '$lib/utils';
 	import { buildAgentLookup, agentFor, agentAccent } from '$lib/agents';
+	import { extractRecordsGiven } from '$lib/rollout';
 
 	// Col 3 — the session inspector (ARCHITECTURE.md §11). Driven by the same
 	// `?session=` selection as Col 2, it surfaces the raw record behind the rendered
@@ -17,6 +19,25 @@
 	const session = sessionQuery(() => activeId);
 	const meta = $derived(session.data?.session);
 	const invocations = $derived(session.data?.toolInvocations ?? []);
+
+	// Session-records sections (spec SESSION-RECORDS §8, "Details pane"):
+	// - sessionRecord: this session's own record row (null if none exists yet)
+	// - decisionsQ: all decision evaluations for this session, grouped by decisionGroup
+	// - recordsGiven: sessions whose records were injected into this session (parsed
+	//   from the transcript by extractRecordsGiven)
+	const sessionRecord = sessionRecordQuery(() => activeId);
+	const decisionsQ = sessionDecisionsQuery(() => activeId);
+	const decisionGroups = $derived(() => {
+		const evs = decisionsQ.data?.evaluations ?? [];
+		const map = new Map<string, (typeof evs)[number][]>();
+		for (const ev of evs) {
+			map.set(ev.decisionGroup, [...(map.get(ev.decisionGroup) ?? []), ev]);
+		}
+		return map;
+	});
+	const recordsGiven = $derived(
+		session.data?.transcript ? extractRecordsGiven(session.data.transcript) : []
+	);
 
 	let rawOpen = $state(false);
 
@@ -199,6 +220,81 @@
 					<div class="space-y-1 font-mono text-[11px]">
 						{#each session.data.modelPrompts as mp (mp.member + ':' + mp.profile + ':' + (mp.hash ?? ''))}
 							{@render kv(mp.member, `${mp.profile}${mp.hash ? ` #${mp.hash}` : ''} · ${mp.requests} req`)}
+						{/each}
+					</div>
+				</div>
+			{/if}
+
+			<!-- Decisions (spec SESSION-RECORDS §8): one row per decision group with a
+			     scroll-jump link to the inline card in the rollout. -->
+			{#if decisionsQ.data && decisionsQ.data.evaluations.length > 0}
+				{@const groups = decisionGroups()}
+				<div>
+					<div class="mb-1 text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">Decisions ({groups.size})</div>
+					<div class="space-y-1">
+						{#each [...groups.entries()] as [dg, evs] (dg)}
+							{@const first = evs[0]}
+							<div class="flex items-center justify-between gap-2 font-mono text-[11px]">
+								<div class="min-w-0 flex-1">
+									<span class="text-muted-foreground">{first?.point ?? '?'}</span>
+									{#if first?.source === 'heuristic'}
+										<span class="ml-1 rounded bg-amber-500/20 px-1 text-[10px] text-amber-300">heuristic</span>
+									{/if}
+								</div>
+								<a
+									href={'#decision-' + dg}
+									class="shrink-0 text-[10px] text-violet-400 hover:text-violet-300"
+									title={dg}
+								>↗ rollout</a>
+							</div>
+						{/each}
+					</div>
+				</div>
+			{/if}
+
+			<!-- Session record (spec SESSION-RECORDS §3): the record written at the end
+			     of this session's work; null when the session produced no record yet. -->
+			{#if sessionRecord.data?.sessionRecord}
+				{@const rec = sessionRecord.data.sessionRecord}
+				<div>
+					<div class="mb-1 text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">Session record</div>
+					<div class="space-y-1 font-mono text-[11px]">
+						{@render kv('tokens', String(rec.tokenCount))}
+						{#if rec.modelId}{@render kv('model', rec.modelId)}{/if}
+						{#if rec.buildsOn.length > 0}
+							<div class="flex items-baseline justify-between gap-2">
+								<span class="text-muted-foreground">builds on</span>
+								<div class="flex flex-col items-end gap-0.5">
+									{#each rec.buildsOn as bid (bid)}
+										<a
+											href={'?session=' + encodeURIComponent(bid)}
+											class="break-all text-right text-violet-400 hover:text-violet-300"
+										>{bid}</a>
+									{/each}
+								</div>
+							</div>
+						{/if}
+					</div>
+					<details class="mt-1">
+						<summary class="cursor-pointer text-[10px] text-muted-foreground hover:text-foreground">record text</summary>
+						<pre class="mt-1 max-h-48 overflow-auto whitespace-pre-wrap rounded bg-muted p-2 text-[10px] leading-relaxed">{rec.text}</pre>
+					</details>
+				</div>
+			{/if}
+
+			<!-- Records given (spec SESSION-RECORDS §4): session records that were
+			     injected into this session's context (derived from the transcript). -->
+			{#if recordsGiven.length > 0}
+				<div>
+					<div class="mb-1 text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">Records given ({recordsGiven.length})</div>
+					<div class="space-y-1">
+						{#each recordsGiven as r (r.sessionId)}
+							<div class="font-mono text-[11px]">
+								<a
+									href={'?session=' + encodeURIComponent(r.sessionId)}
+									class="text-violet-400 hover:text-violet-300"
+								>{r.sessionId}</a>
+							</div>
 						{/each}
 					</div>
 				</div>
