@@ -164,6 +164,26 @@ export class DynamicToolRegistry {
   }
 
   /**
+   * Mark `names` loaded before the first turn (decision-model routing preloads,
+   * ARCHITECTURE.md §8h). Silent like {@link seedFromTranscript} (no
+   * {@link onChange}: the agent does not exist yet, and the built context's
+   * tool estimate already counts the initial set). Not added to
+   * {@link immediateNames}, so a declared-deferred transport keeps the same
+   * `tools` array as an unrouted session. Returns the names newly loaded.
+   */
+  loadInitial(names: readonly string[]): string[] {
+    const added: string[] = [];
+    for (const name of names) {
+      if (this.byName.has(name) && !this.loadedNames.has(name)) {
+        this.loadedNames.add(name);
+        added.push(name);
+      }
+    }
+    if (added.length > 0) this.currentArr = this.computeCurrent();
+    return added;
+  }
+
+  /**
    * Recompute the loaded set from a persisted transcript (spec §7): the loaded
    * set is definitionally (immediate ∪ every `addedToolNames` on any tool
    * result) — the same rule pi-ai's `splitDeferredTools` derives from the same

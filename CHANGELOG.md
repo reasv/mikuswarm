@@ -48,6 +48,16 @@ Unreleased section; it is not part of any release's notes.
   to the session's payee like a tool call, and `[[limits]].classes` accepts `"decision"`.
   Every evaluation logs `decision_evaluated`. Configured under `[decisions]`, with per-agent
   overrides in `[agents.<name>.decisions]`. See ARCHITECTURE.md §8h.
+- **Decision-model routing** (`[decisions.routing]`, off by default): when a human starts a
+  chat session, the decision model classifies the request into operator-defined task
+  categories (and optionally a difficulty level) and picks the listed skill it needs. A
+  category can name a model preference cascade (`models = [...]`, tried before normal
+  selection, with per-user affordability and health checks; when every entry is exhausted
+  selection is unchanged), a `thinking_level`, skills to preload, and extra `tail_files`.
+  Preloaded skills have their tools loaded before the first turn and their instructions
+  rendered next to the tail instructions, without changing the cached prompt prefix; resumes
+  re-apply them. Low confidence or any decision-model failure leaves the session exactly as
+  before. Database schema v22 adds `agent_sessions.initial_preloads`.
 - **OpenAI Responses API prefill**: `[models.<name>.prefill]` forces a required `analysis` argument on every tool call via strict JSON schema `pattern`, anchoring persona adherence on GPT-6 Sol/Luna. Includes `no_reply` tool, `drop_reasoning` option, and per-serving-member gating via `onPayload`. See spec/OPENAI-PREFILL.md.
 - **Captioning via OpenAI Responses API**: `[models.*]` with `api = "openai-responses"` can now serve as a caption model for images. Incomplete, refused, and unsupported-modality results are classified as content failures. (Port of MR !1 captioning code by contributor nopm.)
 

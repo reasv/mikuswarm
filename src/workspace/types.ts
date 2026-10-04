@@ -47,6 +47,25 @@ export interface SatelliteRuntimeInput {
    * login/cookies survive and it can be reopened. Omitted when unset.
    */
   resumeNote?: string;
+  /**
+   * Decision-model routing additions to the final user turn (ARCHITECTURE.md §8h):
+   * preloaded skill bodies rendered immediately before `<tail_instructions>`, and
+   * per-task tail files rendered after it. Only a fresh routed build sets this.
+   */
+  routedSatellite?: RoutedSatellite;
+}
+
+/** What routing adds to the satellite block (ARCHITECTURE.md §8h). */
+export interface RoutedSatellite {
+  preloadedSkills: Array<{
+    name: string;
+    body: string;
+    /** Tool names this preload loaded before the first turn. */
+    tools: string[];
+    /** Definitions of those tools as text, for members that declare deferred tools. */
+    toolDefinitions?: string;
+  }>;
+  tailFiles: Array<{ source: string; content: string }>;
 }
 
 /**

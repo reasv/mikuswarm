@@ -1006,6 +1006,13 @@ export interface AgentSessionRow {
    * falls back to the new trigger's timestamp (a one-time bounded fallback).
    */
   chat_upper_bound_ts: number | null;
+  /**
+   * Routing state chosen by decision-model routing (ARCHITECTURE.md §8h), JSON
+   * {@link SessionRoutingState}: preloaded skills + tools (loaded before the first
+   * turn), and the routed model / cascade / thinking level. A resume re-applies it
+   * so the rollout keeps its model, effort and loaded tools. NULL when unrouted.
+   */
+  initial_preloads: string | null;
   no_reply: number;
   error: string | null;
   created_at: number;
@@ -1100,6 +1107,20 @@ export interface ToolInvocationInput {
   images?: number | null;
   cost?: number | null;
   ref?: string | null;
+}
+
+/**
+ * What decision-model routing decided for a session (ARCHITECTURE.md §8h),
+ * persisted in `agent_sessions.initial_preloads` so a resume keeps it: the
+ * preloaded skills and their tools, the routed head model (no per-user limits),
+ * the routed cascade (per-user limits), and the routed thinking level.
+ */
+export interface SessionRoutingState {
+  skills: string[];
+  tools: string[];
+  model?: string;
+  cascade?: string[];
+  thinkingLevel?: string;
 }
 
 /** Consumer class of a {@link UsageEventRow} (spec USAGE-COST-LIMITS §3). */
@@ -7913,6 +7934,43 @@ export class Storage {
   }
 
   /**
+   * Persist a routed session's initial preloads (ARCHITECTURE.md §8h). Written
+   * once at creation, after the placeholder insert (FIFO on the single-writer
+   * queue), so a later resume re-applies exactly the same loaded tool set.
+   */
+  setSessionInitialPreloads(id: string, preloads: SessionRoutingState): Promise<void> {
+    return this.write((db) => {
+      const result = db
+        .prepare(`update agent_sessions set initial_preloads = @json, updated_at = @updatedAt where id = @id`)
+        .run({ id, json: JSON.stringify(preloads), updatedAt: Date.now() });
+      this.warnIfNoSessionRow("setSessionInitialPreloads", id, result.changes);
+    });
+  }
+
+  /** The routed initial preloads of a session (ARCHITECTURE.md §8h), or undefined. */
+  getSessionInitialPreloads(id: string): SessionRoutingState | undefined {
+    const row = this.read((db) =>
+      db.prepare(`select initial_preloads from agent_sessions where id = ?`).get(id) as
+        | { initial_preloads: string | null }
+        | undefined,
+    );
+    if (!row?.initial_preloads) return undefined;
+    try {
+      const parsed = JSON.parse(row.initial_preloads) as Record<string, unknown>;
+      const strings = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
+      return {
+        skills: strings(parsed["skills"]),
+        tools: strings(parsed["tools"]),
+        ...(typeof parsed["model"] === "string" ? { model: parsed["model"] } : {}),
+        ...(Array.isArray(parsed["cascade"]) ? { cascade: strings(parsed["cascade"]) } : {}),
+        ...(typeof parsed["thinkingLevel"] === "string" ? { thinkingLevel: parsed["thinkingLevel"] } : {}),
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
    * Advance a session's gap-backfill lower bound (spec RESUMABLE-SESSIONS §9.2) to
    * `ts` — the latest member of the trigger group that just resumed it (== that
    * trigger's timestamp). Called on each accepted reply-resume AFTER the gap is
@@ -10714,6 +10772,9 @@ create table if not exists agent_sessions (
   -- (chat_upper_bound_ts, new trigger]. Nullable: legacy (pre-v27) rows are NULL
   -- and fall back to the new trigger's timestamp on their first resume.
   chat_upper_bound_ts integer,
+  -- Decision-model routing (ARCHITECTURE.md §8h): JSON { skills, tools } preloaded
+  -- before the first turn, re-applied on resume. NULL for unrouted sessions. (v22)
+  initial_preloads text,
   no_reply integer not null default 0,
   error text,
   created_at integer not null,
@@ -10797,7 +10858,7 @@ ${TIMELINE_COUNTS_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 21;
+export const LATEST_SCHEMA_VERSION = 22;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -11626,6 +11687,19 @@ function addUsageEventPartitionsTimelineKey(db: Database.Database): void {
   );
 }
 
+/**
+ * v21→v22: add `agent_sessions.initial_preloads` (decision-model routing,
+ * ARCHITECTURE.md §8h) — the skills/tools a routed session started with, so a
+ * resume recomputes the same loaded tool set. Nullable, no back-fill: every
+ * existing session was unrouted. PRAGMA table_info guard keeps it idempotent.
+ */
+function addAgentSessionInitialPreloads(db: Database.Database): void {
+  const cols = db.prepare("PRAGMA table_info(agent_sessions)").all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === "initial_preloads")) {
+    db.exec("ALTER TABLE agent_sessions ADD COLUMN initial_preloads TEXT");
+  }
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -11652,6 +11726,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   addWorkspaceSeedLedger,               // v18→v19
   repairStaleEditedQuotes,              // v19→v20
   addUsageEventPartitionsTimelineKey,   // v20→v21
+  addAgentSessionInitialPreloads,       // v21→v22
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write

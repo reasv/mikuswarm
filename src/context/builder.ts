@@ -29,7 +29,7 @@ import {
   type SummaryLabelCache,
   type SummarySelection,
 } from "./summary-layer.js";
-import type { WorkspaceContent, SessionTypeConfig } from "../workspace/types.js";
+import type { WorkspaceContent, SessionTypeConfig, RoutedSatellite } from "../workspace/types.js";
 import {
   renderSystemPromptWithSegments,
   renderSatelliteBlock,
@@ -80,6 +80,8 @@ export interface ImageBlock {
 }
 
 export interface BuildContextOptions {
+  /** Decision-model routing additions to the satellite (ARCHITECTURE.md §8h). */
+  routedSatellite?: RoutedSatellite;
   timelineKey: string;
   trigger: CanonicalChatEvent;
   activeSessions: AgentSessionRecord[];

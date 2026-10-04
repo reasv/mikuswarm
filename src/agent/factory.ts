@@ -11,7 +11,7 @@ import type { ContextMessage } from "../context/builder.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import { convertToLlm } from "./convert.js";
 import { withStaleThinkingDropped } from "./stale-thinking.js";
-import { makeDeferLoadingInjector, withDeclaredDeferredTools, type DeclaredToolSet } from "./declared-tools.js";
+import { makeDeferLoadingInjector, renderLoadedToolDefinitions, withDeclaredDeferredTools, type DeclaredToolSet } from "./declared-tools.js";
 import { estimateLiveSliceTokens } from "./live-token-estimate.js";
 import { extractLlmRequestClass, withRequestRetry } from "./request-retry.js";
 import {
@@ -27,8 +27,13 @@ import {
   type BuiltModelFallback,
 } from "./model-fallback.js";
 import { loadWorkspace, renderSystemPrompt } from "../workspace/index.js";
-import type { WorkspaceContent, SessionTypeConfig } from "../workspace/types.js";
+import type { WorkspaceContent, SessionTypeConfig, SkillMeta, RoutedSatellite } from "../workspace/types.js";
+import type { RoutingVerdict } from "../decisions/points/routing.js";
+import { parseFrontmatter, frontmatterToolPatterns } from "../workspace/skills.js";
+import { resolveWorkspacePath } from "../tools/workspace.js";
+import { readFile } from "node:fs/promises";
 import type { Storage, Summary } from "../storage/index.js";
+import type { SessionRoutingState } from "../storage/database.js";
 import type { Logger } from "../observability/logger.js";
 import type { SessionLiveEventBus } from "../observability/live-events.js";
 import type { LlmRequestRing } from "./request-ring.js";
@@ -298,6 +303,15 @@ export interface CreateAgentOptions {
    */
   resume?: { snapshot: AgentMessage[]; transcript?: AgentMessage[] };
   /**
+   * Decision-model routing (ARCHITECTURE.md §8h "Routing"). Supplied by the app
+   * only for a FRESH, human-triggered chat-lane session whose agent has routing
+   * enabled. Called once, after the workspace is loaded and before model
+   * selection, with the session's listed skills; its verdict (model preference
+   * cascade, thinking level, skill preloads, extra tail files) is applied below.
+   * Undefined result or a throw = no routing (today's behaviour).
+   */
+  route?: (input: { listedSkills: readonly SkillMeta[] }) => Promise<RoutingVerdict | undefined>;
+  /**
    * Reply-resume continuation (spec RESUMABLE-SESSIONS §9/§11). Set ALONGSIDE
    * `resume` when continuing a COMPLETED session because a user replied to it:
    * instead of `continue()`-ing the seeded transcript (the failure-recovery
@@ -498,6 +512,30 @@ export class AgentSessionFactory {
    * `agentModelOverrides` is absent (legacy mode or tests without the module),
    * falls back to `resolveSessionType(sessionType)?.model ?? "default"` directly.
    */
+  /**
+   * Can `logicalId`'s chain serve a request right now — some member healthy (or
+   * probe-due) and in budget? The routed-cascade check (ARCHITECTURE.md §8h); the
+   * same `chooseChainMember` predicate the per-attempt resolver applies.
+   */
+  private chainViable(
+    logicalId: string,
+    scheduler: LlmScheduler | undefined,
+    isModelAvailable: ((id: string) => boolean) | undefined,
+  ): boolean {
+    let chain;
+    try {
+      chain = resolveModelChain(logicalId, this.options.config.models);
+    } catch {
+      return false;
+    }
+    const members = chain.map((m) => ({
+      logicalId: m.logicalId,
+      healthKey: `${m.config.endpoint ?? "unknown"}::${m.config.id}`,
+      operativeWindow: Number.POSITIVE_INFINITY,
+    }));
+    return chooseChainMember(members, { scheduler, isModelAvailable }).reason !== "all-unhealthy";
+  }
+
   private resolveModelKey(sessionType: string, timelineKey?: string): string {
     const agentName =
       timelineKey !== undefined && this.options.resolveAgentName
@@ -557,18 +595,74 @@ export class AgentSessionFactory {
     const sessionTypeConfig = this.resolveSessionType(session.sessionType);
     const fallbackPrompt = this.options.config.agent.system.fallback_prompt;
 
+    // Decision-model routing (ARCHITECTURE.md §8h): the workspace is loaded early
+    // (and reused below) so the router sees the session's listed skills. Fresh
+    // sessions only — a resume keeps the model and context it was built for.
+    let routing: RoutingVerdict | undefined;
+    let earlyWorkspace: WorkspaceContent | undefined;
+    if (opts?.route && !opts.resume) {
+      earlyWorkspace = await loadWorkspace(workspaceRoot, sessionTypeConfig);
+      try {
+        routing = await opts.route({ listedSkills: earlyWorkspace.skills.listed });
+      } catch (error) {
+        this.options.logger?.warn("routing_failed", {
+          sessionId: session.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    // A resumed routed session keeps what routing chose when it was created (its
+    // model, effort and preloads): the rollout was built for them (§8h).
+    const persistedRouting = opts?.resume ? this.options.storage?.getSessionInitialPreloads(session.id) : undefined;
+    const scheduler = this.options.scheduler;
+    const budgetEngine = this.options.budget?.engine;
+    const isModelAvailableFn = budgetEngine ? (id: string) => budgetEngine.isModelAvailable(id) : undefined;
+    const userLimit = opts?.userLimit;
+    const userSelection = userLimit?.resolution.active === true;
+
     // Per-agent model override (spec PER-AGENT-MODEL-OVERRIDES §4/§8): resolve via
     // the shared private helper so create() and the public resolvers are always
     // one code path — no divergence in guarding logic.
-    const modelKey = this.resolveModelKey(session.sessionType, session.timelineKey);
+    const defaultModelKey = this.resolveModelKey(session.sessionType, session.timelineKey);
+    // A routed model cascade (§8h) is tried before normal selection. Under per-user
+    // limits it is prepended to the user's preference list below (each entry gets
+    // the same per-request affordable ∧ healthy ∧ fits check); without them the
+    // first entry whose chain has a healthy, in-budget member heads the session,
+    // and with every entry exhausted selection is exactly today's.
+    const routedCascade = (routing?.models ?? persistedRouting?.cascade ?? []).filter((key) => {
+      const known = this.options.config.models[key] !== undefined;
+      if (!known) this.options.logger?.warn("routing_model_missing", { sessionId: session.id, model: key });
+      return known;
+    });
+    const persistedHead =
+      persistedRouting?.model && this.options.config.models[persistedRouting.model] ? persistedRouting.model : undefined;
+    const routedHead =
+      persistedHead ??
+      (routedCascade.length > 0 && !userSelection && !opts?.resume
+        ? routedCascade.find((key) => this.chainViable(key, scheduler, isModelAvailableFn))
+        : undefined);
+    const modelKey = routedHead ?? defaultModelKey;
+    if (routing && routedCascade.length > 0) {
+      this.options.logger?.info("routing_model_selected", {
+        sessionId: session.id,
+        task: routing.task,
+        cascade: routedCascade,
+        chosen: userSelection ? "per_user_selection" : routedHead ?? null,
+        fallback: userSelection || routedHead ? undefined : defaultModelKey,
+      });
+    }
     const modelConfig = this.options.config.models[modelKey];
     if (!modelConfig) throw new Error(`Model "${modelKey}" not found in config`);
-    // Extended-thinking level for this session (the head model's config, default off).
-    // Fixed for the whole rollout — it flows as pi-ai `options.reasoning` on every
-    // request regardless of which per-user model serves — and is the basis for the
-    // per-requested-model additive thinking budget the affordability estimate reserves
-    // (#4). Resolved once here; also fed verbatim to the Agent's `initialState` below.
-    const thinkingLevel: ThinkingLevel = modelConfig.thinking_level ?? "off";
+    // Extended-thinking level for this session (the head model's config, default off;
+    // a routed task's level overrides it, §8h — ignored by a model declared not
+    // thinking-capable). Fixed for the whole rollout — it flows as pi-ai
+    // `options.reasoning` on every request regardless of which per-user model serves —
+    // and is the basis for the per-requested-model additive thinking budget the
+    // affordability estimate reserves (#4). Resolved once here; also fed verbatim to
+    // the Agent's `initialState` below.
+    const requestedThinking = (routing?.thinkingLevel ?? persistedRouting?.thinkingLevel) as ThinkingLevel | undefined;
+    const routedThinking = requestedThinking && modelConfig.reasoning !== false ? requestedThinking : undefined;
+    const thinkingLevel: ThinkingLevel = routedThinking ?? modelConfig.thinking_level ?? "off";
     // Per-session-run USD cost ceiling (spec SESSION-COST-LIMITS §3), resolved
     // once and fed to the hard-cap pre-flight below. `undefined` = unlimited. The
     // per-user dynamic-ceiling override (PER-USER-LIMITS §6.3) replaces the static
@@ -589,7 +683,6 @@ export class AgentSessionFactory {
     // Scheduler admission (spec §5.4): group from the model
     // (`rate_limit_group`, unset = `default`), priority from the session type
     // (override > configured > built-in default).
-    const scheduler = this.options.scheduler;
     const rateLimitGroup = modelConfig.rate_limit_group ?? "default";
     // The session type's OWN class — the workload category. `opts.priority` (a
     // priority-inheritance escalation, e.g. a summarization job raised by a
@@ -614,7 +707,6 @@ export class AgentSessionFactory {
     // budget-violation pre-flight calls recordAttempt before the loop runs, so
     // getServedModel() returns undefined there (no dispatch happened). ✓
     let servedModelForAttempt: string | undefined = undefined;
-    const budgetEngine = this.options.budget?.engine;
     // Capability pre-filter (spec MODEL-FALLBACK §3 #1): pixels are shipped for a
     // session ONLY when its own reply model (`modelConfig` — the per-agent resolved
     // model key above) accepts image input. `replyModelCanSeeImages` is threaded
@@ -635,14 +727,11 @@ export class AgentSessionFactory {
     // used at `contextCeiling` below), not the chain min.
     const replyModelCanSeeImages = modelConfig.input_modalities.includes("image");
     const requiresMultimodal = replyModelCanSeeImages && rawInputsRequireMultimodal(session, opts);
-    const isModelAvailableFn = budgetEngine ? (id: string) => budgetEngine.isModelAvailable(id) : undefined;
     // Per-user selection (spec PER-USER-LIMITS §6): when an ACTIVE per-user rule is
     // supplied for this human session, the factory builds one composite per PREFERRED
     // model and re-selects per request. `requestedMember` tracks the per-user
     // selector's chosen model (the ledger's `requested_model_id`, §7), distinct from
     // `resolvedMember` (the served chain member, set by the chosen composite's onResolve).
-    const userLimit = opts?.userLimit;
-    const userSelection = userLimit?.resolution.active === true;
     const requestedMember: { logicalId: string } = { logicalId: modelKey };
     // Shared builder so the default + each preferred composite are built identically
     // (spec MODEL-FALLBACK §3): capability pre-filter + per-member windows fixed
@@ -753,7 +842,10 @@ export class AgentSessionFactory {
     }
     const selectables: Selectable[] = [];
     if (userSelection) {
-      const preferred = userLimit!.resolution.models ?? [modelKey];
+      // Routed cascade first (§8h), then the user's normal preference list.
+      const preferred = [
+        ...new Set([...routedCascade, ...(userLimit!.resolution.models ?? [modelKey])]),
+      ];
       for (const logicalId of preferred) {
         const requestedConfig = this.options.config.models[logicalId];
         if (!requestedConfig) {
@@ -1339,7 +1431,7 @@ export class AgentSessionFactory {
     );
 
     // Load workspace files from disk at session creation time
-    const workspace = await loadWorkspace(workspaceRoot, sessionTypeConfig);
+    const workspace = earlyWorkspace ?? (await loadWorkspace(workspaceRoot, sessionTypeConfig));
 
     // Per-agent MCP server allowlist (spec PER-AGENT-MCP-SCOPING): drop tools
     // from MCP servers not in this agent's allowlist, then apply the session-type
@@ -1495,6 +1587,52 @@ export class AgentSessionFactory {
         ),
       };
     }
+    // Decision-model routing preloads (ARCHITECTURE.md §8h). Applied AFTER the
+    // deferred-tools index above, so the system prompt (and the cached prefix) is
+    // byte-identical to an unrouted session's. A fresh routed session loads its
+    // skills' tools before the first turn and persists the set; a resume re-applies
+    // the persisted set (with the transcript's own loads) so it recomputes the same.
+    let routedSatellite: RoutedSatellite | undefined;
+    if (opts?.resume) {
+      if (persistedRouting && registry) registry.loadInitial(persistedRouting.tools);
+    } else if (routing) {
+      routedSatellite =
+        routing.skills.length > 0 || routing.tailFiles.length > 0
+          ? await this.buildRoutedSatellite(routing, {
+              workspace,
+              workspaceRoot,
+              registry,
+              sessionId: session.id,
+              declaredDeferred: modelConfig.compat?.declare_deferred_tools === true,
+            })
+          : { preloadedSkills: [], tailFiles: [] };
+      const preloadedTools = routedSatellite.preloadedSkills.flatMap((skill) => skill.tools);
+      const state: SessionRoutingState = {
+        skills: routedSatellite.preloadedSkills.map((skill) => skill.name),
+        tools: preloadedTools,
+        ...(routedHead ? { model: routedHead } : {}),
+        ...(userSelection && routedCascade.length > 0 ? { cascade: routedCascade } : {}),
+        ...(routedThinking ? { thinkingLevel: routedThinking } : {}),
+      };
+      if (state.skills.length > 0 || state.model || state.cascade || state.thinkingLevel) {
+        void this.options.storage
+          ?.setSessionInitialPreloads(session.id, state)
+          .catch((error) =>
+            logger?.warn("routing_preloads_persist_failed", {
+              sessionId: session.id,
+              error: error instanceof Error ? error.message : String(error),
+            }),
+          );
+      }
+      logger?.info("routing_applied", {
+        sessionId: session.id,
+        task: routing.task,
+        skills: routedSatellite.preloadedSkills.map((skill) => skill.name),
+        tools: preloadedTools,
+        tailFiles: routedSatellite.tailFiles.map((file) => file.source),
+        thinkingLevel: routedThinking,
+      });
+    }
     // The session's initial wire tool set: immediate-only under dynamic loading,
     // the full wrapped catalog otherwise.
     const initialTools = registry ? registry.current : wrappedTools;
@@ -1596,6 +1734,7 @@ export class AgentSessionFactory {
         // Thread the per-agent model's vision capability so the builder's
         // pixel-block gate reflects the actual serving model (spec FIX 5).
         replyModelCanSeeImages,
+        routedSatellite,
       });
       await dumpBuiltContext(
         this.options.config.app.context_dump_dir,
@@ -1861,6 +2000,8 @@ export class AgentSessionFactory {
      * the builder must not re-derive from the global `sessionType.model`.
      */
     replyModelCanSeeImages?: boolean;
+    /** Decision-model routing additions to the satellite (§8h). */
+    routedSatellite?: RoutedSatellite;
   }): Promise<BuiltContext> {
     const generation = Boolean(args.summarizationCutoff || args.condenseInputs || args.diaryRange);
     return this.options.contextBuilder.build({
@@ -1880,7 +2021,78 @@ export class AgentSessionFactory {
       priority: args.priority,
       abortSignal: args.abortSignal,
       replyModelCanSeeImages: args.replyModelCanSeeImages,
+      routedSatellite: args.routedSatellite,
     });
+  }
+
+  /**
+   * Resolve a routing verdict's skills and tail files (ARCHITECTURE.md §8h): each
+   * skill must be a LISTED skill of this workspace (an inlined one is already in
+   * the system prompt; an unknown one is skipped with a warning). Bodies are read
+   * live from disk like `load_skill`; the skill's tool patterns are loaded into
+   * the registry before the first turn. Tail files that cannot be read are skipped.
+   */
+  private async buildRoutedSatellite(
+    routing: RoutingVerdict,
+    ctx: {
+      workspace: WorkspaceContent;
+      workspaceRoot: string;
+      registry: DynamicToolRegistry | undefined;
+      sessionId: string;
+      declaredDeferred: boolean;
+    },
+  ): Promise<RoutedSatellite> {
+    const logger = this.options.logger;
+    const preloadedSkills: RoutedSatellite["preloadedSkills"] = [];
+    for (const name of routing.skills) {
+      const meta = ctx.workspace.skills.listed.find((skill) => skill.name === name);
+      if (!meta) {
+        logger?.warn("routing_skill_unknown", { sessionId: ctx.sessionId, skill: name });
+        continue;
+      }
+      let body: string | undefined;
+      let patterns = meta.tools ?? [];
+      try {
+        const absolute = resolveWorkspacePath(ctx.workspaceRoot, meta.path);
+        if (absolute === null) throw new Error("outside workspace");
+        const raw = await readFile(absolute, "utf-8");
+        const parsed = parseFrontmatter(raw);
+        body = parsed ? parsed.body : raw;
+        if (parsed) patterns = frontmatterToolPatterns(parsed.frontmatter) ?? [];
+      } catch (error) {
+        logger?.warn("routing_skill_unreadable", {
+          sessionId: ctx.sessionId,
+          skill: name,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        continue;
+      }
+      const tools = ctx.registry ? ctx.registry.loadInitial(ctx.registry.matchCatalog(patterns)) : [];
+      const definitions =
+        ctx.declaredDeferred && ctx.registry && tools.length > 0
+          ? renderLoadedToolDefinitions(
+              ctx.registry.catalogTools.filter((tool) => tools.includes(tool.name)) as unknown as Parameters<
+                typeof renderLoadedToolDefinitions
+              >[0],
+            )
+          : undefined;
+      preloadedSkills.push({ name, body: body.trim(), tools, ...(definitions ? { toolDefinitions: definitions } : {}) });
+    }
+    const tailFiles: RoutedSatellite["tailFiles"] = [];
+    for (const source of routing.tailFiles) {
+      try {
+        const absolute = resolveWorkspacePath(ctx.workspaceRoot, source);
+        if (absolute === null) throw new Error("outside workspace");
+        tailFiles.push({ source, content: (await readFile(absolute, "utf-8")).trim() });
+      } catch (error) {
+        logger?.warn("routing_tail_file_unreadable", {
+          sessionId: ctx.sessionId,
+          file: source,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    return { preloadedSkills, tailFiles };
   }
 
   /**

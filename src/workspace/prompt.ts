@@ -186,6 +186,20 @@ export function renderSatelliteBlock(
     parts.push(`<runtime_state>\n${renderRuntimeState(options)}\n</runtime_state>`);
   }
 
+  // Part 1b: Skills preloaded by decision-model routing (ARCHITECTURE.md §8h),
+  // immediately before the tail. The final turn is volatile per session, so this
+  // costs the cached prefix nothing.
+  for (const skill of options.routedSatellite?.preloadedSkills ?? []) {
+    const notes: string[] = [];
+    if (skill.tools.length > 0) {
+      notes.push(`Tools enabled by this skill (already loaded, directly callable): ${skill.tools.join(", ")}.`);
+    }
+    if (skill.toolDefinitions) notes.push(skill.toolDefinitions);
+    parts.push(
+      `<preloaded_skill name="${escapeAttr(skill.name)}">\n${skill.body}${notes.length > 0 ? `\n\n${notes.join("\n\n")}` : ""}\n</preloaded_skill>`,
+    );
+  }
+
   // Part 2: Tail instructions (omitted when the resume satellite toggles them off,
   // spec RESUMABLE-SESSIONS §11).
   if (workspace.tailContent && !options.suppressTail) {
@@ -196,6 +210,10 @@ export function renderSatelliteBlock(
         `<tail_instructions source="${escapeAttr(sourceFile)}">\n${workspace.tailContent}\n</tail_instructions>`,
       );
     }
+  }
+  // Part 2b: Per-task tail files chosen by routing (§8h), after TAIL.md.
+  for (const file of options.routedSatellite?.tailFiles ?? []) {
+    parts.push(`<tail_instructions source="${escapeAttr(file.source)}">\n${file.content}\n</tail_instructions>`);
   }
 
   // Part 3: Session instruction

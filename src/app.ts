@@ -59,8 +59,13 @@ import {
   type AgentSessionRecord,
   type ManualResumeResult,
 } from "./agent/index.js";
+import type { CreateAgentOptions } from "./agent/factory.js";
 import {
   DECISION_POINT_NAMES,
+  ROUTING_OTHER,
+  routingHasQuestions,
+  routingInputFrom,
+  routingPoint,
   DecisionClient,
   DecisionEngine,
   anyDecisionPointEnabled,
@@ -6323,6 +6328,43 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     activeRuns.add(run);
   }
 
+  /**
+   * The routing hook for a fresh session (ARCHITECTURE.md §8h), or undefined when
+   * the session's agent does not run the routing point. The decision row is billed
+   * to this session (and so to its payee).
+   */
+  function makeRouter(
+    inbound: InboundChatEvent,
+    session: { id: string; sessionType: string; timelineKey: string },
+  ): NonNullable<CreateAgentOptions["route"]> | undefined {
+    if (!decisionEngine) return undefined;
+    const agentName = agentNameForTimeline(session.timelineKey);
+    if (!decisionEngine.isEnabled("routing", agentName)) return undefined;
+    const routingConfig = decisionEngine.raw(agentName).routing ?? {};
+    return async ({ listedSkills }) => {
+      const stored = timeline.getById(inbound.event.id) ?? inbound.event;
+      const limit = routingConfig.recent_messages ?? 10;
+      const before = limit > 0
+        ? timeline.query({ timelineKey: session.timelineKey, toTimestamp: stored.timestamp, limit: limit + 1 })
+        : [];
+      const [trigger, ...recent] = hydrateEvents(storage, [stored, ...before]);
+      const input = routingInputFrom({ trigger: trigger!, recent, listedSkills, routing: routingConfig });
+      if (!routingHasQuestions(input)) return undefined;
+      const outcome = await decisionEngine.evaluate(routingPoint, input, {
+        agentName,
+        attribution: {
+          agentSessionId: session.id,
+          sessionType: session.sessionType,
+          timelineKey: session.timelineKey,
+          triggerSenderId: inbound.event.sender?.id ?? null,
+        },
+        heuristicVerdict: { task: ROUTING_OTHER },
+        signal: drainAbort.signal,
+      });
+      return outcome.source === "model" ? outcome.verdict : undefined;
+    };
+  }
+
   async function launchSession(
     inbound: InboundChatEvent,
     duplicate: boolean,
@@ -6553,6 +6595,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         session,
         tools,
         {
+          // Decision-model routing (ARCHITECTURE.md §8h): human-triggered chat-lane
+          // sessions of an agent with routing on. Evaluated inside create(), after
+          // the readiness wait above, so the trigger's captions are in the state.
+          route:
+            !proactive && !isBotTriggered && session.sessionType === "default"
+              ? makeRouter(inbound, session)
+              : undefined,
           proactive: proactive ? true : undefined,
           usage,
           // Per-user selection input + dynamic ceiling (spec PER-USER-LIMITS §6).
