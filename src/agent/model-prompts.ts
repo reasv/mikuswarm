@@ -84,8 +84,10 @@ type ModelPromptSource = NonNullable<NonNullable<AppConfig["model_prompts"]>[str
 /**
  * Resolve and read the model prompts of a session's reachable members. Files are
  * read once per (profile) and held for the session's lifetime — the next session
- * reads the current files. A missing/empty source omits that position with one
- * `model_prompt_source_missing` warning. Members resolving to no text are absent.
+ * reads the current files. An empty (or whitespace-only) source, or a workspace file
+ * that does not exist, omits that position silently; any other unreadable source
+ * omits it with a `model_prompt_source_missing` warning. Members resolving to no
+ * text are absent.
  */
 export async function loadModelPrompts(params: {
   config: AppConfig;
@@ -114,7 +116,12 @@ export async function loadModelPrompts(params: {
         text = await readFile(resolveWorkspacePath(params.workspaceRoot, source.workspace_file), "utf-8");
       }
     } catch (error) {
-      logger?.warn("model_prompt_source_missing", {
+      // A workspace file that does not exist is how an agent goes without this
+      // position (workspaces are per agent), so it is not worth a warning. Any other
+      // failure (a vanished config-dir file, an unreadable or escaping path) is.
+      const absent =
+        source.workspace_file !== undefined && (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+      (absent ? logger?.debug : logger?.warn)?.call(logger, "model_prompt_source_missing", {
         sessionId,
         profile,
         position,
@@ -123,11 +130,11 @@ export async function loadModelPrompts(params: {
       });
       return undefined;
     }
-    const trimmed = text?.trimEnd();
-    if (!trimmed) {
-      if (where !== undefined) logger?.warn("model_prompt_source_missing", { sessionId, profile, position, source: where, error: "empty" });
-      return undefined;
-    }
+    // Empty or whitespace-only = not set: the position is omitted silently, and since
+    // the profile was still the one resolved, a lower rung is not consulted (exactly
+    // like overriding it with "none"). Lets an operator keep placeholder files.
+    const trimmed = text?.trim();
+    if (!trimmed) return undefined;
     return trimmed;
   };
   const loadProfile = (profile: string) => {

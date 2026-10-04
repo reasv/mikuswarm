@@ -66,7 +66,9 @@ Unreleased section; it is not part of any release's notes.
   model serves it, so a session that falls back or is routed to another model sends that
   model's text, and the stored context stays model-neutral. Session types override the
   profile per model (`[agent.session_types.<type>.model_prompts]`, with `"*"` for every
-  other model and `"none"` for no model prompt). Files are re-read at each session start.
+  other model and `"none"` for no model prompt). Files are re-read at each session start;
+  an empty file counts as unset, so placeholder files can be filled in later without a
+  config change.
   Usage rows record the profile and a hash of the text sent, and the console session panel
   lists them. Database schema v23 adds `usage_events.model_prompt` and `model_prompt_hash`.
   See ARCHITECTURE.md §8 "Model prompts".

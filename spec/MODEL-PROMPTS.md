@@ -14,6 +14,10 @@ for review. Deviations from this draft, decided during implementation:
 - §6: the prompt text is not persisted. The console session panel lists member, profile,
   hash and request count from `usage_events`; context dumps carry the head member's
   resolved text. The context inspector does not render the text.
+- §3.2 (owner, 2026-10-04): an empty or whitespace-only source is "not set" and is omitted
+  silently (still the resolved profile, so it overrides like "none"), so placeholder
+  files can be kept and filled in later. A `workspace_file` that does not exist is also
+  silent (debug), since that is how an agent goes without a shared profile.
 
 **Author**: design session 2026-10-04.
 

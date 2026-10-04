@@ -145,33 +145,58 @@ test("apply: an image-bearing turn gets the tail in its leading text part", () =
 
 // --- loading --------------------------------------------------------------------
 
-test("load: sources read once per profile, missing workspace file omits the position", async () => {
+test("load: sources read once per profile; missing workspace files and empty files are unset, silently", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "miku-mp-"));
   try {
     await writeFile(path.join(root, "MODEL_TAIL.md"), "Tail from workspace.\n");
+    await writeFile(path.join(root, "EMPTY.md"), "  \n\n");
     const config = {
-      models: { a: { model_prompt: "p" }, b: { model_prompt: "p" }, c: { model_prompt: "q" } },
+      models: { a: { model_prompt: "p" }, b: { model_prompt: "p" }, c: { model_prompt: "q" }, d: { model_prompt: "p" } },
       model_prompts: {
         p: { preamble: { text: "Pre." }, tail: { workspace_file: "MODEL_TAIL.md" } },
-        q: { preamble: { workspace_file: "MISSING.md" } },
+        q: { preamble: { workspace_file: "MISSING.md" }, tail: { workspace_file: "EMPTY.md" } },
+        e: { preamble: { workspace_file: "EMPTY.md" } },
       },
     } as unknown as AppConfig;
     const warnings: unknown[] = [];
     const logger = { info: () => {}, warn: (...a: unknown[]) => warnings.push(a), debug: () => {}, error: () => {} } as any;
-    const loaded = await loadModelPrompts({
-      config,
-      sessionType: undefined,
-      sessionTypeName: "default",
-      logicalIds: ["a", "b", "c"],
-      workspaceRoot: root,
-      estimateTokens,
-      logger,
-    });
+    const load = (sessionType?: Record<string, unknown>) =>
+      loadModelPrompts({
+        config,
+        sessionType: sessionType as any,
+        sessionTypeName: "default",
+        logicalIds: ["a", "b", "c", "d"],
+        workspaceRoot: root,
+        estimateTokens,
+        logger,
+      });
+    const loaded = await load();
     assert.equal(loaded.get("a")?.preamble, "Pre.");
     assert.equal(loaded.get("a")?.tail, '<tail_instructions source="MODEL_TAIL.md">\nTail from workspace.\n</tail_instructions>');
     assert.equal(loaded.get("a")?.hash, loaded.get("b")?.hash, "same profile, same bytes, same hash");
-    assert.equal(loaded.has("c"), false, "nothing readable → no model prompt");
-    assert.equal(warnings.length, 1);
+    assert.equal(loaded.has("c"), false, "missing + empty → no model prompt");
+    // An override to a profile whose file is empty works like "none": d's own default is not used.
+    const overridden = await load({ model_prompts: { d: "e" } });
+    assert.equal(overridden.has("d"), false);
+    assert.ok(overridden.has("a"));
+    assert.equal(warnings.length, 0, "absent workspace files and empty files are not warnings");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("load: an unreadable source still warns", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "miku-mp-"));
+  try {
+    const config = {
+      models: { a: { model_prompt: "p" } },
+      model_prompts: { p: { preamble: { file: path.join(root, "vanished.md") } } },
+    } as unknown as AppConfig;
+    const warnings: unknown[] = [];
+    const logger = { info: () => {}, warn: (...a: unknown[]) => warnings.push(a), debug: () => {}, error: () => {} } as any;
+    const loaded = await loadModelPrompts({ config, sessionType: undefined, sessionTypeName: "default", logicalIds: ["a"], workspaceRoot: root, estimateTokens, logger });
+    assert.equal(loaded.size, 0);
+    assert.equal(warnings.length, 1, "a config-dir file validated at startup that vanished is worth a warning");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
