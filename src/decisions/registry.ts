@@ -8,9 +8,12 @@
  * budget blocked, every member unhealthy, no fitting member, timeout, HTTP or
  * parse failure, or low confidence. Every evaluation of an enabled point is
  * logged once (`decision_evaluated`) and every billed attempt is one
- * `usage_events` row of class `decision`.
+ * `usage_events` row of class `decision`. Enabled points also emit one
+ * {@link DecisionEvaluationRow} per evaluation to the optional `onEvaluation`
+ * sink (CONTRACT decision 6/§8); storage wiring is left to the caller.
  */
 
+import { nanoid } from "nanoid";
 import type { AppConfig } from "../config/index.js";
 import type { LlmScheduler, PriorityClass } from "../agent/scheduler.js";
 import type { Logger } from "../observability/logger.js";
@@ -24,6 +27,56 @@ import {
   type PointSettings,
 } from "./config.js";
 import { summarizeAnswers, type DecisionAnswers, type DecisionQuestion } from "./types.js";
+
+/**
+ * One row emitted per `evaluate()` outcome — maps 1:1 to the
+ * `decision_evaluations` table (CONTRACT §storage). The sink receives it
+ * immediately after the evaluation; storage wiring is the caller's concern.
+ *
+ * Column mapping (camelCase → snake_case):
+ *   ts               → ts
+ *   decisionGroup    → decision_group
+ *   point            → point
+ *   agent            → agent
+ *   timelineKey      → timeline_key
+ *   agentSessionId   → agent_session_id
+ *   triggerEventId   → trigger_event_id
+ *   candidateSessionId → candidate_session_id
+ *   source           → source
+ *   reason           → reason
+ *   verdictJson      → verdict_json
+ *   answersJson      → answers_json
+ *   stateJson        → state_json  (capped 64 KiB; ends with "…[truncated]" when cut)
+ *   questionsJson    → questions_json  (capped 16 KiB; same marker when cut)
+ *   servedModel      → served_model
+ *   servedVersion    → served_version
+ *   latencyMs        → latency_ms
+ *   inputTokens      → input_tokens
+ *   costUsd          → cost_usd
+ */
+export interface DecisionEvaluationRow {
+  ts: number;
+  decisionGroup: string;
+  point: string;
+  agent: string | null;
+  timelineKey: string | null;
+  agentSessionId: string | null;
+  triggerEventId: string | null;
+  candidateSessionId: string | null;
+  source: "model" | "heuristic";
+  reason: string | null;
+  verdictJson: string | null;
+  answersJson: string | null;
+  /** JSON of the state sent to the member; capped at 64 KiB. */
+  stateJson: string | null;
+  /** JSON of the questions sent; capped at 16 KiB. */
+  questionsJson: string | null;
+  servedModel: string | null;
+  servedVersion: string | null;
+  latencyMs: number | null;
+  inputTokens: number | null;
+  costUsd: number | null;
+}
 
 /** Who a decision is billed to (ARCHITECTURE.md §8f/§8h). */
 export interface DecisionAttribution {
@@ -59,6 +112,8 @@ export interface DecisionOutcome<V> {
   answers?: DecisionAnswers;
   servedModel?: string;
   costUsd: number;
+  /** Groups this outcome with related evaluations (CONTRACT decision 6). */
+  decisionGroup: string;
 }
 
 export interface BudgetCheck {
@@ -80,6 +135,12 @@ export interface DecisionEngineOptions {
   budget?: () => BudgetCheck | undefined;
   /** The usage-ledger fan-in (`recordUsageEvent`). */
   record?: (event: UsageEventInput) => void;
+  /**
+   * Evaluation sink (CONTRACT decision 6/§8): called once per `evaluate()`
+   * outcome for every enabled point. The caller wires this to storage; no
+   * storage import here. Disabled points produce no row.
+   */
+  onEvaluation?: (row: DecisionEvaluationRow) => void;
   logger?: Logger;
   now?: () => number;
 }
@@ -91,6 +152,16 @@ export interface EvaluateContext {
   signal?: AbortSignal;
   /** Cheap verdict of today's code, logged alongside for agreement analysis. */
   heuristicVerdict?: unknown;
+  /**
+   * Groups related evaluations (CONTRACT decision 6). When omitted a fresh id
+   * is generated; pass the same value across a parallel batch (e.g. all records
+   * candidates plus routing in one trigger) to tie their rows together.
+   */
+  decisionGroup?: string;
+  /** The candidate session being evaluated (records point; logged as-is). */
+  candidateSessionId?: string | null;
+  /** The event that triggered this decision (logged as-is). */
+  triggerEventId?: string | null;
 }
 
 const UNAVAILABLE_LOG_INTERVAL_MS = 60_000;
@@ -116,10 +187,67 @@ export class DecisionEngine {
 
   async evaluate<I, V>(point: DecisionPoint<I, V>, input: I, ctx: EvaluateContext): Promise<DecisionOutcome<V>> {
     const settings = this.settings(point.name, ctx.agentName);
-    if (!settings) return { verdict: point.fallback(input), source: "heuristic", reason: "disabled", costUsd: 0 };
-    const started = (this.options.now ?? Date.now)();
+    const decisionGroup = ctx.decisionGroup ?? nanoid();
+    if (!settings) {
+      return { verdict: point.fallback(input), source: "heuristic", reason: "disabled", costUsd: 0, decisionGroup };
+    }
+    const now = this.options.now ?? Date.now;
+    const started = now();
     let costUsd = 0;
     let inputTokens = 0;
+
+    // Compute questions once (pure, deterministic for the same settings).
+    const questions = point.questions(input, settings);
+    const questionsJson = capJsonBytes(questions, 16 * 1024);
+
+    // Emit one evaluation row to the optional sink (no storage import here).
+    const emitRow = (
+      source: "model" | "heuristic",
+      reason: string | null,
+      verdictJson: string | null,
+      answersJson: string | null,
+      stateJson: string | null,
+      servedModel: string | null,
+      servedVersion: string | null,
+    ): void => {
+      if (!this.options.onEvaluation) return;
+      try {
+        this.options.onEvaluation({
+          ts: now(),
+          decisionGroup,
+          point: point.name,
+          agent: ctx.agentName,
+          timelineKey: ctx.attribution.timelineKey ?? null,
+          agentSessionId: ctx.attribution.agentSessionId ?? null,
+          triggerEventId: ctx.triggerEventId ?? null,
+          candidateSessionId: ctx.candidateSessionId ?? null,
+          source,
+          reason,
+          verdictJson,
+          answersJson,
+          stateJson,
+          questionsJson,
+          servedModel,
+          servedVersion: servedVersion ?? null,
+          latencyMs: now() - started,
+          inputTokens: inputTokens > 0 ? inputTokens : null,
+          costUsd: costUsd > 0 ? costUsd : null,
+        });
+      } catch (error) {
+        this.options.logger?.warn("decision_emit_row_failed", { point: point.name, error: errorMessage(error) });
+      }
+    };
+
+    // Best-effort state JSON for fallback rows where no request was made.
+    const fallbackStateJson = (): string | null => {
+      try {
+        const state = point.state(input, settings.stateMaxTokens);
+        return capJsonBytes(state, 64 * 1024);
+      } catch {
+        return null;
+      }
+    };
+
     const fallback = (reason: string, extra: Record<string, unknown> = {}): DecisionOutcome<V> => {
       const verdict = point.fallback(input);
       this.log(point, settings, ctx, started, {
@@ -130,7 +258,36 @@ export class DecisionEngine {
         inputTokens,
         ...extra,
       });
-      return { verdict, source: "heuristic", reason, costUsd, ...("answers" in extra ? { answers: extra["answers"] as DecisionAnswers } : {}) };
+      // Use actual state when we ran a request (low_confidence has stateTokens).
+      let stateJson: string | null;
+      const stateTokens = typeof extra["stateTokens"] === "number" ? extra["stateTokens"] : null;
+      if (stateTokens !== null) {
+        try {
+          stateJson = capJsonBytes(point.state(input, stateTokens), 64 * 1024);
+        } catch {
+          stateJson = fallbackStateJson();
+        }
+      } else {
+        stateJson = fallbackStateJson();
+      }
+      const answersJson = "answers" in extra ? safeJson(extra["answers"]) : null;
+      emitRow(
+        "heuristic",
+        reason,
+        safeJson(point.describe(verdict)),
+        answersJson,
+        stateJson,
+        typeof extra["servedModel"] === "string" ? extra["servedModel"] : null,
+        typeof extra["servedVersion"] === "string" ? extra["servedVersion"] : null,
+      );
+      return {
+        verdict,
+        source: "heuristic",
+        reason,
+        costUsd,
+        decisionGroup,
+        ...("answers" in extra ? { answers: extra["answers"] as DecisionAnswers } : {}),
+      };
     };
 
     let chain;
@@ -183,7 +340,7 @@ export class DecisionEngine {
       result = await this.options.client.decide(
         settings.model,
         {
-          questions: point.questions(input, settings),
+          questions,
           state: (budgetTokens) => point.state(input, budgetTokens),
           stateMaxTokens: settings.stateMaxTokens,
           minStateTokens: settings.minStateTokens,
@@ -229,12 +386,29 @@ export class DecisionEngine {
       inputTokens,
       ...served,
     });
+    // Reconstruct actual state sent using the stateTokens reported by the result.
+    let stateJson: string | null;
+    try {
+      stateJson = capJsonBytes(point.state(input, result.stateTokens), 64 * 1024);
+    } catch {
+      stateJson = null;
+    }
+    emitRow(
+      "model",
+      null,
+      safeJson(point.describe(verdict)),
+      safeJson(result.answers),
+      stateJson,
+      result.logicalId,
+      result.servedVersion ?? null,
+    );
     return {
       verdict,
       source: "model",
       answers: result.answers,
       servedModel: result.logicalId,
       costUsd,
+      decisionGroup,
     };
   }
 
@@ -293,4 +467,29 @@ export class DecisionEngine {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Serialize `value` to JSON, capping the result at `maxBytes` UTF-8 bytes.
+ * When truncated, appends `…[truncated]` so the reader knows the value is cut.
+ */
+function capJsonBytes(value: unknown, maxBytes: number): string {
+  const full = JSON.stringify(value);
+  if (Buffer.byteLength(full, "utf8") <= maxBytes) return full;
+  // Slice to roughly maxBytes chars (UTF-8 chars are 1–4 bytes; chars ≈ bytes).
+  const marker = "…[truncated]";
+  let sliced = full.slice(0, maxBytes - marker.length);
+  while (Buffer.byteLength(sliced + marker, "utf8") > maxBytes && sliced.length > 0) {
+    sliced = sliced.slice(0, sliced.length - 1);
+  }
+  return sliced + marker;
+}
+
+/** `JSON.stringify(value)` or `null` on any error. */
+function safeJson(value: unknown): string | null {
+  try {
+    return JSON.stringify(value) ?? null;
+  } catch {
+    return null;
+  }
 }
