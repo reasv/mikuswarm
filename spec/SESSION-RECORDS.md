@@ -138,13 +138,15 @@ The continuation point of DECISION-MODEL §5.2 is **removed** (`[decisions.conti
 
 Every decision-model decision is recorded and inspectable. This applies to all points, not only this one, and replaces "logged only" (ARCHITECTURE.md §8h step 5).
 
-- New table `decision_evaluations(id, ts, point, agent, timeline_key, agent_session_id?, trigger_event_id?, candidate_session_id?, source, reason?, verdict_json, answers_json /* with probabilities */, served_model, served_version, latency_ms, input_tokens, cost_usd)`. One row per evaluation request.
-- Console, session view: a **Decisions** card listing the evaluations that shaped the session:
-  - routing: the task with its confidence, why it fell back, the skills preloaded;
-  - records: each candidate with its probability, whether it was injected;
-  - the synthetic calls they produced, marked as harness-made in the transcript.
-- Console, room view: the evaluations not bound to a session.
+- New table `decision_evaluations(id, ts, point, agent, timeline_key, agent_session_id?, trigger_event_id?, candidate_session_id?, source, reason?, verdict_json, answers_json /* with probabilities */, state_json, questions_json, served_model, served_version, latency_ms, input_tokens, cost_usd)`. One row per evaluation request.
+  - The state and questions sent are stored (capped), not only the answers. Without them a decision cannot be judged: you would see what was decided but not what the model was looking at. That includes checking whether the non-reply framing (§6.2) biases it.
+- Console, session view, **two places for every decision of the session**:
+  - **Inline in the rollout**, as its own card at the point where it took effect. Routing and record selection come before turn 1, each right before the synthetic calls it produced (marked as harness-made). A decision that injected nothing still gets a card ("below threshold, nothing injected"). Later points (redo, edits, judged interjections) appear where they happen mid-rollout.
+    - Collapsed: the point, the verdict, the top confidence, the fallback reason if any.
+    - Expanded: every answer with probabilities, the state and questions sent, the served model and version, latency, cost.
+  - **In the details pane**, a **Decisions** section listing all of them, so nobody has to scroll the rollout to find them. Each entry shows the collapsed summary and jumps to its inline card.
 - Console, session view: the session's record (if any), and the records it was given.
+- Console, room view: the room view renders the next session's context, not a chronological log, so there is no timeline there to place decisions in. The only decisions not bound to a session will come from presence (DECISION-MODEL §5.3). A room-level decision history is designed with it.
 
 ## 9. Not in scope here
 
