@@ -366,6 +366,10 @@ export function createXSearchTool(context: XSearchToolContext): AgentTool {
         // tried in order, the chosen member's endpoint/id/key/cost used per attempt.
         let live: GrokResult;
         let billed: FetchChainMember | undefined;
+        // Set when any attempt hit the wall-clock timeout. A timed-out request is
+        // not cancelled upstream: the provider finishes it and bills it, so the
+        // error below tells the model not to pay for the same search again.
+        let timedOut = false;
         try {
           live = await runFetchWithFallback<GrokResult>(
             chain,
@@ -404,6 +408,7 @@ export function createXSearchTool(context: XSearchToolContext): AgentTool {
                 signal: agentSignal,
               });
               if ("error" in result) {
+                if (result.timedOut) timedOut = true;
                 // A 400/413/422 is THIS request's content (deterministic on
                 // replay) and never falls over or marks the head unhealthy (§9);
                 // every other failure (5xx/timeout/parse/reset) is environmental.
@@ -428,6 +433,7 @@ export function createXSearchTool(context: XSearchToolContext): AgentTool {
           // a spurious "X search failed" (the helper already skipped the health
           // feed + fall over for it — spec MODEL-FALLBACK §9).
           if (error instanceof Error && error.name === "AbortError") throw error;
+          if (timedOut) return textError(timeoutErrorText(model, config.timeoutMs));
           return textError(`X search failed (model ${model}): ${errMessage(error)}`);
         }
         grok = live;
@@ -605,6 +611,8 @@ interface OpenRouterResponse {
  */
 interface GrokPostError {
   error: string;
+  /** The wall-clock timeout fired (the request may still complete and bill upstream). */
+  timedOut?: boolean;
   status?: number;
   retryAfterMs?: number;
 }
@@ -650,7 +658,7 @@ async function postGrok(input: {
       // no fall over). A bare wall-clock timeout (signal not aborted) is
       // environmental and falls over to the next member.
       if (input.signal?.aborted) throw abortError();
-      return { error: `timed out after ${input.timeoutMs}ms` };
+      return { error: `timed out after ${input.timeoutMs}ms`, timedOut: true };
     }
     return { error: errMessage(error) };
   } finally {
@@ -672,7 +680,7 @@ async function postGrok(input: {
   } catch (error) {
     if ((error as { name?: string })?.name === "AbortError") {
       if (input.signal?.aborted) throw abortError();
-      return { error: `timed out after ${input.timeoutMs}ms` };
+      return { error: `timed out after ${input.timeoutMs}ms`, timedOut: true };
     }
     return { error: `unreadable response: ${errMessage(error)}` };
   }
@@ -680,6 +688,20 @@ async function postGrok(input: {
   const synthesis = extractSynthesis(parsed);
   const citations = extractCitations(parsed);
   return { synthesis, citations, usage: parseOpenAiUsage(parsed.usage), model: input.body.model as string };
+}
+
+/**
+ * The agent-facing result of a timed-out search. Hanging up does not stop the
+ * provider: it finishes the search and bills it, so an immediate retry pays for
+ * the same expensive search again and usually times out the same way.
+ */
+export function timeoutErrorText(model: string, timeoutMs: number): string {
+  return (
+    `X search timed out after ${Math.round(timeoutMs / 1000)}s (model ${model}). ` +
+    "The search was probably still charged in full even though no result came back. " +
+    "Do not retry this search or a reworded version of it in this turn; " +
+    "answer without it and tell the user the search timed out."
+  );
 }
 
 /** A neutral abort error whose `name` the fallback helper keys on (spec §9). */

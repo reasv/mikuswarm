@@ -4,6 +4,7 @@ export {
   makeRateLimitedClaimGate,
   makeChainClaimGate,
   makeAgentLoopChainClaimGate,
+  makeToolBudgetGate,
   type AdmissionResult,
   type BlockingRule,
   type BudgetHooks,

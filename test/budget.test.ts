@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { BudgetEngine, makeRateLimitedClaimGate, makeChainClaimGate, makeAgentLoopChainClaimGate, type BudgetHooks, type LimitRule, type SpendDescriptor } from "../src/budget/engine.js";
+import { BudgetEngine, makeRateLimitedClaimGate, makeChainClaimGate, makeAgentLoopChainClaimGate, makeToolBudgetGate, type BudgetHooks, type LimitRule, type SpendDescriptor } from "../src/budget/engine.js";
 import type { UsageEventInput } from "../src/storage/database.js";
 import { normalizeLimits, type RawLimitRule } from "../src/budget/normalize.js";
 import { normalizeUserLimits, type RawUserLimitRule } from "../src/budget/normalize-user-limits.js";
@@ -1667,4 +1667,34 @@ test("§8 normalizeUserLimits: both agent+account set and agent unmapped = exact
   assert.equal(res.fatal.length, 1, `expected exactly 1 fatal, got ${res.fatal.length}: ${res.fatal.join("; ")}`);
   assert.ok(res.fatal[0].includes("cannot set both"), `expected 'cannot set both', got: ${res.fatal[0]}`);
   assert.equal(res.rules.length, 0);
+});
+
+test("§8 makeToolBudgetGate: an agent-scoped tool cap blocks only that agent's sessions", () => {
+  const rules: LimitRule[] = [
+    {
+      name: "grok-alice",
+      maxUsd: 3,
+      window: dayWindow,
+      selector: { models: ["grok"], timelineKeyPrefixes: ["matrix:alice"] },
+    },
+  ];
+  const engine = engineWithScoped(rules);
+  engine.record({
+    class: "tool",
+    toolName: "x_search",
+    modelId: "grok",
+    logicalModelId: "grok",
+    costUsd: 3,
+    timelineKey: "matrix:alice:room:!r:hs",
+  });
+  const gate = (timelineKey: string) =>
+    makeToolBudgetGate({ engine: () => engine, toolName: "x_search", timelineKey, formatResetsAt: () => "soon" });
+
+  assert.match(gate("matrix:alice:room:!r:hs")("grok") ?? "", /Over budget for x_search \(limit grok-alice\)/);
+  assert.equal(gate("matrix:bob:room:!r:hs")("grok"), undefined, "another agent's session is not capped");
+  assert.equal(
+    makeToolBudgetGate({ engine: () => undefined, toolName: "x_search", timelineKey: "matrix:alice:room:!r:hs", formatResetsAt: () => "" })("grok"),
+    undefined,
+    "no engine wired = no gate",
+  );
 });

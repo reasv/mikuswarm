@@ -723,6 +723,48 @@ export function makeRateLimitedClaimGate(opts: {
 }
 
 /**
+ * Build the per-tool period-budget gate (spec USAGE-COST-LIMITS §6.3) for the paid
+ * LLM-calling tools (image_generate, x_search): called with a chain member's
+ * logical model id, it returns an agent-facing refusal when that spend is over
+ * budget, else undefined.
+ *
+ * `timelineKey` is the calling session's. Agent/account-scoped rules match only
+ * when the descriptor carries one (spec MULTI-AGENT-SUPPORT §8), so a gate built
+ * without it would let every per-agent tool cap through.
+ */
+export function makeToolBudgetGate(opts: {
+  engine: () => BudgetEngine | undefined;
+  toolName: string;
+  timelineKey: string;
+  formatResetsAt: (ms: number) => string;
+}): (modelId: string) => string | undefined {
+  return (modelId) => {
+    const engine = opts.engine();
+    if (!engine) return undefined;
+    const descriptor: SpendDescriptor = {
+      class: "tool",
+      tool: opts.toolName,
+      modelId,
+      timelineKey: opts.timelineKey,
+    };
+    const result = engine.check(descriptor);
+    if (result.allowed) return undefined;
+    engine.logBlocked("tool_call", result.blockingRules, descriptor, { toolName: opts.toolName });
+    // Surface the ACCURATE reset (rolling rules age out at oldest-spend + duration,
+    // not the cheap now + duration the gate carries — §5 #5); fall back to the
+    // gate's value if the rule can't be resolved.
+    const resetsAt = result.primary
+      ? (engine.accurateResetsAt(result.primary.name) ?? result.primary.resetsAt)
+      : undefined;
+    const when = resetsAt !== undefined ? opts.formatResetsAt(resetsAt) : "later";
+    return (
+      `Over budget for ${opts.toolName} (limit ${result.primary?.name ?? "unknown"}); ` +
+      `resets ${when}. Try again after that.`
+    );
+  };
+}
+
+/**
  * Build a CHAIN-AWARE worker-pool claim gate (spec MODEL-FALLBACK §6): a
  * `() => boolean` that parks the pool ONLY when EVERY chain member is over budget —
  * the per-attempt resolver would serve the first in-budget member, so a head-only

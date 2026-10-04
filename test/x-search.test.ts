@@ -765,6 +765,34 @@ test("x_search: agent abort surfaces cleanly (neutral) — no 'X search failed',
   }
 });
 
+test("x_search: a wall-clock timeout tells the model not to retry the search", async () => {
+  // The provider keeps running (and billing) a request we hang up on, so the
+  // timeout result must steer the model away from paying for it again.
+  let hangRes: http.ServerResponse | undefined;
+  const server = http.createServer((_req, res) => {
+    hangRes = res; // never respond
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const addr = server.address();
+  if (!addr || typeof addr === "string") throw new Error("no address");
+  const url = `http://127.0.0.1:${addr.port}`;
+  const h = await makeHarness({ serverUrl: url, rawConfig: { timeout_ms: 100 } });
+  h.context.scheduler = makeStubScheduler().scheduler;
+  try {
+    const tool = createXSearchTool(h.context);
+    const result: any = await tool.execute("c", { query: "q" });
+    const text: string = result.content[0].text;
+    assert.match(text, /timed out after 0s/);
+    assert.match(text, /charged/);
+    assert.match(text, /Do not retry this search/);
+    assert.equal(h.records.length, 0, "no usage row: the response never arrived");
+  } finally {
+    hangRes?.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await h.cleanup();
+  }
+});
+
 test("x_search: head over budget → fallback member's endpoint is hit", async () => {
   const head = await startOpenRouter(() => ({ json: grokResponse("head answer", []) }));
   const fb = await startOpenRouter(() => ({ json: grokResponse("fallback answer", []) }));

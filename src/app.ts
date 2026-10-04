@@ -142,7 +142,7 @@ import { DiaryWorkerPool } from "./diary/index.js";
 import { ChannelVisibilityResolver, validateVisibilityChannels, type VisibilityConfig } from "./visibility/index.js";
 import { ProactiveScheduler } from "./proactive/index.js";
 import { parseTimelineKey, buildTimelineKey, timelineKindOf } from "./storage/timeline-key.js";
-import { BudgetEngine, collectZeroCostModelIds, collectKnownModelIds, normalizeLimits, makeAgentLoopChainClaimGate, UserLimitEngine, normalizeUserLimits, type BudgetHooks, type SpendDescriptor, type AdmissionResult, type UserLimitContext, type UserLimitResolution, type ResolvedConstraint } from "./budget/index.js";
+import { BudgetEngine, collectZeroCostModelIds, collectKnownModelIds, normalizeLimits, makeAgentLoopChainClaimGate, makeToolBudgetGate, UserLimitEngine, normalizeUserLimits, type BudgetHooks, type SpendDescriptor, type AdmissionResult, type UserLimitContext, type UserLimitResolution, type ResolvedConstraint } from "./budget/index.js";
 import type { UsageEventInput } from "./storage/database.js";
 import { createRetrievalSubsystem, resolveRetrievalConfig, type RetrievalSubsystem } from "./retrieval/index.js";
 import {
@@ -2160,28 +2160,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     return [];
   };
 
-  // Per-tool period-budget gate (spec USAGE-COST-LIMITS §6.3): returns an
-  // agent-facing refusal message when the tool/model is over budget, else
-  // undefined. Wired into the paid LLM-calling tools (image_generate, x_search).
-  const makeToolBudgetCheck = (toolName: string) => (modelId: string): string | undefined => {
-    const engine = budgetHooks.engine;
-    if (!engine) return undefined;
-    const descriptor = { class: "tool" as const, tool: toolName, modelId };
-    const result = engine.check(descriptor);
-    if (result.allowed) return undefined;
-    engine.logBlocked("tool_call", result.blockingRules, descriptor, { toolName });
-    // Surface the ACCURATE reset (rolling rules age out at oldest-spend + duration,
-    // not the cheap now + duration the gate carries — §5 #5); fall back to the
-    // gate's value if the rule can't be resolved.
-    const resetsAt = result.primary
-      ? (engine.accurateResetsAt(result.primary.name) ?? result.primary.resetsAt)
-      : undefined;
-    const when = resetsAt !== undefined ? formatResetsAt(resetsAt) : "later";
-    return (
-      `Over budget for ${toolName} (limit ${result.primary?.name ?? "unknown"}); ` +
-      `resets ${when}. Try again after that.`
-    );
-  };
+  // Per-tool period-budget gate (spec USAGE-COST-LIMITS §6.3), wired into the paid
+  // LLM-calling tools (image_generate, x_search) with the calling session's timeline.
+  const makeToolBudgetCheck = (toolName: string, timelineKey: string) =>
+    makeToolBudgetGate({ engine: () => budgetHooks.engine, toolName, timelineKey, formatResetsAt });
 
   // Fail-fast: a misconfigured summarizer must not silently fall back to the
   // default chat agent or model. Both this check and pool instantiation use
@@ -5193,7 +5175,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             agentSessionId: sessionId,
             recordToolUsage,
             // Period-budget gate (spec USAGE-COST-LIMITS §6.3).
-            checkBudget: makeToolBudgetCheck("image_generate"),
+            checkBudget: makeToolBudgetCheck("image_generate", inbound.timelineKey),
             isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
             // Unified registry (spec MODEL-FALLBACK §2.3): each tier resolves to a
             // [models.*] chain (head + fallback members); pricing lives on the model.
@@ -5259,7 +5241,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             agentSessionId: sessionId,
             recordToolUsage,
             // Period-budget gate (spec USAGE-COST-LIMITS §6.3).
-            checkBudget: makeToolBudgetCheck("x_search"),
+            checkBudget: makeToolBudgetCheck("x_search", inbound.timelineKey),
           })]
         : []),
       // youtube_fetch: YouTube metadata + transcript + workspace download tool
