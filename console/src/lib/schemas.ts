@@ -876,3 +876,75 @@ export const UsageLeaderboard = Schema.Struct({
 	systemActors: Schema.Array(UsageLeaderboardUser)
 });
 export type UsageLeaderboard = Schema.Schema.Type<typeof UsageLeaderboard>;
+
+// ===========================================================================
+// Session records (spec SESSION-RECORDS §3, §8, CONTRACT.md). Tables
+// `session_records` and `decision_evaluations` added in migration v24.
+// Backends without them return empty/null, not errors (CONTRACT.md §Storage).
+// ===========================================================================
+
+/**
+ * One row from `session_records` (spec §3.4, CONTRACT.md).
+ * `buildsOn` is the JSON-decoded list of session ids injected into this session.
+ */
+export const SessionRecord = Schema.Struct({
+	sessionId: Schema.String,
+	timelineKey: Schema.String,
+	agent: Schema.NullOr(Schema.String),
+	text: Schema.String,
+	tokenCount: Schema.Number,
+	buildsOn: Schema.Array(Schema.String),
+	modelId: Schema.NullOr(Schema.String),
+	/** Epoch ms; replaced on a later resume generation. */
+	createdAt: Schema.Number
+});
+export type SessionRecord = Schema.Schema.Type<typeof SessionRecord>;
+
+/**
+ * GET /api/sessions/:id/record — the session's own record (null if none or
+ * tables absent). Always a 200; empty when the session did no tool work or the
+ * record is still being written (in-flight).
+ */
+export const SessionRecordResponse = Schema.Struct({
+	sessionRecord: Schema.NullOr(SessionRecord)
+});
+export type SessionRecordResponse = Schema.Schema.Type<typeof SessionRecordResponse>;
+
+/**
+ * One row from `decision_evaluations` (spec §8, CONTRACT.md §Storage).
+ * Raw JSON columns (`verdictJson`, `answersJson`, `stateJson`, `questionsJson`)
+ * are kept as strings and pretty-printed in the inspector.
+ */
+export const DecisionEvaluation = Schema.Struct({
+	id: Schema.Number,
+	ts: Schema.Number,
+	decisionGroup: Schema.String,
+	point: Schema.String,              // 'routing' | 'records'
+	agent: Schema.NullOr(Schema.String),
+	timelineKey: Schema.NullOr(Schema.String),
+	agentSessionId: Schema.NullOr(Schema.String),
+	triggerEventId: Schema.NullOr(Schema.String),
+	candidateSessionId: Schema.NullOr(Schema.String),  // records point only
+	source: Schema.String,             // 'model' | 'heuristic'
+	reason: Schema.NullOr(Schema.String),
+	verdictJson: Schema.NullOr(Schema.String),
+	answersJson: Schema.NullOr(Schema.String),   // with probabilities
+	stateJson: Schema.NullOr(Schema.String),     // capped 64 KiB
+	questionsJson: Schema.NullOr(Schema.String), // capped 16 KiB
+	servedModel: Schema.NullOr(Schema.String),
+	servedVersion: Schema.NullOr(Schema.String),
+	latencyMs: Schema.NullOr(Schema.Number),
+	inputTokens: Schema.NullOr(Schema.Number),
+	costUsd: Schema.NullOr(Schema.Number)
+});
+export type DecisionEvaluation = Schema.Schema.Type<typeof DecisionEvaluation>;
+
+/**
+ * GET /api/sessions/:id/decisions — all `decision_evaluations` rows for this
+ * session, in `ts` order. Empty array when the table is absent or no decisions
+ * were made. The console groups them by `decisionGroup` for the inline cards.
+ */
+export const SessionDecisionsResponse = Schema.Struct({
+	evaluations: Schema.Array(DecisionEvaluation)
+});
+export type SessionDecisionsResponse = Schema.Schema.Type<typeof SessionDecisionsResponse>;

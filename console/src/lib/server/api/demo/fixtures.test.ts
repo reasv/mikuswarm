@@ -23,7 +23,9 @@ import {
 	PipelineItemsResponse,
 	PipelineItemDetail,
 	CostOverview,
-	AgentsResponse
+	AgentsResponse,
+	SessionRecordResponse,
+	SessionDecisionsResponse
 } from '$lib/schemas';
 
 /**
@@ -48,6 +50,8 @@ const cases: Case[] = [
 	{ path: `/api/rooms/${room}/session-facets`, schema: SessionFacetsResponse as never },
 	{ path: `/api/rooms/${room}/context`, schema: RoomContextResponse as never },
 	{ path: `/api/sessions/${encodeURIComponent(DEMO_FEATURED_SESSION)}`, schema: SessionDetailResponse as never },
+	{ path: `/api/sessions/${encodeURIComponent(DEMO_FEATURED_SESSION)}/record`, schema: SessionRecordResponse as never },
+	{ path: `/api/sessions/${encodeURIComponent(DEMO_FEATURED_SESSION)}/decisions`, schema: SessionDecisionsResponse as never },
 	{ path: '/api/pipelines', schema: PipelinesResponse as never },
 	{ path: '/api/cost-overview', schema: CostOverview as never },
 	{ path: '/api/pipelines/captioning/items', schema: PipelineItemsResponse as never },
