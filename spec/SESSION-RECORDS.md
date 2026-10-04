@@ -51,7 +51,13 @@ After the run settles from the user's point of view (claims released, timeline s
 
 The record is capped (`max_tokens`, configurable, sized like a summary node). Length scales with the work under that cap.
 
-The record turn is billed like any request of the session: class `agent_loop`, the session's payee. It runs at background priority after the settle and never delays the next trigger. Its row (`session_records`, §3.4) is written when it lands. A trigger that arrives before the record exists gets none injected (it may wait up to `[session_records].inject_wait_ms` on an in-flight record). The agent can still fetch it later.
+The record turn is part of the session's rollout: persisted in its transcript and inspectable in the console like any other turn, marked as harness-made (§8).
+
+The record turn is billed like any request of the session: class `agent_loop`, the session's payee. It always runs at **interactive** priority: it extends the interactive rollout that just finished, it must land while that rollout's cache is still warm, and triggers may be waiting on it. Its row (`session_records`, §3.4) is written when it lands. Production is bounded by `[session_records].timeout_ms`; past it the record is abandoned.
+
+**Triggers that need an in-flight record wait for it.** Owner direction: a reply whose record is still being written waits for it, and proceeds without it only when record production times out. The exact policy (replies only, or every trigger that would inject the record) is settled at implementation. The agent can still fetch an abandoned or late record later.
+
+A record turn that is refused (a `refusal` stop reason) or blocked by a budget gate writes no record. It is logged and the session is otherwise unaffected. Generic refusal handling (§9) will later retry such requests on another model.
 
 ### 3.3 Chains
 
@@ -80,7 +86,7 @@ Uses:
 
 The synthetic messages are persisted in the transcript like any turn. The console shows them as tool calls with a marker that the harness made them (§8). They follow the final user turn, so the frozen prefix and its cache are untouched.
 
-Verify at implementation: a synthetic `tool_use` with no thinking block, appended after the final user turn, on each wire API in use (the Bedrock relay, OpenAI Responses with prefill, OpenAI completions). Expected fine: there are no reasoning blocks in synthetic content, and `drop_stale_thinking` already sends tool-use turns without thinking.
+Verify at implementation: a synthetic `tool_use` with no thinking block, appended after the final user turn, on each wire API in use (Anthropic Messages, the Bedrock relay, OpenAI Responses with prefill, OpenAI completions). Expected fine: there are no reasoning blocks in synthetic content, and `drop_stale_thinking` already sends tool-use turns without thinking.
 
 ## 5. Agent-facing tools
 
@@ -105,6 +111,8 @@ Per CLAUDE.md "Agent-facing tools: activation & discovery design".
 
 A trigger that is a **reply to a bot message** injects that message's session record, if one exists. No time window and no same-user check: context is rebuilt normally, so the reasons for the old limits (a frozen rollout drifting from the room) do not apply. The only cost is context space. Every other trigger injects nothing, and the tools remain.
 
+"Reply" means the event's reply target is a bot message, whatever its trigger type: on Matrix nearly every reply arrives as a `mention`, because clients auto-mention the replied-to user. A reply to the bot always triggers, like a mention. `resolveReplyTrigger` drops its `resume.enabled` check, a leftover from RESUMABLE-SESSIONS that today lets a reply without a mention (a Discord reply with the ping off) trigger only where resume is on.
+
 ### 6.2 With a decision model
 
 The decision model replaces the reply rule with a judgement, and extends it to triggers that are not replies (`[decisions.records]`, a new point; DECISION-MODEL §3 machinery).
@@ -128,7 +136,9 @@ The decision model replaces the reply rule with a judgement, and extends it to t
 
 ## 7. Resume
 
-**Off by default** once records ship (`[agent.sessions.resume].enabled` false in `00-defaults.toml`). The code stays.
+**Off by default** once records ship (`[agent.sessions.resume].enabled` false in `00-defaults.toml`). The code stays. Reintroducing it means first solving how a resume interacts with the record turn, which now ends every work-gated rollout.
+
+**Follow-up folding no longer resumes.** Its settled branch (`resumeFollowUp`) is replaced: a follow-up whose owning session has already completed starts a **fresh** session with that session's record injected, like any other message that arrives after the rollout ended, and waits on an in-flight record the same way (§3.2). Folding into a running or not-yet-live session (steer, park) is unchanged.
 
 The principled way back, for genuinely iterative work, is the session **declaring itself resumable**. That would be an automated end-of-session prompt rather than an implicit flag on the last `send_message`, so the decision is made with full context and never conflicts with record injection later. Models tend to treat every agentic session as resumable, so the prompt would need to explain the trade-off well. Not part of this work: records cover most of it, and asking every session would cost a turn that is rarely needed.
 
@@ -158,15 +168,23 @@ Every decision-model decision is recorded and inspectable. This applies to all p
   - **Cost.** A redo wastes the cancelled request. Cache writes are the big cost and likely stay hot for the redo; making sure they do is a primary concern.
   - **Console.** It must make redone sessions understandable.
   - **Decision model.** Not required for edits (an unambiguous signal), but useful: a typo fix that would not confuse a model needs no redo; the next session sees the edited text anyway.
+- **Refusal handling.** A generic system for every request site, of which the record turn is one. Owner direction, recorded here for future implementation:
+  - **Detect.** A hard refusal is the API's `refusal` stop reason. Soft refusals carry no stop reason, and some models (local ones, for example) never report one, so a decision model (Jev) detects them.
+  - **Recover by switching models.** Retrying on a different model is the only reliable runtime workaround. The retry needs no encrypted reasoning from the refused request, and the other model need not be the same model or even an Anthropic one. With no other model to try, the request is dropped and nothing else happens.
+  - **Refusal fallback rules** (optional, config). Similar to model routing: each rule matches on the task or session type (for example, a session's normal rollout vs. its record turn, or summarization, or captioning) and on the refusal reason, however it was detected, and names the models to try. So a refusal for distillation reasons can be sent specifically to non-proprietary models that do not have that problem.
+  - **Custom refusal reasons.** Like routing's task categories, the config can define custom refusal reasons. These are, in effect, operator-defined Jev questions, and rules can match on them.
+  - **No rule matches.** The refusal is treated like any other model failure and goes through the ordinary fallback chain.
+  - **Mechanical jobs benefit most.** Summarization and captioning get no output rather than a refusal written into a summary or caption when nothing is left to try. Nor do they keep retrying a model that refuses: today a refusing summarizer is nudged again and again to call the summary tool.
+  - **Collect statistics.** When the API gives no refusal reason, Jev classifies one. Per-model statistics record how often each model refuses and why. The collector runs whether or not fallback models are configured or enabled, so the data exists before it is acted on.
 
 ## 10. Configuration (sketch)
 
 ```toml
 [session_records]
-enabled = false          # write records for work-gated sessions
+enabled = true           # write records for work-gated sessions
 max_tokens = 1500
 inject_on_reply = true   # the 6.1 default rule
-inject_wait_ms = 15000   # wait on an in-flight record before giving up injecting it
+timeout_ms = 60000       # give up on producing a record; triggers waiting on it proceed without it
 
 [decisions.records]      # the 6.2 point; needs [decisions] enabled
 enabled = false
@@ -177,7 +195,7 @@ max_injected = 2
 
 ## 11. Risks and open points
 
-- **Distillation classifiers** (owner concern). A provider may flag prompts that extract a model's reasoning. Mitigation: the record prompt asks for a handoff note (what, where, one-line why), never for reasoning. Verify with real sessions through the relay before enabling.
+- **Distillation classifiers** (owner concern). A provider may flag prompts that extract a model's reasoning. Mitigation: the record prompt asks for a handoff note (what, where, one-line why), never for reasoning. A refused record turn writes no record (§3.2); generic refusal handling (§9) will later retry it on another model.
 - **Records that miss what is later asked.** The prompt's purpose statement and the message anchoring are the defence, and `read_session_transcript` is the backstop.
 - **Cost.** One extra turn per work-gated session: a cache read of the rollout plus a capped output. Small next to the session itself, but unconditional for those sessions.
 - **Bias in the non-reply state** (§6.2): the shaping above is the best guess; the evaluations table makes it checkable.
