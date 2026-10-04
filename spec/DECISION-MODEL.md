@@ -1,6 +1,6 @@
 # Decision-model integration — session gating, model routing, continuation, dedup, style, retrieval
 
-**Status**: PROPOSAL, revision 3 (2026-10-04; revision 2 earlier the same day; revision 1 was the planning session of 2026-09-18). Nothing here is implemented.
+**Status**: PROPOSAL, revision 3.1 (2026-10-04: owner decisions on every open question folded in, §7; revision 2 earlier the same day; revision 1 was the planning session of 2026-09-18). Nothing here is implemented.
 **Companion**: `spec/DECISION-MODEL-SURVEY.md`, measured capabilities, context, latency, billing and rate limits of the decision models on OpenRouter (2026-10-04). Facts below marked *measured* come from it.
 **Target ARCHITECTURE.md home once implemented**: a new §8h "Decision model" (client, decision-point registry, billing lane, fallback rule, vision routing); touched sections §8 (resumable sessions / follow-up folding / duplicate-reply mitigation), §8a (model resolution), §8f (ledger class), §9 (final user turn additions), §9d (auto-retrieval), §9g (proactive scheduler), §10 (`send_message`), §4 (config schema).
 **Related**: PER-USER-LIMITS, MODEL-FALLBACK, PER-MEMBER-CONTEXT-FITS, RESUMABLE-SESSIONS, FOLLOWUP-FOLDING, DUPLICATE-REPLY-MITIGATION, DYNAMIC-TOOL-LOADING, SUMMARY-LAYER-BUDGET.
@@ -44,7 +44,7 @@ Owner constraints 3–7 (no shadow mode, never hard-gate, no de-escalation, task
 2. **Availability is a chain, the heuristic is its last rung.** *Revised:* decision models now have drop-in replacements, so a deployment configures a fallback chain of them like any other model (§3.1), optionally ending in a self-hosted one. On any failure of the *whole chain* (unavailable, timeout, rate-limited, unhealthy, malformed, low confidence, budget-blocked) the point falls back to today's behaviour for that decision automatically and silently. Today's code paths stay intact as that fallback; they are no longer a design target that new work must keep in parity.
 3. **No dry-run / shadow mode.** Decision points are evaluated by turning them on and watching the bot. Every evaluation is *logged* (answers, confidence, latency, cost, served member, and the heuristic verdict where it is cheap to compute alongside) so decisions can be analysed later, but nothing in this design gates a rollout on that log.
 4. **The decision model never hard-gates the agent.** It gates *spend* (whether a session starts, which model heads it) and it *advises*. Where it intervenes on something the agent is doing (the duplicate guard, the style gate), the agent gets an explanatory error and may proceed on the next attempt.
-5. **No de-escalation.** The default chat model is chosen for writing quality and persona; switching normal chat to a cheaper model degrades every reply and poisons the context. Routing only ever *escalates* to a more capable model for specific task types, bounded by the user's quota. There is no "trivial chat" tier: if a cheaper model were good enough for normal chat it would already be the default.
+5. **No de-escalation of normal chat.** The default chat model is chosen for writing quality and persona; switching normal chat to a cheaper model degrades every reply and poisons the context. There is no "trivial chat" tier: if a cheaper model were good enough for normal chat it would already be the default. *Revised 2026-10-04:* routing assigns **operator-chosen models to specific task types**, because different models are better at different tasks. The code does not rank models or enforce an "only better" rule; which model suits which task is configuration, bounded by the user's quota (§5.1).
 6. **Route by task type first, difficulty second.** The decision model is far more reliable at "what kind of task is this" than at "how hard is this". Task categories map to models and skills; the difficulty scale is only a fallback for requests no category covers.
 7. **Billing follows the session.** A decision made for a user-triggered session is billed to that session's payee for per-user limits, because it is part of the cost of serving that user. On top of that, decision-model spend needs its own aggregate cap, because it is used everywhere.
 
@@ -334,8 +334,8 @@ preload_skills = true
 vision = "uncaptioned"          # §3.5
 [decisions.routing.tasks.creative_writing]
 description = "Writing a character card, story, scene, song, or other long-form creative text."
-model = "frontier"              # a [models.*] key; optional
-thinking_level = "high"         # optional effort escalation on the session's model, §5.1
+models = ["frontier", "frontier_alt"]   # optional per-task preference cascade (§5.1); `model = "x"` = ["x"]
+thinking_level = "high"         # optional per-task effort on the model that heads the session
 skills = ["character-cards"]    # preloaded on route; optional
 tail_files = ["tail/creative.md"]   # extra tail instructions for this task; optional
 [decisions.routing.tasks.coding]
@@ -356,7 +356,7 @@ levels = [
   "Several steps of work, e.g. reading a page and comparing two things.",
   "Careful multi-constraint work where quality matters more than speed.",
 ]
-models = { 4 = "frontier" }     # level index → model; only the levels listed escalate
+models = { 4 = ["frontier"] }   # level index → cascade; only the listed levels route
 
 [decisions.continuation]        # §5.2
 enabled = false
@@ -430,11 +430,17 @@ Each point states: **when** it runs (the trigger condition is always a cheap mec
 - `skill` — `choice` over the session's listed skills plus `none` (only if `preload_skills`). This is the cookbook pattern that measured 2.3× fewer wrong loads than a roster prompt; it is orthogonal to the static `tasks.*.skills` mapping and the union of both is preloaded.
 - `image_kind` — `choice` over `photo`, `screenshot_of_text_or_code`, `artwork_or_illustration`, `meme_or_reaction_image`, `chart_or_document`, `other` (asked only when `[decisions.routing.image_kinds]` is configured and the request or its reply target carries an image). The table maps a kind to extra skills to preload, e.g. `screenshot_of_text_or_code = ["coding"]`; confident kinds add their skills to the preload union and never pick a model. It is the one routing question that clearly benefits from the vision chain under `vision = "always"`; under the default it is answered from the caption.
 
-**Verdict** `{ model?: string, thinkingLevel?: string, skills: string[], tailFiles: string[], task: string | "other" }`:
-- `model` = `tasks[task].model` when `task ≠ other` and `confidence ≥ min_confidence`; else `difficulty.models[round(score)]` when configured and confident; else none.
-- `thinkingLevel` = `tasks[task].thinking_level` (or `difficulty.thinking_levels[round(score)]`) under the same confidence rule. Effort escalation is the cheap sibling of model escalation and the only one available when the default model is already the best in the preference order: the session keeps its model (and therefore its persona and cache lineage) and only raises effort for, say, coding or long creative work. It is applied to the head member only and only when it is *higher* than the member's configured `thinking_level` (same escalation-only rule, on the level order `off < minimal < low < medium < high < xhigh`); a member whose `reasoning` is false or whose `thinking_level_map` has no entry for the level ignores it. Fallback members keep their own levels.
-- **Escalation-only rule (constraint 5), enforced structurally**, not by trusting config: a routed model is applied only if it appears *earlier* than the session's default model in the governing preference order — the user's `[[user_limits]].models` list when per-user limits are active, else the default model's own chain. The preference order *is* the quality order (PER-USER-LIMITS §4.2); "earlier" means "better". A routed model not in that list is ignored with a `decision_route_ignored` log.
-- **Quota-bounded**: with per-user limits active, the routed model becomes the *requested head* and the user's preference list stays as the degradation tail — preference-outer, chain-inner, exactly as today. If the user cannot afford the routed model right now (`engine.affordable`), selection proceeds down the list as it would for any exhausted rung; the escalation simply does not happen. Without per-user limits, the routed model's own `fallback` chain applies.
+**Verdict** `{ models: string[], thinkingLevel?: string, skills: string[], tailFiles: string[], task: string | "other" }`:
+- `models` = `tasks[task].models` when `task ≠ other` and `confidence ≥ min_confidence`; else `difficulty.models[round(score)]` when configured and confident; else empty.
+  - `models` is a **per-task preference cascade**: an ordered list of `[models.*]` keys. `model = "x"` is shorthand for `models = ["x"]`.
+  - It is applied **as configured**: there is no ranking check (constraint 5, revised), because the operator decides which models suit which task.
+- **Selection with a routed cascade** (owner decision, 2026-10-04):
+  - The cascade is tried in order, and each entry goes through exactly the affordability and health checks normal selection applies to a preference-list entry: `engine.affordable` under per-user limits, preference-outer, chain-inner.
+  - The first entry that passes heads the session.
+  - When **every** cascade entry is exhausted, selection proceeds **as if the router had picked nothing**: the user's normal preference list (or the session type's default chain) is tried exactly as today.
+  - So the effective order is `cascade ++ normal selection`. A routed task can never leave a user with less than they would have had without routing.
+  - Without per-user limits, the cascade's entries (each with its own `fallback` chain) are tried before the default chain the same way.
+- `thinkingLevel` = `tasks[task].thinking_level` (or `difficulty.thinking_levels[round(score)]`) under the same confidence rule, applied **as configured** to the member that heads the session. Effort is a per-task knob for deployments whose best model is already the default: the session keeps its model, persona and cache lineage and only changes effort. A member whose `reasoning` is false, or whose `thinking_level_map` has no entry for the level, ignores it. Fallback members keep their own levels.
 - `skills` are preloaded through the dynamic-tool registry (`registry.load(matches)`) so their tools are in `initialState.tools`, and each body is rendered in the **final user turn** as `<preloaded_skill name="…">…</preloaded_skill>` immediately before `<tail_instructions>`. The final turn is already volatile per session, so this costs the prompt cache nothing; putting bodies in the system prompt would break the cross-session stable prefix. (Open: whether to instead seed the transcript with a synthetic `load_skill` call/result pair so the model sees the load as its own action; the satellite render is simpler and cache-identical, and is the recommendation.)
 - `tailFiles` are appended to `<tail_instructions>` after `TAIL.md`. This is the first step toward **tailored instructions**: an operator splits task-specific guidance out of the always-on tail into per-task files, so a routed session sees fewer, more specific instructions and every other session sees a shorter tail. A later revision may add conditional sections inside one file (`<when task="creative_writing">…</when>`); per-task files need no parser and are recommended for v1.
 
@@ -449,10 +455,11 @@ Each point states: **when** it runs (the trigger condition is always a cheap mec
 Today's chain (`handleInbound`, after edit/self-echo/gap-freeze handling, the activation gate, and `router.route`): reply to a running session → steer (`steerReplyToActiveSession`); quick same-sender follow-up → fold (`foldFollowUp`: steer/park/resume); no trigger → stop; bot-chain cap (`botChainCapGate`, multi-agent); shared reply-target → coalesce (`coalesceCoTargetReply`); accept/claim; reply to a completed session → resume gate (`evaluateResumeGate`: same-user, window, capability, work gate); else fresh (`launchSession`). It is all reply-target and same-sender rules, and it mostly needs an explicit reply. The gap the owner wants closed: a follow-up that is *not* a reply and *not* quick — a fresh `@` thirty seconds later, or a bare "and what about X?" from the same person — starts an amnesiac session.
 
 **When.** A message reaches this point only when there is something to continue: at least one **running** session in the timeline, or at least one **completed** session younger than `continuation.window_ms` that is resume-eligible on the mechanical gates (row `completed`, generation current, context below ceiling, not a synthetic type). The message must be one of:
-- a trigger-bearing message that is **not** an explicit reply to a bot message (explicit replies keep their existing paths: they are an address, not a guess), or
+- an **explicit reply to a bot message of a completed session** (owner decision 2026-10-04: explicit replies are judged too; the work gate still applies first, see Verdict). Explicit replies to a *running* session keep the existing steer path. Or:
+- a trigger-bearing message that is **not** an explicit reply, or
 - when `untriggered_senders = "recent"`: an *untriggered* group message from a sender who triggered, or was the reply target of, one of the candidate sessions. Everything else stays inert, which bounds cost to "people who were just talking to the bot".
 
-Existing precedence stays ahead of it: `steerReplyToActiveSession` and `coalesceCoTargetReply` run first (explicit reply shapes). Follow-up folding's *quick* windows also run first; this point is the slow, context-judged extension of the same idea and takes over where the fold's clocks give up.
+Existing precedence stays ahead of it: `steerReplyToActiveSession` (explicit reply to a running session) and `coalesceCoTargetReply` run first. For an explicit reply to a completed session, this point replaces the decision part of `evaluateResumeGate`. Follow-up folding's *quick* windows also run first; this point is the slow, context-judged extension of the same idea and takes over where the fold's clocks give up.
 
 **State.**
 ```json
@@ -464,7 +471,11 @@ Existing precedence stays ahead of it: `steerReplyToActiveSession` and `coalesce
 ```
 **Questions.** `target` — `choice` over candidate ids (each described by its `asked`/`last_reply`) plus `new: "A new request unrelated to the candidates."` and, for untriggered messages, `not_for_bot: "The message is not directed at the bot and continues nothing of its."`; `is_followup` — `noul` "The message continues, corrects, or asks about the candidate's exchange."
 
-**Verdict.** `target = running id` → steer as an `<interjection>` (the existing path, image-capable); `target = completed id` → resume via `runResumeSession` with the **decision gate**: the mechanical checks above, the CAS, and material viability — the *work gate*, `same_user_only`, and the time window are replaced by the model's judgment (the owner's point: whether this is a follow-up is a question about the *conversation*, not about the rollout's tool calls); `new` → the normal fresh path; `not_for_bot` → inert. Confidence below `min_confidence` → heuristic.
+**Verdict.** `target = running id` → steer as an `<interjection>` (the existing path, image-capable); `target = completed id` → resume via `runResumeSession` with the **decision gate**:
+- The mechanical checks above, the CAS, material viability, and the **work gate** stay mandatory for every resume. A completed session that fails the work gate is never a candidate, because its conversation is already in the shared chat context and resuming it would only add cost. (Owner decision 2026-10-04, for explicit replies and non-reply follow-ups alike.)
+- `same_user_only` and the time window are **replaced by the model's judgment**: whether this is a follow-up is a question about the conversation. **Any participant may resume a session**, not only the user who started it. Per-user billing follows the resuming message's sender, as for any session.
+
+`new` → the normal fresh path; `not_for_bot` → inert. Confidence below `min_confidence` → heuristic (today's chain, including `same_user_only` and the window).
 
 Explicitly kept: the **capability gate** (persisted `context_tokens` below the ceiling). A long browser session near its ceiling is never resumed, decision or not, until rollout compaction exists.
 
@@ -492,7 +503,7 @@ The current scheduler wakes at random times inside a quota-derived cadence, chec
 
 **Structured kickoff.** The proactive launch is unchanged (`launchSession(inbound, false, { proactive: true })`, synthetic inbound, `proactive.session_type`, typing suppressed) except that the kickoff is rendered from `[decisions.presence].kickoff_prompt` with `{time}`, `{reason}` (the chosen reason's label), `{targets}` (the `target` id with a short quote, plus the runner-up when its probability is within 0.2), and `{addressed}` (a sentence when the addressed threshold fired). The default template inverts today's framing: *"It is {time}. You were not mentioned, but this looks like a good moment to join: {reason}. The most relevant messages are {targets}. Reply as a participant, briefly, in one message — or output NO_REPLY if on reading it you have nothing to add."* `NO_REPLY` stays available and the session type's `session_instruction` (length rules) stays as is. The `target` id lets the session `send_message` with `reply_to_id` when a reply is the natural shape.
 
-**Per-user billing enhancement (optional, later).** When `addressed` fires and `target` names a message, the launched session can be attributed to that message's sender for per-user limits, turning "proactive" into an ordinary reply for accounting. Not in v1: the session is billed to the proactive session type as today.
+**Billing an addressed launch** (owner decision 2026-10-04, v1): when `addressed` fires and `target` names a message, the launched session is attributed to that message's sender for per-user limits, like an ordinary reply. That also stops someone from farming the bot by talking to it without mentions. Launches on `join` alone are billed to the proactive session type as today. **Quota** (owner decision): `daily_posts` keeps counting every unprompted session, `NO_REPLY` included, so it bounds spend as well as volume.
 
 **Heuristic.** When the point is disabled or the model is unavailable, the scheduler runs today's cadence (`computeNextAttempt` + `evaluateGate` + today's `proactive.kickoff_prompt`), automatically. The two modes share the quota counter and the launch path, so switching between them mid-day is safe.
 
@@ -621,13 +632,15 @@ Revised for revision 2: with the availability risk gone, the foundation ships to
 
 Each phase is independently switchable per point.
 
-## 7. Open questions for the owner
+## 7. Owner decisions (2026-10-04)
 
-1. **Escalation-only enforcement.** The spec enforces "never route to a model later in the preference order than the default" (and, for effort, "never route to a lower thinking level"). Is the preference order reliably the quality order in every deployment, or should the rule be config-declared (`[decisions.routing].escalation_order = [...]`)?
-2. **Skill preload placement.** Satellite render (recommended) vs a synthetic `load_skill` call/result in the transcript.
-3. **Continuation for explicit replies.** Explicit replies to bot messages keep the existing resume gate (work gate included). Should the decision model also be allowed to *override* the work gate for an explicit reply when it judges the reply a follow-up, or is the work gate authoritative there?
-4. **Presence quota semantics.** `daily_posts` keeps counting `NO_REPLY` sessions. With the evaluator filtering attempts, is a *sent-only* quota preferable?
-5. **Who pays for an `addressed` launch.** v1 bills the proactive type; the enhancement bills the addressed message's sender. Default for v2?
+All open questions are resolved:
+
+1. **Routing to models.** No ranking or "escalation-only" check: different models are better at different tasks, and the operator configures which. Each task may name a **preference cascade**. Each entry is checked for affordability as normal, and once the cascade is exhausted, selection proceeds as if routing had picked nothing (§5.1).
+2. **Skill preload placement.** Satellite render in the final user turn, next to `<tail_instructions>`.
+3. **Continuation and resume.** The work gate stays mandatory for every resume. Beyond it, the decision model decides (replacing `same_user_only` and the time window), for explicit replies to completed sessions as well as non-reply follow-ups. Any participant may resume a session (§5.2).
+4. **Presence quota.** `daily_posts` keeps counting every unprompted session.
+5. **Addressed launches** are billed to the addressed message's sender (§5.3).
 
 Resolved in revision 2 without an owner decision: *decision budget exhaustion* (formerly question 6). At $0.04–0.24 per million input tokens a reserved slice for routing is not worth its configuration surface; on the daily cap every point falls back for the rest of the window, and the cap is sized so that this does not happen in normal operation.
 
