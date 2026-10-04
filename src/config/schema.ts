@@ -1045,19 +1045,6 @@ const DecisionRoutingSchema = StrictObject({
   difficulty: Type.Optional(RoutingDifficultySchema),
 });
 
-const DecisionContinuationSchema = StrictObject({
-  ...DecisionPointCommonFields,
-  // Completed sessions younger than this are continuation candidates. Default 30 min.
-  window_ms: Type.Optional(Type.Integer({ minimum: 1000 })),
-  // "recent": offer untriggered messages from recent HUMAN participants of a
-  // candidate session to the point; "none" (default): triggers only.
-  untriggered_senders: Type.Optional(Type.Union([Type.Literal("recent"), Type.Literal("none")])),
-  // Messages around the evaluated one carried as context. Default 6.
-  context_messages: Type.Optional(Type.Integer({ minimum: 0, maximum: 30 })),
-  // Most candidate sessions offered to the model. Default 4.
-  max_candidates: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
-});
-
 const DecisionsSchema = StrictObject({
   // Master switch. Off (default) = no decision model is ever called and every
   // point behaves exactly as without this feature.
@@ -1077,7 +1064,6 @@ const DecisionsSchema = StrictObject({
   // ("min_confidence") overrides it for every point, "<point>.<name>" for one.
   calibration: Type.Optional(Type.Record(Type.String(), Type.Record(Type.String(), Type.Number({ minimum: 0, maximum: 1 })))),
   routing: Type.Optional(DecisionRoutingSchema),
-  continuation: Type.Optional(DecisionContinuationSchema),
 });
 
 const AgentModelsSchema = StrictObject({

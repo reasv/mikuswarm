@@ -42,13 +42,3 @@ export {
   type RoutingInput,
   type RoutingVerdict,
 } from "./points/routing.js";
-export {
-  CONTINUATION_NEW,
-  CONTINUATION_NOT_FOR_BOT,
-  candidateKey,
-  continuationMessageFrom,
-  continuationPoint,
-  type ContinuationCandidate,
-  type ContinuationInput,
-  type ContinuationVerdict,
-} from "./points/continuation.js";

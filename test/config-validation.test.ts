@@ -1263,9 +1263,6 @@ enabled = true
 [decisions.routing.tasks.coding]
 description = "Writing or fixing code."
 skills = ["shell"]
-[decisions.continuation]
-enabled = false
-untriggered_senders = "recent"
 
 [[limits]]
 name = "decisions-daily"

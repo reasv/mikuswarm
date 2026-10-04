@@ -64,10 +64,10 @@ coalesce_window_ms = 60000
 # delegations bypass this — it gates human replies only.
 same_user_only = true
 
-# Resume is on by default per context; set false to disable it there (§14).
+# Resume is off by default (§7, SESSION-RECORDS); set true to enable per context.
 [agent.sessions.resume.enabled]
-dm = true
-group = true
+dm = false
+group = false
 
 # Resume time window (§7), per context. A reply more than this many ms after the
 # session completed starts a fresh session. 0 or -1 = unlimited.

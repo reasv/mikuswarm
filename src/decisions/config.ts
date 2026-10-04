@@ -16,8 +16,8 @@ export const DEFAULT_TIMEOUT_MS = 3000;
 export const DEFAULT_MIN_CONFIDENCE = 0.6;
 export const DEFAULT_STATE_MAX_TOKENS = 8000;
 
-export type DecisionPointName = "routing" | "continuation";
-export const DECISION_POINT_NAMES: readonly DecisionPointName[] = ["routing", "continuation"];
+export type DecisionPointName = "routing";
+export const DECISION_POINT_NAMES: readonly DecisionPointName[] = ["routing"];
 
 export function isDecisionModel(model: ModelConfig | undefined): boolean {
   return model?.api === DECISION_API;

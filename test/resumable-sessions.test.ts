@@ -938,8 +938,8 @@ test("group reply to a NON-bot message: resolver declines → no trigger (still 
   assert.equal(triggerBearing(deliveries).length, 0, "an unresolved reply target never becomes a trigger");
 });
 
-test("group reply when resume is disabled (resolver returns undefined): no trigger", async () => {
-  // Mirrors `enabled.group !== true`: the app-side resolver short-circuits to undefined.
+test("group reply when resolver returns undefined (e.g. target not a bot message): no trigger", async () => {
+  // Resolver declines (e.g. the reply target is not a bot message) → no trigger emitted.
   const { deliveries, drive } = holdHarness({ resolveReplyTrigger: () => undefined });
   drive(nativeReply({ eventId: "$reply", body: "hello again", replyToId: "$bot-msg" }));
   await new Promise((r) => setTimeout(r, SETTLE_MS));
