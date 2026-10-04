@@ -11,9 +11,9 @@ Revision 3 replaces revision 2's assumption that "same API means drop-in" with m
 
 - **Different models for different purposes** (§3.7). Each decision point names its own model chain (and vision chain), defaulting to the global one. The measured landscape has no single best model:
   - Jev is the strongest general text decider.
-  - Clef-flash and the Perplexity Decider are the vision routes.
+  - Clef-flash and the Perplexity Decider are the vision routes (only Perplexity has ZDR today).
   - Perplexity (to ~250k tokens) and Solar (to 500k+) are the only long-context routes.
-  - Span-01 is a cheap, fast judge of assistant replies.
+  - Span-01 is a cheap, fast judge of assistant replies (no ZDR today).
 - **Per-member capability declarations grow** (§3.6):
   - Question types and limits.
   - Accepted state shapes: Span-01 takes only a string or an `{input, output}` conversation.
@@ -84,9 +84,9 @@ Facts the design depends on (TypeSafe and OpenRouter docs, plus the measurements
   - Questions per request: ≤64 on Clef.
   - Span-01 answers only `noul` with plain-string instructions, over a string or an `{input, output}` conversation state.
   - Effective state: Jev ~32k (clean 400 above), Liquid D1 ~64k (clean 422), Perplexity 262k (clean 400), Solar 500k+, hosted Kev ~8k.
-  - **Clef and Clef-flash silently truncate state to its first ~2.2k tokens** on OpenRouter despite a 64k listing. **Span-01's fact lookup fails above ~0.5–2k tokens** while still billing the whole state.
+  - **The hosted Clef / Clef-flash route silently truncates state to its first ~2.2k tokens** on OpenRouter despite a 64k listing. This is a serving configuration: the open weights have a far larger window. **Span-01's fact lookup fails above ~0.5–2k tokens** while still billing the whole state.
   - Errors: `429`/`503`/`529` with backoff; `400`/`413`/`422` on a malformed or oversized request; `402` on credit exhaustion.
-- **Cost**: output is free everywhere; input runs from free to $0.24/M (Clef). Jev, Kev, and Span-01 bill the state **once per request**. D1, Clef, Perplexity, Tev1, and Solar bill it **once per question**, so 3 questions over an 8.6k-token state cost $0.00036 on Jev and $0.0009–0.0013 on the per-question routes (*measured*).
+- **Cost**: output is free everywhere; input runs from free to $0.24/M (Clef). Only Jev, Kev, and Span-01 bill the state **once per request**. Everything else bills it **once per question** (D1, Clef, Mercury, Perplexity, Tev1, Solar), because those models run a generative backbone with each question as its own prompt over the shared state, so 3 questions over an 8.6k-token state cost $0.00036 on Jev and $0.0009–0.0013 on the per-question routes (*measured*).
 - **Latency** (*measured*, sequential, p50):
   - About 0.3–0.5 s for Jev, Perplexity, Span-01, Clef-flash, Mercury, and Tev1 on small-to-8k states; 0.5–1.2 s for Clef, D1, and Kev.
   - **Solar takes ~14.6 s once the state reaches ~2k tokens.**
@@ -94,6 +94,7 @@ Facts the design depends on (TypeSafe and OpenRouter docs, plus the measurements
   - Realistic JPEGs (43–65 KB) answer in 0.36–0.72 s on the three vision routes.
   - Cloudflare's route rejects large base64 payloads (a 1 MB PNG counted as ~262k tokens), so images are always downscaled and JPEG-encoded first.
 - **Rate limits** (*measured*): OpenRouter's free tier allows 20 requests/minute **per key across all `:free` models** and answers the 21st with a 429 carrying `X-RateLimit-*` headers; Perplexity's provider returns 429 on bursts above ~8–10 concurrent requests.
+- **Data retention** (*measured*): ZDR endpoints exist for Jev, Perplexity, D1, Solar, Tev1, and Kev; **not** for Clef, Clef-flash, Span-01/Lite, or the free Mercury route (survey §0).
 - **Version pinning**: `jev-latest` silently moves; pin the versioned id in config and log the dated id from the response.
 - **Images** (vision-capable models only). Through OpenRouter, images travel **inside `state`** as OpenAI-style content parts: `state = [ { type: "text", text: … }, { type: "image_url", image_url: { url: "data:image/png;base64,…" } } ]`. Verified 2026-10-04 on Clef, Clef-flash, and the Perplexity Decider (a red and a green test square each answered correctly with confidence above 0.95). Cloudflare's native API instead takes a top-level `images` array (max 4 images, 4 MiB / 16 MP each); **OpenRouter silently drops that field** (red and green squares got byte-identical answers and token counts). A text-only model given an image part (Jev) does not error: it answers anyway with low confidence and a guessed verdict. So the harness must never send image parts to a member that does not declare image input (§3.5).
 - **Documented weaknesses** that shape every state builder below (stated for Jev; assume they hold for the alternatives until measured): instructions are read literally (avoid negations and implied conditions); it cannot count or do date arithmetic (every count and elapsed time is a precomputed field, never inferred from timestamps); accuracy degrades with irrelevant material in the state (keep state small and tailored); it has no adversarial hardening (chat text is user-controlled state, so a question must be phrased so that an injected "reply now" costs at most one session, never a wrong hard action); no multi-hop reasoning; English is strongest. Published comparisons put Clef ahead on classification/routing-style tasks and Jev ahead on reasoning-heavy ones; neither is measured on chat-presence judgments, which is why the evaluation log records the served member.
@@ -275,7 +276,9 @@ model = "decider_long"           # e.g. Perplexity → Solar: whole rollouts, la
 
 Resolution: `[decisions.<point>].model` → `[decisions].model`; `[decisions.<point>].vision_model` → `[decisions].vision_model`. Per-agent overrides (§4) apply on top. Fits (§3.6) still govern each member, so a point pointed at a judge chain with a `choice` question simply skips the judge member.
 
-Reference mapping, from the measurements (deployments choose freely; nothing in code assumes a vendor):
+**Data retention is a filter on chains, not a point setting.** A deployment that requires zero data retention sets `openrouter_routing = { zdr = true }` (§3.2) on every decision member and lists only members that have a ZDR endpoint (survey §0: today Jev, Perplexity, D1, Solar, Tev1, Kev; not Clef, Span-01 or the free routes). A ZDR-filtered request to a member without one returns 404 "No endpoints found matching your data policy". The client treats that as a **configuration failure of that member**: it is not a health strike, it is not retried, and it is logged as an error once per member. The chain moves to the next member, so a misconfigured member never silently becomes the source of every verdict.
+
+Reference mapping, from the measurements (deployments choose freely; nothing in code assumes a vendor). With a ZDR requirement, the chains reduce to: general Jev → Perplexity → D1; vision Perplexity (the only ZDR vision route today); judge Jev; long state Perplexity → Solar.
 
 | point | wants | sensible chain |
 |---|---|---|
@@ -286,7 +289,7 @@ Reference mapping, from the measurements (deployments choose freely; nothing in 
 | transcript audit, future summary pre-expansion | 50k–250k state, background | Perplexity → Solar |
 | self-hosted | local GPU, Jev contract | Kev (text), Clef-flash weights (vision) |
 
-Routes to avoid in chains: Solar on any hot path (~14.6 s at 2k tokens); anything `:free` (shared 20/min key limit); hosted Kev and Tev1 (weaker calibration, low option/context limits).
+Routes to avoid in chains: Solar on any hot path (~14.6 s at 2k tokens); hosted Kev and Tev1 (weaker calibration, low option/context limits). Free routes share a 20/minute key-wide limit, which rate-limit isolation (§3.1) contains.
 
 ### 3.8 Judge-shaped state
 

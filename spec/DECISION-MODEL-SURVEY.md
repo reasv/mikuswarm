@@ -14,6 +14,16 @@
 
 Models: `typesafe/jev-1.13`, `cloudflare/clef`, `cloudflare/clef-flash`, `perplexity/pplx-decider-v1-27b`, `liquid/d1`, `upstage/solar-decide`, `togethercomputer/tev1-4b-experimental`, `inception/mercury-decide:free`, `respan/span-01`, `respan/span-01-lite`, `jaredpalmer/kev-4b`.
 
+## 0. Data retention (measured): which routes are ZDR
+
+Checked against OpenRouter's ZDR endpoint list (`GET /api/v1/endpoints/zdr`) and live with `provider: { zdr: true }`. Non-ZDR routes answer 404 "No endpoints found matching your data policy (Zero data retention)".
+
+| ZDR available | no ZDR endpoint (2026-10-04) |
+|---|---|
+| Jev 1.13 (TypeSafe), Perplexity Decider 27B (Perplexity), Liquid D1 (Liquid), Solar Decide (Upstage), Tev1 (Together), Kev 4B (SiliconFlow) | Clef, Clef-flash (Cloudflare), Span-01, Span-01 Lite (Respan), Mercury Decide free (Inception) |
+
+For a deployment that requires ZDR, this is the first filter, and everything below should be read through it. It removes the only judge model (Span-01) and two of the three vision routes. **The Perplexity Decider is the one ZDR vision route today.** Clef's weights are open (Apache 2.0), so ZDR hosting from other providers is a matter of time; the same is true of anything self-hosted.
+
 ## 1. Capabilities (measured)
 
 | model | question types | max choice options | max questions | score levels | state shapes | images |
@@ -43,7 +53,7 @@ Notes:
 | model | advertised | measured behaviour |
 |---|---|---|
 | Jev | 32k | Clean 400 `max_tokens_exceeded` past ~32k real tokens. Needle found at all positions up to the limit. |
-| Clef / Clef-flash | 64k | **Silent head truncation at ~2.2k tokens of state.** Reported `input_tokens` is constant (2,198 for one question) for any larger state. A needle in the first ~1.6k tokens is found (0.98); one later is missed (0.02–0.05). Same for string and object state. The open weights default to 16k *(documented)*, so this is a serving limit of the hosted route. |
+| Clef / Clef-flash | 64k | **The hosted route silently truncates state to its first ~2.2k tokens.** This is a serving configuration, not the model: the weights are a Qwen 3.8 27B / 3.5 9B fine-tune with a far larger native window. OpenRouter drops unknown request fields, so it cannot be raised from the client. Other hosts of the open weights will behave differently. Details: Reported `input_tokens` is constant (2,198 for one question) for any larger state. A needle in the first ~1.6k tokens is found (0.98); one later is missed (0.02–0.05). Same for string and object state. The open weights default to 16k *(documented)*, so this is a serving limit of the hosted route. |
 | Perplexity Decider | 262,144 | Needle found at 5/50/95% at ~180k real tokens (13 s). Clean 400 past 262,144. |
 | Liquid D1 | 64k | Fine at ~39k. Clean 422 ("prompt for question … is over the model's limit") at ~78k. |
 | Solar Decide | 512k | Needle found at ~276k real tokens, but 12–17 s per call. |
@@ -52,12 +62,15 @@ Notes:
 | Span-01 | not stated | **Effective fact lookup collapses between ~0.5k and ~2.3k tokens.** It answers a flat 0.016 for any question on longer text, at any position, and is still billed for the whole state. |
 | Kev 4B (hosted) | 8k | Rejects states of ~8.5k tokens and more ("parameter is invalid"). The 4B weights are validated to 8k *(documented)*. |
 
-### Billing: per request or per question
+### Billing: which routes bill the state once
 
-Reported `input_tokens` shows two billing models. This matters for wide fan-outs such as retrieval re-ranking.
+Most of these models are a generative LLM backbone that evaluates each question as its own prompt over the shared state, batched in parallel. Unsurprisingly, they bill the state once per question. The interesting set is the routes that bill it **once per request**, measured as the marginal tokens per extra question on a 50-token state (16 to 128 questions):
 
-- **State billed once per request**: Jev (~23 tokens per extra question), Kev (~20), Span-01 (~23).
-- **State billed once per question**: D1, Clef, Perplexity, Tev1, Solar. Each question re-bills the whole state: ~74–436 tokens per extra question on a 50-token state; ~25k tokens for 3 questions over an 8.6k state.
+| bills state once per request | bills state once per question |
+|---|---|
+| **Jev** ~20 tokens/question (ZDR), **Kev** ~19 (ZDR), **Span-01 / Lite** ~23 (no ZDR) | D1 ~74, Clef / Clef-flash ~90, Mercury ~100, Perplexity ~149, Tev1 ~153, Solar ~436 |
+
+Among ZDR routes, only Jev and Kev bill the state once. With 3 questions over an 8.6k state, the per-question routes report ~22–26k input tokens against Jev's 8.7k (table below). This matters for wide fan-outs such as retrieval re-ranking and audits.
 
 | 8.6k-token state, 3 questions | input tokens | cost |
 |---|---|---|
@@ -116,7 +129,7 @@ Published comparisons *(documented, vendor-run)*:
 
 ## 5. Rate limits (measured)
 
-- **OpenRouter free tier: 20 requests/minute per key across `:free` models.** The 21st request returns 429 with `X-RateLimit-Limit: 20`, `X-RateLimit-Remaining: 0`, `X-RateLimit-Reset: <epoch ms>` and `limit_source: openrouter_free_tier_per_minute`. Paid routes showed no such limit at the same volume (26 sequential requests in 10 s). Free routes are unsuitable as anything but a curiosity, and **any client or gateway that scopes this 429 to the whole endpoint will stall paid traffic.** Rate-limit state must be scoped per model.
+- **OpenRouter free tier: 20 requests/minute per key across `:free` models.** The 21st request returns 429 with `X-RateLimit-Limit: 20`, `X-RateLimit-Remaining: 0`, `X-RateLimit-Reset: <epoch ms>` and `limit_source: openrouter_free_tier_per_minute`. Paid routes showed no such limit at the same volume (26 sequential requests in 10 s). 20/minute may well exceed a single bot's decision volume. The real hazard is a client or gateway that scopes this 429 to the whole endpoint and so stalls paid traffic. Rate-limit state must be scoped per model.
 - **Perplexity** returned its own 429 ("Request rate limit exceeded") on bursts above ~8–10 concurrent requests.
 - Span-01 Lite has a daily cap *(documented)*.
 
@@ -151,6 +164,18 @@ Published comparisons *(documented, vendor-run)*:
 
 ## 7. What each is good for
 
+Under a ZDR requirement (§0), the usable set today is Jev, Perplexity, D1, Solar, Tev1 and Kev:
+
+| role (ZDR only) | chain | notes |
+|---|---|---|
+| general hot-path decisions | Jev → Perplexity → D1 | |
+| image-bearing decisions | Perplexity | the only ZDR vision route; add Clef once a ZDR host exists |
+| judging an assistant reply | Jev | Span-01 has no ZDR endpoint |
+| long state | Perplexity → Solar | |
+| self-hosted | Kev, Clef-flash weights | |
+
+Without the ZDR filter:
+
 | role | best fits (measured) | why |
 |---|---|---|
 | General hot-path decisions (routing, continuation, presence, dedup) | **Jev**, then Clef-flash / Perplexity / D1 as fallbacks | Top-tier accuracy, ~0.35–0.5 s, state billed once, honest limits. Clef-flash only if the state fits in ~2k tokens. |
@@ -158,4 +183,4 @@ Published comparisons *(documented, vendor-run)*:
 | Long state (whole session transcripts, many retrieved passages, summary trees) | **Perplexity** (to ~250k, ~13 s at 180k), **Solar** (to 500k+, 12–17 s, ≤26 options) | The only routes that use more than 64k. Background work only, and per-question billing argues for few questions over a big state. |
 | Judging an assistant reply (style gate, duplicate check, refusal/ism audit) | **Span-01** (≤ ~0.5–2k tokens, $0.02/M, ~0.33 s), Jev | Native `{input, output}` shape, perfect on the judge set, cheapest paid route. Only usable with short context and `noul` questions. |
 | Self-hosted / local | **Kev** (text), **Clef-flash** weights (vision) | Open weights, standard serving, Jev contract. |
-| Avoid for production | Solar on the hot path (14 s at 2k tokens), Tev1 (≤20 options, weaker), hosted Kev (8k cap, weaker), anything `:free` (shared 20/min key limit) | |
+| Avoid for production | Solar on the hot path (14 s at 2k tokens), Tev1 (≤20 options, weaker), hosted Kev (8k cap, weaker) | Free routes work (Mercury free answered in 0.36 s p50) but have no ZDR and a shared 20/min key limit. |
