@@ -629,7 +629,13 @@ export type FetchAttemptOutcome<T> =
   /** Environmental (5xx/timeout/reset/empty) — feeds the streak, falls over to the next member. */
   | { ok: false; kind: "environmental"; status?: number; retryAfterMs?: number; error: unknown }
   /** Content/fatal (4xx-from-this-request, bad input) — NEVER triggers fallback (§9); rethrown. */
-  | { ok: false; kind: "content"; status?: number; error: unknown };
+  | { ok: false; kind: "content"; status?: number; error: unknown }
+  /**
+   * Configuration failure of THIS member (e.g. a data-policy filter no endpoint of
+   * it satisfies): neutral for health and throttling (not evidence the model is
+   * unwell, not budget pressure), and falls over to the next member.
+   */
+  | { ok: false; kind: "skip"; status?: number; error: unknown };
 
 export interface RunFetchFallbackOptions {
   consumer: string;
@@ -652,6 +658,21 @@ export interface RunFetchFallbackOptions {
    * Plumbed through for API completeness and future use.
    */
   observedContextTokens?: number;
+  /**
+   * Per-call member filter (decision-model fits, ARCHITECTURE.md §8h). Unlike
+   * `capability` it may drop the head too: a member that cannot serve THIS
+   * request is never attempted. When it leaves no member, the call throws a
+   * {@link NoFittingMemberError} without attempting anything.
+   */
+  memberFilter?: (member: FetchChainMember) => boolean;
+}
+
+/** Thrown by {@link runFetchWithFallback} when `memberFilter` rejects every member. */
+export class NoFittingMemberError extends Error {
+  constructor(consumer: string) {
+    super(`${consumer}: no chain member fits this request`);
+    this.name = "NoFittingMemberError";
+  }
 }
 
 /** Build the per-member runtime (capability-filtered, head retained) from a chain. */
@@ -689,7 +710,9 @@ export async function runFetchWithFallback<T>(
   options: RunFetchFallbackOptions,
   attempt: (member: FetchChainMember) => Promise<FetchAttemptOutcome<T>>,
 ): Promise<T> {
-  const members = buildFetchChain(chain, options.capability);
+  const built = buildFetchChain(chain, options.capability);
+  const members = options.memberFilter ? built.filter(options.memberFilter) : built;
+  if (members.length === 0) throw new NoFittingMemberError(options.consumer);
   const scheduler = options.scheduler;
   // Each member is attempted AT MOST ONCE per call (the consumer's own retry layer
   // re-drives across calls, by which point §8a health has shifted). An
@@ -760,6 +783,14 @@ export async function runFetchWithFallback<T>(
       scheduler?.noteOutcome(member.group, member.healthKey, "content", outcome.status);
       release?.();
       throw outcome.error;
+    }
+    if (outcome.kind === "skip") {
+      // Neutral for both axes (a configuration failure of this member, not a
+      // health or budget signal); move on to the next member.
+      scheduler?.noteOutcome(member.group, member.healthKey, "content", outcome.status);
+      release?.();
+      lastError = outcome.error;
+      continue;
     }
     scheduler?.noteOutcome(
       member.group,

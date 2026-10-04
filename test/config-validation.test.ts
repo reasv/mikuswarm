@@ -1235,3 +1235,67 @@ max_tokens = 1024
     );
   });
 });
+
+test("config: a system-one decision model, [decisions] and a decision limit class parse", async () => {
+  const toml = `${BASE_CONFIG}
+[models.decider]
+id = "vendor/decider-1"
+provider = "openrouter"
+api = "system-one"
+endpoint = "http://localhost/decisions"
+api_key = "k"
+input_modalities = ["text"]
+max_tokens = 1
+context_window = 32000
+compat = { openrouter_routing = { zdr = true } }
+[models.decider.decision]
+max_choice_options = 255
+max_questions = 128
+max_score_levels = 10
+state_budget_tokens = 30000
+billing = "per_request"
+
+[decisions]
+enabled = true
+model = "decider"
+[decisions.routing]
+enabled = true
+[decisions.routing.tasks.coding]
+description = "Writing or fixing code."
+skills = ["shell"]
+[decisions.continuation]
+enabled = false
+untriggered_senders = "recent"
+
+[[limits]]
+name = "decisions-daily"
+classes = ["decision"]
+max_usd = 1.5
+window = { type = "calendar", period = "day", tz = "UTC" }
+`;
+  await withConfigDir(toml, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    assert.equal(config.models.decider!.api, "system-one");
+    assert.equal(config.models.decider!.decision?.billing, "per_request");
+    assert.equal(config.decisions?.routing?.tasks?.coding?.skills?.[0], "shell");
+    assert.deepEqual(config.limits?.[0]?.classes, ["decision"]);
+  });
+});
+
+test("config: an unknown [models.*.decision] field is rejected", async () => {
+  const toml = `${BASE_CONFIG}
+[models.decider]
+id = "vendor/decider-1"
+provider = "openrouter"
+api = "system-one"
+endpoint = "http://localhost/decisions"
+api_key = "k"
+input_modalities = ["text"]
+max_tokens = 1
+[models.decider.decision]
+max_choices = 3
+`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(() => loadConfig(dir, { env: false }));
+  });
+});

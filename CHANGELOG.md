@@ -36,6 +36,18 @@ Unreleased section; it is not part of any release's notes.
 
 ### Added
 
+- **Decision models** (off by default): `[models.*]` blocks with `api = "system-one"` call a
+  decision model (TypeSafe Jev and drop-in alternatives, e.g. through OpenRouter's decisions
+  endpoint) with typed `choice`/`score`/`noul` questions. Chains fall back member to member
+  like any model; per-member `[models.*.decision]` limits (question types, option/level/question
+  counts, state budget, billing mode) skip members that cannot serve a request, and the state
+  is clamped to each member's budget. `compat.openrouter_routing` is sent as the request's
+  `provider` object (e.g. `{ zdr = true }`); a data-policy 404 skips that member without a
+  health strike. Each decision model gets its own rate-limit group, so its 429s never pause
+  chat. Spend is recorded as usage class `decision` (with OpenRouter's reported cost), billed
+  to the session's payee like a tool call, and `[[limits]].classes` accepts `"decision"`.
+  Every evaluation logs `decision_evaluated`. Configured under `[decisions]`, with per-agent
+  overrides in `[agents.<name>.decisions]`. See ARCHITECTURE.md §8h.
 - **OpenAI Responses API prefill**: `[models.<name>.prefill]` forces a required `analysis` argument on every tool call via strict JSON schema `pattern`, anchoring persona adherence on GPT-6 Sol/Luna. Includes `no_reply` tool, `drop_reasoning` option, and per-serving-member gating via `onPayload`. See spec/OPENAI-PREFILL.md.
 - **Captioning via OpenAI Responses API**: `[models.*]` with `api = "openai-responses"` can now serve as a caption model for images. Incomplete, refused, and unsupported-modality results are classified as content failures. (Port of MR !1 captioning code by contributor nopm.)
 

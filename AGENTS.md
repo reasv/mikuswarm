@@ -59,6 +59,7 @@ src/
   youtube/          YouTube video understanding: URL parser (url.ts), yt-dlp subprocess wrapper (ytdlp.ts), config resolution (config.ts), payload types and format helpers (payload.ts) (see ARCHITECTURE.md §7e)
   yotsuba/          4chan support: URL recognition (url.ts), API types + config resolver (types.ts), comment HTML→text (markup.ts), thread graph + helpers (graph.ts), post-view engine (view.ts), rendering vocabulary (format.ts), HTTP client with caching/pacing (client.ts) (see ARCHITECTURE.md §7f)
   net/              Shared HTTP utilities: PacedLimiter (paced-limiter.ts) — generic paced request limiter with interactive/background priority classes, extracted from and re-used by DanbooruRateLimiter
+  decisions/        Decision models: System-One client over the fallback chain, per-member fits, decision points + evaluate(), [decisions] config (see ARCHITECTURE.md §8h)
   budget/           Period cost limits: BudgetEngine + window math + [[limits]] normalization + zero-cost model collection; seeded from usage_events, six enforcement gates (see ARCHITECTURE.md §8e/§8f)
   agent/            Session factory, runner, manager; LLM request scheduler + retry/resume recovery (ARCHITECTURE.md §8/§8a)
   context/          Context builder, renderer, compaction

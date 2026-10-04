@@ -1103,7 +1103,7 @@ export interface ToolInvocationInput {
 }
 
 /** Consumer class of a {@link UsageEventRow} (spec USAGE-COST-LIMITS §3). */
-export type UsageEventClass = "agent_loop" | "tool" | "caption" | "embedding";
+export type UsageEventClass = "agent_loop" | "tool" | "caption" | "embedding" | "decision";
 
 /**
  * One billable event in the unified usage ledger (spec USAGE-COST-LIMITS §3).
@@ -4665,7 +4665,8 @@ export class Storage {
            left join (
              select agent_session_id, sum(cost_usd) as toolCost, count(*) as toolCalls
              from usage_events
-             where class = 'tool'
+             -- decision rows (§8h) ride the tool lane, keyed by tool_name = point name
+             where class in ('tool', 'decision')
              group by agent_session_id
            ) t on t.agent_session_id = s.id
            ${scope.sql ? `where${scope.sql.slice(4)}` : ""}
@@ -4677,7 +4678,7 @@ export class Storage {
   }
 
   /**
-   * Recent paid non-agent-loop events — tool / caption / embedding (spec §7.1
+   * Recent paid non-agent-loop events — tool / caption / embedding / decision (spec §7.1
    * table 6), newest first. Optionally scoped to an agent's account prefixes
    * (spec CONSOLE-MULTI-AGENT §9).
    */
@@ -4692,7 +4693,7 @@ export class Storage {
           `select e.*, coalesce(m.display_name, e.timeline_key) as channel_label
              from usage_events e
              left join room_metadata m on m.timeline_key = e.timeline_key
-             where e.class in ('tool', 'caption', 'embedding')${scope.sql}
+             where e.class in ('tool', 'caption', 'embedding', 'decision')${scope.sql}
              order by e.ts desc limit ?`,
         )
         .all(...scope.params, limit) as UsageEventRowWithChannel[];

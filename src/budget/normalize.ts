@@ -17,7 +17,7 @@ export interface RawLimitRule {
   window:
     | { type: "rolling"; duration: string }
     | { type: "calendar"; period: "day" | "week" | "month"; tz?: string };
-  classes?: ("agent_loop" | "tool" | "caption" | "embedding")[];
+  classes?: ("agent_loop" | "tool" | "caption" | "embedding" | "decision")[];
   session_types?: string[];
   tools?: string[];
   models?: string[];

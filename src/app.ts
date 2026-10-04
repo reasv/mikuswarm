@@ -59,6 +59,14 @@ import {
   type AgentSessionRecord,
   type ManualResumeResult,
 } from "./agent/index.js";
+import {
+  DECISION_POINT_NAMES,
+  DecisionClient,
+  DecisionEngine,
+  anyDecisionPointEnabled,
+  applyDecisionRateLimitGroups,
+  validateDecisionsConfig,
+} from "./decisions/index.js";
 import { attachSessionCapture, type SessionCaptureHandle } from "./agent/session-capture.js";
 import { buildAgentModelOverrides } from "./agent/agent-model-overrides.js";
 import { emptyUsageTotals } from "./agent/usage.js";
@@ -230,6 +238,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // `rate_limit_group` naming a group not declared in `[rate_limits.llm.*]` is a
   // typo; an UNSET group is fine (it means `default`), and `default` itself needs
   // no declaration (declaring it merely tunes it).
+  // Decision models get their own rate-limit group each (`decision:<key>`) unless
+  // they name one, so a decision 429 never pauses chat traffic (ARCHITECTURE.md §8h).
+  // Runs before the group validation and the scheduler, which then see them declared.
+  applyDecisionRateLimitGroups(config);
   const llmGroups = config.rate_limits?.llm ?? {};
   {
     const groupRefs: Array<{ group: string | undefined; source: string }> = [
@@ -273,6 +285,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // not at boot. Sweep the whole registry so EVERY `[models.*]` chain (incl.
   // unreferenced ones) is validated here too. Pure `resolveModelChain` calls.
   validateModelFallbackChains(config);
+  // Decision models (ARCHITECTURE.md §8h): system-one models only in [decisions],
+  // chains homogeneous, per-point models valid, routing tasks consistent.
+  validateDecisionsConfig(config, {
+    workspaceRootFor: (agentName) =>
+      agentName ? config.agents?.[agentName]?.workspace_root : config.workspace?.root_dir ?? "./workspaces/miku",
+    warn: (event, fields) => logger.warn(event, fields),
+  });
   // [fxtwitter.tool] cross-field sanity (same fail-fast convention): the
   // per-window default must fit under the per-window hard cap, which must fit
   // under the assembled-document cap — anything else is a config typo that
@@ -1771,6 +1790,38 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     }
   }
 
+  // Agent owning a timeline (null in legacy single-agent mode or when unresolvable).
+  const agentNameForTimeline = (timelineKey: string): string | null => {
+    if (agentWorkspaces.length === 0) return null;
+    const entry = resolveWorkspaceForTimeline(timelineKey);
+    if (!entry || entry.agentName === "__legacy__") return null;
+    return entry.agentName;
+  };
+  // Decision models (ARCHITECTURE.md §8h). Built only when some point can run, so a
+  // deployment without decision points never constructs a client.
+  const decisionEngine = anyDecisionPointEnabled(config)
+    ? new DecisionEngine({
+        config,
+        client: new DecisionClient({
+          models: config.models,
+          scheduler: llmScheduler,
+          logger: logger.child("decisions"),
+        }),
+        scheduler: llmScheduler,
+        budget: () => budgetHooks.engine,
+        record: (event) => budgetHooks.record?.(event),
+        logger: logger.child("decisions"),
+      })
+    : undefined;
+  if (decisionEngine) {
+    logger.info("decisions_active", {
+      model: config.decisions?.model,
+      agents: Object.keys(config.agents ?? {}).filter((agent) =>
+        DECISION_POINT_NAMES.some((point) => decisionEngine.isEnabled(point, agent)),
+      ),
+    });
+  }
+
   const factory = new AgentSessionFactory({
     config,
     contextBuilder,
@@ -2012,7 +2063,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // only, never tool usage of the same upstream model. The ledger reseed mirrors
       // this via the agent-loop-gated null-fallback in `usageCostClauses`. Background/
       // proactive lanes have no resolution entry and are skipped.
-      if (userLimitEngine && (event.class === "agent_loop" || event.class === "tool")) {
+      // A `decision` row (ARCHITECTURE.md §8h) is part of serving the session's payee
+      // and is metered exactly like a tool row: total + pools, never a sub-cap.
+      if (userLimitEngine && (event.class === "agent_loop" || event.class === "tool" || event.class === "decision")) {
         const entry = event.agentSessionId ? userLimitResolutions.get(event.agentSessionId) : undefined;
         if (entry) {
           // For an agent_loop event with an `entry` (the only branch that reaches
@@ -2022,7 +2075,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           // (where `coverageModel` is unused). No null-`requestedModelId` per-user
           // agent-loop case exists; the tail is defensive, not a real fallback.
           const coverageModel =
-            event.class === "tool"
+            event.class === "tool" || event.class === "decision"
               ? undefined
               : event.requestedModelId ?? event.logicalModelId ?? event.modelId;
           userLimitEngine.record(entry.resolution, coverageModel, event.costUsd);

@@ -514,6 +514,32 @@ const PrefillSchema = StrictObject({
   drop_reasoning: Type.Optional(Type.Boolean()),
 });
 
+const DecisionFitsSchema = StrictObject({
+  // Question types the member answers. Default: all three.
+  question_types: Type.Optional(Type.Array(Type.Union([
+    Type.Literal("choice"),
+    Type.Literal("score"),
+    Type.Literal("noul"),
+  ]), { minItems: 1 })),
+  // Most questions in one request. Unset = unlimited.
+  max_questions: Type.Optional(Type.Integer({ minimum: 1 })),
+  // Most options in one `choice` question. Unset = unlimited.
+  max_choice_options: Type.Optional(Type.Integer({ minimum: 2 })),
+  // Most levels in one `score` question. Unset = unlimited.
+  max_score_levels: Type.Optional(Type.Integer({ minimum: 2 })),
+  // "any" (default) or "text_or_conversation" for judge models that accept only
+  // a string or an `{input, output}` conversation as state.
+  state_shapes: Type.Optional(Type.Union([Type.Literal("any"), Type.Literal("text_or_conversation")])),
+  // The largest state (tokens) the member actually READS. Defaults to
+  // `context_window`; set lower for routes that truncate or degrade silently.
+  // The client clamps every state to this itself and never relies on provider
+  // truncation.
+  state_budget_tokens: Type.Optional(Type.Integer({ minimum: 1 })),
+  // "per_request" (default): the state is billed once per request.
+  // "per_question": the state is re-billed for every question.
+  billing: Type.Optional(Type.Union([Type.Literal("per_request"), Type.Literal("per_question")])),
+});
+
 const ModelSchema = StrictObject({
   // Model inheritance (spec MODEL-FALLBACK §2.1). When set, the named `[models.*]`
   // block is deep-merged UNDER this one (child fields win, everything else
@@ -545,6 +571,11 @@ const ModelSchema = StrictObject({
     Type.Literal("openai-completions"),
     Type.Literal("openai-responses"),
     Type.Literal("google-generative-ai"),
+    // A decision model (ARCHITECTURE.md §8h): typed answers over options the
+    // caller defines, served by a System-One-shaped decisions endpoint. Never a
+    // chat model: startup refuses it anywhere pi-ai would use it. `endpoint` is
+    // the FULL URL of the decisions route.
+    Type.Literal("system-one"),
   ])),
   endpoint: Type.String(),
   api_key: Type.String(),
@@ -679,6 +710,12 @@ const ModelSchema = StrictObject({
   // fallback can pin a tighter cap here so it returns to the primary sooner.
   // Unset = the global `recovery.llm_probe_backoff_max_ms`.
   llm_probe_backoff_max_ms: Type.Optional(Type.Number({ minimum: 1 })),
+  // Per-member capability limits of a `system-one` decision model
+  // (ARCHITECTURE.md §8h "Fits"). Models sharing the request body differ in what
+  // they accept and in how much state they actually read; a member whose limits a
+  // request exceeds is skipped (never sent the request). Only valid with
+  // api = "system-one".
+  decision: Type.Optional(DecisionFitsSchema),
   compat: Type.Optional(StrictObject({
     supports_cache_control_on_tools: Type.Optional(Type.Boolean()),
     supports_long_cache_retention: Type.Optional(Type.Boolean()),
@@ -912,6 +949,110 @@ const AgentModelsCaptioningSchema = StrictObject({
  * The override surface mirrors the global role-bearing keys so each knob is
  * discoverable by analogy (§2 design principle 3: per-role, mirroring global keys).
  */
+// --- Decision models (ARCHITECTURE.md §8h) ---
+// The same table shape serves the global `[decisions]` block and the per-agent
+// `[agents.<name>.decisions]` override (every field optional; an agent's tables
+// deep-merge over the global ones, except `routing.tasks`, which an agent
+// replaces wholesale). Cross-field validation lives in src/decisions/config.ts.
+const DecisionThinkingLevelSchema = Type.Union([
+  Type.Literal("off"),
+  Type.Literal("minimal"),
+  Type.Literal("low"),
+  Type.Literal("medium"),
+  Type.Literal("high"),
+  Type.Literal("xhigh"),
+]);
+
+const RoutingTaskSchema = StrictObject({
+  // What a request of this kind looks like. Becomes the option's criterion in
+  // the routing `task` question, so write it as a description of the request.
+  description: Type.String({ minLength: 1 }),
+  // Per-task model preference cascade: `[models.*]` keys (chat models) tried in
+  // order before normal selection. `model = "x"` is shorthand for `models = ["x"]`.
+  model: Type.Optional(Type.String({ minLength: 1 })),
+  models: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
+  // Thinking effort for the model that heads a session routed to this task.
+  thinking_level: Type.Optional(DecisionThinkingLevelSchema),
+  // Listed workspace skills preloaded for a session routed to this task.
+  skills: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  // Workspace-relative files appended to the tail instructions of a routed session.
+  tail_files: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+});
+
+const RoutingDifficultySchema = StrictObject({
+  // Ordered level descriptions, easiest first (a `score` question).
+  levels: Type.Array(Type.String({ minLength: 1 }), { minItems: 2 }),
+  // Level index ("0".."n-1") → model preference cascade. Only listed levels route.
+  models: Type.Optional(Type.Record(Type.String(), Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }))),
+  // Level index → thinking level for the session head.
+  thinking_levels: Type.Optional(Type.Record(Type.String(), DecisionThinkingLevelSchema)),
+});
+
+const DecisionPointCommonFields = {
+  // Point switch. A point runs only when both this and `[decisions].enabled` are true.
+  enabled: Type.Optional(Type.Boolean()),
+  // A `[models.*]` key with api = "system-one" (its fallback chain applies).
+  // Unset = `[decisions].model`.
+  model: Type.Optional(Type.String({ minLength: 1 })),
+  // Hard timeout for this point's evaluation. Unset = `[decisions].timeout_ms`.
+  timeout_ms: Type.Optional(Type.Integer({ minimum: 100 })),
+  // State cap (tokens). Clamped further to the serving member's state budget.
+  state_max_tokens: Type.Optional(Type.Integer({ minimum: 100 })),
+  // A member whose state budget is below this is skipped rather than fed a
+  // uselessly short window. Default 1000.
+  min_state_tokens: Type.Optional(Type.Integer({ minimum: 1 })),
+  // Confidence floor for this point's choice/score verdicts.
+  min_confidence: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+};
+
+const DecisionRoutingSchema = StrictObject({
+  ...DecisionPointCommonFields,
+  // Ask which listed skill the request needs (one `choice` over the session's
+  // listed skills plus `none`) and preload it. Default true.
+  preload_skills: Type.Optional(Type.Boolean()),
+  // How many recent messages the routing state carries. Default 10.
+  recent_messages: Type.Optional(Type.Integer({ minimum: 0, maximum: 50 })),
+  // Operator-defined task categories; `other` is implicit.
+  tasks: Type.Optional(Type.Record(Type.String(), RoutingTaskSchema)),
+  // Optional fallback axis for requests no category covers.
+  difficulty: Type.Optional(RoutingDifficultySchema),
+});
+
+const DecisionContinuationSchema = StrictObject({
+  ...DecisionPointCommonFields,
+  // Completed sessions younger than this are continuation candidates. Default 30 min.
+  window_ms: Type.Optional(Type.Integer({ minimum: 1000 })),
+  // "recent": offer untriggered messages from recent HUMAN participants of a
+  // candidate session to the point; "none" (default): triggers only.
+  untriggered_senders: Type.Optional(Type.Union([Type.Literal("recent"), Type.Literal("none")])),
+  // Messages around the evaluated one carried as context. Default 6.
+  context_messages: Type.Optional(Type.Integer({ minimum: 0, maximum: 30 })),
+  // Most candidate sessions offered to the model. Default 4.
+  max_candidates: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+});
+
+const DecisionsSchema = StrictObject({
+  // Master switch. Off (default) = no decision model is ever called and every
+  // point behaves exactly as without this feature.
+  enabled: Type.Optional(Type.Boolean()),
+  // Default decision chain for every point: a `[models.*]` key with api = "system-one".
+  model: Type.Optional(Type.String({ minLength: 1 })),
+  // Hard timeout per evaluation (whole chain). Default 3000.
+  timeout_ms: Type.Optional(Type.Integer({ minimum: 100 })),
+  // Default confidence floor for choice/score verdicts. Default 0.6.
+  min_confidence: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+  // Default state cap (tokens). Default 8000.
+  state_max_tokens: Type.Optional(Type.Integer({ minimum: 100 })),
+  // Two-to-four line operator-written summary of the bot's persona, used in
+  // question instructions (never in state).
+  persona: Type.Optional(Type.String()),
+  // Per-member threshold overrides, keyed by `[models.*]` key: a threshold name
+  // ("min_confidence") overrides it for every point, "<point>.<name>" for one.
+  calibration: Type.Optional(Type.Record(Type.String(), Type.Record(Type.String(), Type.Number({ minimum: 0, maximum: 1 })))),
+  routing: Type.Optional(DecisionRoutingSchema),
+  continuation: Type.Optional(DecisionContinuationSchema),
+});
+
 const AgentModelsSchema = StrictObject({
   /**
    * Per-session-type model overrides — chat lane (spec PER-AGENT-MODEL-OVERRIDES §3/§4).
@@ -1011,6 +1152,12 @@ const AgentBlockSchema = StrictObject({
    * when a server is removed from config).
    */
   mcp_servers: Type.Optional(Type.Array(Type.String())),
+  /**
+   * Per-agent decision-model overrides (ARCHITECTURE.md §8h). Same shape as
+   * `[decisions]`; tables deep-merge over the global block (agent wins), except
+   * `routing.tasks`, which replaces the global task map wholesale.
+   */
+  decisions: Type.Optional(DecisionsSchema),
 });
 
 /**
@@ -1682,6 +1829,7 @@ const LimitRuleSchema = StrictObject({
         Type.Literal("tool"),
         Type.Literal("caption"),
         Type.Literal("embedding"),
+        Type.Literal("decision"),
       ]),
     ),
   ),
@@ -2058,6 +2206,8 @@ export const AppConfigSchema = StrictObject({
   search: Type.Optional(SearchSchema),
   reactions: Type.Optional(ReactionsSchema),
   proactive: Type.Optional(ProactiveSchema),
+  /** Decision-model integration (ARCHITECTURE.md §8h). Off by default. */
+  decisions: Type.Optional(DecisionsSchema),
   // Channel visibility (ARCHITECTURE.md §9h). Default-absent = all-shared; zero
   // behavior change for deployments that never touch this block.
   visibility: Type.Optional(VisibilitySchema),
@@ -2166,6 +2316,8 @@ export type FxTwitterRawConfig = Static<typeof FxTwitterSchema>;
 export type YouTubeRawConfig = Static<typeof YouTubeSchema>;
 export type YotsubaRawConfig = Static<typeof YotsubaSchema>;
 export type ProactiveConfig = Static<typeof ProactiveSchema>;
+export type DecisionsRawConfig = Static<typeof DecisionsSchema>;
+export type DecisionFitsConfig = Static<typeof DecisionFitsSchema>;
 export type ProactiveChannelConfig = Static<typeof ProactiveChannelSchema>;
 /** Per-agent workspace config (spec MULTI-AGENT-SUPPORT §4.1, §10, §10a). */
 export type AgentBlockConfig = Static<typeof AgentBlockSchema>;
