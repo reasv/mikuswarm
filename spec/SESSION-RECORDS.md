@@ -46,14 +46,19 @@ After the run settles from the user's point of view (claims released, timeline s
   - for something made or changed: the artifacts (paths, message ids), their state, and how to continue or verify;
   - anything left open;
 - tells it to anchor the record to the messages it sent (by message id), because users reply to any of them, not only the last;
-- asks for the record as plain text. Not a tool call: a new tool would change `tools`, and that leads the request and would cost the cache.
 - never asks it to restate its reasoning. A record of *what* and *where*, with one-line *why*s, is a handoff note. Explicit chain-of-thought extraction is what provider distillation classifiers target (owner concern, §11).
 
-The record is capped (`max_tokens`, configurable, sized like a summary node). Length scales with the work under that cap.
+**The record is written with a tool, like a summary.** The record turn is a generation step, the same shape as a summarization session, and works the same way: the agent writes the record with **`session_record_tool`**, a `summary_tool` variant over an in-memory draft (`create`/`view`/`str_replace`/`insert`/`finalize`, `finalize: true` on an editing call or the standalone command, `terminate: true`). Its per-edit check is the token budget (`max_tokens`, configurable, sized like a summary node; an edit over budget is reverted and the error says by how much). Length scales with the work under that cap. `finalize` on an empty draft is the legitimate "nothing worth recording" skip, as with `diary_tool`, and writes no row. Success is judged by draft state, never by chat-completion validity. Because every turn is a tool call, this also works unchanged under OpenAI prefill (`tool_choice = "required"`).
+
+**The tool must not cost the cache.** `tools` leads the request, so the tool is never added to the wire array at the record turn:
+
+- `session_record_tool` is in the catalog of every chat-lane and proactive session as a **deferred** tool. It is never immediate, never in a skill, and never returned by `tool_search` (zero always-on cost; under `declare_deferred_tools` the declared array is byte-identical for the whole session, as for any deferred tool).
+- The record turn loads it through the native load point with the §4 mechanism: the harness user turn is followed by a synthetic loading call whose result carries `addedToolNames: ["session_record_tool"]`. Each transport then serializes the load in its most cache-friendly form (`tool_reference`, `tool_search_output`, or the text load point), exactly as a skill load mid-session does.
+- Outside the record turn, a call to it returns an error ("only used by the harness at the end of a session"); during the record turn, every other tool returns an error naming `session_record_tool`. Tools stay on the wire; only execution is restricted. The turn is bounded (a small `max_turns`, plus `timeout_ms`), and a model that never finalizes writes no record rather than being nudged again and again (§9).
 
 The record turn is part of the session's rollout: persisted in its transcript and inspectable in the console like any other turn, marked as harness-made (§8).
 
-The record turn is billed like any request of the session: class `agent_loop`, the session's payee. It always runs at **interactive** priority: it extends the interactive rollout that just finished, it must land while that rollout's cache is still warm, and triggers may be waiting on it. Its row (`session_records`, §3.4) is written when it lands. Production is bounded by `[session_records].timeout_ms`; past it the record is abandoned.
+The record turn is billed like any request of the session: class `agent_loop`, the session's payee. It always runs at **interactive** priority: it extends the interactive rollout that just finished, it must land while that rollout's cache is still warm, and triggers may be waiting on it. Its row (`session_records`, §3.4) is written when the tool finalizes. Production is bounded by `[session_records].timeout_ms`; past it the record is abandoned.
 
 **Triggers that need an in-flight record wait for it.** Owner direction: a reply whose record is still being written waits for it, and proceeds without it only when record production times out. The exact policy (replies only, or every trigger that would inject the record) is settled at implementation. The agent can still fetch an abandoned or late record later.
 
@@ -94,6 +99,7 @@ Per CLAUDE.md "Agent-facing tools: activation & discovery design".
 
 - **`read_session_record(session_id)`**: returns the record, with `builds_on` ids and a one-line pointer to the transcript tool.
   - Errors are actionable: "no record: this session did no tool work (its messages are all there is)", and "record still being written, try again shortly".
+  - Visibility: the same gate as `read_messages`. A record or transcript is readable only when the session's timeline is (channel visibility, isolated DMs, inactive channels), and only for the agent's own sessions.
   - **Immediate.** It is reactive: a user points at a bot message mid-conversation with no other cue naming the task. Bot messages already render `agent_session_id`, so the argument is always in sight.
   - Cost: one short definition.
 - **`read_session_transcript(session_id, query?, range?)`**: drill-down into the raw rollout. Tool calls with arguments, results clipped per the tool-result budget, either matching `query` or within a turn range.
@@ -136,7 +142,7 @@ The decision model replaces the reply rule with a judgement, and extends it to t
 
 ## 7. Resume
 
-**Off by default** once records ship (`[agent.sessions.resume].enabled` false in `00-defaults.toml`). The code stays. Reintroducing it means first solving how a resume interacts with the record turn, which now ends every work-gated rollout.
+**Off by default** once records ship (`[agent.sessions.resume].enabled` false in `00-defaults.toml`). The code stays. Reintroducing it as the default means first solving how a resume interacts with the record turn, which now ends every work-gated rollout. A deployment that turns it on gets the simple behaviour: a reply that resumes a session injects nothing (the rollout is already there, record turn included), and the resumed generation writes a new record (§3.4).
 
 **Follow-up folding no longer resumes.** Its settled branch (`resumeFollowUp`) is replaced: a follow-up whose owning session has already completed starts a **fresh** session with that session's record injected, like any other message that arrives after the rollout ended, and waits on an in-flight record the same way (§3.2). Folding into a running or not-yet-live session (steer, park) is unchanged.
 
@@ -182,7 +188,8 @@ Every decision-model decision is recorded and inspectable. This applies to all p
 ```toml
 [session_records]
 enabled = true           # write records for work-gated sessions
-max_tokens = 1500
+max_tokens = 1500        # session_record_tool draft budget
+max_turns = 4            # bound on the record turn's tool-call loop
 inject_on_reply = true   # the 6.1 default rule
 timeout_ms = 60000       # give up on producing a record; triggers waiting on it proceed without it
 
