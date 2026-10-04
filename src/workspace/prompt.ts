@@ -2,6 +2,7 @@ import type { WorkspaceContent, SessionTypeConfig, SatelliteRuntimeInput } from 
 import { escapeXml, escapeAttr } from "../context/xml.js";
 import { estimateTokens } from "../context/tokens.js";
 import { formatAgentTimestamp } from "../time/index.js";
+import type { ModelTailAt } from "../agent/model-prompts.js";
 
 /**
  * One named piece of the system prompt and its token contribution.
@@ -179,6 +180,20 @@ export function renderSatelliteBlock(
   workspace: WorkspaceContent,
   sessionType?: SessionTypeConfig,
 ): string {
+  return renderSatelliteBlockWithTailSlot(options, workspace, sessionType).text;
+}
+
+/**
+ * {@link renderSatelliteBlock}, plus where a model tail would go (ARCHITECTURE.md
+ * §8 "Model prompts"): after the tail instructions, before the session
+ * instruction. The slot is metadata only — nothing is written into the text.
+ * Absent when the tail is suppressed (the resume satellite's tail toggle).
+ */
+export function renderSatelliteBlockWithTailSlot(
+  options: SatelliteRuntimeInput,
+  workspace: WorkspaceContent,
+  sessionType?: SessionTypeConfig,
+): { text: string; tailSlot?: ModelTailAt } {
   const parts: string[] = [];
 
   // Part 1: Runtime state (suppressed for summarization builds)
@@ -216,6 +231,9 @@ export function renderSatelliteBlock(
     parts.push(`<tail_instructions source="${escapeAttr(file.source)}">\n${file.content}\n</tail_instructions>`);
   }
 
+  // Part 2c: the model tail's slot (inserted per attempt for the serving member).
+  const partsBeforeSlot = parts.length;
+
   // Part 3: Session instruction
   if (sessionType?.session_instruction) {
     parts.push(
@@ -223,7 +241,13 @@ export function renderSatelliteBlock(
     );
   }
 
-  return parts.join("\n\n");
+  const text = parts.join("\n\n");
+  if (options.suppressTail) return { text };
+  const tailSlot: ModelTailAt =
+    partsBeforeSlot > 0
+      ? { offset: parts.slice(0, partsBeforeSlot).join("\n\n").length, join: "before" }
+      : { offset: 0, join: parts.length > 0 ? "after" : "none" };
+  return { text, tailSlot };
 }
 
 /**

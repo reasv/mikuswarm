@@ -83,6 +83,30 @@ const SessionTypeSchema = StrictObject({
   // request is never blocked locally. `0` disables the cap for this type even when
   // a global default is set.
   max_session_cost_usd: Type.Optional(Type.Number({ minimum: 0 })),
+  // Per-model model-prompt overrides for this session type (ARCHITECTURE.md §8
+  // "Model prompts"). Key: a `[models.*]` logical id, or "*" for every model not
+  // listed. Value: a `[model_prompts.*]` profile name, or "none" for no model
+  // prompt. Beats the model block's own `model_prompt`. Cross-checked at load.
+  model_prompts: Type.Optional(Type.Record(Type.String({ minLength: 1 }), Type.String({ minLength: 1 }))),
+});
+
+/**
+ * One position of a model-prompt profile: exactly one source (cross-checked at
+ * load). `file` is relative to the config directory (made absolute at load);
+ * `workspace_file` is relative to the serving agent's workspace root.
+ */
+const ModelPromptSourceSchema = StrictObject({
+  text: Type.Optional(Type.String()),
+  file: Type.Optional(Type.String({ minLength: 1 })),
+  workspace_file: Type.Optional(Type.String({ minLength: 1 })),
+});
+
+/** A named model-prompt profile (`[model_prompts.<name>]`, ARCHITECTURE.md §8 "Model prompts"). */
+const ModelPromptProfileSchema = StrictObject({
+  // Prepended to the system prompt: the first bytes of the context.
+  preamble: Type.Optional(ModelPromptSourceSchema),
+  // Appended to the satellite's tail instructions, before <session_instruction>.
+  tail: Type.Optional(ModelPromptSourceSchema),
 });
 
 const DiarySchema = StrictObject({
@@ -819,6 +843,10 @@ const ModelSchema = StrictObject({
   // block-prefix matching instead). Default: unset (off).
   // Enable with: cache_breakpoints = "explicit"
   cache_breakpoints: Type.Optional(Type.Literal("explicit")),
+  // Default model-prompt profile (a `[model_prompts.*]` name) for every session
+  // type this model serves; a session type's `model_prompts` overrides it
+  // (ARCHITECTURE.md §8 "Model prompts"). Unset = no model prompt.
+  model_prompt: Type.Optional(Type.String({ minLength: 1 })),
 });
 
 const MatrixAccountSchema = StrictObject({
@@ -2128,6 +2156,12 @@ export const AppConfigSchema = StrictObject({
     Type.Object({ default: ModelSchema }),
     Type.Record(Type.String(), ModelSchema),
   ]),
+  /**
+   * Named model-prompt profiles (ARCHITECTURE.md §8 "Model prompts"): per-model
+   * system-prompt preamble and tail text, referenced by `[models.*].model_prompt`
+   * and `[agent.session_types.*].model_prompts`.
+   */
+  model_prompts: Type.Optional(Type.Record(Type.String({ minLength: 1 }), ModelPromptProfileSchema)),
   context: StrictObject({
     tiers: StrictObject({
       rich_target_tokens: Type.Number({ minimum: 1 }),

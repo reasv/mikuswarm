@@ -192,6 +192,18 @@
 				</div>
 			{/if}
 
+			<!-- Model prompts (per-model preamble/tail) the served members sent. -->
+			{#if session.data?.modelPrompts && session.data.modelPrompts.length > 0}
+				<div>
+					<div class="mb-1 text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">Model prompts</div>
+					<div class="space-y-1 font-mono text-[11px]">
+						{#each session.data.modelPrompts as mp (mp.member + ':' + mp.profile + ':' + (mp.hash ?? ''))}
+							{@render kv(mp.member, `${mp.profile}${mp.hash ? ` #${mp.hash}` : ''} · ${mp.requests} req`)}
+						{/each}
+					</div>
+				</div>
+			{/if}
+
 			{#if session.data?.contextDumpPath}
 				<div>
 					<div class="mb-1 text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">Context dump</div>

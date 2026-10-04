@@ -31,6 +31,7 @@ import type { WorkspaceContent, SessionTypeConfig, SkillMeta, RoutedSatellite } 
 import type { RoutingVerdict } from "../decisions/points/routing.js";
 import { parseFrontmatter, frontmatterToolPatterns } from "../workspace/skills.js";
 import { resolveWorkspacePath } from "../tools/workspace.js";
+import { loadModelPrompts, withModelPrompt, type ResolvedModelPrompt } from "./model-prompts.js";
 import { readFile } from "node:fs/promises";
 import type { Storage, Summary } from "../storage/index.js";
 import type { SessionRoutingState } from "../storage/database.js";
@@ -749,6 +750,16 @@ export class AgentSessionFactory {
     const resumedMessages = new WeakSet<object>(
       (opts?.resume?.transcript ?? []).filter((m): m is AgentMessage & object => typeof m === "object" && m !== null),
     );
+    // Model prompts (ARCHITECTURE.md §8 "Model prompts"): resolved and read once
+    // for every member this session can reach, held for its lifetime, and applied
+    // per attempt to whichever member serves.
+    const modelPrompts = await this.loadSessionModelPrompts({
+      heads: [modelKey, ...(userSelection ? [...routedCascade, ...(userLimit!.resolution.models ?? [])] : [])],
+      sessionType: sessionTypeConfig,
+      sessionTypeName: session.sessionType,
+      workspaceRoot,
+      sessionId: session.id,
+    });
     const buildFor = (logicalId: string): BuiltModelFallback => {
       const cached = builtFallbacks.get(logicalId);
       if (cached) return cached;
@@ -768,6 +779,11 @@ export class AgentSessionFactory {
             : loading;
         },
         makeModel: (cfg, cw) => createModelFromConfig(cfg, cw),
+        wrapMember: (id, dispatch) => {
+          const prompt = modelPrompts.get(id);
+          return prompt ? withModelPrompt(dispatch, prompt) : dispatch;
+        },
+        memberOverheadTokens: (id) => modelPrompts.get(id)?.tokens ?? 0,
         capability: requiresMultimodal ? (cfg) => cfg.input_modalities.includes("image") : undefined,
         contextOverride: sessionTypeConfig?.max_context_tokens,
         scheduler,
@@ -1219,6 +1235,9 @@ export class AgentSessionFactory {
               modelId: message.model ?? model.id,
               logicalModelId: resolvedMember.logicalId,
               requestedModelId,
+              // The model prompt the served member sent (ARCHITECTURE.md §8 "Model prompts").
+              modelPrompt: modelPrompts.get(resolvedMember.logicalId)?.profile ?? null,
+              modelPromptHash: modelPrompts.get(resolvedMember.logicalId)?.hash ?? null,
               provider: message.provider ?? model.provider ?? null,
               inputTokens: u.input ?? null,
               outputTokens: u.output ?? null,
@@ -1742,6 +1761,12 @@ export class AgentSessionFactory {
         session.id,
         built,
         session.trigger.event.id,
+        (() => {
+          const head = modelPrompts.get(modelKey);
+          return head
+            ? { member: modelKey, profile: head.profile, hash: head.hash, preamble: head.preamble, tail: head.tail }
+            : undefined;
+        })(),
       ).catch(() => undefined);
       // Single source of truth for the prefix/trigger boundary: `splitBuiltContext`
       // computes the trailing-live-turn cut once and returns BOTH the runtime prefix
@@ -2022,6 +2047,35 @@ export class AgentSessionFactory {
       abortSignal: args.abortSignal,
       replyModelCanSeeImages: args.replyModelCanSeeImages,
       routedSatellite: args.routedSatellite,
+    });
+  }
+
+  /**
+   * Resolve and read the model prompts (ARCHITECTURE.md §8 "Model prompts") of
+   * every chain member reachable from the given heads. Empty when no profile is
+   * configured.
+   */
+  private async loadSessionModelPrompts(params: {
+    heads: string[];
+    sessionType: SessionTypeConfig | undefined;
+    sessionTypeName: string;
+    workspaceRoot: string;
+    sessionId: string;
+  }): Promise<Map<string, ResolvedModelPrompt>> {
+    const config = this.options.config;
+    if (!config.model_prompts || Object.keys(config.model_prompts).length === 0) return new Map();
+    const reachable = params.heads
+      .filter((key) => config.models[key] !== undefined)
+      .flatMap((key) => resolveModelChain(key, config.models).map((entry) => entry.logicalId));
+    return loadModelPrompts({
+      config,
+      sessionType: params.sessionType,
+      sessionTypeName: params.sessionTypeName,
+      logicalIds: reachable,
+      workspaceRoot: params.workspaceRoot,
+      estimateTokens,
+      logger: this.options.logger,
+      sessionId: params.sessionId,
     });
   }
 
@@ -2495,6 +2549,8 @@ export function mapBuiltMessages(built: BuiltContext): AgentMessage[] {
           // user turn) renders the real values rather than 0/`trigger` (#9).
           tier: message.tier,
           tokenEstimate: message.tokenEstimate,
+          // The model tail's slot (metadata, ARCHITECTURE.md §8 "Model prompts").
+          ...(message.modelTailAt ? { modelTailAt: message.modelTailAt } : {}),
         },
       ];
     }

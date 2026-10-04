@@ -32,9 +32,10 @@ import {
 import type { WorkspaceContent, SessionTypeConfig, RoutedSatellite } from "../workspace/types.js";
 import {
   renderSystemPromptWithSegments,
-  renderSatelliteBlock,
+  renderSatelliteBlockWithTailSlot,
   type SystemPromptSegment,
 } from "../workspace/prompt.js";
+import type { ModelTailAt } from "../agent/model-prompts.js";
 import { renderToolBlock, type ToolDefinitionLike, type ToolBlockSummary } from "./tool-block.js";
 import { buildRecentDiaryContent } from "./diary-layer.js";
 import { buildAutoRetrievalBlock, type AutoRetrievalDeps } from "./auto-retrieval.js";
@@ -70,7 +71,20 @@ export interface ContextMessage {
   tokenEstimate: number;
   imageBlocks?: ImageBlock[];
   timestamp?: number;
+  /**
+   * Where the serving model's tail goes in `content` (ARCHITECTURE.md §8 "Model
+   * prompts"). Set on satellite-bearing turns only; metadata, never text.
+   */
+  modelTailAt?: ModelTailAt;
 }
+
+/** Shift a satellite-relative tail slot to its position inside the turn text. */
+function offsetTailSlot(slot: ModelTailAt | undefined, by: number): ModelTailAt | undefined {
+  return slot ? { ...slot, offset: slot.offset + by } : undefined;
+}
+
+/** The `<system>` wrapper every satellite is rendered in. */
+const SATELLITE_OPEN = "<system>\n";
 
 export interface ImageBlock {
   eventId: string;
@@ -632,7 +646,7 @@ export class ContextBuilder {
         });
       }
     }
-    const satellite = renderSatelliteBlock(
+    const { text: satellite, tailSlot } = renderSatelliteBlockWithTailSlot(
       {
         ...options,
         suppressRuntimeState: generation,
@@ -777,7 +791,7 @@ export class ContextBuilder {
             })
             .finally(() => retrievalEmbedAbort?.());
 
-    const systemBlock = `<system>\n${satellite}\n</system>`;
+    const systemBlock = `${SATELLITE_OPEN}${satellite}\n</system>`;
     // For a proactive build there are no trigger events; the immediate "decide now"
     // prompt is the kickoff (§9g). Standing framing (default to silence, don't
     // announce yourself) lives in the proactive session type's session_instruction,
@@ -786,6 +800,11 @@ export class ContextBuilder {
     const finalUserContent = generation
       ? systemBlock
       : [retrievedMemory, systemBlock, finalTurnTail].filter(Boolean).join("\n\n");
+    // The model tail's slot inside the final turn (metadata; nothing in the text).
+    const modelTailAt = offsetTailSlot(
+      tailSlot,
+      (!generation && retrievedMemory ? retrievedMemory.length + 2 : 0) + SATELLITE_OPEN.length,
+    );
 
     // Input-addressed integrity (spec SUMMARIZATION-JOB-INPUT-INTEGRITY §3.1):
     // surface exactly what was rendered as "material to reduce" so the worker
@@ -818,6 +837,7 @@ export class ContextBuilder {
         tier: "trigger",
         tokenEstimate: estimateTokens(finalUserContent),
         imageBlocks,
+        ...(modelTailAt ? { modelTailAt } : {}),
       },
     ];
     // Tool-definition block (out-of-band wire `tools[]`): folded into the estimate
@@ -925,7 +945,7 @@ export class ContextBuilder {
         });
       }
     }
-    const satellite = renderSatelliteBlock(
+    const { text: satellite, tailSlot } = renderSatelliteBlockWithTailSlot(
       {
         timelineKey: options.timelineKey,
         trigger: options.trigger,
@@ -940,7 +960,7 @@ export class ContextBuilder {
       options.workspace,
       options.sessionType,
     );
-    const systemBlock = `<system>\n${satellite}\n</system>`;
+    const systemBlock = `${SATELLITE_OPEN}${satellite}\n</system>`;
 
     // Gap backfill (§9): contiguous newest-first run of room messages the session
     // missed, excluding trigger members, claim-marked and budget-truncated.
@@ -951,6 +971,7 @@ export class ContextBuilder {
       : null;
 
     const finalUserContent = [gapRendered, systemBlock, triggerContent].filter(Boolean).join("\n\n");
+    const modelTailAt = offsetTailSlot(tailSlot, (gapRendered ? gapRendered.length + 2 : 0) + SATELLITE_OPEN.length);
     return {
       type: "triggerGroup",
       content: finalUserContent,
@@ -958,6 +979,7 @@ export class ContextBuilder {
       timestamp: now,
       tier: "trigger",
       tokenEstimate: estimateTokens(finalUserContent),
+      ...(modelTailAt ? { modelTailAt } : {}),
     } as AgentMessage;
   }
 

@@ -1,5 +1,6 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message, TextContent, Usage } from "@earendil-works/pi-ai";
+import { MODEL_TAIL_AT, type ModelTailAt } from "./model-prompts.js";
 
 const STUB_USAGE: Usage = {
   input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
@@ -36,13 +37,16 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
     }
 
     if (message.type === "triggerGroup" || message.type === "satellite") {
-      return [
-        {
-          role: "user",
-          content: contentWithImages(message.content, message.imageBlocks),
-          timestamp: message.timestamp ?? Date.now(),
-        } as Message,
-      ];
+      const out = {
+        role: "user",
+        content: contentWithImages(message.content, message.imageBlocks),
+        timestamp: message.timestamp ?? Date.now(),
+      } as Message;
+      // The model tail's slot rides beside the text under a symbol key, so it
+      // never reaches a payload; the serving member's withModelPrompt reads it
+      // (ARCHITECTURE.md §8 "Model prompts").
+      if (message.modelTailAt) (out as { [MODEL_TAIL_AT]?: ModelTailAt })[MODEL_TAIL_AT] = message.modelTailAt;
+      return [out];
     }
 
     if ("role" in message) {

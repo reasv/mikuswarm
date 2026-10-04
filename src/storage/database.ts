@@ -1172,6 +1172,10 @@ export interface UsageEventRow {
    *  §11) — the space-scoped seed for per-user-per-space counters + per-space pools.
    *  Null when the room has no parent space or the deployment uses no space rules. */
   space_id: string | null;
+  /** Model-prompt profile the serving member sent (ARCHITECTURE.md §8 "Model prompts"); null = none / not an agent request. */
+  model_prompt: string | null;
+  /** Short hash of the exact preamble + tail bytes sent; identifies the text after a prompt-file edit. */
+  model_prompt_hash: string | null;
   provider: string | null;
   input_tokens: number | null;
   output_tokens: number | null;
@@ -1181,6 +1185,14 @@ export interface UsageEventRow {
   cost_usd: number;
   ref: string | null;
   created_at: number;
+}
+
+/** One served member's model prompt within a session (see {@link Storage.getSessionModelPrompts}). */
+export interface SessionModelPromptRow {
+  member: string;
+  profile: string;
+  hash: string | null;
+  requests: number;
 }
 
 /**
@@ -1239,6 +1251,9 @@ export interface UsageEventInput {
    * resolved + frozen at admission. Omitted (no space rules / no parent) → null.
    */
   spaceId?: string | null;
+  /** Model-prompt profile + text hash the serving member sent (ARCHITECTURE.md §8 "Model prompts"). */
+  modelPrompt?: string | null;
+  modelPromptHash?: string | null;
   provider?: string | null;
   inputTokens?: number | null;
   outputTokens?: number | null;
@@ -4108,6 +4123,26 @@ export class Storage {
   }
 
   /**
+   * The model prompts a session's served members sent (ARCHITECTURE.md §8 "Model
+   * prompts"): one row per (served member, profile, text hash) over the session's
+   * agent-loop ledger rows, in first-use order. Empty when none was sent.
+   */
+  getSessionModelPrompts(agentSessionId: string): SessionModelPromptRow[] {
+    return this.read((db) => {
+      return db
+        .prepare(
+          `select logical_model_id as member, model_prompt as profile, model_prompt_hash as hash,
+                  count(*) as requests
+             from usage_events
+            where agent_session_id = ? and class = 'agent_loop' and model_prompt is not null
+            group by logical_model_id, model_prompt, model_prompt_hash
+            order by min(ts)`,
+        )
+        .all(agentSessionId) as SessionModelPromptRow[];
+    });
+  }
+
+  /**
    * All ledger rows for a session, newest-first (spec §10.3) — matched into the
    * transcript by `tool_call_id` so the rollout can annotate the right block.
    */
@@ -4255,6 +4290,8 @@ export class Storage {
       // Space id (§11) cannot be derived from intrinsic columns — it is supplied by
       // the per-user recorder from the session's frozen resolution (null otherwise).
       space_id: input.spaceId ?? null,
+      model_prompt: input.modelPrompt ?? null,
+      model_prompt_hash: input.modelPromptHash ?? null,
       provider: input.provider ?? null,
       input_tokens: input.inputTokens ?? null,
       output_tokens: input.outputTokens ?? null,
@@ -4270,11 +4307,13 @@ export class Storage {
         `insert into usage_events (
            id, ts, class, agent_session_id, session_type, timeline_key, trigger_sender_id,
            tool_name, model_id, logical_model_id, requested_model_id, budget_partition, room_id, space_id,
+           model_prompt, model_prompt_hash,
            provider, input_tokens, output_tokens, cache_read_tokens,
            cache_write_tokens, images, cost_usd, ref, created_at
          ) values (
            @id, @ts, @class, @agent_session_id, @session_type, @timeline_key, @trigger_sender_id,
            @tool_name, @model_id, @logical_model_id, @requested_model_id, @budget_partition, @room_id, @space_id,
+           @model_prompt, @model_prompt_hash,
            @provider, @input_tokens, @output_tokens, @cache_read_tokens,
            @cache_write_tokens, @images, @cost_usd, @ref, @created_at
          )`,
@@ -9744,6 +9783,11 @@ create table if not exists usage_events (
   budget_partition text,
   room_id text,
   space_id text,
+  -- Model prompts (ARCHITECTURE.md §8 "Model prompts"; added v23): the profile the
+  -- serving member sent and a short hash of its exact preamble + tail bytes. Null
+  -- for requests without a model prompt and for non-agent lanes.
+  model_prompt text,
+  model_prompt_hash text,
   provider text,
   input_tokens integer,
   output_tokens integer,
@@ -10858,7 +10902,7 @@ ${TIMELINE_COUNTS_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 22;
+export const LATEST_SCHEMA_VERSION = 23;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -11693,6 +11737,23 @@ function addUsageEventPartitionsTimelineKey(db: Database.Database): void {
  * resume recomputes the same loaded tool set. Nullable, no back-fill: every
  * existing session was unrouted. PRAGMA table_info guard keeps it idempotent.
  */
+/**
+ * v22→v23: add `usage_events.model_prompt` + `model_prompt_hash` (model prompts,
+ * ARCHITECTURE.md §8 "Model prompts"). Nullable, no back-fill: no earlier request
+ * carried a model prompt. PRAGMA table_info guard keeps it idempotent.
+ */
+function addUsageEventModelPrompt(db: Database.Database): void {
+  const cols = db.prepare("PRAGMA table_info(usage_events)").all() as Array<{ name: string }>;
+  // No table yet: SCHEMA (which runs after the migrations) creates it at the latest shape.
+  if (cols.length === 0) return;
+  if (!cols.some((c) => c.name === "model_prompt")) {
+    db.exec("ALTER TABLE usage_events ADD COLUMN model_prompt TEXT");
+  }
+  if (!cols.some((c) => c.name === "model_prompt_hash")) {
+    db.exec("ALTER TABLE usage_events ADD COLUMN model_prompt_hash TEXT");
+  }
+}
+
 function addAgentSessionInitialPreloads(db: Database.Database): void {
   const cols = db.prepare("PRAGMA table_info(agent_sessions)").all() as Array<{ name: string }>;
   if (!cols.some((c) => c.name === "initial_preloads")) {
@@ -11727,6 +11788,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   repairStaleEditedQuotes,              // v19→v20
   addUsageEventPartitionsTimelineKey,   // v20→v21
   addAgentSessionInitialPreloads,       // v21→v22
+  addUsageEventModelPrompt,             // v22→v23
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write

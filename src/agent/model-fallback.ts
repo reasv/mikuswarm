@@ -75,6 +75,20 @@ export interface BuildModelFallbackOptions {
   consumer: string;
   /** Build the base StreamFn for a member (streamSimple / wrapCompleteAsStream + SDK retries off). */
   makeBase: (config: ModelConfig) => StreamFn;
+  /**
+   * Outermost per-member wrapper around the member's dispatch (outside admission,
+   * so it sees each request first). Never applied to the background prober's bare
+   * stream fn. The agent path installs the member's model prompt here
+   * (ARCHITECTURE.md §8 "Model prompts"). Absent = identity.
+   */
+  wrapMember?: (logicalId: string, dispatch: StreamFn) => StreamFn;
+  /**
+   * Tokens a member adds to every request on top of the shared context (its model
+   * prompt). Subtracted from that member's operative window for fits and
+   * enforcement, so a member is never chosen for a context its own additions push
+   * over its window. The Model descriptor keeps the real window. Absent = 0.
+   */
+  memberOverheadTokens?: (logicalId: string) => number;
   /** Build the pi-ai Model descriptor for a member at the given operative context window. */
   makeModel: (config: ModelConfig, contextWindow: number) => Model<Api>;
   /**
@@ -243,13 +257,17 @@ export function buildModelFallback(
   // are skipped here — in practice all members have one (the build-time throw above is
   // a backstop for the chain-wide case).
   const memberWindowMap = new Map<string, number>();
+  // The member's real operative window (before its model-prompt overhead) — what its
+  // Model descriptor declares.
+  const descriptorWindowMap = new Map<string, number>();
   let maxOperativeContextWindow = 0;
   for (const entry of survivors) {
     const w = entry.config.context_window;
     if (typeof w === "number") {
       const mw = options.contextOverride !== undefined ? Math.min(w, options.contextOverride) : w;
-      memberWindowMap.set(entry.logicalId, mw);
-      maxOperativeContextWindow = Math.max(maxOperativeContextWindow, mw);
+      descriptorWindowMap.set(entry.logicalId, mw);
+      memberWindowMap.set(entry.logicalId, Math.max(0, mw - (options.memberOverheadTokens?.(entry.logicalId) ?? 0)));
+      maxOperativeContextWindow = Math.max(maxOperativeContextWindow, memberWindowMap.get(entry.logicalId)!);
     }
   }
   const memberWindows: Record<string, number> = Object.fromEntries(memberWindowMap);
@@ -261,10 +279,10 @@ export function buildModelFallback(
     // carries ITS OWN window so any window-keyed SDK mechanism sees the number
     // that is true for the model actually serving the attempt.
     const memberWindow = memberWindowMap.get(entry.logicalId) ?? operativeContextWindow;
-    const model = options.makeModel(entry.config, memberWindow);
+    const model = options.makeModel(entry.config, descriptorWindowMap.get(entry.logicalId) ?? memberWindow);
     const base = options.makeBase(entry.config);
     const group = entry.config.rate_limit_group ?? "default";
-    const dispatch: StreamFn =
+    const admitted: StreamFn =
       options.scheduler && options.admission
         ? withSchedulerAdmission(base, options.scheduler, {
             group,
@@ -276,6 +294,7 @@ export function buildModelFallback(
             onAdmissionWait: options.admission.onAdmissionWait,
           })
         : base;
+    const dispatch = options.wrapMember ? options.wrapMember(entry.logicalId, admitted) : admitted;
     return {
       logicalId: entry.logicalId,
       model,

@@ -1,4 +1,5 @@
 import { writeContextDump } from "../observability/index.js";
+import type { ContextDump } from "../observability/context-dump.js";
 import type { BuiltContext } from "./builder.js";
 
 /**
@@ -18,6 +19,7 @@ export async function dumpBuiltContext(
   sessionId: string,
   context: BuiltContext,
   triggerEventId?: string,
+  modelPrompt?: ContextDump["modelPrompt"],
 ): Promise<string> {
   return writeContextDump(dumpDir, {
     sessionId,
@@ -55,7 +57,9 @@ export async function dumpBuiltContext(
       tier: message.tier,
       tokenEstimate: message.tokenEstimate,
       content: message.content,
+      ...(message.modelTailAt ? { modelTailAt: message.modelTailAt } : {}),
     })),
+    ...(modelPrompt ? { modelPrompt } : {}),
   });
 }
 

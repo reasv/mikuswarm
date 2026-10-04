@@ -178,4 +178,9 @@ export interface SessionTypeConfig {
    * when a global default is set.
    */
   max_session_cost_usd?: number;
+  /**
+   * Per-model model-prompt overrides (ARCHITECTURE.md §8 "Model prompts"): a
+   * `[models.*]` logical id or "*" → a `[model_prompts.*]` profile name or "none".
+   */
+  model_prompts?: Record<string, string>;
 }

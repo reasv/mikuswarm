@@ -329,6 +329,17 @@ llm_request_max_wait_ms = 120000
 # text = ""             # prefix text the analysis must begin with, e.g. "We must "
 # tools = []            # which tools carry analysis; absent = all tools (including no_reply)
 # drop_reasoning = false # strip native thinking blocks from history and storage
+# Model prompts (ARCHITECTURE.md §8 "Model prompts"): a per-model system-prompt
+# preamble and/or tail, from a named profile. Unset = none. Example (commented — set
+# in local config):
+#   model_prompt = "claude"                    # a [model_prompts.*] profile name
+#   [model_prompts.claude]
+#   preamble = { file = "model-prompts/claude.md" }   # config-dir relative; or text = "…"
+#   tail = { workspace_file = "MODEL_TAIL.md" }        # agent-workspace relative
+# A session type can override it per model ("*" = every other model, "none" = no prompt):
+#   [agent.session_types.summarize.model_prompts]
+#   claude_opus = "claude_worker"
+#   "*" = "none"
 
 [models.default.cost]
 input = 0

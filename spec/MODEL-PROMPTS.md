@@ -1,6 +1,19 @@
 # Model Prompts — per-model system preamble and tail
 
-**Status**: DRAFT — awaiting owner review.
+**Status**: IMPLEMENTED — superseded by ARCHITECTURE.md §8 "Model prompts" (plus the
+config overview, the session-type field list and the v22→v23 migration note); retained
+for review. Deviations from this draft, decided during implementation:
+- The slot is recorded as `modelTailAt: { offset, join }` (`join` says which side the
+  satellite's `\n\n` separator goes on, so the result equals a direct render).
+- §4.3: the wrapper is installed through a new `wrapMember` hook on `buildModelFallback`
+  (outermost, outside admission), not inside `makeBase`, because `makeBase`'s output is
+  also the background prober's bare stream fn, which is shared across sessions.
+- §5: fits subtracts each member's model-prompt tokens from that member's operative
+  window (`memberOverheadTokens`); the running context counter stays model-neutral, so
+  the head's tokens are not also added to the frozen estimate (that would count them twice).
+- §6: the prompt text is not persisted. The console session panel lists member, profile,
+  hash and request count from `usage_events`; context dumps carry the head member's
+  resolved text. The context inspector does not render the text.
 
 **Author**: design session 2026-10-04.
 

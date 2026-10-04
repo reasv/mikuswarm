@@ -1,4 +1,4 @@
-export { loadConfig } from "./loader.js";
+export { loadConfig, MODEL_PROMPT_NONE } from "./loader.js";
 export { loadDotEnv, parseDotEnv, type EnvLoadOptions, type EnvLoadResult } from "./env.js";
 export type {
   AppConfig,

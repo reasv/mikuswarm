@@ -1,5 +1,5 @@
 import { Value, ValueErrorType } from "@sinclair/typebox/value";
-import { readdir, readFile } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { parse } from "smol-toml";
 import { loadDotEnv, type EnvLoadOptions } from "./env.js";
@@ -206,6 +206,7 @@ export async function loadConfig(configDir: string, options: ConfigLoadOptions =
 
   const config = Value.Decode(AppConfigSchema, merged);
   validateConfig(config);
+  await validateModelPrompts(config, configDir);
   resetRedactionRegistry();
   registerSecretsByKey(config);
   // Establish the agent's timezone (and set process.env.TZ) as part of config
@@ -213,6 +214,73 @@ export async function loadConfig(configDir: string, options: ConfigLoadOptions =
   // zone (fail-fast), mirroring the redaction-registry wiring above.
   configureAgentTimezone(config.agent.timezone ?? "UTC");
   return config;
+}
+
+/** The reserved `model_prompts` value meaning "no model prompt" (ARCHITECTURE.md §8 "Model prompts"). */
+export const MODEL_PROMPT_NONE = "none";
+
+/**
+ * Cross-reference checks for model prompts (ARCHITECTURE.md §8 "Model prompts"),
+ * and resolution of every config-dir `file` source to an absolute path so the
+ * runtime never needs to know the config directory.
+ */
+async function validateModelPrompts(config: AppConfig, configDir: string): Promise<void> {
+  const profiles = config.model_prompts ?? {};
+  for (const [name, profile] of Object.entries(profiles)) {
+    if (name === MODEL_PROMPT_NONE) {
+      throw new Error(`Invalid config: [model_prompts.${MODEL_PROMPT_NONE}] is reserved (it means "no model prompt").`);
+    }
+    if (!profile.preamble && !profile.tail) {
+      throw new Error(`Invalid config: [model_prompts.${name}] needs a preamble, a tail, or both.`);
+    }
+    for (const position of ["preamble", "tail"] as const) {
+      const source = profile[position];
+      if (!source) continue;
+      const given = (["text", "file", "workspace_file"] as const).filter((key) => source[key] !== undefined);
+      if (given.length !== 1) {
+        throw new Error(
+          `Invalid config: [model_prompts.${name}].${position} must set exactly one of text, file, workspace_file` +
+            (given.length > 0 ? ` (got ${given.join(", ")}).` : "."),
+        );
+      }
+      if (source.file !== undefined) {
+        const absolute = path.resolve(configDir, source.file);
+        const info = await stat(absolute).catch(() => undefined);
+        if (!info?.isFile()) {
+          throw new Error(`Invalid config: [model_prompts.${name}].${position}.file "${source.file}" not found (resolved to ${absolute}).`);
+        }
+        source.file = absolute;
+      }
+    }
+  }
+  const profileRef = (where: string, value: string, allowNone: boolean): void => {
+    if (allowNone && value === MODEL_PROMPT_NONE) return;
+    if (!(value in profiles)) {
+      const known = Object.keys(profiles);
+      throw new Error(
+        `Invalid config: ${where} = "${value}" names no [model_prompts.*] profile` +
+          (allowNone ? ` (use "${MODEL_PROMPT_NONE}" for no model prompt)` : "") +
+          (known.length > 0 ? `; defined: ${known.join(", ")}.` : "; none are defined."),
+      );
+    }
+  };
+  for (const [name, model] of Object.entries(config.models)) {
+    if (model.model_prompt === undefined) continue;
+    if (model.api === "system-one") {
+      throw new Error(`Invalid config: [models.${name}].model_prompt is not valid on a decision model (api = "system-one").`);
+    }
+    profileRef(`[models.${name}].model_prompt`, model.model_prompt, false);
+  }
+  for (const [type, sessionType] of Object.entries(config.agent.session_types ?? {})) {
+    for (const [modelKey, value] of Object.entries(sessionType.model_prompts ?? {})) {
+      if (modelKey !== "*" && !(modelKey in config.models)) {
+        throw new Error(
+          `Invalid config: [agent.session_types.${type}.model_prompts] key "${modelKey}" is neither "*" nor a [models.*] name.`,
+        );
+      }
+      profileRef(`[agent.session_types.${type}.model_prompts].${modelKey}`, value, true);
+    }
+  }
 }
 
 /** Validate [models.*].prefill settings (cross-field checks). */

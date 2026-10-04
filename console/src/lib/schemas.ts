@@ -225,7 +225,19 @@ export const SessionDetailResponse = Schema.Struct({
 	contextDumpPath: Schema.NullOr(Schema.String),
 	// Auxiliary tool-use ledger rows for this session (spec §10.3); optional so a
 	// pre-feature backend still decodes.
-	toolInvocations: Schema.optional(Schema.Array(ToolInvocation))
+	toolInvocations: Schema.optional(Schema.Array(ToolInvocation)),
+	// Model prompts the served members sent (one row per member/profile/text hash);
+	// optional so a pre-feature backend still decodes.
+	modelPrompts: Schema.optional(
+		Schema.Array(
+			Schema.Struct({
+				member: Schema.String,
+				profile: Schema.String,
+				hash: Schema.NullOr(Schema.String),
+				requests: Schema.Number
+			})
+		)
+	)
 });
 export type SessionDetailResponse = Schema.Schema.Type<typeof SessionDetailResponse>;
 

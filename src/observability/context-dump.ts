@@ -8,6 +8,8 @@ export interface ContextDumpMessage {
   tier?: "system" | "compact" | "rich" | "mixed" | "runtime" | "trigger" | "summary" | "diary";
   tokenEstimate?: number;
   content: unknown;
+  /** Where the serving model's tail is inserted into `content` (ARCHITECTURE.md §8 "Model prompts"). */
+  modelTailAt?: { offset: number; join: string };
 }
 
 export interface ContextDump {
@@ -33,6 +35,11 @@ export interface ContextDump {
     sizeBytes?: number;
   }>;
   messages: ContextDumpMessage[];
+  /**
+   * The session head member's model prompt (ARCHITECTURE.md §8 "Model prompts"),
+   * applied per attempt and so absent from `messages`. A fallback member sends its own.
+   */
+  modelPrompt?: { member: string; profile: string; hash: string; preamble?: string; tail?: string };
 }
 
 function safeFilename(value: string): string {

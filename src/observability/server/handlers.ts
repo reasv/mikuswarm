@@ -253,6 +253,8 @@ export function sessionDetail(
     transcript,
     rolloutStartIndex: rolloutStartIndex(transcript),
     contextDumpPath: row.context_dump_path,
+    // Model prompts the served members sent (ARCHITECTURE.md §8 "Model prompts").
+    modelPrompts: ctx.deps.storage.getSessionModelPrompts(row.id),
   });
 }
 

@@ -58,6 +58,18 @@ Unreleased section; it is not part of any release's notes.
   rendered next to the tail instructions, without changing the cached prompt prefix; resumes
   re-apply them. Low confidence or any decision-model failure leaves the session exactly as
   before. Database schema v22 adds `agent_sessions.initial_preloads`.
+- **Model prompts** (off by default): a model can carry its own system-prompt preamble and
+  tail, defined as named `[model_prompts.<name>]` profiles and assigned with
+  `[models.*].model_prompt`. The preamble is placed at the very start of the system prompt,
+  the tail after the tail instructions; each text can be inline, a file in the config
+  directory, or a file in the agent's workspace. Both are applied per request for whichever
+  model serves it, so a session that falls back or is routed to another model sends that
+  model's text, and the stored context stays model-neutral. Session types override the
+  profile per model (`[agent.session_types.<type>.model_prompts]`, with `"*"` for every
+  other model and `"none"` for no model prompt). Files are re-read at each session start.
+  Usage rows record the profile and a hash of the text sent, and the console session panel
+  lists them. Database schema v23 adds `usage_events.model_prompt` and `model_prompt_hash`.
+  See ARCHITECTURE.md §8 "Model prompts".
 - **Decision-model continuation** (`[decisions.continuation]`, off by default): when a running or
   recently completed session is open in the room, the decision model decides whether a new
   message (a trigger, an explicit reply, or optionally an untriggered message from a recent human
