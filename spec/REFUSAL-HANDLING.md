@@ -64,6 +64,11 @@ Today the code cannot tell refusal reasons apart, cannot see soft refusals, keep
 12. **Refusal rules can match on the session's routed task** (§8.1), as model routing already does.
 13. **Send-contract give-up settles as `NO_REPLY`**, with no failure notice: unlike a quota, it is not actionable and not caused by the user's input (§7.5).
 14. **One send-contract redo per failure point**, so per message, not per session: the bound exists to stop an endless loop, and a redo that succeeded once suggests the model will manage the next message of the same session (§7.5).
+15. **The statistics page measures model behaviour** (performance in the machine-learning sense: refusals, the send contract, style), not provider reliability or speed. Gate latency and fail-open counts are operational and stay out of it (§12.3).
+16. **"A model" is the config entry** by default, with a toggle to group by underlying model (§12.3).
+17. **Change markers** on the trend charts: wanted (§12.4).
+18. **The page is passive**: no alerts or notifications for now.
+19. **Tasks are multi-label** (DECISION-MODEL §5.1a): a request may select several tasks, and some tasks exist only as labels.
 
 ## 4. Checks
 
@@ -311,7 +316,7 @@ on_exhausted = "send_last"        # chat sites: "send_last" (default) | "withhol
 ```
 
 - **Sites** are session-type names plus the internal sites (`record_turn`, `summarize`, `condense`, `diary`, `caption`).
-- **Tasks**: the task key the routing point gave the session (`[decisions.routing.tasks.<key>]`, operator-defined, or `other`), the same classification that already picks the session's model cascade. A refused request of a given kind can so be sent to a model suited to that kind. A session without a routing verdict (routing off, routing fell back, internal sites) has no task, and a rule with `tasks` never matches it. Startup validation: every listed key exists in the routing tasks of each agent the rule applies to (agents may replace their task list, DECISION-MODEL §4). A redo keeps the session's routed skills and tail files; only the model changes.
+- **Tasks**: the task keys the routing point gave the session (`[decisions.routing.tasks.<key>]`, operator-defined, or `other`), the same classification that already picks the session's model cascade. Tasks are multi-label (DECISION-MODEL §5.1a); the condition matches when any of the session's tasks is listed. A refused request of a given kind can so be sent to a model suited to that kind. A session without a routing verdict (routing off, routing fell back, internal sites) has no task, and a rule with `tasks` never matches it. Startup validation: every listed key exists in the routing tasks of each agent the rule applies to (agents may replace their task list, DECISION-MODEL §4). A redo keeps the session's routed skills and tail files; only the model changes.
 - **Precedence**: the first matching rule in file order (authored order, like PER-USER-LIMITS).
 - **Composition**: a matching rule **replaces** the implicit chain fallover for that refusal. With no matching rule, a hard refusal keeps today's implicit fallover and a soft refusal is recorded only.
 - **Gates**: a rule's model passes the usual gates (health, budget, per-user limits, context fits, capability). An entry that fails them is skipped. The redo is billed to the session's payee and counts on the redo model's caps.
@@ -395,14 +400,62 @@ Like conversation branches in chat interfaces:
 - **Ending card** at `no_reply`: the sources that were judged and the verdicts (`no_reply_intent`, refusal, contradiction).
 - **Session list chips**: refused, redone (n), nudged (n), revised (n), unjudged (n).
 
-### 12.3 Aggregates
+### 12.3 Model behaviour page
 
-Per served model, per day, filterable by agent and site:
+A new console page (`/models`) for **model behaviour**: how often each model refuses, breaks the send contract, and produces style issues, and what happens next. Provider reliability and speed (error classes, stalls, time to first token, cache hits) are out of scope (owner decision 15); so are the gate's own latency and fail-open counts, which describe the decision model, not the chat model, and stay in logs and the session view.
 
-- refusal rate by reason, site and detection method; rule outcomes; cost of discarded branches;
-- send-contract: share of sessions with ≥1 nudge, distribution of nudges to recovery, outcome mix, failure-type mix, `after_correction` mix;
-- style: hits per 1k tokens and share of messages with a hit (DECISION-MODEL §5.8 owner decision), revisions and overrides per check;
-- gate latency (p50/p95) and fail-open count per site.
+**Filters** (all in the URL, like the other pages, ARCHITECTURE.md §11): time window (the usage page's set: today, 24h, 7d, 30d, this month, all), agent, site (session type or internal job), task (multi-label, DECISION-MODEL §5.1a), and a group-by (model, agent, site, task). Every section follows them.
+
+**What counts as a model** (owner decision 16): the config entry (`[models.<key>]`) by default, so the same underlying model served by two providers is two rows. A toggle groups by underlying model through an optional `[models.<key>].family` field (entries without one stay separate). Every event is attributed to the model that served that specific request or attempt, not to the session's head: fallback and sticky redo can change the model within a session.
+
+**Sections:**
+
+1. **Scorecard**: one row per model, one column per headline rate, each with its raw count and its change against the previous window of the same length. Rates over too few samples are greyed (a minimum count per metric). Clicking a cell selects that model and metric for the sections below. Headline rates and their denominators:
+   - refusals per request, split hard / judged;
+   - sessions with at least one nudge, per session;
+   - recovered after nudges, per nudged session;
+   - send-contract redos and exhaustions, per session;
+   - style hits per 1k message tokens, and share of messages with a hit (both denominators, DECISION-MODEL §5.8 owner decision);
+   - refusal redos, per session.
+2. **Over time**: the selected metric, one line per model, hourly buckets at 24h, daily at 7d/30d, weekly beyond, with change markers (§12.4).
+3. **Breakdown** for the selected family:
+   - refusals: by reason, site and detection method; rule outcomes; cost of discarded branches;
+   - send contract: nudges until recovery (1, 2, 3, after redo, gave up), failure-type mix, what happened to the message (`after_correction`), `no_reply` intent after a nudge;
+   - style: hits per check; revisions and overrides per check.
+4. **Incident log**: newest first, one row per session (its refusals, nudges, redos, revisions and judged endings grouped), with time, agent, room, model, chips and a one-line outcome. Each row links to the session in the conversation view at the branch and tool call where it happened. Filterable by incident type; cursor-paginated.
+
+**Passive** (owner decision 18): the page flags nothing and sends no notifications.
+
+**Storage.** Rates are read from an hourly rollup table maintained at write time through the single-writer queue (the pattern of the pipelines page's materialized counts): counters keyed by hour, agent, site, model and metric, including the denominators (requests, sessions, messages sent, message tokens). Task is a separate rollup dimension, one row per task label, because labels overlap. The raw tables (§10.1) are read only by the incident log and click-through. The history backfill (§10.2) rebuilds the rollups.
+
+### 12.4 Change markers
+
+Rates move when something about the model's situation changes, so the trend charts mark those changes. Two sources, both turned into typed, explainable events:
+
+**1. Behaviour-config snapshots at startup.** Config only changes on a restart, so at boot the app builds a **resolved behaviour snapshot**: the effective, merged, per-agent result of the config (after file merge, `${VAR}` templating and `[agents.<name>.…]` overrides), restricted to what shapes model behaviour, and never containing credentials:
+
+- per agent and site: the model chain (head and fallbacks), thinking level, and the per-user preference lists;
+- routing tasks and what each maps to;
+- refusal rules, enabled checks with their remedies and thresholds, the gate's decision chains;
+- the code version (package version plus a build revision baked into the image).
+
+The snapshot is stored with its hash (`behaviour_snapshots`); when the hash differs from the previous one, the two **structured** snapshots are diffed field by field, and each difference becomes a typed event in `behaviour_changes` from a fixed vocabulary with a sentence template and the models, agents and sites it touches:
+
+| event | example sentence |
+|---|---|
+| `head_model_changed` | agent A, chat: head model B → C |
+| `chain_changed` | agent A, chat: fallbacks now C, D (was C) |
+| `preference_changed` | agent A: user preference list changed (B moved to first) |
+| `thinking_changed` | agent A, chat on B: thinking medium → high |
+| `routing_task_changed` | task `coding`: models now B, C |
+| `rule_changed` / `check_changed` | rule `distillation`: added; check `style_x`: threshold 0.8 → 0.85 |
+| `code_changed` | deploy: 1.4.0+abc123 → 1.4.0+def456 |
+
+A difference outside the vocabulary becomes a generic `config_changed` event naming the resolved path and the old and new values, so nothing is silently missed; frequent generic paths are candidates for a typed event later. Diffing the resolved structure rather than the TOML is what makes the events explainable: a model moved between files, renamed variables or a reordered table produce no event, and a one-line change in a shared block produces one event per agent and site it actually affects.
+
+**2. Observed prompt changes.** The system prompt and the per-model prompts change without a restart when workspace files are edited. `usage_events` already carries `model_prompt_hash` per request; a matching `system_prompt_hash` (the frozen system prompt's hash) is added. A change in either hash for a served member, between consecutive requests, is recorded as `prompt_changed` (which prompt, which agent and model; the hash only, never the text).
+
+**On the chart**, markers are filtered to the models, agents and sites displayed; changes within a few minutes of each other (one deploy) collapse into one marker that lists them on hover. Traffic shifts that are not changes (a budget cap moving traffic to a fallback, a health fallover) are not markers; they show in the volume counts.
 
 ## 13. Latency
 

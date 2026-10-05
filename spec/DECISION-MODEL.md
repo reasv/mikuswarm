@@ -450,6 +450,22 @@ Each point states: **when** it runs (the trigger condition is always a cheap mec
 
 **Interaction with the deterministic skill→model switch.** A skill loaded *mid-session* via `load_skill` still cannot change the model (context is frozen for it). That remains a possible separate feature and is not designed here; routing at creation is the general answer.
 
+### 5.1a Multi-label tasks (proposal, 2026-10-05, not implemented)
+
+**Status**: PROPOSAL, owner direction 2026-10-05. Amends the implemented single-task routing (ARCHITECTURE.md §8h "Routing"). Motivation: a request can involve several kinds of work at once, and some task categories exist only to label a request (for statistics and refusal rules, spec/REFUSAL-HANDLING.md §8.1), not to change anything about the session.
+
+- **Questions.** The `task` `choice` becomes one `noul` per `[decisions.routing.tasks.<key>]`: "The request involves: <description>." Every task at or above its threshold (`tasks.<key>.threshold`, default the point's `min_confidence`, calibrated per member as today) is selected. `other` is the session's only task when none is selected. On per-request-billed members the extra questions cost almost nothing; per-question-billed members pay per task, which the fits account for (§3.6).
+- **Tag-only tasks.** A task with no `models`/`model`, `skills`, `tail_files` or `thinking_level` is a label: it is recorded and matched by rules and statistics and changes nothing else.
+- **Merging the selected tasks:**
+  - `skills` and `tail_files`: the union, in authored task order;
+  - `thinking_level`: the highest among the selected tasks that set one;
+  - `models`: the selected tasks' cascades concatenated in authored task order, duplicates dropped. The first selected task (in config order) with models therefore gives the session its head, and the others extend the cascade. The rest of selection is unchanged (`cascade ++ normal selection`);
+  - when no selected task names models, the difficulty axis applies, as it does for `other` today.
+- **Skills.** The `skill` `choice` likewise becomes one `noul` per listed skill, so a request can preload several; the union with the tasks' static skills is preloaded as today.
+- **Persistence.** The selected task keys are stored with the routing state (`SessionRoutingState.tasks`, on `agent_sessions.initial_preloads`), so statistics and refusal rules read them without parsing evaluation rows; a resume keeps them. Sessions routed before this change get theirs from the routing row's verdict (`task`) in `decision_evaluations` during the statistics backfill.
+- **Scope unchanged.** Routing still runs only for fresh human-triggered chat-lane sessions. Proactive and bot-triggered sessions have no tasks; statistics separate them by site, not by task.
+- **Statistics.** A session counts under each of its tasks, so per-task totals overlap; the console says so wherever it shows a task breakdown.
+
 ### 5.2 Continuation — where does this message go?
 
 Today's chain (`handleInbound`, after edit/self-echo/gap-freeze handling, the activation gate, and `router.route`): reply to a running session → steer (`steerReplyToActiveSession`); quick same-sender follow-up → fold (`foldFollowUp`: steer/park/resume); no trigger → stop; bot-chain cap (`botChainCapGate`, multi-agent); shared reply-target → coalesce (`coalesceCoTargetReply`); accept/claim; reply to a completed session → resume gate (`evaluateResumeGate`: same-user, window, capability, work gate); else fresh (`launchSession`). It is all reply-target and same-sender rules, and it mostly needs an explicit reply. The gap the owner wants closed: a follow-up that is *not* a reply and *not* quick — a fresh `@` thirty seconds later, or a bare "and what about X?" from the same person — starts an amnesiac session.
