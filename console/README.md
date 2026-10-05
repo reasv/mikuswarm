@@ -79,6 +79,8 @@ MIKUSWARM_CONSOLE_DEMO=1 pnpm dev
 # then open http://localhost:5173
 #   /usage-cost                                  → Cost & Budget view
 #   /?room=matrix%3Aaria%3Aroom%3A%21general%3Amatrix.example.org&session=ses_op4kq2  → session observability
+#   /?room=matrix%3Aaria%3Aroom%3A%21general%3Amatrix.example.org&session=ses_rf7w3k  → branches, check cards, nudges
+#   /models                                      → model behaviour page
 ```
 
 Demo mode swaps the BFF's `AgentApiClient` for a fixture-backed layer (spec

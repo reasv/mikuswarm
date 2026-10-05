@@ -72,8 +72,12 @@ src/
   yotsuba/          4chan support: URL recognition (url.ts), API types + config resolver (types.ts), comment HTML→text (markup.ts), thread graph + helpers (graph.ts), post-view engine (view.ts), rendering vocabulary (format.ts), HTTP client with caching/pacing (client.ts) (see ARCHITECTURE.md §7f)
   net/              Shared HTTP utilities: PacedLimiter (paced-limiter.ts) — generic paced request limiter with interactive/background priority classes, extracted from and re-used by DanbooruRateLimiter
   decisions/        Decision models: System-One client over the fallback chain, per-member fits, decision points + evaluate(), [decisions] config (see ARCHITECTURE.md §8h)
+  checks/           Output checks: check catalogue + built-in refusal/style/contract checks, the output gate, judged-check evaluator, judge-shaped state, acting policy, revise remedy (see ARCHITECTURE.md §8j)
+  refusals/         Refusal handling: API-signal classifier, [[refusal_fallback]] rules and walks, session refusal handle, soft-refusal redo, mechanical-job reruns, caption refusal routing (see ARCHITECTURE.md §8j)
+  behaviour/        Model behaviour statistics: behaviour snapshots + change events, prompt-change tracker, hourly rollups, the /models read API (see ARCHITECTURE.md §8k)
+  audit/            Offline audit worker: send-contract diagnosis, judged history backfill, calibration core for scripts/calibrate-checks.ts (see ARCHITECTURE.md §9i)
   budget/           Period cost limits: BudgetEngine + window math + [[limits]] normalization + zero-cost model collection; seeded from usage_events, six enforcement gates (see ARCHITECTURE.md §8e/§8f)
-  agent/            Session factory, runner, manager; LLM request scheduler + retry/resume recovery (ARCHITECTURE.md §8/§8a)
+  agent/            Session factory, runner, manager; LLM request scheduler + retry/resume recovery (ARCHITECTURE.md §8/§8a); send-contract derivation, fork core and redo loop (§8j)
   context/          Context builder, renderer, compaction
   matrix/           Matrix provider, inbound normalization, native client
   tools/            Agent tool implementations (53 tools: the 50 default-session tools of §10, the background-session summary_tool and diary_tool, and the harness-only session_record_tool used only by the end-of-session record turn, §8i)
