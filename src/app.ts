@@ -6864,17 +6864,16 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // Session records to start with (spec SESSION-RECORDS §6/§7): planned in
       // parallel with routing and the build, awaited inside create() right before
       // the kickoff is assembled, and executed there with the session's own tools.
-      const injections = planRecordInjections(
-        inbound,
-        session,
-        proactive ? undefined : ownerSessionId,
-      ).catch((error) => {
-        logger.warn("records_injection_plan_failed", {
-          sessionId: session.id,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        return [] as SyntheticCallSpec[];
-      });
+      // A proactive check-in has no request to match records against.
+      const injections = proactive
+        ? undefined
+        : planRecordInjections(inbound, session, ownerSessionId).catch((error) => {
+            logger.warn("records_injection_plan_failed", {
+              sessionId: session.id,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            return [] as SyntheticCallSpec[];
+          });
       created = await factory.create(session, tools, {
         // Decision-model routing (ARCHITECTURE.md §8h): human-triggered chat-lane
         // sessions of an agent with routing on. Evaluated inside create(), after
