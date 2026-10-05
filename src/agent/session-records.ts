@@ -164,6 +164,12 @@ export interface StartRecordTurnParams {
    */
   setRefusalFallover?: (enabled: boolean) => void;
   /**
+   * The created agent's refusal-site switch: the turn's requests are refusal site
+   * `record_turn`, so a `[[refusal_fallback]]` rule naming it (or naming no sites)
+   * redoes a refused record turn on its model (spec REFUSAL-HANDLING §8.1).
+   */
+  setRefusalSite?: (site: string | undefined) => void;
+  /**
    * Persist the turn's messages (the run's transcript capture flush). Awaited
    * before the in-flight entry resolves, so a waiter (a reply-resume loading the
    * transcript, a reply injecting the record) sees the finished turn. Never throws.
@@ -299,6 +305,9 @@ export class SessionRecordService {
     // A refused record turn writes no record (spec §3.2): no fallover to
     // another chain member, so the refusal ends the turn at once.
     params.setRefusalFallover?.(false);
+    // The opt-out above disables only the implicit fallover; a refusal rule for
+    // this site still applies (spec REFUSAL-HANDLING §8.1).
+    params.setRefusalSite?.("record_turn");
 
     // A steer that landed after the rollout's last turn would otherwise be fed
     // into the record turn's loop. The session is over: clear the queue. The app
@@ -369,6 +378,7 @@ export class SessionRecordService {
       handles.gate.active = false;
       entry.abort = undefined;
       params.setRefusalFallover?.(true);
+      params.setRefusalSite?.(undefined);
     }
 
     if (abortReason && !finalized) {

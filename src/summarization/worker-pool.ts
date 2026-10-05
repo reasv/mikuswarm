@@ -364,6 +364,9 @@ export class SummarizationWorkerPool {
     });
 
     let agentError: unknown;
+    // Set when a refusal rule's entries were all exhausted (spec REFUSAL-HANDLING
+    // §8.2): the job ends with no output and is not re-run on the refusing model.
+    let refusalExhausted = false;
     try {
       // Input-addressed generation (spec SUMMARIZATION-JOB-INPUT-INTEGRITY
       // §3.1): a condense job renders its DECLARED child summaries directly —
@@ -376,7 +379,7 @@ export class SummarizationWorkerPool {
         job.level === 1
           ? { summarizationCutoff: { endTimestamp: input.cutoffTimestamp } }
           : { condenseInputs: { summaries: input.summaries ?? [] } };
-      const { agent, finalTurn, snapshot, tokenEstimate, usage, renderedInputIds } = await factory.create(
+      const { agent, finalTurn, snapshot, tokenEstimate, usage, renderedInputIds, refusal } = await factory.create(
         syntheticSession,
         [summaryTool],
         {
@@ -475,6 +478,7 @@ export class SummarizationWorkerPool {
         // cap aborts, and our own code throwing — all semantic.
         assertRunSettledCleanly(agent);
       } catch (err) {
+        refusalExhausted = refusal?.lastHardOutcome() === "exhausted_no_output";
         // The run rejected (possibly before any turn_end). Best-effort flush the
         // current transcript so the discarded summarization session is still
         // inspectable (issue #1), before detaching. Never let the flush mask the
@@ -593,7 +597,14 @@ export class SummarizationWorkerPool {
     });
 
     try {
-      if (job.attempts <= job.maxRetries) {
+      if (refusalExhausted) {
+        // Every entry of the matching refusal rule refused too (spec
+        // REFUSAL-HANDLING §8.2): no output, no salvaged draft, no re-run.
+        logger.warn("summarization_refusal_exhausted", { jobId: job.id, summaryLevel: job.level, attempt: job.attempts });
+        await storage.failSummarizationJob(job.id, errMsg);
+        this.options.onError(job.id, new Error(errMsg));
+        this.emit(job, "failed", "failed");
+      } else if (job.attempts <= job.maxRetries) {
         await storage.retrySummarizationJob(job.id, errMsg);
         this.emit(job, "retried", "pending");
       } else {

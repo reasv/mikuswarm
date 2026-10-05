@@ -1,3 +1,4 @@
+import { isRefusalExhausted } from "../refusals/fetch.js";
 import type { MediaAssetRow, Storage } from "../storage/index.js";
 import type { InferenceClient } from "./inference-client.js";
 import type { MediaModality } from "./describe.js";
@@ -316,7 +317,9 @@ export class CaptionWorkerPool {
     const attempts = asset.caption_attempts ?? 1;
     const maxRetries = this.options.config.max_retries ?? 2;
 
-    if (attempts >= maxRetries) {
+    // Every entry of a matching refusal rule refused too (spec REFUSAL-HANDLING
+    // §8.2): no caption, and no re-run on the refusing models.
+    if (attempts >= maxRetries || isRefusalExhausted(error)) {
       await this.options.storage.setCaptionStatus(
         asset.id, "failed",
         error instanceof Error ? error.message : String(error),

@@ -59,6 +59,14 @@ import {
 } from "./dynamic-tools.js";
 import { createLoadSkillTool, loadSkillToolDefinition } from "../tools/load-skill.js";
 import { createToolSearchTool, toolSearchToolDefinition } from "../tools/tool-search.js";
+import type { CheckCatalogue, RefusalRule } from "../checks/types.js";
+import { isPostingTool } from "../tools/side-effects.js";
+import {
+  createSessionRefusalController,
+  isInternalSite,
+  refusalRuleModels,
+  type SessionRefusalHandle,
+} from "../refusals/session.js";
 
 /**
  * Compose a session's operative context-token ceiling (spec
@@ -230,6 +238,13 @@ export interface AgentFactoryOptions {
    * and treats every tool as a non-MCP tool (safe: no scoping applied).
    */
   mcpToolServerMap?: Map<string, string>;
+  /**
+   * Refusal handling (spec REFUSAL-HANDLING §8): the app's check catalogue (built
+   * once, classifies hard refusals) and the normalized `[[refusal_fallback]]`
+   * rules. Absent (tests) = no rules; hard refusals are still recorded when
+   * storage is wired, as uncategorized.
+   */
+  refusals?: { catalogue: CheckCatalogue; rules: RefusalRule[] };
 }
 
 /** Result of a room-context preview build (spec §9). */
@@ -492,6 +507,17 @@ export interface CreatedAgent {
    * SESSION-RECORDS §3.2).
    */
   setRefusalFallover: (enabled: boolean) => void;
+  /**
+   * The session's refusal handle (spec REFUSAL-HANDLING §8): rules, the sticky
+   * pin a rule redo leaves, refusal statistics. Layer 0 consults it on every
+   * hard refusal; the output gate reads it for soft ones.
+   */
+  refusal: SessionRefusalHandle;
+  /**
+   * Switch the refusal site of this agent's later requests: the record turn sets
+   * `record_turn` (spec REFUSAL-HANDLING §8.1); undefined restores the session type.
+   */
+  setRefusalSite: (site: string | undefined) => void;
 }
 
 export class AgentSessionFactory {
@@ -806,11 +832,31 @@ export class AgentSessionFactory {
     const resumedMessages = new WeakSet<object>(
       (opts?.resume?.transcript ?? []).filter((m): m is AgentMessage & object => typeof m === "object" && m !== null),
     );
+    // Refusal rules (spec REFUSAL-HANDLING §8): the session's site is its type
+    // (the record turn switches it to `record_turn`); a resumed session keeps the
+    // pin a rule redo left (§8.3). Every model a rule can switch the session to
+    // joins the model-prompt heads below, so a redo is served with its own
+    // preamble and tail (§8.3, owner decision 27).
+    const refusalRules = this.options.refusals?.rules ?? [];
+    const refusalAgent = this.options.resolveAgentName?.(session.timelineKey) ?? null;
+    const resumedPin = opts?.resume ? this.options.storage?.getAgentSessionRefusalPin?.(session.id) : undefined;
+    const refusalHeads = [
+      ...refusalRuleModels(refusalRules, {
+        // A chat session may end in a record turn (site `record_turn`); a job never does.
+        sites: isInternalSite(session.sessionType) ? [session.sessionType] : [session.sessionType, "record_turn"],
+        agent: refusalAgent,
+      }),
+      ...(resumedPin && this.options.config.models[resumedPin.model] ? [resumedPin.model] : []),
+    ];
     // Model prompts (ARCHITECTURE.md §8 "Model prompts"): resolved and read once
     // for every member this session can reach, held for its lifetime, and applied
     // per attempt to whichever member serves.
     const modelPrompts = await this.loadSessionModelPrompts({
-      heads: [modelKey, ...(userSelection ? [...routedCascade, ...(userLimit!.resolution.models ?? [])] : [])],
+      heads: [
+        modelKey,
+        ...(userSelection ? [...routedCascade, ...(userLimit!.resolution.models ?? [])] : []),
+        ...refusalHeads,
+      ],
       sessionType: sessionTypeConfig,
       sessionTypeName: session.sessionType,
       workspaceRoot,
@@ -860,6 +906,7 @@ export class AgentSessionFactory {
         onResolve: (id) => {
           resolvedMember.logicalId = id;
           servedModelForAttempt = id;
+          refusal.noteServing(id);
         },
         // Feed the §5.3 running counter for per-member fits gating per attempt
         // (spec PER-MEMBER-CONTEXT-FITS §2.1). Guard: return undefined before the
@@ -1130,6 +1177,90 @@ export class AgentSessionFactory {
           return sel.fallback.streamFn(m, context, opts2);
         }
       : fallback.streamFn;
+    // Per-user affordability of a specific model now (spec PER-USER-LIMITS §5.3),
+    // for a refusal rule's entry and the pin that follows (REFUSAL-HANDLING §8.1/
+    // §8.3): the same estimate the per-user resolver builds, priced at that model.
+    const affordableNow = (logicalId: string) => {
+      refreshRunningContext();
+      const observed = ctxCounter.running;
+      const withinTtl =
+        ctxCounter.lastRequestAtMs > 0 && Date.now() - ctxCounter.lastRequestAtMs < PROMPT_CACHE_TTL_MS;
+      const built = buildFor(logicalId);
+      const probe = chooseChainMember(built.survivorMembers, { scheduler, isModelAvailable: isModelAvailableFn });
+      const withinCacheTtl =
+        withinTtl &&
+        ctxCounter.cacheDomainAtLast !== "" &&
+        built.survivorMembers[probe.index]?.healthKey === ctxCounter.cacheDomainAtLast;
+      const cfg = this.options.config.models[logicalId];
+      return userLimit!.engine.affordable(
+        userLimit!.resolution,
+        logicalId,
+        { cachedTokens: ctxCounter.cachedAtLast, newTokens: Math.max(0, observed - ctxCounter.cachedAtLast), withinCacheTtl },
+        cfg ? additiveThinkingBudgetTokens(cfg, thinkingLevel) : 0,
+      );
+    };
+    // The session's refusal handle (spec REFUSAL-HANDLING §8). A rule entry is
+    // usable when the session's gates pass for it: capability (the reply's image
+    // needs), health + budget + context fits over its own chain, and the user's
+    // per-user limits. A model that refused is not excluded: explicit entries may
+    // retry it (§8.1 tries).
+    const refusal = createSessionRefusalController({
+      sessionType: session.sessionType,
+      agent: refusalAgent,
+      sessionId: session.id,
+      timelineKey: session.timelineKey,
+      rules: refusalRules,
+      catalogue: this.options.refusals?.catalogue,
+      headModel: modelKey,
+      knownModel: (id) => this.options.config.models[id] !== undefined,
+      chainOf: (id) => {
+        try {
+          return resolveModelChain(id, this.options.config.models).map((m) => m.logicalId);
+        } catch {
+          return [id];
+        }
+      },
+      isUsable: (logicalId) => {
+        const cfg = this.options.config.models[logicalId];
+        if (!cfg) return false;
+        if (requiresMultimodal && !cfg.input_modalities.includes("image")) return false;
+        const built = buildFor(logicalId);
+        refreshRunningContext();
+        const pick = chooseChainMember(built.survivorMembers, {
+          scheduler,
+          isModelAvailable: isModelAvailableFn,
+          observedContextTokens: ctxCounter.seenMsgs < 0 ? undefined : ctxCounter.running,
+        });
+        if (pick.reason === "all-unhealthy") return false;
+        return !userSelectionActive || affordableNow(logicalId).ok;
+      },
+      initialPin: resumedPin,
+      persistPin: this.options.storage?.setAgentSessionRefusalPin
+        ? (pin) => this.options.storage!.setAgentSessionRefusalPin(session.id, pin)
+        : undefined,
+      insertEvent: this.options.storage?.insertRefusalEvent
+        ? (row) => this.options.storage!.insertRefusalEvent(row)
+        : undefined,
+      logger: this.options.logger,
+    });
+    // Sticky refusal redo (spec REFUSAL-HANDLING §8.3): once a rule pinned the
+    // session to an entry, every later request (the record turn included) goes to
+    // that entry with its own fallback chain, over the routed cascade and the
+    // per-user preference list. Under per-user limits the entry is the requested
+    // model: billed to the session's payee, counted on its caps, output capped at
+    // its affordable headroom.
+    const sessionStreamFn: StreamFn = (m, context, streamOptions) => {
+      // The pin, or a same-model retry's target for the rest of this request.
+      const pinned = refusal.dispatchModel();
+      if (pinned === undefined) return admittedStreamFn(m, context, streamOptions);
+      requestedMember.logicalId = pinned;
+      let opts2 = streamOptions;
+      if (userSelectionActive) {
+        const aff = affordableNow(pinned);
+        if (aff.ok) opts2 = { ...(streamOptions ?? {}), maxTokens: aff.maxOutput } as typeof streamOptions;
+      }
+      return buildFor(pinned).streamFn(m, context, opts2);
+    };
     // Per-class retry budget (spec §6): interactive-class work (live chat +
     // proactive — both time-sensitive, P3) is wall-clock-bounded; background-
     // class work (summaries, diaries — must eventually exist) is unbounded.
@@ -1150,7 +1281,7 @@ export class AgentSessionFactory {
     // which have no tool-cost lane).
     const usage = opts?.usage ?? new SessionUsageTracker(opts?.usageSeed);
     const streamFn = withRequestRetry(
-      admittedStreamFn,
+      sessionStreamFn,
       {
         maxWaitMs: interactiveBudget ? interactiveMaxWaitMs : undefined,
         backoffBaseMs: recovery?.llm_request_backoff_base_ms ?? 500,
@@ -1188,6 +1319,9 @@ export class AgentSessionFactory {
         // getServedModel() returns undefined there as desired).
         getRequestedModel: () => requestedMember.logicalId,
         refusalFallover: () => refusalFallover.enabled,
+        // Refusal rules replace the implicit fallover when one matches (spec
+        // REFUSAL-HANDLING §8.1); every refused attempt is recorded.
+        onRefusal: (info) => refusal.onHardRefusal(info),
         getServedModel: () => servedModelForAttempt,
         resetServedModel: () => { servedModelForAttempt = undefined; },
         // Observability tap (spec LLM-FAILURE-HANDLING §4.2): raw attempt
@@ -1207,6 +1341,9 @@ export class AgentSessionFactory {
         // ledger write is additive — the §8b `agent_sessions.usage_*` aggregate
         // is still maintained by the tracker's persistence subscriber.
         onRequestCommitted: (message: AssistantMessage) => {
+          // A clean commit ends the request: the models that refused it may serve
+          // the next one (a refused attempt's usage arrives here too, §10.3).
+          if (message.stopReason !== "error") refusal.noteCommitted();
           // Same billed-model expression the ledger row below uses (spec
           // MODEL-FALLBACK §2.2/§6.1): the committed message's own `model` when
           // the provider reports one, else this attempt's descriptor. Feeding it
@@ -1315,13 +1452,17 @@ export class AgentSessionFactory {
           // Per-user selection owns the context "fits" check per attempt (spec §6.2):
           // resolveUserSelection delegates to chooseChainMember with observedContextTokens,
           // and terminates via checkCostBudget when no selectable fits. Defer here.
-          if (userSelectionActive) return undefined;
+          // A session pinned by a refusal rule (§8.3) is checked against the pinned
+          // entry's chain, per-user or not.
+          const pinnedModel = refusal.pinnedModel();
+          if (userSelectionActive && pinnedModel === undefined) return undefined;
+          const checked = pinnedModel !== undefined ? buildFor(pinnedModel) : fallback;
           const observed = usage.snapshot().contextTokens;
-          const maxWindow = fallback.maxOperativeContextWindow;
+          const maxWindow = checked.maxOperativeContextWindow;
           // Block only when the context exceeds EVERY member's window (fits no member).
           if (observed === null || observed <= maxWindow) return undefined;
           // At this point: observed > maxWindow → no surviving member can serve.
-          const skipped = fallback.survivorMembers
+          const skipped = checked.survivorMembers
             .filter((m) => m.operativeWindow < observed)
             .map((m) => m.logicalId);
           this.options.logger?.warn("session_context_limit_exceeded", {
@@ -1418,7 +1559,24 @@ export class AgentSessionFactory {
           // qualifies — degradation finishes the rollout on a cheaper model rather than
           // guillotining it. The resolver reads the exact running context counter and
           // the prompt-cache split internally (§5.3).
-          if (userSelectionActive) {
+          // A session pinned by a refusal rule (REFUSAL-HANDLING §8.3) stays on the
+          // pinned entry: it is the requested model, and only its affordability
+          // decides; the preference list is not consulted again.
+          const pinnedForUser = userSelectionActive ? refusal.pinnedModel() : undefined;
+          if (pinnedForUser !== undefined) {
+            if (!affordableNow(pinnedForUser).ok) {
+              this.options.logger?.warn("usage_limit_blocked", {
+                gate: "user_preflight",
+                sessionId: session.id,
+                timelineKey: session.timelineKey,
+                userId: userLimit!.ctx.userId,
+                cause: "budget",
+                pinnedModel: pinnedForUser,
+              });
+              return `per-user budget exhausted: the pinned refusal-redo model ${pinnedForUser} is not affordable for ${userLimit!.ctx.userId}`;
+            }
+            userLimit!.engine.noteSelection(session.id, userLimit!.ctx.userId, userLimit!.ctx.roomId, pinnedForUser);
+          } else if (userSelectionActive) {
             const picked = resolveUserSelection();
             if (picked.ok) {
               activeSelection = picked.selection;
@@ -1463,6 +1621,8 @@ export class AgentSessionFactory {
         ...(userSelectionActive
           ? {
               onBudgetTruncation: (committed: AssistantMessage): "reselect" | "accept" => {
+                // A pinned session (refusal redo, §8.3) has no cheaper model to move to.
+                if (refusal.pinnedModel() !== undefined) return "accept";
                 const cap = activeSelection.maxTokens;
                 // Disambiguate budget-cap vs legitimate length stop against the
                 // REQUESTED model's OWN `max_tokens` — the value `cap` was derived from
@@ -1967,6 +2127,13 @@ export class AgentSessionFactory {
         : {}),
     });
     agentRef.agent = agent;
+    // A delivered message ends the refusal point: a later refusal starts its rule
+    // from the first entry (spec REFUSAL-HANDLING §8.1 "Tries and same-model retries").
+    agent.subscribe((event) => {
+      if (event.type === "tool_execution_end" && !event.isError && isPostingTool(event.toolName)) {
+        refusal.noteDelivered();
+      }
+    });
     if (registry) {
       // Between-run pickup + accounting (spec §7/§9): reassert `agent.state.tools`
       // so the NEXT run's snapshot sees the loaded set (steering/follow-up/forced-
@@ -2089,6 +2256,10 @@ export class AgentSessionFactory {
       },
       setRefusalFallover: (enabled: boolean) => {
         refusalFallover.enabled = enabled;
+      },
+      refusal,
+      setRefusalSite: (site: string | undefined) => {
+        refusal.setSite(site);
       },
     };
   }

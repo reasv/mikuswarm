@@ -1144,8 +1144,18 @@ const RefusalRuleSchema = StrictObject({
   from_models: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
   agents: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
   tasks: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
-  // Chat models tried in order.
-  models: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
+  // Chat models tried in order: a [models.*] key, or "@same" (the model that
+  // refused), or { model, tries } (tries default 1, at most 10). Repeats allowed.
+  models: Type.Array(
+    Type.Union([
+      Type.String({ minLength: 1 }),
+      StrictObject({
+        model: Type.String({ minLength: 1 }),
+        tries: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
+      }),
+    ]),
+    { minItems: 1 },
+  ),
   // Whether a judged (soft) refusal triggers a redo. Default "redo".
   soft: Type.Optional(Type.Union([Type.Literal("redo"), Type.Literal("observe")])),
   // Chat sites, when every entry refused. Default "send_last".

@@ -34,7 +34,7 @@ function config(over: Record<string, unknown> = {}): any {
 
 const rule = (name: string, over: Partial<RefusalRule> = {}): RefusalRule => ({
   name,
-  models: ["open_model_x"],
+  models: [{ model: "open_model_x", tries: 1 }],
   soft: "redo",
   onExhausted: "send_last",
   index: 0,
@@ -53,12 +53,15 @@ test("normalizeRefusalRules: defaults, authored order, empty tasks dropped", () 
       name: "distill",
       reasons: ["distillation"],
       fromModels: ["model_a"],
-      models: ["open_model_x", "open_model_y"],
+      models: [
+        { model: "open_model_x", tries: 1 },
+        { model: "open_model_y", tries: 1 },
+      ],
       soft: "redo",
       onExhausted: "send_last",
       index: 0,
     },
-    { name: "any", models: ["open_model_y"], soft: "observe", onExhausted: "withhold", index: 1 },
+    { name: "any", models: [{ model: "open_model_y", tries: 1 }], soft: "observe", onExhausted: "withhold", index: 1 },
   ]);
   assert.deepEqual(normalizeRefusalRules({}), []);
 });
@@ -66,7 +69,7 @@ test("normalizeRefusalRules: defaults, authored order, empty tasks dropped", () 
 test("matchRefusalRule: first match wins; omitted conditions match anything", () => {
   const rules = [
     rule("distill", { reasons: ["distillation"], index: 0 }),
-    rule("generic", { models: ["open_model_y"], index: 1 }),
+    rule("generic", { models: [{ model: "open_model_y", tries: 1 }], index: 1 }),
   ];
   const base = { site: "default", agent: "agent_a", tasks: null, fromModel: "model_a", kind: "hard" as const };
   assert.equal(matchRefusalRule(rules, { ...base, reason: "distillation" })?.name, "distill");
@@ -136,6 +139,8 @@ test("validateRefusalRules: a valid set passes; no rules is fine", () => {
         models: ["open_model_x", "open_model_y"],
       },
       { name: "generic", models: ["open_model_y"], tasks: [] },
+      // Same-model retries and repeated keys (spec §8.1 tries).
+      { name: "retry", models: [{ model: "@same", tries: 2 }, "open_model_x", { model: "open_model_x", tries: 10 }] },
     ],
   });
   validateRefusalRules(cfg, buildCheckCatalogue(cfg));
@@ -164,6 +169,10 @@ test("validateRefusalRules: startup errors", () => {
     [[{ name: "a", models: ["open_model_x"], sites: ["nowhere"] }], /sites: unknown site "nowhere"/],
     [[{ name: "a", models: ["open_model_x"], reasons: ["made_up"] }], /reasons: unknown reason "made_up"/],
     [[{ name: "a", models: ["open_model_x"], sites: [] }], /sites: must not be empty/],
+    [[{ name: "a", models: [{ model: "open_model_x", tries: 0 }] }], /models\[0\]: tries must be an integer from 1 to 10 \(got 0\)/],
+    [[{ name: "a", models: ["open_model_x", { model: "@same", tries: 11 }] }], /models\[1\]: tries must be an integer/],
+    [[{ name: "a", models: [{ model: "open_model_x", tries: 2.5 }] }], /tries must be an integer/],
+    [[], /models\.@same: "@same" is reserved/, { models: { ...config().models, "@same": chatModel("m-same") } }],
   ];
   for (const [rules, re, over] of cases) {
     const cfg = config({ refusal_fallback: rules, ...(over ?? {}) });

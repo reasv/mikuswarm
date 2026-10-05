@@ -6,7 +6,7 @@ settings:
 
 patchedDependencies:
   '@earendil-works/pi-ai@0.84.2':
-    hash: 140d4e5f1b8147b6b597135924cd47dd89760ef040f2760a3088a419b1b6af7f
+    hash: 7f0db6299c0e1792e30da1f515138f4aad8d416a1d549ce8001f249da7e440aa
     path: patches/@earendil-works__pi-ai@0.84.2.patch
 
 importers:
@@ -18,7 +18,7 @@ importers:
         version: 0.84.2(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.20.1)(zod@4.4.3)
       '@earendil-works/pi-ai':
         specifier: 0.84.2
-        version: 0.84.2(patch_hash=140d4e5f1b8147b6b597135924cd47dd89760ef040f2760a3088a419b1b6af7f)(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.20.1)(zod@4.4.3)
+        version: 0.84.2(patch_hash=7f0db6299c0e1792e30da1f515138f4aad8d416a1d549ce8001f249da7e440aa)(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.20.1)(zod@4.4.3)
       '@modelcontextprotocol/sdk':
         specifier: ^1.29.0
         version: 1.29.0(zod@4.4.3)
@@ -2663,7 +2663,7 @@ snapshots:
 
   '@earendil-works/pi-agent-core@0.84.2(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.20.1)(zod@4.4.3)':
     dependencies:
-      '@earendil-works/pi-ai': 0.84.2(patch_hash=140d4e5f1b8147b6b597135924cd47dd89760ef040f2760a3088a419b1b6af7f)(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.20.1)(zod@4.4.3)
+      '@earendil-works/pi-ai': 0.84.2(patch_hash=7f0db6299c0e1792e30da1f515138f4aad8d416a1d549ce8001f249da7e440aa)(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.20.1)(zod@4.4.3)
       '@earendil-works/pi-telemetry': 0.84.2
       diff: 8.0.4
       ignore: 7.0.5
@@ -2677,7 +2677,7 @@ snapshots:
       - ws
       - zod
 
-  '@earendil-works/pi-ai@0.84.2(patch_hash=140d4e5f1b8147b6b597135924cd47dd89760ef040f2760a3088a419b1b6af7f)(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.20.1)(zod@4.4.3)':
+  '@earendil-works/pi-ai@0.84.2(patch_hash=7f0db6299c0e1792e30da1f515138f4aad8d416a1d549ce8001f249da7e440aa)(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.20.1)(zod@4.4.3)':
     dependencies:
       '@anthropic-ai/sdk': 0.91.1(zod@4.4.3)
       '@aws-sdk/client-bedrock-runtime': 3.1048.0

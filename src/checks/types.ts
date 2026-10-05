@@ -77,6 +77,18 @@ export interface CheckCatalogue {
   enabledFor(checkpoint: Checkpoint, agent?: string | null): CheckDefinition[];
 }
 
+/** Reserved rule-entry key: the model that refused (spec §8.1 "Tries and same-model retries"). */
+export const SAME_MODEL_KEY = "@same";
+
+/** Maximum `tries` of one rule entry. */
+export const MAX_RULE_ENTRY_TRIES = 10;
+
+/** One entry of a rule's `models`: a `[models.*]` key or {@link SAME_MODEL_KEY}, tried `tries` times. */
+export interface RefusalRuleEntry {
+  model: string;
+  tries: number;
+}
+
 /** A normalized `[[refusal_fallback]]` rule (spec §8.1). */
 export interface RefusalRule {
   name: string;
@@ -85,7 +97,8 @@ export interface RefusalRule {
   fromModels?: string[];
   agents?: string[];
   tasks?: string[];
-  models: string[];
+  /** Entries in order; repeated keys allowed. */
+  models: RefusalRuleEntry[];
   soft: "redo" | "observe";
   onExhausted: "send_last" | "withhold" | "park";
   /** Position in the authored list (precedence: first match wins). */

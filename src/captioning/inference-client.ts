@@ -1,9 +1,9 @@
 import { readFile, unlink } from "node:fs/promises";
-import { describeMedia, CaptionContentError, type CaptionModelConfig, type MediaModality } from "./describe.js";
+import { describeMedia, CaptionContentError, CaptionRefusalError, type CaptionModelConfig, type MediaModality } from "./describe.js";
+import { runFetchWithRefusalRules, type FetchRefusalRouting } from "../refusals/fetch.js";
 import { type LlmScheduler } from "../agent/scheduler.js";
 import { extractStatus } from "../agent/request-retry.js";
 import {
-  runFetchWithFallback,
   type ModelChainEntry,
   type FetchChainMember,
 } from "../agent/model-fallback.js";
@@ -73,6 +73,23 @@ export interface InferenceClientOptions {
   videoProcessing?: VideoProcessingOptions;
   audioProcessing?: AudioProcessingOptions;
   timeoutMs?: number;
+  /**
+   * Refusal rules for site `caption` (spec REFUSAL-HANDLING §8.1): a refused
+   * caption is recorded and, when a rule matches, re-run on the rule's next
+   * usable model. Absent = a refusal is a content failure, as before.
+   */
+  refusals?: FetchRefusalRouting;
+  /** Bills a refused caption attempt (spec §10.3): the provider charged for it. */
+  onRefusedAttempt?: (attempt: RefusedCaptionAttempt) => void;
+}
+
+/** A refused caption attempt's billing (same fields as a {@link CaptionResponse}). */
+export interface RefusedCaptionAttempt {
+  model: string;
+  logicalModelId: string;
+  provider: string | null;
+  usage: RawTokenUsage | null;
+  cost: number | null;
 }
 
 export interface CaptionRequest {
@@ -246,7 +263,7 @@ export class InferenceClient {
     // treats as a NEUTRAL teardown (never a health-streak hit), so the pool's
     // stop() never stalls for a probe window during a caption-model outage.
     let billed: FetchChainMember | undefined;
-    const result = await runFetchWithFallback(
+    const result = await runFetchWithRefusalRules(
       this.options.chain,
       {
         consumer: `caption:${this.options.modality}`,
@@ -290,6 +307,17 @@ export class InferenceClient {
           const kind = status === 400 || status === 413 || status === 422 ? "content" : "environmental";
           return { ok: false as const, kind, status, error: err };
         }
+      },
+      this.options.refusals,
+      (member, error) => {
+        const usage = error instanceof CaptionRefusalError ? error.usage : null;
+        this.options.onRefusedAttempt?.({
+          model: (error instanceof CaptionRefusalError ? error.refusal.wireModel : undefined) ?? member.config.id,
+          logicalModelId: member.logicalId,
+          provider: member.config.provider ?? null,
+          usage,
+          cost: usage ? computeUsageCost(costRatesOf(member.config), usage).total : null,
+        });
       },
     );
 
