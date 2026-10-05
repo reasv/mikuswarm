@@ -948,3 +948,186 @@ export const SessionDecisionsResponse = Schema.Struct({
 	evaluations: Schema.Array(DecisionEvaluation)
 });
 export type SessionDecisionsResponse = Schema.Schema.Type<typeof SessionDecisionsResponse>;
+
+// ===========================================================================
+// Model behaviour page (spec REFUSAL-HANDLING §12.3, §12.4). Wire shapes of
+// GET /api/models/behaviour and /api/models/behaviour/incidents, mirroring
+// src/behaviour/types.ts.
+// ===========================================================================
+
+/** A typed change event (config diff at boot, or an observed prompt change). */
+export const BehaviourChangeEvent = Schema.Struct({
+	id: Schema.Number,
+	ts: Schema.Number,
+	/** head_model_changed | chain_changed | preference_changed | thinking_changed | routing_task_changed | rule_changed | check_changed | code_changed | config_changed | prompt_changed */
+	kind: Schema.String,
+	sentence: Schema.String,
+	path: Schema.NullOr(Schema.String),
+	old: Schema.Unknown,
+	new: Schema.Unknown,
+	/** Touched agents / sites / models; [] = every one. */
+	agents: Schema.Array(Schema.String),
+	sites: Schema.Array(Schema.String),
+	models: Schema.Array(Schema.String),
+	/** prompt_changed: { prompt: 'system' | 'model', oldHash, newHash }. */
+	detail: Schema.NullOr(Schema.Record({ key: Schema.String, value: Schema.Unknown }))
+});
+export type BehaviourChangeEvent = Schema.Schema.Type<typeof BehaviourChangeEvent>;
+
+/** One chart marker: changes within a few minutes of each other (one deploy). */
+export const BehaviourMarker = Schema.Struct({
+	ts: Schema.Number,
+	until: Schema.Number,
+	kinds: Schema.Array(Schema.String),
+	events: Schema.Array(BehaviourChangeEvent)
+});
+export type BehaviourMarker = Schema.Schema.Type<typeof BehaviourMarker>;
+
+export const BehaviourRateCell = Schema.Struct({
+	rate: Schema.NullOr(Schema.Number),
+	count: Schema.Number,
+	denominator: Schema.Number,
+	previousRate: Schema.NullOr(Schema.Number),
+	change: Schema.NullOr(Schema.Number),
+	/** Denominator below the rate's minSample: render greyed. */
+	lowSample: Schema.Boolean
+});
+export type BehaviourRateCell = Schema.Schema.Type<typeof BehaviourRateCell>;
+
+export const BehaviourScorecardRow = Schema.Struct({
+	group: Schema.String,
+	members: Schema.Array(Schema.String),
+	volume: Schema.Struct({ requests: Schema.Number, sessions: Schema.Number, messages: Schema.Number }),
+	/** Keyed by headline rate id. */
+	cells: Schema.Record({ key: Schema.String, value: BehaviourRateCell })
+});
+export type BehaviourScorecardRow = Schema.Schema.Type<typeof BehaviourScorecardRow>;
+
+export const BehaviourRateDefinition = Schema.Struct({
+	id: Schema.String,
+	label: Schema.String,
+	numerator: Schema.Array(Schema.String),
+	denominator: Schema.String,
+	scale: Schema.Number,
+	minSample: Schema.Number
+});
+export type BehaviourRateDefinition = Schema.Schema.Type<typeof BehaviourRateDefinition>;
+
+export const BehaviourSeriesPoint = Schema.Struct({
+	bucket: Schema.Number,
+	group: Schema.String,
+	count: Schema.Number,
+	denominator: Schema.Number,
+	rate: Schema.NullOr(Schema.Number)
+});
+export type BehaviourSeriesPoint = Schema.Schema.Type<typeof BehaviourSeriesPoint>;
+
+const BehaviourCount = Schema.Struct({ key: Schema.String, count: Schema.Number });
+const BehaviourCheckBreakdown = Schema.Struct({
+	code: Schema.String,
+	hits: Schema.Number,
+	revisions: Schema.Number,
+	overrides: Schema.Number
+});
+
+export const BehaviourBreakdown = Schema.Struct({
+	refusals: Schema.Struct({
+		hard: Schema.Number,
+		judged: Schema.Number,
+		redos: Schema.Number,
+		byReason: Schema.Array(BehaviourCount),
+		bySite: Schema.Array(BehaviourCount),
+		byMethod: Schema.Array(BehaviourCount),
+		outcomes: Schema.Array(BehaviourCount),
+		discardedBranchCostUsd: Schema.Number
+	}),
+	contract: Schema.Struct({
+		nudgedSessions: Schema.Number,
+		failedAttempts: Schema.Number,
+		/** keys "1", "2", "3" (3+), "after_redo", "gave_up", "exhausted". */
+		untilRecovery: Schema.Array(BehaviourCount),
+		failureTypes: Schema.Array(BehaviourCount),
+		redos: Schema.Number,
+		discardedBranchCostUsd: Schema.Number,
+		afterCorrection: Schema.Array(BehaviourCount),
+		noReplyIntent: Schema.Array(BehaviourCount)
+	}),
+	style: Schema.Struct({
+		hits: Schema.Number,
+		messagesWithHit: Schema.Number,
+		revisions: Schema.Number,
+		overrides: Schema.Number,
+		perCheck: Schema.Array(BehaviourCheckBreakdown)
+	}),
+	checks: Schema.Array(BehaviourCheckBreakdown)
+});
+export type BehaviourBreakdown = Schema.Schema.Type<typeof BehaviourBreakdown>;
+
+export const BehaviourIncidentRow = Schema.Struct({
+	sessionId: Schema.String,
+	ts: Schema.Number,
+	agent: Schema.NullOr(Schema.String),
+	timelineKey: Schema.String,
+	roomLabel: Schema.String,
+	site: Schema.String,
+	models: Schema.Array(Schema.String),
+	/** refusal | nudge | redo | revision | ending */
+	types: Schema.Array(Schema.String),
+	chips: Schema.Struct({
+		refused: Schema.Number,
+		redone: Schema.Number,
+		nudged: Schema.Number,
+		revised: Schema.Number,
+		overridden: Schema.Number,
+		endings: Schema.Number
+	}),
+	outcome: Schema.String,
+	link: Schema.Struct({
+		sessionId: Schema.String,
+		branchNo: Schema.Number,
+		toolCallId: Schema.NullOr(Schema.String),
+		attemptNo: Schema.NullOr(Schema.Number)
+	})
+});
+export type BehaviourIncidentRow = Schema.Schema.Type<typeof BehaviourIncidentRow>;
+
+/** GET /api/models/behaviour/incidents — one page; pass `nextCursor` back as `cursor`. */
+export const BehaviourIncidentPage = Schema.Struct({
+	rows: Schema.Array(BehaviourIncidentRow),
+	nextCursor: Schema.NullOr(Schema.String)
+});
+export type BehaviourIncidentPage = Schema.Schema.Type<typeof BehaviourIncidentPage>;
+
+/** GET /api/models/behaviour — the whole page under one set of URL filters. */
+export const ModelBehaviourResponse = Schema.Struct({
+	window: Schema.String,
+	since: Schema.Number,
+	until: Schema.Number,
+	groupBy: Schema.String,
+	family: Schema.Boolean,
+	filters: Schema.Struct({
+		agent: Schema.NullOr(Schema.String),
+		site: Schema.NullOr(Schema.String),
+		task: Schema.NullOr(Schema.String),
+		selected: Schema.NullOr(Schema.String)
+	}),
+	metric: Schema.String,
+	rates: Schema.Array(BehaviourRateDefinition),
+	scorecard: Schema.Array(BehaviourScorecardRow),
+	series: Schema.Struct({
+		metric: Schema.String,
+		bucketMs: Schema.Number,
+		points: Schema.Array(BehaviourSeriesPoint)
+	}),
+	breakdown: BehaviourBreakdown,
+	markers: Schema.Array(BehaviourMarker),
+	incidents: BehaviourIncidentPage,
+	facets: Schema.Struct({
+		agents: Schema.Array(Schema.String),
+		sites: Schema.Array(Schema.String),
+		models: Schema.Array(Schema.String),
+		tasks: Schema.Array(Schema.String)
+	}),
+	pendingHours: Schema.Number
+});
+export type ModelBehaviourResponse = Schema.Schema.Type<typeof ModelBehaviourResponse>;

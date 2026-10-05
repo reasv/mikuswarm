@@ -1,0 +1,574 @@
+{
+	"window": "24h",
+	"since": 3520800000,
+	"until": 3607200000,
+	"groupBy": "model",
+	"family": false,
+	"filters": {
+		"agent": null,
+		"site": null,
+		"task": null,
+		"selected": "model_b"
+	},
+	"metric": "refusals_hard_per_request",
+	"rates": [
+		{
+			"id": "refusals_hard_per_request",
+			"label": "Hard refusals per request",
+			"numerator": [
+				"refusals_hard"
+			],
+			"denominator": "requests",
+			"scale": 1,
+			"minSample": 50
+		},
+		{
+			"id": "refusals_judged_per_request",
+			"label": "Judged refusals per request",
+			"numerator": [
+				"refusals_judged"
+			],
+			"denominator": "requests",
+			"scale": 1,
+			"minSample": 50
+		},
+		{
+			"id": "nudged_per_session",
+			"label": "Sessions nudged",
+			"numerator": [
+				"sessions_nudged"
+			],
+			"denominator": "sessions",
+			"scale": 1,
+			"minSample": 20
+		},
+		{
+			"id": "recovered_per_nudged",
+			"label": "Recovered after nudges",
+			"numerator": [
+				"contract_recovered_1",
+				"contract_recovered_2",
+				"contract_recovered_3",
+				"contract_recovered_after_redo"
+			],
+			"denominator": "sessions_nudged",
+			"scale": 1,
+			"minSample": 5
+		},
+		{
+			"id": "contract_redos_per_session",
+			"label": "Send-contract redos per session",
+			"numerator": [
+				"contract_redos"
+			],
+			"denominator": "sessions",
+			"scale": 1,
+			"minSample": 20
+		},
+		{
+			"id": "contract_exhaustions_per_session",
+			"label": "Send-contract exhaustions per session",
+			"numerator": [
+				"contract_exhausted"
+			],
+			"denominator": "sessions",
+			"scale": 1,
+			"minSample": 20
+		},
+		{
+			"id": "style_hits_per_1k_tokens",
+			"label": "Style hits per 1k message tokens",
+			"numerator": [
+				"style_hits"
+			],
+			"denominator": "message_tokens",
+			"scale": 1000,
+			"minSample": 2000
+		},
+		{
+			"id": "messages_with_style_hit",
+			"label": "Messages with a style hit",
+			"numerator": [
+				"messages_with_style_hit"
+			],
+			"denominator": "messages_sent",
+			"scale": 1,
+			"minSample": 20
+		},
+		{
+			"id": "refusal_redos_per_session",
+			"label": "Refusal redos per session",
+			"numerator": [
+				"refusal_redos"
+			],
+			"denominator": "sessions",
+			"scale": 1,
+			"minSample": 20
+		}
+	],
+	"scorecard": [
+		{
+			"group": "model_a",
+			"members": [],
+			"volume": {
+				"requests": 2,
+				"sessions": 2,
+				"messages": 0
+			},
+			"cells": {
+				"refusals_hard_per_request": {
+					"rate": 0.5,
+					"count": 1,
+					"denominator": 2,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"refusals_judged_per_request": {
+					"rate": 0,
+					"count": 0,
+					"denominator": 2,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"nudged_per_session": {
+					"rate": 0.5,
+					"count": 1,
+					"denominator": 2,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"recovered_per_nudged": {
+					"rate": 0,
+					"count": 0,
+					"denominator": 1,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"contract_redos_per_session": {
+					"rate": 0.5,
+					"count": 1,
+					"denominator": 2,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"contract_exhaustions_per_session": {
+					"rate": 0.5,
+					"count": 1,
+					"denominator": 2,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"style_hits_per_1k_tokens": {
+					"rate": null,
+					"count": 0,
+					"denominator": 0,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"messages_with_style_hit": {
+					"rate": null,
+					"count": 0,
+					"denominator": 0,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"refusal_redos_per_session": {
+					"rate": 0.5,
+					"count": 1,
+					"denominator": 2,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				}
+			}
+		},
+		{
+			"group": "model_b",
+			"members": [],
+			"volume": {
+				"requests": 1,
+				"sessions": 1,
+				"messages": 2
+			},
+			"cells": {
+				"refusals_hard_per_request": {
+					"rate": 0,
+					"count": 0,
+					"denominator": 1,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"refusals_judged_per_request": {
+					"rate": 0,
+					"count": 0,
+					"denominator": 1,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"nudged_per_session": {
+					"rate": 1,
+					"count": 1,
+					"denominator": 1,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"recovered_per_nudged": {
+					"rate": 1,
+					"count": 1,
+					"denominator": 1,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"contract_redos_per_session": {
+					"rate": 0,
+					"count": 0,
+					"denominator": 1,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"contract_exhaustions_per_session": {
+					"rate": 0,
+					"count": 0,
+					"denominator": 1,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"style_hits_per_1k_tokens": {
+					"rate": 142.85714285714286,
+					"count": 1,
+					"denominator": 7,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"messages_with_style_hit": {
+					"rate": 0.5,
+					"count": 1,
+					"denominator": 2,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"refusal_redos_per_session": {
+					"rate": 0,
+					"count": 0,
+					"denominator": 1,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				}
+			}
+		},
+		{
+			"group": "cap_model",
+			"members": [],
+			"volume": {
+				"requests": 1,
+				"sessions": 0,
+				"messages": 0
+			},
+			"cells": {
+				"refusals_hard_per_request": {
+					"rate": 1,
+					"count": 1,
+					"denominator": 1,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"refusals_judged_per_request": {
+					"rate": 0,
+					"count": 0,
+					"denominator": 1,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"nudged_per_session": {
+					"rate": null,
+					"count": 0,
+					"denominator": 0,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"recovered_per_nudged": {
+					"rate": null,
+					"count": 0,
+					"denominator": 0,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"contract_redos_per_session": {
+					"rate": null,
+					"count": 0,
+					"denominator": 0,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"contract_exhaustions_per_session": {
+					"rate": null,
+					"count": 0,
+					"denominator": 0,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"style_hits_per_1k_tokens": {
+					"rate": null,
+					"count": 0,
+					"denominator": 0,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"messages_with_style_hit": {
+					"rate": null,
+					"count": 0,
+					"denominator": 0,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"refusal_redos_per_session": {
+					"rate": null,
+					"count": 0,
+					"denominator": 0,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				}
+			}
+		}
+	],
+	"series": {
+		"metric": "refusals_hard_per_request",
+		"bucketMs": 3600000,
+		"points": [
+			{
+				"bucket": 3600000000,
+				"group": "cap_model",
+				"count": 1,
+				"denominator": 1,
+				"rate": 1
+			},
+			{
+				"bucket": 3600000000,
+				"group": "model_a",
+				"count": 1,
+				"denominator": 2,
+				"rate": 0.5
+			},
+			{
+				"bucket": 3600000000,
+				"group": "model_b",
+				"count": 0,
+				"denominator": 1,
+				"rate": 0
+			}
+		]
+	},
+	"breakdown": {
+		"refusals": {
+			"hard": 0,
+			"judged": 0,
+			"redos": 0,
+			"byReason": [],
+			"bySite": [],
+			"byMethod": [],
+			"outcomes": [],
+			"discardedBranchCostUsd": 0
+		},
+		"contract": {
+			"nudgedSessions": 1,
+			"failedAttempts": 1,
+			"untilRecovery": [
+				{
+					"key": "1",
+					"count": 1
+				},
+				{
+					"key": "2",
+					"count": 0
+				},
+				{
+					"key": "3",
+					"count": 0
+				},
+				{
+					"key": "after_redo",
+					"count": 0
+				},
+				{
+					"key": "gave_up",
+					"count": 0
+				},
+				{
+					"key": "exhausted",
+					"count": 0
+				}
+			],
+			"failureTypes": [
+				{
+					"key": "text_only",
+					"count": 1
+				}
+			],
+			"redos": 0,
+			"discardedBranchCostUsd": 0,
+			"afterCorrection": [],
+			"noReplyIntent": []
+		},
+		"style": {
+			"hits": 1,
+			"messagesWithHit": 1,
+			"revisions": 1,
+			"overrides": 0,
+			"perCheck": [
+				{
+					"code": "style_x",
+					"hits": 1,
+					"revisions": 1,
+					"overrides": 0
+				}
+			]
+		},
+		"checks": [
+			{
+				"code": "style_x",
+				"hits": 1,
+				"revisions": 1,
+				"overrides": 0
+			}
+		]
+	},
+	"markers": [
+		{
+			"ts": 3600060000,
+			"until": 3600090000,
+			"kinds": [
+				"prompt_changed",
+				"head_model_changed"
+			],
+			"events": [
+				{
+					"id": 1,
+					"ts": 3600060000,
+					"kind": "prompt_changed",
+					"sentence": "agent agent_a, default on model_a: system prompt changed (aaa → bbb)",
+					"path": null,
+					"old": null,
+					"new": null,
+					"agents": [
+						"agent_a"
+					],
+					"sites": [
+						"default"
+					],
+					"models": [
+						"model_a"
+					],
+					"detail": {
+						"prompt": "system",
+						"oldHash": "aaa",
+						"newHash": "bbb"
+					}
+				},
+				{
+					"id": 2,
+					"ts": 3600090000,
+					"kind": "head_model_changed",
+					"sentence": "agent agent_a, default: head model model_a → model_b",
+					"path": "agents.agent_a.sites.default",
+					"old": "model_a",
+					"new": "model_b",
+					"agents": [
+						"agent_a"
+					],
+					"sites": [
+						"default"
+					],
+					"models": [
+						"model_a",
+						"model_b"
+					],
+					"detail": null
+				}
+			]
+		}
+	],
+	"incidents": {
+		"rows": [
+			{
+				"sessionId": "s1",
+				"ts": 3600001000,
+				"agent": "agent_a",
+				"timelineKey": "matrix:acc_a:room:!r1:x",
+				"roomLabel": "matrix:acc_a:room:!r1:x",
+				"site": "default",
+				"models": [
+					"model_a",
+					"model_b"
+				],
+				"types": [
+					"refusal",
+					"nudge",
+					"redo",
+					"revision"
+				],
+				"chips": {
+					"refused": 1,
+					"redone": 1,
+					"nudged": 1,
+					"revised": 1,
+					"overridden": 0,
+					"endings": 0
+				},
+				"outcome": "refused (distillation) by model_a, redone on model_b; nudged 1×, recovered; revised 1×",
+				"link": {
+					"sessionId": "s1",
+					"branchNo": 0,
+					"toolCallId": null,
+					"attemptNo": null
+				}
+			}
+		],
+		"nextCursor": null
+	},
+	"facets": {
+		"agents": [
+			"agent_a",
+			"agent_b"
+		],
+		"sites": [
+			"caption",
+			"default",
+			"proactive"
+		],
+		"models": [
+			"cap_model",
+			"model_a",
+			"model_b"
+		],
+		"tasks": [
+			"coding"
+		]
+	},
+	"pendingHours": 0
+}
