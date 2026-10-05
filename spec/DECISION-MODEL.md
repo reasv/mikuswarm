@@ -564,6 +564,8 @@ Asking `pending_media` at trigger time and stretching the 2 s hold to ~10 s only
 
 ### 5.8 Transcript audit — offline classification of model failures (sketch, owner-raised 2026-09-18)
 
+**Partly superseded (2026-10-05)**: the refusal audit and the send-contract audit (questions, storage, console) are specified in spec/REFUSAL-HANDLING.md §7, §10 and §12. This worker remains their offline runner and history backfill.
+
 Everything above is on the hot path. This point is not: it reads **completed** sessions and classifies what went wrong, for statistics and examples. It is the best-suited use of a decision model in this spec — the questions are about the *shape of text in a transcript*, not about social judgment — and a wrong answer costs nothing but a miscounted statistic.
 
 **Mechanical triggers (no model needed to detect).** The runner already knows when a session: entered forced completion (≥1 corrective user message injected, §8 "Forced completion"); ended `noReply` because `forced_completion_retries` was exhausted; received one or more `send_message` error results; sent a `final: false` progress message and then never sent again; or was force-completed after prior sends. Each of these is a row-level fact and should be **persisted as such** on `agent_sessions` (a small `contract_events` JSON column, or counters) regardless of the decision model — the counts alone are useful and today they exist only in logs. The audit worker consumes these facts; a configurable sample of *clean* sessions is also audited for the refusal questions, since a refusal is a terminally valid turn.
@@ -601,6 +603,8 @@ Everything above is on the hot path. This point is not: it reads **completed** s
 **Config.** `[decisions.audit]`: `enabled`, `sample_clean_sessions` (0–1, default 0.1; applies to history and live alike, seeded per session id so re-runs pick the same sample), `audits = ["send_contract", "refusal", "isms"]`, `[decisions.audit.isms.<key>]` catalogue entries (`description` + `examples`, or `pattern`), `state_max_tokens`, `audit_backlog_max_age_ms` (default unlimited), `workers` (default 1). The contract-event reconciliation has no switch: it runs once per `contract_version` on every deployment, model or not.
 
 ### 5.9 Style gate: catch LLM-isms before they are sent
+
+**Superseded (2026-10-05)** by spec/REFUSAL-HANDLING.md §6 (the outgoing-message gate, shared with refusal checks: one check catalogue, per-check override argument, consecutive and per-session bounds). Retained for review.
 
 **Why.** §5.8 measures which models produce which isms; this point acts on it. It is the one hot-path point that touches every reply, which is why revision 1 deferred it, and the reason it is designed now (provider latency and redundancy, §2 and §3.1).
 
