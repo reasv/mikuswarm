@@ -112,6 +112,12 @@ export async function startHarness(opts: {
   /** Extra TOML merged over the base config (`LLM_URL` is replaced by the fake endpoint). */
   toml?: string;
   decideNoul?: DecideNoul;
+  /**
+   * Called on every provider typing toggle and awaited. The runner turns typing
+   * off after the agent loop ended and before the run settles, so a hook on
+   * `on === false` holds the session in that window.
+   */
+  onTyping?: (on: boolean) => Promise<void> | void;
 }): Promise<AppHarness> {
   const llm = await startFakeLlm(opts.script, opts.decideNoul);
   const root = await mkdtemp(path.join(os.tmpdir(), "miku-app-harness-"));
@@ -145,7 +151,9 @@ export async function startHarness(opts: {
       sends.push({ target, msg, externalId });
       return { provider: "matrix", target, externalId, deliveredAt: Date.now() };
     },
-    async setTyping() {},
+    async setTyping(_target: OutboundTarget, on: boolean) {
+      await opts.onTyping?.(on);
+    },
     accountIds: () => ["test"],
     getSelf: () => ({ id: BOT_ID, displayName: "Bot" }),
     ownsUserId: (id: string) => id === BOT_ID,

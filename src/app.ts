@@ -3755,7 +3755,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
 
     // The trigger-hold re-delivery already steered this event on its immediate
     // emission. Suppress the spawn (return true) but do not re-inject.
-    if (steeredEventIds.has(inbound.event.id)) return true;
+    if (steeredEventIds.has(inbound.event.id)) {
+      noteSteeredReplyTwin(target.agentSessionId, inbound);
+      return true;
+    }
 
     // The steered (injected) turn bypasses the trigger path's enrichment-readiness
     // wait + hydrateEvents, so `inbound.event.replyTo` carries only `externalId`.
@@ -3763,12 +3766,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // quotes the original message just like the normal trigger path would.
     const eventForRender = buildReplyHydratedEvent(inbound, target);
 
+    const message: SteerMessage = { type: "interjection", content: renderRichMessage(eventForRender) };
     const ok = sessions.steer(
       target.agentSessionId,
-      {
-        type: "interjection",
-        content: renderRichMessage(eventForRender),
-      },
+      message,
       {
         eventId: inbound.event.id,
         externalId: inbound.event.externalId,
@@ -3780,6 +3781,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     );
     if (ok) {
       markSteered(inbound.event.id);
+      trackSteer(target.agentSessionId, message, { inbound, form: "reply" });
       logger.info("reply_steered", {
         sessionId: target.agentSessionId,
         timelineKey: inbound.timelineKey,
@@ -3981,9 +3983,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     const content = buildCoReplyInterjection(inbound, target);
     // Pass the interjection source so it is indexed for the timeline→session debug
     // path (master ef173b1).
+    const message: SteerMessage = { type: "interjection", content };
     const steered = sessions.steer(
       coReplySessionId,
-      { type: "interjection", content },
+      message,
       {
         eventId: inbound.event.id,
         externalId: inbound.event.externalId,
@@ -3996,6 +3999,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     if (!steered) return "not-live";
 
     markSteered(inbound.event.id);
+    trackSteer(coReplySessionId, message, { inbound, form: "co-reply" });
     retainCoReplyForSpawn(inbound, coReplySessionId);
     logger.info("co_reply_coalesced", {
       sessionId: coReplySessionId,
@@ -4079,9 +4083,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       });
     }
     const content = buildCoReplyInterjection(inbound, target, eventForRender);
+    const message: SteerMessage = { type: "interjection", content, ...(imageBlocks ? { imageBlocks } : {}) };
     const steered = sessions.steer(
       coReplySessionId,
-      { type: "interjection", content, ...(imageBlocks ? { imageBlocks } : {}) },
+      message,
       {
         eventId: inbound.event.id,
         externalId: inbound.event.externalId,
@@ -4101,6 +4106,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       });
       return;
     }
+    trackSteer(coReplySessionId, message, { inbound, form: "co-reply" });
     retainCoReplyForSpawn(inbound, coReplySessionId);
     logger.info("co_reply_coalesced", {
       sessionId: coReplySessionId,
@@ -4267,6 +4273,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     inbound: InboundChatEvent;
     form: FollowUpForm;
     gapMs: number;
+  }
+
+  /** What foldAfterSettle takes: a follow-up, or a steered reply / co-reply never read. */
+  interface FoldDelivery {
+    inbound: InboundChatEvent;
+    form: FollowUpForm | "reply" | "co-reply";
   }
 
   /**
@@ -4463,9 +4475,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       }
     }
     const content = buildFollowUpInterjection(inbound, form, gapMs, hydrated);
+    const message: SteerMessage = { type: "interjection", content, ...(imageBlocks ? { imageBlocks } : {}) };
     const steered = sessions.steer(
       sessionId,
-      { type: "interjection", content, ...(imageBlocks ? { imageBlocks } : {}) },
+      message,
       {
         eventId: inbound.event.id,
         externalId: inbound.event.externalId,
@@ -4483,6 +4496,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       await foldAfterSettle(delivery, sessionId);
       return;
     }
+    trackSteer(sessionId, message, delivery);
     retainFollowUpForSpawn(inbound, sessionId);
     logger.info("follow_up_steered", {
       sessionId,
@@ -4614,7 +4628,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
    * `retainFollowUpForSpawn`). An owner that did not complete (discarded, parked),
    * or a setup failure, reverts the follow-up to native fate.
    */
-  async function foldAfterSettle(delivery: FollowUpDelivery, ownerSessionId: string): Promise<void> {
+  async function foldAfterSettle(delivery: FoldDelivery, ownerSessionId: string): Promise<void> {
     const { inbound } = delivery;
     // Settle window (review issue #3): the owner's record is evicted synchronously
     // but its terminal status persists through the write queue. Drain it so the
@@ -4671,6 +4685,79 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         error: error instanceof Error ? error.message : String(error),
       });
       revertFollowUpToNativeFate(inbound, "fold-after-settle-failed");
+    }
+  }
+
+  // ── Steered timeline messages a settled session never read ────────────────
+  //
+  // A steer queues its interjection on the agent; pi drains the queue at each turn
+  // boundary. One that lands after the rollout's last check (but before the run
+  // settles) is never read, and the record turn clears the agent's queues. Each
+  // timeline-originated steer (follow-up, reply, co-reply) is tracked here per
+  // session; when the session settles `completed`, every one whose message is not
+  // in the transcript is handed to foldAfterSettle with that session as owner
+  // (a fresh session with its record), exactly once. Non-timeline steers (cost
+  // warning, delegate_to_session) are not tracked: the session they addressed is
+  // over. Other terminal states keep their fates (an operator interrupt drops the
+  // queue on purpose).
+  type SteerMessage = Parameters<typeof sessions.steer>[1];
+  interface PendingSteer {
+    message: SteerMessage;
+    delivery: FoldDelivery;
+    /**
+     * A reply steered on the trigger hold's immediate (trigger-less) emission: its
+     * trigger-bearing twin is still due. Once the session settled the twin takes the
+     * native path itself, so this one is not redelivered.
+     */
+    twinPending: boolean;
+  }
+  const pendingSteers = new Map<
+    string,
+    { agent: NonNullable<ReturnType<typeof sessions.getAgent>>; entries: Map<string, PendingSteer> }
+  >();
+
+  function trackSteer(sessionId: string, message: SteerMessage, delivery: FoldDelivery): void {
+    let slot = pendingSteers.get(sessionId);
+    if (!slot) {
+      const agent = sessions.getAgent(sessionId);
+      if (!agent) return;
+      const created = { agent, entries: new Map<string, PendingSteer>() };
+      slot = created;
+      pendingSteers.set(sessionId, created);
+      sessions.onSettle(sessionId, (status) => redeliverUnreadSteers(sessionId, created, status));
+    }
+    slot.entries.set(delivery.inbound.event.id, {
+      message,
+      delivery,
+      twinPending: delivery.form === "reply" && !delivery.inbound.trigger,
+    });
+  }
+
+  /** The trigger hold's twin of a steered reply arrived while the session was live. */
+  function noteSteeredReplyTwin(sessionId: string, inbound: InboundChatEvent): void {
+    const entry = pendingSteers.get(sessionId)?.entries.get(inbound.event.id);
+    if (!entry || !inbound.trigger) return;
+    entry.delivery = { ...entry.delivery, inbound };
+    entry.twinPending = false;
+  }
+
+  function redeliverUnreadSteers(
+    sessionId: string,
+    slot: { agent: NonNullable<ReturnType<typeof sessions.getAgent>>; entries: Map<string, PendingSteer> },
+    status: string | undefined,
+  ): void {
+    if (pendingSteers.get(sessionId) === slot) pendingSteers.delete(sessionId);
+    if (status !== "completed" || draining) return;
+    const read = new Set<unknown>(slot.agent.state.messages);
+    for (const entry of slot.entries.values()) {
+      if (read.has(entry.message) || entry.twinPending) continue;
+      logger.warn("steer_unread_redelivered", {
+        sessionId,
+        eventId: entry.delivery.inbound.event.id,
+        timelineKey: entry.delivery.inbound.timelineKey,
+        form: entry.delivery.form,
+      });
+      void foldAfterSettle(entry.delivery, sessionId);
     }
   }
 

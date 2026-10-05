@@ -505,6 +505,69 @@ candidates = 3
 inject_threshold = 0.6
 `;
 
+test("app: a reply steered after the rollout's last check is redelivered, not dropped (Z5)", async () => {
+  let h!: AppHarness;
+  let held = false;
+  h = await startHarness({
+    script: chatScript({ recordTurn: () => finalize("record A") }),
+    // The agent loop is over; the run has not settled yet. A reply to the bot now
+    // still steers into the session (it is running) but nothing will read it.
+    onTyping: async (on) => {
+      if (on || held || h === undefined || h.sends.length === 0) return;
+      held = true;
+      h.say("wait, also this", { mention: true, replyTo: h.sends.at(-1)!.externalId });
+      await h.until(() => hasLog(h, "reply_steered"), "the reply steered into the ending session");
+    },
+  });
+  try {
+    h.say("[work] first", { mention: true });
+    const rows = await settled(h, 2);
+    const a = rows[0]!;
+    assert.ok(hasLog(h, "steer_unread_redelivered", { sessionId: a.id, form: "reply" }));
+    assert.ok(hasLog(h, "follow_up_fold_after_settle", { ownerSessionId: a.id, form: "reply" }));
+    assert.ok(!transcript(a).some((m) => JSON.stringify(m).includes("wait, also this")), "A never read it");
+    // Exactly once: one fresh session answers it, starting with A's record.
+    const handling = h.llm.requests.filter((r) => !isRecordTurnRequest(r) && triggerText(r).includes("wait, also this"));
+    assert.ok(handling.length >= 1);
+    assert.equal(sessions(h).length, 2);
+    const call = injectedCall(handling[0]!);
+    assert.ok(call, "the fresh session starts with the owner's record");
+    assert.deepEqual(JSON.parse(call!.tool_calls![0]!.function.arguments), { session_id: a.id });
+  } finally {
+    await h.stop();
+  }
+});
+
+test("app: a steered reply whose trigger-hold twin is still due is left to the twin (Z5)", async () => {
+  let h!: AppHarness;
+  let held = false;
+  let replyTo = "";
+  h = await startHarness({
+    script: chatScript({ recordTurn: () => finalize("record A") }),
+    onTyping: async (on) => {
+      if (on || held || h === undefined || h.sends.length === 0) return;
+      held = true;
+      replyTo = h.sends.at(-1)!.externalId;
+      // The trigger hold's immediate emission: no trigger yet.
+      h.say("wait, also this", { replyTo, id: "$twin" });
+      await h.until(() => hasLog(h, "reply_steered"), "the raw emission steered");
+    },
+  });
+  try {
+    h.say("[work] first", { mention: true });
+    await settled(h, 1);
+    await h.until(() => hasLog(h, "session_record_written"), "A's record");
+    assert.ok(!hasLog(h, "steer_unread_redelivered"), "not redelivered while its twin is due");
+    // The twin (post-hold, trigger-bearing) arrives after A settled: native path.
+    h.say("wait, also this", { mention: true, replyTo, id: "$twin" });
+    await settled(h, 2);
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(sessions(h).length, 2, "handled exactly once");
+  } finally {
+    await h.stop();
+  }
+});
+
 test("app: routing and records write decision rows with separate groups; the judged record is injected", async () => {
   const h = await startHarness({
     script: chatScript({ recordTurn: () => finalize("judged record") }),

@@ -82,7 +82,7 @@ export class SessionManager {
   private readonly byTimeline = new Map<string, Set<string>>();
   private readonly runStates = new Map<string, RunState>();
   /** Per-session "run settled" listeners, fired once on {@link evict}. */
-  private readonly settleListeners = new Map<string, Set<() => void>>();
+  private readonly settleListeners = new Map<string, Set<(status?: AgentSessionStatus) => void>>();
 
   /**
    * Storage and logger are optional so existing unit tests that construct
@@ -323,8 +323,11 @@ export class SessionManager {
    * spans it. If the run has already settled (the agent is gone), there is
    * nothing to fire — the caller's own liveness re-check ({@link isAgentLive})
    * handles that race and renders the persisted record instead.
+   *
+   * The listener receives the session's final in-memory status (`completed`,
+   * `discarded`, `interrupted`, ...), when there was a record to evict.
    */
-  onSettle(sessionId: string, listener: () => void): () => void {
+  onSettle(sessionId: string, listener: (status?: AgentSessionStatus) => void): () => void {
     let set = this.settleListeners.get(sessionId);
     if (!set) {
       set = new Set();
@@ -345,13 +348,13 @@ export class SessionManager {
    * being observed) cannot mutate the set mid-iteration. Observe-only: a throwing
    * listener is swallowed so it can never break {@link evict}.
    */
-  private fireSettle(sessionId: string): void {
+  private fireSettle(sessionId: string, status?: AgentSessionStatus): void {
     const set = this.settleListeners.get(sessionId);
     if (!set) return;
     this.settleListeners.delete(sessionId);
     for (const listener of [...set]) {
       try {
-        listener();
+        listener(status);
       } catch (err) {
         this.deps.logger?.error("session manager: settle listener failed", {
           sessionId,
@@ -481,7 +484,7 @@ export class SessionManager {
     this.runStates.delete(sessionId);
     // Notify run-settlement observers (the SSE stream) AFTER the maps are torn
     // down: a listener that re-checks liveness must observe the settled state.
-    this.fireSettle(sessionId);
+    this.fireSettle(sessionId, session?.status);
     if (!session) return;
     const ids = this.byTimeline.get(session.timelineKey);
     ids?.delete(sessionId);
