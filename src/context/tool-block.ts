@@ -23,6 +23,8 @@ export interface ToolDefinitionLike {
   description: string;
   /** TypeBox/JSON schema; serialized verbatim into the wire `tools[]` entry. */
   parameters: unknown;
+  /** Harness-only (spec SESSION-RECORDS §3.2): never immediate, never indexed. Not serialized. */
+  harnessOnly?: boolean;
 }
 
 /** One tool's contribution within the block, with its own definition. */

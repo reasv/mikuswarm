@@ -138,14 +138,15 @@ import { createYotsubaTool } from "./tools/yotsuba.js";
 import { createNoReplyTool } from "./tools/no-reply.js";
 import { createSessionRecordTool, SummaryDraft } from "./tools/session-record-tool.js";
 import { createReadSessionRecordTool, createReadSessionTranscriptTool } from "./tools/read-session-record.js";
-import { wrapToolsWithRecordTurnGate, type RecordTurnGate, type SessionRecordHandles } from "./agent/record-turn.js";
+import type { SessionRecordHandles } from "./agent/record-turn.js";
 import { SessionRecordService } from "./agent/session-records.js";
 import {
   decisionsFor,
   selectRecordsToInject,
+  DEFAULT_RECORDS_CANDIDATES,
   type RecordsCandidate,
 } from "./decisions/index.js";
-import { executeSyntheticCalls, type SyntheticModelInfo } from "./agent/synthetic-calls.js";
+import type { SyntheticCallSpec } from "./agent/synthetic-calls.js";
 import { SauceNaoRateLimiter } from "./saucenao/rate-limiter.js";
 import { setEgressGuardEnabled } from "./tools/ssrf.js";
 import { configureHttpLimiter } from "./tools/http-limiter.js";
@@ -488,6 +489,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // Drained into the session the moment it goes live (`launchSession`/resume
   // post-attachAgent), or reverted to native fate if the owner is abandoned.
   const pendingFollowUps = new Map<string, FollowUpDelivery[]>();
+  // Fold-after-settle owners (spec SESSION-RECORDS §7), keyed by the follow-up's
+  // trigger event id: whichever launch picks the trigger up (at once, or later from
+  // the timeline queue) injects that owner's record. Consumed by launchSession.
+  const foldOwners = new Map<string, string>();
   // ─── Workspace setup (spec MULTI-AGENT-SUPPORT §4.1/§4.2) ──────────────────
   //
   // Hard validation (§3 account key colons, §4.2 cross-field invariants) via the
@@ -1773,12 +1778,16 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       },
     };
     try {
+      // With record handles, like a real session: the record tools are in the
+      // catalog, so the preview's immediate/deferred split matches create().
       const full = buildSessionTools(
         inbound,
         `inspector-${sessionType}`,
         inbound.outboundTarget!,
         sessionType,
         new SessionUsageTracker(),
+        0,
+        { gate: { active: false }, draft: new SummaryDraft() },
       );
       // Apply the same two-stage filter as create(): MCP scoping first, then
       // the session-type allowlist. Both compose as an intersection so the
@@ -1788,10 +1797,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // immediate/deferred split themselves — they own the session-type gate.
       const mcpFiltered = filterMcpToolsByAllowlist(full, agentMcpServers, mcpToolServerMap);
       const filtered = filterTools(mcpFiltered, factory.resolveSessionType(sessionType));
+      // harnessOnly survives the mapping: splitDefsForDynamic keeps such tools
+      // out of the immediate set and the deferred index, as create() does.
       const defs = filtered.map((t) => ({
         name: t.name,
         description: t.description,
         parameters: t.parameters,
+        ...(t.harnessOnly ? { harnessOnly: true } : {}),
       }));
       toolDefsByType.set(memoKey, defs);
       return defs;
@@ -4244,7 +4256,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // A quick same-sender follow-up — a forced-split image, a trailing bare-text
   // thought, or an amending re-`@` — is folded into the session its immediately-prior
   // triggering message produced: STEERED in if it is running, PARKED if it is still
-  // building, or RESUMED if it just completed. The synchronous `foldFollowUp` fork
+  // building, or, if it already completed, handed to a FRESH session that starts with
+  // the owner's session record (fold-after-settle, spec SESSION-RECORDS §7). The synchronous `foldFollowUp` fork
   // (in `handleInbound`, after reply-steer and before the `!trigger` return / accept)
   // makes the decision; the deliveries run async, never blocking the dispatch path.
 
@@ -4284,12 +4297,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
 
   /**
    * The synchronous fold fork (spec §6). Returns true when the follow-up was consumed
-   * (steered / parked / resume-dispatched, or its trigger-hold twin suppressed) — the
+   * (steered / parked / fold-after-settle dispatched, or its trigger-hold twin suppressed) — the
    * caller returns without spawning. Returns false to fall through to the normal path
    * (native fate): a reply, a non-matching event, the RAW delivery of a trigger-bearing
-   * follow-up (folded later on its post-hold delivery), or a settled-but-unresumable
-   * owner. Fully synchronous so it preserves the accept→claim serialization invariant;
-   * the actual steer/resume work is fired as detached promises.
+   * follow-up (folded later on its post-hold delivery), or an owner that settled into
+   * a non-completed state. Fully synchronous so it preserves the accept→claim
+   * serialization invariant; the actual steer/fold work is fired as detached promises.
    */
   function foldFollowUp(inbound: InboundChatEvent): boolean {
     if (!followUpActive) return false;
@@ -4336,17 +4349,17 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // The owner's liveness at fold time picks the delivery route (spec §5 / §2 table),
     // extracted as a pure decision so the precedence is unit-testable. A live
     // `created`/`running` record steers (if its agent is attached) or parks; an owner
-    // gone from memory resumes iff its durable row is `completed` (the only
-    // fold-resumable state, §5.3/§7.2) — a discarded/interrupted/failed/pruned row, or
-    // a never-launched one, yields `none`.
+    // gone from memory takes the settled route (route name `resume`) iff its durable
+    // row is `completed` — a discarded/interrupted/failed/pruned row, or a
+    // never-launched one, yields `none`.
     //
     // Settle-window discrimination (review issue #3): `markCompleted` evicts the
     // in-memory record SYNCHRONOUSLY but enqueues the `completed` persist on the
     // single-writer queue. In that window a fold sees the record absent while the row
     // still reads `running`/`resuming` — the pure decision would demote a just-settled
-    // session to native fate. `resolveFollowUpRoute` routes that case to **resume**;
-    // `resumeFollowUp` then `waitForIdle`s so the queued `completed` write drains before
-    // the gate + CAS read the row. Read the RAW row status once and pass it through.
+    // session to native fate. `resolveFollowUpRoute` routes that case to the settled
+    // route; `foldAfterSettle` then `waitForIdle`s so the queued terminal write drains
+    // before it reads the row. Read the RAW row status once and pass it through.
     const route = resolveFollowUpRoute({
       recordPresent: !!record,
       recordStatus: record?.status,
@@ -4463,14 +4476,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       },
     );
     if (!steered) {
-      // The owner settled between the fold decision and here — it completed during the
-      // download wait above (uncommon: needs a slow download racing a fast owner, since
-      // the wait is on the DOWNLOAD, not the slow caption pool). Prefer resuming the
-      // just-settled owner — carrying the now-ready pixels (§5.3) — over dropping the
-      // fold to native fate. `resumeFollowUp` self-guards (its gate resumes only a
-      // `completed` row and otherwise reverts to native fate itself), so this is safe
-      // even if the owner settled into a non-resumable state.
-      await resumeFollowUp(delivery, sessionId);
+      // The owner settled between the fold decision and here (it completed during the
+      // download wait above). Folding never resumes (spec SESSION-RECORDS §7): take the
+      // settled branch, a fresh session with the owner's record. `foldAfterSettle`
+      // reverts to native fate itself when the owner did not complete.
+      await foldAfterSettle(delivery, sessionId);
       return;
     }
     retainFollowUpForSpawn(inbound, sessionId);
@@ -4591,149 +4601,76 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   }
 
   /**
-   * Resume a just-completed session because a quick same-sender follow-up arrived
-   * (spec §5.3). Acquires a per-timeline slot without queuing (mirrors proactive — a
-   * follow-up resume must not queue behind or race a concurrent session), runs the
-   * follow-up resume gate (a SUBSET of reply-resume's: completed + non-synthetic +
-   * capability ceiling + material viable; NO work gate, NO window, same-sender is
-   * structural via the watch), performs the single-consumption CAS, and continues the
-   * rollout via the shared `runResumeSession` with the §10 follow-up preamble. Any
-   * gate/CAS/slot miss reverts to native fate. The settled→resume re-arms the watch to
-   * the resumed session inside `runResumeSession` (§7), so chains stay linear.
-   */
-  /**
-   * Launch a fresh session to handle a follow-up after the owner session settled
-   * (spec SESSION-RECORDS §6, fold-after-settle branch).
+   * Fold-after-settle (spec SESSION-RECORDS §7): a follow-up whose owning session
+   * has already completed starts a FRESH session with the owner's record injected
+   * (it waits for an in-flight one), like any message that arrives after a rollout
+   * ended. Folding never resumes.
    *
-   * Replaces the `resumeFollowUp` path: instead of appending the follow-up to
-   * the completed transcript, spin a new session that inherits the owner's session
-   * record at kickoff (`ownerSessionId` injection) and starts clean.
-   *
-   * For bare-group follow-ups (no trigger), a `mention` trigger is synthesized
-   * so `launchSession` can route it normally.
+   * The follow-up was consumed by `foldFollowUp` (its trigger-hold twin is
+   * suppressed), so it must never be dropped: it goes through the normal trigger
+   * path — accept (spawn, or queue behind a busy slot), claim, launch — with the
+   * owner id carried in `foldOwners` to whichever launch picks it up. A bare group
+   * follow-up gets a synthesized `mention` trigger (same idiom as
+   * `retainFollowUpForSpawn`). An owner that did not complete (discarded, parked),
+   * or a setup failure, reverts the follow-up to native fate.
    */
   async function foldAfterSettle(delivery: FollowUpDelivery, ownerSessionId: string): Promise<void> {
     const { inbound } = delivery;
-    if (!triggerCoordinator.tryAcquire(inbound.timelineKey)) {
-      revertFollowUpToNativeFate(inbound, "fold-after-settle-no-slot");
+    // Settle window (review issue #3): the owner's record is evicted synchronously
+    // but its terminal status persists through the write queue. Drain it so the
+    // read below sees the settled status.
+    await storage.waitForIdle();
+    if (storage.getAgentSession(ownerSessionId)?.status !== "completed" || !inbound.outboundTarget) {
+      revertFollowUpToNativeFate(inbound, "fold-owner-not-completed");
       return;
     }
-    // Synthesize a trigger for bare-group follow-ups (no trigger → mention).
-    // Trigger-bearing forms (reply, DM, re-@) already carry their own trigger.
     const spawnInbound: InboundChatEvent = inbound.trigger
       ? inbound
       : (() => {
           const trigger: TriggerInfo = {
             type: "mention",
-            reason: "follow-up after session settled",
+            reason: "same-sender follow-up after the session it followed had completed",
             triggeredBy: inbound.event.sender,
             groupedEventIds: [inbound.event.id],
           };
           return { ...inbound, trigger, event: { ...inbound.event, trigger } };
         })();
-    await launchSession(spawnInbound, false, { ownerSessionId });
-  }
-
-  async function resumeFollowUp(delivery: FollowUpDelivery, sessionId: string): Promise<void> {
-    const { inbound, form, gapMs } = delivery;
-    const target = inbound.outboundTarget;
-    if (!target) {
-      revertFollowUpToNativeFate(inbound, "resume-no-target");
-      return;
-    }
-    // Single-flight with reply-resume: a concurrent reply to the same state sees this
-    // and degrades to FRESH (and vice-versa), so only the CAS winner runs.
-    if (resumeClaims.has(sessionId)) {
-      revertFollowUpToNativeFate(inbound, "resume-inflight");
-      return;
-    }
-    if (!triggerCoordinator.tryAcquire(inbound.timelineKey)) {
-      // No free slot (a concurrent session holds the timeline) → native fate.
-      revertFollowUpToNativeFate(inbound, "resume-no-slot");
-      return;
-    }
-    resumeClaims.add(sessionId);
+    foldOwners.set(spawnInbound.event.id, ownerSessionId);
     try {
-      // Settle-window drain (review issue #3): a fold that reached `resume` may have done
-      // so while the owner's `completed` persist was still queued (the record was already
-      // evicted, but `getAgentSession` read its pre-completion `running`/`resuming` status
-      // — see `resolveFollowUpRoute`). Drain the single-writer queue so the gate below —
-      // and the FIFO-ordered CAS at `acceptResumeGeneration` — observe the settled
-      // `completed` row. Cheap when the queue is already empty; the common (truly-settled)
-      // case adds nothing. If the row settled to a terminal non-completed status instead,
-      // the gate fails → native fate (existing behaviour).
-      await storage.waitForIdle();
-      const verdict = await evaluateFollowUpResumeGate({
-        sessionId,
-        getSession: () => storage.getAgentSession(sessionId),
-        // Thread timelineKey (supplied by the gate from row.timeline_key) for per-agent
-        // model resolution (spec PER-AGENT-MODEL-OVERRIDES FIX 7).
-        resolveCeiling: (sessionType, timelineKey) => factory.resolveSessionContextCeiling(sessionType, timelineKey),
-        // Per-agent workspace (spec MULTI-AGENT-SUPPORT §4.1/§4.3): resolve from the
-        // inbound timeline key so the follow-up resume reads the correct agent dir.
-        // In agents mode an unresolvable account returns null → gate rejects (no resume).
-        loadMaterial: (row) => {
-          const wsEntry = resolveWorkspaceForTimeline(inbound.timelineKey);
-          if (!wsEntry && config.agents) return Promise.resolve(null);
-          return loadCompletedSessionMaterial(row, {
-            media: storage,
-            workspaceRoot: wsEntry?.workspaceRoot ?? workspaceRoot,
-            logger,
-          });
-        },
+      await resolveTriggerGroup(spawnInbound);
+      captionPool.notifyNewWork();
+      const decision = triggerCoordinator.accept(spawnInbound);
+      if (decision.action === "spawn" || decision.action === "queued") addClaim(spawnInbound);
+      logger.info("follow_up_fold_after_settle", {
+        ownerSessionId,
+        eventId: inbound.event.id,
         timelineKey: inbound.timelineKey,
-        logger,
+        form: delivery.form,
+        action: decision.action,
       });
-      if (!verdict.resume) {
-        drainNextQueuedTrigger(inbound.timelineKey); // release the slot we acquired
-        revertFollowUpToNativeFate(inbound, "resume-gate-failed");
+      if (decision.action === "queued") return; // launched by the slot's drain
+      if (decision.action !== "spawn") {
+        // Queue full: the native fate of this trigger is the same refusal.
+        foldOwners.delete(spawnInbound.event.id);
         return;
       }
-      const { row, material } = verdict;
-      // Single-consumption CAS (§5.3): completed → resuming. A racing fold/reply that
-      // already consumed this state gets `undefined` → native fate.
-      const generation = await storage.acceptResumeGeneration(sessionId);
-      if (generation === undefined) {
-        drainNextQueuedTrigger(inbound.timelineKey);
-        revertFollowUpToNativeFate(inbound, "resume-cas-lost");
-        return;
-      }
-      // Past the CAS we own the slot; `runResumeSession` releases it (its terminal
-      // drain) on every path. A throw in its pre-run setup settles before that — evict
-      // + drain so the timeline can't deadlock (mirrors `tryReplyResume`). The orphaned
-      // generation bump is harmless (the row is no longer `completed` → FRESH after).
-      try {
-        await runResumeSession({
-          inbound,
-          duplicate: false,
-          target,
-          row,
-          material,
-          generation,
-          continuation: {
-            tail: config.agent.sessions.resume?.satellite?.tail ?? true,
-            // A follow-up resume continues seconds later — there is no meaningful gap.
-            gap: undefined,
-            triggerPreamble: buildFollowUpResumePreamble(inbound, form, gapMs),
-          },
-          resumeLabel: "follow-up",
+      void launchSession(spawnInbound, false).catch((error) => {
+        releaseClaimFor(spawnInbound);
+        logger.error("follow_up_fold_launch_failed", {
+          timelineKey: inbound.timelineKey,
+          error: error instanceof Error ? error.message : String(error),
         });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (sessions.get(sessionId)) sessions.markDiscarded(sessionId, { error: message });
-        logger.error("follow_up_resume_setup_threw", { sessionId, timelineKey: inbound.timelineKey, error: message });
         drainNextQueuedTrigger(inbound.timelineKey);
-        // The resumed session never went live, yet the follow-up was already consumed
-        // (`markSteered` in `foldFollowUp`, suppressing its trigger-hold twin). Revert it
-        // to native fate (review issue #4) so a trigger-bearing follow-up (re-`@` / DM)
-        // re-dispatches as its own session rather than vanishing; a bare-group one stays
-        // inert. Safe from double-dispatch: the follow-up here is the resume *trigger*,
-        // not a parked entry, so the discarded session's `revertAbandonedFollowUps` settle
-        // listener (which drains `pendingFollowUps`) never touches it.
-        revertFollowUpToNativeFate(inbound, "resume-setup-threw");
-      }
-    } finally {
-      resumeClaims.delete(sessionId);
+      });
+    } catch (error) {
+      foldOwners.delete(spawnInbound.event.id);
+      releaseClaimFor(spawnInbound);
+      logger.error("follow_up_fold_after_settle_failed", {
+        ownerSessionId,
+        eventId: inbound.event.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      revertFollowUpToNativeFate(inbound, "fold-after-settle-failed");
     }
   }
 
@@ -4784,41 +4721,6 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   }
 
   /**
-   * The one-line preamble prepended to a settled-then-resume follow-up's appended turn
-   * (spec §10). The follow-up IS the new turn (not an interjection to break out), so the
-   * bare media/text forms carry no spawn_session affordance — just the framing that a
-   * quick follow-up arrived. The mention form (a re-@, the likeliest genuinely-separate
-   * ask) names spawn_session(message_id) so the resumed agent can fork it out (review
-   * Q1): the resume turn's trigger is retained for spawn_session in runResumeSession (the
-   * bare forms are not, matching this preamble).
-   */
-  function buildFollowUpResumePreamble(inbound: InboundChatEvent, form: FollowUpForm, gapMs: number): string {
-    // §6.2: human-facing label uses `username ?? id` as the fallback.
-    const senderName = escapeXml(inbound.event.sender.displayName ?? inbound.event.sender.username ?? inbound.event.sender.id);
-    const n = Math.max(0, Math.round(gapMs / 1000));
-    if (form === "media") {
-      return (
-        `<follow_up reason="media">${senderName} sent this ${n}s after your last reply, without addressing you again — ` +
-        `Matrix splits images out, so it's probably the image they meant. Continue as part of the same exchange.</follow_up>`
-      );
-    }
-    if (form === "mention") {
-      const externalId = inbound.event.externalId;
-      const spawnHint = externalId
-        ? ` If it's a genuinely separate ask, call spawn_session(message_id="${escapeAttr(externalId)}") to give it its own session.`
-        : ``;
-      return (
-        `<follow_up reason="mention">${senderName} @'d you again ${n}s after your last reply — ` +
-        `probably amending or adding to it. Continue the same exchange.${spawnHint}</follow_up>`
-      );
-    }
-    return (
-      `<follow_up reason="text">${senderName} sent this ${n}s after your last reply, without addressing you again — ` +
-      `likely a continuation of the same thought. Continue the same exchange.</follow_up>`
-    );
-  }
-
-  /**
    * Assemble the full per-session tool set. Shared by the fresh-launch path
    * (`launchSession`) and resume-in-place (`resumeSessionRun`, spec
    * CONCURRENCY-AND-RATE-LIMITING §6.2), which must rebuild the SAME tool set
@@ -4834,9 +4736,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // Threaded into send_message so every outbound event is tagged with it. 0 for
     // a fresh launch; the bumped value for a reply-resumed run.
     resumeGeneration: number = 0,
-    // Session record handles (spec SESSION-RECORDS CONTRACT §3).  When provided,
-    // session_record_tool, read_session_record and read_session_transcript are
-    // wired in and the full tool list is wrapped with the gate.
+    // Session record handles (spec SESSION-RECORDS CONTRACT §3). When provided,
+    // session_record_tool (capturing the draft), read_session_record and
+    // read_session_transcript are wired in; the factory applies the gate.
     recordHandles?: SessionRecordHandles,
   ) {
     // Per-session workspace (spec MULTI-AGENT-SUPPORT §4.1): in agents mode each
@@ -5431,7 +5333,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       ...mcpTools,
       // Session record tools (spec SESSION-RECORDS §3/§5).  Only for live chat
       // sessions (default + proactive); not wired for other session types.
-      ...(recordHandles && (sessionType === "default" || sessionType === (config.proactive?.session_type ?? "proactive"))
+      ...(recordHandles && (sessionType === "default" || sessionType === proactiveSessionTypeName())
         ? [
             createSessionRecordTool({
               draft: recordHandles.draft,
@@ -5464,10 +5366,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           ]
         : []),
     ].filter((t) => !disabledTools.has(t.name));
-
-    if (recordHandles) {
-      return wrapToolsWithRecordTurnGate(allTools, recordHandles.gate);
-    }
+    // The record-turn gate is applied by the factory to the final tool list
+    // (`recordTurnGate` in create()), so it also covers load_skill/tool_search.
     return allTools;
   }
 
@@ -5679,6 +5579,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     record: AgentSessionRecord,
     inbound: InboundChatEvent,
     attempt: number,
+    /** Release the timeline slot early (idempotent): called before the record turn. */
+    releaseSlot: () => void,
   ): Promise<{ outcome: "completed" | "mechanical" | "content" | "fatal" | "unresumable"; error?: string }> {
     const row = storage.getAgentSession(record.id);
     if (!row) return { outcome: "unresumable", error: "session row missing" };
@@ -5740,6 +5642,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     );
     // Session record handles for this recovery run's record turn (spec SESSION-RECORDS §3).
     const recoveryRecordHandles: SessionRecordHandles = { gate: { active: false }, draft: new SummaryDraft() };
+    let created: Awaited<ReturnType<typeof factory.create>>;
     // Tag this resumed run's sends with the row's CURRENT resume_generation
     // (spec RESUMABLE-SESSIONS §6), so a session that was reply-resumed (generation
     // bumped) then parked stays reply-resumable from its newest output after a
@@ -5761,7 +5664,6 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     let kickoff;
     let snapshot: ContextMessage[] | undefined;
     let tokenEstimate: number | undefined;
-    let recoveryRegistry: Awaited<ReturnType<typeof factory.create>>["registry"];
     if (material.mode === "fresh") {
       // The transcript never flushed (hard crash before the first turn_end —
       // e.g. a kill mid-first-request): no turn committed, so no side effect
@@ -5771,13 +5673,15 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // same row. The rebuild sees the timeline as of NOW (including messages
       // that arrived after the crash), which a launch would too.
       try {
-        ({ agent, kickoff, snapshot, tokenEstimate, registry: recoveryRegistry } = await factory.create(record, tools, {
+        created = await factory.create(record, tools, {
           proactive: isProactiveResume ? true : undefined,
+          recordTurnGate: recoveryRecordHandles.gate,
           abortSignal: drainAbort.signal,
           usage,
           userLimit: recoveryGate?.userLimit,
           costCeilingOverride: recoveryGate?.ceilingOverride,
-        }));
+        });
+        ({ agent, kickoff, snapshot, tokenEstimate } = created);
         if (!kickoff) throw new Error("context build produced no final user turn");
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -5792,12 +5696,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       try {
         // Continue mode inherits the row's persisted totals so the resumed
         // session keeps accumulating from where it left off (spec §4.3).
-        ({ agent, registry: recoveryRegistry } = await factory.create(record, tools, {
+        created = await factory.create(record, tools, {
           resume: material,
+          recordTurnGate: recoveryRecordHandles.gate,
           usage,
           userLimit: recoveryGate?.userLimit,
           costCeilingOverride: recoveryGate?.ceilingOverride,
-        }));
+        });
+        ({ agent } = created);
       } catch (error) {
         return {
           outcome: "fatal",
@@ -5838,7 +5744,6 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       target,
       suppressTyping: record.sessionType === (config.proactive?.session_type ?? "proactive"),
     });
-    let recoveryDrainCalled = false;
     try {
       const result = await runner.run(
         agent,
@@ -5850,6 +5755,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         kickoff,
         sessions.runLifecycle(record.id),
       );
+      const interrupted = sessions.get(record.id)?.status === "interrupted";
       sessions.markCompleted(record.id, { noReply: result.noReply });
       logger.info("session_resumed_completed", {
         sessionId: record.id,
@@ -5857,31 +5763,21 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         mode: material.mode,
         noReply: result.noReply,
       });
-      recoveryDrainCalled = true;
-      await sessionRecordService.runRecordTurn({
-        sessionId: record.id,
-        timelineKey: record.timelineKey,
-        sessionType: record.sessionType,
-        proactiveSessionType: config.proactive?.session_type,
-        agentName: agentNameForTimeline(record.timelineKey),
-        agent,
-        draft: recoveryRecordHandles.draft,
-        gate: recoveryRecordHandles.gate,
-        buildsOn: [],
-        config: config.session_records,
-        exemptToolNames: resumeExemptToolNames([]),
-        storage,
-        llmScheduler,
-        registry: recoveryRegistry,
-        logger,
-        modelInfo: { api: "openai", provider: "openai", model: factory.resolveModelId(record.sessionType, record.timelineKey) },
-      });
-      await captureHandle.flushNow().catch((err) => {
-        logger.warn("session_record_flush_failed", {
-          sessionId: record.id,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      });
+      // Same tail as a fresh run: register the record turn, THEN free the slot
+      // (the manual resume's own release becomes a no-op), then write the record.
+      const recordTurn = interrupted
+        ? undefined
+        : startRecordTurn({
+            sessionId: record.id,
+            timelineKey: record.timelineKey,
+            sessionType: record.sessionType,
+            inbound,
+            created,
+            handles: recoveryRecordHandles,
+            flush: () => captureHandle.flushNow(),
+          });
+      releaseSlot();
+      await recordTurn;
       return { outcome: "completed" };
     } catch (error) {
       try {
@@ -5944,7 +5840,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // post-start so getSelf is available; falls back to undefined (same handling as
     // "unknown account") when the provider isn't registered.
     selfUserIdForAccount: (provider, accountId) => providers.get(provider)?.getSelf(accountId)?.id,
-    runAttempt: (record, inbound) => resumeSessionRun(record, inbound, 0),
+    runAttempt: (record, inbound, releaseSlot) => resumeSessionRun(record, inbound, 0, releaseSlot),
     markFailedResumable: (id, error) => sessions.markFailedResumable(id, { error }),
     markDiscarded: (id, error) => sessions.markDiscarded(id, { error }),
     logger,
@@ -6033,6 +5929,202 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     return new Set<string>([...BUILTIN_RESUME_EXEMPT_TOOL_NAMES, ...extra]);
   }
 
+  /** The proactive session type's name (one helper so the tails cannot diverge). */
+  function proactiveSessionTypeName(): string {
+    return config.proactive?.session_type ?? "proactive";
+  }
+
+  /** The work gate's exempt names for a session's own context (dm/group), the
+   *  same set the reply-resume gate uses. */
+  function workGateExemptToolNames(inbound: InboundChatEvent): Set<string> {
+    const ctx = channelTypeOf(inbound);
+    return resumeExemptToolNames(config.agent.sessions.resume?.work_gate?.[ctx]?.extra_exempt_tools ?? []);
+  }
+
+  /**
+   * Start the record turn of a run that just completed (spec SESSION-RECORDS §3.2).
+   * The one tail shared by the fresh launch, the reply-resume and the manual
+   * console resume, so their eligibility, exempt set and priority cannot diverge.
+   * Call it BEFORE releasing the timeline slot: the in-flight entry is registered
+   * synchronously, so a trigger launched by that release that replies to this
+   * session waits for its record. Returns undefined when the run writes no record
+   * (not eligible, or an interrupted run).
+   */
+  function startRecordTurn(args: {
+    sessionId: string;
+    timelineKey: string;
+    sessionType: string;
+    inbound: InboundChatEvent;
+    created: Pick<Awaited<ReturnType<typeof factory.create>>, "agent" | "registry" | "setPriority">;
+    handles: SessionRecordHandles;
+    /** The run's capture flush (`captureHandle.flushNow`). */
+    flush: () => Promise<void>;
+  }): Promise<void> | undefined {
+    return sessionRecordService.start({
+      sessionId: args.sessionId,
+      timelineKey: args.timelineKey,
+      sessionType: args.sessionType,
+      proactiveSessionType: proactiveSessionTypeName(),
+      agentName: agentNameForTimeline(args.timelineKey),
+      agent: args.created.agent,
+      handles: args.handles,
+      config: config.session_records,
+      exemptToolNames: workGateExemptToolNames(args.inbound),
+      storage,
+      registry: args.created.registry,
+      setPriority: args.created.setPriority,
+      flush: args.flush,
+      logger,
+    });
+  }
+
+  /** Recent-chat window for the records point's non-reply state (§6.2). */
+  const RECORDS_RECENT_CHAT_WINDOW = 40;
+  /** Messages kept before a candidate's bot message in its recent_chat. */
+  const RECORDS_RECENT_CHAT_LEAD = 3;
+
+  /**
+   * Which session records a fresh session starts with (spec SESSION-RECORDS §6/§7),
+   * as `read_session_record` injection specs for factory.create. Started before
+   * create and awaited inside it (after routing and the build), so the waits and
+   * the decision requests run in parallel with both. Never rejects.
+   *
+   *   - Fold-after-settle owner (`ownerSessionId`): its record is injected
+   *     unconditionally when it exists, after waiting for an in-flight one (§7).
+   *   - Reply target: the replied-to bot message's session, after waiting for an
+   *     in-flight record (CONTRACT 7). Without the records point it is injected when
+   *     `inject_on_reply` (6.1); with it, it is a candidate like the others.
+   *   - Records point on: the reply target plus the sessions behind the newest
+   *     `candidates` bot messages (one per session, only with a record, in-flight
+   *     ones skipped) are judged one request each (§6.2); a whole-selection failure
+   *     falls back to the 6.1 rule.
+   */
+  async function planRecordInjections(
+    inbound: InboundChatEvent,
+    session: { id: string; sessionType: string; timelineKey: string },
+    ownerSessionId: string | undefined,
+  ): Promise<SyntheticCallSpec[]> {
+    if (config.session_records?.enabled === false) return [];
+    const agentName = agentNameForTimeline(session.timelineKey);
+    const injectOnReply = config.session_records?.inject_on_reply !== false;
+    const pointOn = decisionEngine?.isEnabled("records", agentName) ?? false;
+    // Only this agent's own records (read_session_record would refuse others).
+    const ownRecord = (sessionId: string) => {
+      const row = storage.getSessionRecord(sessionId);
+      if (!row) return undefined;
+      return row.agent !== null && agentName !== null && row.agent !== agentName ? undefined : row;
+    };
+    const spec = (sessionId: string, decisionGroup?: string): SyntheticCallSpec => ({
+      name: "read_session_record",
+      params: { session_id: sessionId },
+      harness: { kind: "injection", ...(decisionGroup ? { decisionGroup } : {}) },
+    });
+
+    let owner: string | undefined;
+    if (ownerSessionId) {
+      await sessionRecordService.waitFor(ownerSessionId);
+      if (ownRecord(ownerSessionId)) owner = ownerSessionId;
+    }
+
+    const replyExternalId = inbound.event.replyTo?.externalId;
+    const replyEvent = replyExternalId
+      ? timeline.getByExternalId(inbound.provider, replyExternalId, inbound.timelineKey)
+      : undefined;
+    let replyTarget: string | undefined;
+    if (replyEvent?.agentSessionId && replyEvent.agentSessionId !== owner && (injectOnReply || pointOn)) {
+      await sessionRecordService.waitFor(replyEvent.agentSessionId);
+      if (ownRecord(replyEvent.agentSessionId)) replyTarget = replyEvent.agentSessionId;
+    }
+    const ruleSpecs = (): SyntheticCallSpec[] => [
+      ...(owner ? [spec(owner)] : []),
+      ...(replyTarget && injectOnReply ? [spec(replyTarget)] : []),
+    ];
+    if (!pointOn || !decisionEngine) return ruleSpecs();
+
+    try {
+      const rawDecisions = decisionsFor(config, agentName);
+      const candidatesLimit = rawDecisions.records?.candidates ?? DEFAULT_RECORDS_CANDIDATES;
+      const exclude = new Set([owner, replyTarget].filter((id): id is string => id !== undefined));
+      const recent = storage
+        .getRecentRecordedBotSessions(
+          session.timelineKey,
+          inbound.event.timestamp,
+          candidatesLimit + exclude.size + sessionRecordService.inFlightCount,
+        )
+        .filter((row) => !exclude.has(row.sessionId) && !sessionRecordService.isInFlight(row.sessionId))
+        .filter((row) => ownRecord(row.sessionId) !== undefined)
+        .slice(0, candidatesLimit);
+      if (!replyTarget && recent.length === 0) return ruleSpecs();
+
+      const sender = inbound.trigger?.triggeredBy ?? inbound.event.sender;
+      const nameOf = (e: { sender?: { displayName?: string; username?: string; id?: string } }) =>
+        e.sender?.displayName ?? e.sender?.username ?? e.sender?.id ?? "unknown";
+      const request = { from: nameOf({ sender }), text: inbound.event.body ?? "" };
+      const triggerIds = new Set([inbound.event.id, ...(inbound.trigger?.groupedEventIds ?? [])]);
+      const window =
+        recent.length > 0
+          ? timeline
+              .query({
+                timelineKey: session.timelineKey,
+                toTimestamp: inbound.event.timestamp,
+                limit: RECORDS_RECENT_CHAT_WINDOW + triggerIds.size,
+              })
+              .filter((e) => !triggerIds.has(e.id))
+          : [];
+      const chat = window.map((e) => ({
+        from: nameOf(e),
+        text: e.body ?? "",
+        ...(e.role === "assistant" || e.sender?.isSelf ? { self: true as const } : {}),
+      }));
+      const candidates: RecordsCandidate[] = [];
+      if (replyTarget) {
+        candidates.push({
+          sessionId: replyTarget,
+          record: ownRecord(replyTarget)!.text,
+          isReplyTarget: true,
+          request,
+          replyTo: { from: nameOf(replyEvent!), text: replyEvent!.body ?? "" },
+        });
+      }
+      for (const row of recent) {
+        // The record's bot message where it actually sat, never as a reply target:
+        // the window from a few messages before it up to the trigger (the point
+        // packs newest-first under its budget).
+        const at = window.findIndex((e) => e.id === row.eventId);
+        candidates.push({
+          sessionId: row.sessionId,
+          record: ownRecord(row.sessionId)!.text,
+          isReplyTarget: false,
+          request,
+          recentChat: at >= 0 ? chat.slice(Math.max(0, at - RECORDS_RECENT_CHAT_LEAD)) : chat,
+        });
+      }
+      const { inject, decisionGroup } = await selectRecordsToInject(
+        decisionEngine,
+        { candidates, rawDecisions },
+        {
+          agentName,
+          attribution: {
+            agentSessionId: session.id,
+            sessionType: session.sessionType,
+            timelineKey: session.timelineKey,
+            triggerSenderId: inbound.event.sender?.id ?? null,
+          },
+          signal: drainAbort.signal,
+          triggerEventId: inbound.event.id,
+        },
+      );
+      // The fold owner's record is outside the judgement (§7): first, uncapped.
+      return [...(owner ? [spec(owner)] : []), ...inject.map((id) => spec(id, decisionGroup))];
+    } catch (error) {
+      logger.warn("records_injection_select_failed", {
+        sessionId: session.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return ruleSpecs();
+    }
+  }
+
   /** Release this timeline's slot and launch the next queued trigger (mirrors the
    *  fresh run's `.finally`; no-op while draining). The single funnel for every
    *  queued-drain tail (active spawn, resume, co-reply, manual resume, proactive,
@@ -6087,6 +6179,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     if (resumeClaims.has(sessionId)) return false;
     resumeClaims.add(sessionId);
     try {
+      // Record wait (spec SESSION-RECORDS CONTRACT §7): a record turn still running
+      // extends this session's rollout; wait for it (bounded by its deadline) so the
+      // gate and the resume material see the finished transcript, and two agents
+      // never run on the same session at once.
+      await sessionRecordService.waitFor(sessionId);
       // ── Pre-CAS gate (§7 steps 2–8) ────────────────────────────────────────
       // Delegated to the throw-safe `evaluateResumeGate` (review issue #2): every
       // ineligible reply — and any UNEXPECTED throw inside the gate (DB read,
@@ -6105,7 +6202,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         inbound,
         ctx,
         resumeCfg,
-        exemptToolNames: resumeExemptToolNames(resumeCfg.work_gate?.[ctx]?.extra_exempt_tools ?? []),
+        exemptToolNames: workGateExemptToolNames(inbound),
         // Thread timelineKey (supplied by the gate from row.timeline_key) for per-agent
         // model resolution (spec PER-AGENT-MODEL-OVERRIDES FIX 7).
         resolveCeiling: (sessionType, timelineKey) => factory.resolveSessionContextCeiling(sessionType, timelineKey),
@@ -6126,12 +6223,6 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       });
       if (!verdict.resume) return false;
       const { row, material } = verdict;
-
-      // Record wait (spec SESSION-RECORDS CONTRACT §7): if the target session's
-      // record turn is still running, wait for it to complete before we load the
-      // resume material — so the resumed session sees the finished record on its
-      // next call to read_session_record.
-      await sessionRecordService.waitFor(sessionId);
 
       // All gates pass → ACCEPT. Single-consumption CAS (§6): completed → resuming,
       // bump generation. A racing reply that already consumed this state gets
@@ -6170,7 +6261,6 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           material,
           generation,
           continuation: { tail: resumeCfg.satellite?.tail ?? true, gap },
-          resumeLabel: "reply",
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -6179,8 +6269,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         drainNextQueuedTrigger(inbound.timelineKey);
         // The resumed session never went live, yet we returned `true` (took over this
         // trigger's slot) so the FRESH launch below never runs — the reply would get no
-        // response. Re-dispatch it as its own trigger (review issue #4, symmetric with
-        // `resumeFollowUp`) so the never-drop invariant holds. A reply reaching here is
+        // response. Re-dispatch it as its own trigger (review issue #4) so the
+        // never-drop invariant holds. A reply reaching here is
         // always trigger-bearing (resolved upstream in the provider hold), so this always
         // re-dispatches. On the re-dispatched launch the row is no longer `completed`
         // (the CAS bumped it; `markDiscarded` set it `discarded`), so `tryReplyResume`
@@ -6203,11 +6293,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
 
   /**
    * Adopt the accepted session and run the resumed rollout (spec RESUMABLE-SESSIONS
-   * §7/§9/§11; spec FOLLOWUP-FOLDING §5.3). Shared by reply-to-continue (a reply to
-   * a completed bot message) and follow-up folding's settled→resume branch — the
-   * caller resolves eligibility through its own gate, performs the single-consumption
-   * CAS, and hands in the pre-computed `continuation` (satellite tail, gap budget,
-   * and the optional follow-up trigger preamble). Mirrors the fresh run's lifecycle
+   * §7/§9/§11) for reply-to-continue (a reply to a completed bot message, resume on):
+   * the caller resolves eligibility through its gate, performs the single-consumption
+   * CAS, and hands in the pre-computed `continuation` (satellite tail, gap budget).
+   * Folding never resumes (spec SESSION-RECORDS §7). Mirrors the fresh run's lifecycle
    * tail (claim attribution, follow-up watch re-arm, capture, run/settle, slot drain,
    * browser close); the differences are: the row is ADOPTED (not created), usage seed
    * + generation come from the bumped row, the snapshot is reused (capture re-persists
@@ -6224,12 +6313,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     continuation: {
       tail: boolean;
       gap?: { maxMessages: number; maxTokens: number; lowerBoundTimestamp: number };
-      triggerPreamble?: string;
     };
-    /** Which resume path drove this — used only for log attribution. */
-    resumeLabel: "reply" | "follow-up";
   }): Promise<void> {
-    const { inbound, duplicate, target, row, material, generation, continuation, resumeLabel } = args;
+    const { inbound, duplicate, target, row, material, generation, continuation } = args;
     const record: AgentSessionRecord = {
       id: row.id,
       timelineKey: row.timeline_key,
@@ -6268,7 +6354,6 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       timelineKey: record.timelineKey,
       generation,
       context: resumeContextFor(record.timelineKey),
-      resumeLabel,
     });
 
     // Per-user limits — Gate A for a resume (spec PER-USER-LIMITS §6). A resume is the
@@ -6299,9 +6384,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       selectToolCostSeed("continue", () => storage.getSessionToolUsage(record.id).cost),
     );
 
-    // Gap backfill (§9): the caller resolved the budget + lower bound (reply-resume
-    // reads it from `[agent.sessions.resume.gap]`; a follow-up resume omits it — the
-    // continuation arrives seconds later, so there is nothing meaningful to surface).
+    // Gap backfill (§9): the caller resolved the budget + lower bound from
+    // `[agent.sessions.resume.gap]`.
     const gap = continuation.gap;
 
     // Advance the gap lower bound to THIS resume's trigger group latest member
@@ -6315,6 +6399,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
 
     // Session record handles for the resumed session's record turn (spec SESSION-RECORDS §3).
     const resumeRecordHandles: SessionRecordHandles = { gate: { active: false }, draft: new SummaryDraft() };
+    let created: Awaited<ReturnType<typeof factory.create>>;
     let agent;
     let kickoff;
     try {
@@ -6340,13 +6425,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // steer path's `followUpHydratedEvent`; falls back to the raw event (caption-only)
       // if the row is somehow not stored yet.
       record.trigger = { ...record.trigger, event: followUpHydratedEvent(record.trigger) };
-      ({ agent, kickoff } = await factory.create(record, tools, {
+      created = await factory.create(record, tools, {
         resume: material,
+        recordTurnGate: resumeRecordHandles.gate,
         resumeContinuation: {
           tail: continuation.tail,
           browserNote: resolveAgentBrowserSession(resolveWorkspaceForTimeline(record.timelineKey)?.agentName ?? null) ? RESUME_BROWSER_NOTE : undefined,
           gap,
-          triggerPreamble: continuation.triggerPreamble,
         },
         usage,
         // Per-user selection + dynamic ceiling apply to a resume exactly as to a
@@ -6355,7 +6440,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         userLimit: resumeGate?.userLimit,
         costCeilingOverride: resumeGate?.ceilingOverride,
         abortSignal: drainAbort.signal,
-      }));
+      });
+      ({ agent, kickoff } = created);
       if (!kickoff) throw new Error("resume continuation produced no appended turn");
     } catch (error) {
       const buildTimeout = error instanceof Error && error.name === "BuildWaitTimeoutError";
@@ -6381,20 +6467,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     sessions.attachAgent(record.id, agent);
     if (ownerExternalId) drainPendingCoRepliesIntoSession(ownerExternalId, record.id);
     // Follow-ups parked while this resumed session was building (§5.2) — steer them in
-    // now that it is live (a follow-up resume can itself accrue a parked follow-up).
+    // now that it is live.
     drainPendingFollowUpsIntoSession(record.id);
-    // Resume-path `spawn_session` affordance for a re-`@` fold (review Q1): a mention-form
-    // follow-up resume names `spawn_session(message_id=…)` in its preamble (the bare
-    // media/text forms do not), but the tool resolves `message_id` ONLY from the in-memory
-    // `coReplyInbounds` map — preamble text alone yields `not_found`. Retain the resume
-    // turn's trigger so the call resolves; scoped to the **mention** form to match the
-    // preamble and preserve the "media/text follow-up IS the new turn" framing. The
-    // mention-form resume inbound is trigger-bearing, so the passthrough uses the real
-    // trigger (no synthesis). Cleaned up on settle / on use, like every other retention.
-    if (resumeLabel === "follow-up" && classifyFollowUpForm(record.trigger.event) === "mention") {
-      retainFollowUpForSpawn(record.trigger, record.id);
-    }
-
     // Effective ceiling reflects the user's remaining headroom (spec §6.3), as for a launch.
     // resumeGate is undefined for bot-triggered sessions (Gate A was skipped) — falls through
     // to the static session ceiling, which is the correct behaviour (no per-user headroom cap).
@@ -6416,11 +6490,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     });
     const costWarnUnsub = wireCostBudgetWarner(record.id, record.sessionType, usage, costCeiling);
     const runner = new SessionRunner({ provider: providers.get(target.provider), target, suppressTyping: false });
-    // drainCalled flag mirrors the launchSession pattern (spec SESSION-RECORDS §3.3).
+    // The success path releases the slot itself, before the record turn (as in
+    // launchSession); the .finally drains only on the error path.
     let resumeDrainCalled = false;
     const run = runner
       .run(agent, record, config.agent.sessions.forced_completion_retries, kickoff, sessions.runLifecycle(record.id))
       .then(async (result) => {
+        const interrupted = sessions.get(record.id)?.status === "interrupted";
         sessions.markCompleted(record.id, { noReply: result.noReply });
         logger.info("session_resumed_completed", {
           sessionId: record.id,
@@ -6428,33 +6504,22 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           noReply: result.noReply,
           duplicate,
         });
-        // Release slot before record turn.
+        // The resumed generation writes a new record (spec SESSION-RECORDS §3.4/§7),
+        // with the same tail as a fresh run (registered before the slot release).
+        const recordTurn = interrupted
+          ? undefined
+          : startRecordTurn({
+              sessionId: record.id,
+              timelineKey: record.timelineKey,
+              sessionType: record.sessionType,
+              inbound,
+              created,
+              handles: resumeRecordHandles,
+              flush: () => captureHandle.flushNow(),
+            });
         resumeDrainCalled = true;
         drainNextQueuedTrigger(record.timelineKey);
-        const proactiveSessionType = config.proactive?.session_type ?? "proactive";
-        await sessionRecordService.runRecordTurn({
-          sessionId: record.id,
-          timelineKey: record.timelineKey,
-          sessionType: record.sessionType,
-          proactiveSessionType,
-          agentName: agentNameForTimeline(record.timelineKey),
-          agent,
-          draft: resumeRecordHandles.draft,
-          gate: resumeRecordHandles.gate,
-          buildsOn: [],
-          config: config.session_records,
-          exemptToolNames: resumeExemptToolNames([]),
-          storage,
-          llmScheduler,
-          logger,
-          modelInfo: { api: "openai", provider: "openai", model: factory.resolveModelId(record.sessionType, record.timelineKey) },
-        });
-        await captureHandle.flushNow().catch((err) => {
-          logger.warn("session_record_flush_failed", {
-            sessionId: record.id,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        });
+        await recordTurn;
       })
       .catch(async (error) => {
         try {
@@ -6568,6 +6633,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // context-build mode, and typing suppression. Everything else — tool assembly,
     // capture, slot release, queued-trigger drainage — is shared.
     const proactive = opts?.proactive === true;
+    const ownerSessionId = opts?.ownerSessionId ?? foldOwners.get(inbound.event.id);
+    foldOwners.delete(inbound.event.id);
     // Resume fork (spec RESUMABLE-SESSIONS §7): a reply that continues a completed,
     // eligible session takes over this trigger's slot and returns true. Any gate
     // failing (or a non-reply/proactive trigger) falls through to the FRESH launch below.
@@ -6764,13 +6831,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // Session record handles (spec SESSION-RECORDS CONTRACT §3): gate + draft are
     // created once and threaded into the tools so the record turn can drive them.
     const recordHandles: SessionRecordHandles = { gate: { active: false }, draft: new SummaryDraft() };
-    // Track which session records were injected so builds_on can be stored.
-    let buildsOn: string[] = [];
+    let created: Awaited<ReturnType<typeof factory.create>> | undefined;
     let agent: Awaited<ReturnType<typeof factory.create>>["agent"] | undefined;
     let kickoff: Awaited<ReturnType<typeof factory.create>>["kickoff"];
     let snapshot: ContextMessage[] | undefined;
     let tokenEstimate: number | undefined;
-    let sessionRegistry: Awaited<ReturnType<typeof factory.create>>["registry"];
     try {
       // §4.3: buildSessionTools throws when agents mode + unresolvable account.
       // Placed INSIDE the try block so the existing catch handles it identically
@@ -6790,173 +6855,43 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // synthetic trigger (no persisted event, no media) this is a fast no-op.
       await awaitTriggerReadiness(inbound);
 
-      // ── Session record injection (spec SESSION-RECORDS §6) ─────────────────
-      // 6.1/6.2: gather candidate records and select which to inject. Run in
-      // parallel with factory.create() (routing uses the decision model too).
-      const agentName = agentNameForTimeline(session.timelineKey);
-      const recordsEnabled = config.session_records?.enabled !== false;
-      const injectOnReply = config.session_records?.inject_on_reply !== false;
-      const proactiveSessionType = config.proactive?.session_type ?? "proactive";
-      // Promise resolves to injection specs + buildsOn list.
-      type InjectionPlan = { specs: Array<{ name: string; params: Record<string, unknown>; harness: { kind: "injection"; decisionGroup?: string } }>; ids: string[] };
-      let injectionPlanPromise: Promise<InjectionPlan> = Promise.resolve({ specs: [], ids: [] });
-
-      if (!proactive && recordsEnabled) {
-        // Find the reply target's session record (6.1 rule).
-        const replyExternalId = inbound.event.replyTo?.externalId;
-        let replyTargetSessionId: string | undefined;
-        if (injectOnReply && replyExternalId) {
-          const replyEvent = timeline.getByExternalId(inbound.provider, replyExternalId, inbound.timelineKey);
-          if (replyEvent?.agentSessionId) {
-            // Wait for an in-flight record (CONTRACT §7).
-            await sessionRecordService.waitFor(replyEvent.agentSessionId);
-            const replyRecord = storage.getSessionRecord(replyEvent.agentSessionId);
-            if (replyRecord) replyTargetSessionId = replyEvent.agentSessionId;
-          }
-        }
-        // If an ownerSessionId was provided (fold-after-settle path), treat it
-        // as the reply target when no replyTo exists.
-        if (!replyTargetSessionId && opts?.ownerSessionId) {
-          await sessionRecordService.waitFor(opts.ownerSessionId);
-          const ownerRecord = storage.getSessionRecord(opts.ownerSessionId);
-          if (ownerRecord) replyTargetSessionId = opts.ownerSessionId;
-        }
-
-        const recordsPointEnabled = decisionEngine?.isEnabled("records", agentName) ?? false;
-        if (recordsPointEnabled && decisionEngine) {
-          // 6.2: gather candidates and run selection in parallel with routing.
-          const rawDecisions = decisionsFor(config, agentName);
-          const candidatesLimit = rawDecisions.records?.candidates ?? 3;
-          // Recent bot messages with a session record, one per session, newest first.
-          const recentBotEvents = timeline.query({
-            timelineKey: session.timelineKey,
-            toTimestamp: inbound.event.timestamp,
-            limit: candidatesLimit + 10, // over-fetch and filter below
-          }).filter((e) => e.sender?.isSelf === true && e.agentSessionId != null);
-
-          const seenSessions = new Set<string>();
-          const candidateSessions: string[] = [];
-          // Reply target goes in first (priority slot, spec §6.2).
-          if (replyTargetSessionId) {
-            seenSessions.add(replyTargetSessionId);
-            candidateSessions.push(replyTargetSessionId);
-          }
-          for (const ev of recentBotEvents) {
-            const sid = ev.agentSessionId!;
-            if (seenSessions.has(sid)) continue;
-            // Skip still-running records (CONTRACT §7 — only skip non-reply ones).
-            if (sessionRecordService.isInFlight(sid)) continue;
-            const rec = storage.getSessionRecord(sid);
-            if (!rec) continue;
-            seenSessions.add(sid);
-            candidateSessions.push(sid);
-            if (candidateSessions.length >= candidatesLimit) break;
-          }
-
-          if (candidateSessions.length > 0) {
-            const triggerText = inbound.event.body ?? "";
-            const triggerSender = inbound.trigger?.triggeredBy?.displayName
-              ?? inbound.event.sender?.displayName
-              ?? inbound.event.sender?.username
-              ?? inbound.event.sender?.id
-              ?? "User";
-            const candidates: RecordsCandidate[] = candidateSessions.map((sid) => {
-              const rec = storage.getSessionRecord(sid)!;
-              const isReplyTarget = sid === replyTargetSessionId;
-              const replyEvent = isReplyTarget && replyExternalId
-                ? timeline.getByExternalId(inbound.provider, replyExternalId, session.timelineKey)
-                : undefined;
-              return {
-                sessionId: sid,
-                record: rec.text,
-                isReplyTarget,
-                request: { from: triggerSender, text: triggerText },
-                ...(isReplyTarget && replyEvent
-                  ? { replyTo: { from: replyEvent.sender?.displayName ?? "bot", text: replyEvent.body ?? "" } }
-                  : {}),
-              };
-            });
-
-            injectionPlanPromise = selectRecordsToInject(
-              decisionEngine,
-              { candidates, rawDecisions },
-              {
-                agentName,
-                attribution: {
-                  agentSessionId: session.id,
-                  sessionType: session.sessionType,
-                  timelineKey: session.timelineKey,
-                  triggerSenderId: inbound.event.sender?.id ?? null,
-                },
-                signal: drainAbort.signal,
-                triggerEventId: inbound.event.id,
-              },
-            ).then(({ inject, decisionGroup }) => ({
-              specs: inject.map((sid) => ({
-                name: "read_session_record",
-                params: { session_id: sid },
-                harness: { kind: "injection" as const, decisionGroup },
-              })),
-              ids: inject,
-            })).catch((err) => {
-              logger.warn("records_injection_select_failed", {
-                sessionId: session.id,
-                error: err instanceof Error ? err.message : String(err),
-              });
-              return { specs: [], ids: [] };
-            });
-          }
-        } else if (replyTargetSessionId) {
-          // 6.1 fallback: inject only the reply target's record, no decision model.
-          injectionPlanPromise = Promise.resolve({
-            specs: [{ name: "read_session_record", params: { session_id: replyTargetSessionId }, harness: { kind: "injection" as const } }],
-            ids: [replyTargetSessionId],
-          });
-        }
-      }
-
-      // Run routing (inside factory.create) AND records selection in parallel.
-      const [factoryResult, injectionPlan] = await Promise.all([
-        factory.create(session, tools, {
-          // Decision-model routing (ARCHITECTURE.md §8h): human-triggered chat-lane
-          // sessions of an agent with routing on. Evaluated inside create(), after
-          // the readiness wait above, so the trigger's captions are in the state.
-          route:
-            !proactive && !isBotTriggered && session.sessionType === "default"
-              ? makeRouter(inbound, session)
-              : undefined,
-          proactive: proactive ? true : undefined,
-          usage,
-          // Per-user selection input + dynamic ceiling (spec PER-USER-LIMITS §6).
-          // Undefined for proactive / non-active resolutions → today's single-model path.
-          userLimit: userLimitForCreate,
-          costCeilingOverride: userCeilingOverride,
-          // Drain cancellation (spec §7.2): a build waiting on a summary job
-          // aborts cleanly at shutdown instead of out-living the worker pool.
-          abortSignal: drainAbort.signal,
-        }),
-        injectionPlanPromise,
-      ]);
-      ({ agent, kickoff, snapshot, tokenEstimate, registry: sessionRegistry } = factoryResult);
-      buildsOn = injectionPlan.ids;
+      // Session records to start with (spec SESSION-RECORDS §6/§7): planned in
+      // parallel with routing and the build, awaited inside create() right before
+      // the kickoff is assembled, and executed there with the session's own tools.
+      const injections = planRecordInjections(
+        inbound,
+        session,
+        proactive ? undefined : ownerSessionId,
+      ).catch((error) => {
+        logger.warn("records_injection_plan_failed", {
+          sessionId: session.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return [] as SyntheticCallSpec[];
+      });
+      created = await factory.create(session, tools, {
+        // Decision-model routing (ARCHITECTURE.md §8h): human-triggered chat-lane
+        // sessions of an agent with routing on. Evaluated inside create(), after
+        // the readiness wait above, so the trigger's captions are in the state.
+        route:
+          !proactive && !isBotTriggered && session.sessionType === "default"
+            ? makeRouter(inbound, session)
+            : undefined,
+        injections,
+        recordTurnGate: recordHandles.gate,
+        proactive: proactive ? true : undefined,
+        usage,
+        // Per-user selection input + dynamic ceiling (spec PER-USER-LIMITS §6).
+        // Undefined for proactive / non-active resolutions → today's single-model path.
+        userLimit: userLimitForCreate,
+        costCeilingOverride: userCeilingOverride,
+        // Drain cancellation (spec §7.2): a build waiting on a summary job
+        // aborts cleanly at shutdown instead of out-living the worker pool.
+        abortSignal: drainAbort.signal,
+      });
+      ({ agent, kickoff, snapshot, tokenEstimate } = created);
       // Chat builds always emit a final trigger turn; absence indicates a build bug.
       if (!kickoff) throw new Error("context build produced no final user turn");
-
-      // Build injection messages and extend kickoff (spec SESSION-RECORDS §6).
-      if (injectionPlan.specs.length > 0) {
-        const injectionModelInfo: SyntheticModelInfo = {
-          api: "openai",
-          provider: "openai",
-          model: factory.resolveModelId(session.sessionType, session.timelineKey),
-        };
-        const injectionMessages = await executeSyntheticCalls(
-          injectionPlan.specs,
-          tools,
-          injectionModelInfo,
-          { registry: sessionRegistry, logger, sessionId: session.id },
-        );
-        kickoff = [...kickoff, ...injectionMessages];
-      }
     } catch (error) {
       // Build-wait timeout (spec LLM-FAILURE-HANDLING §7.1): the build blocked
       // on summary coverage for the whole interactive wall-clock budget (a
@@ -7026,61 +6961,39 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     const costWarnUnsub = wireCostBudgetWarner(session.id, session.sessionType, usage, costCeiling);
     const runner = new SessionRunner({ provider: providers.get(target.provider), target, suppressTyping: proactive });
 
-    // drainCalled: track whether drainNextQueuedTrigger was called in .then so
-    // the .finally doesn't double-drain on the success path (spec SESSION-RECORDS
-    // §3.3: drain before record turn, capture flush after record turn).
+    // drainCalled: the success path releases the timeline slot itself (before the
+    // record turn), so the .finally drains only on the error path.
     let drainCalled = false;
     const run = runner
       .run(agent!, session, config.agent.sessions.forced_completion_retries, kickoff, sessions.runLifecycle(session.id))
       .then(async (result) => {
+        // An operator interrupt settles through here too (markCompleted keeps the
+        // `interrupted` status); such a run writes no record.
+        const interrupted = sessions.get(session.id)?.status === "interrupted";
         sessions.markCompleted(session.id, { noReply: result.noReply });
         logger.info("session_completed", {
           sessionId: session.id,
           noReply: result.noReply,
           duplicate,
         });
-        // Release the timeline slot BEFORE the record turn so the next queued
-        // trigger can start while we write the record (spec SESSION-RECORDS §3.3).
+        // Record turn (spec SESSION-RECORDS §3.2): registered in flight BEFORE the
+        // slot is released, so the next queued trigger sees it; then the slot is
+        // freed and the turn runs while that trigger starts. The capture handle
+        // stays attached (detached in .finally) so the turn lands in the transcript.
+        const recordTurn = interrupted
+          ? undefined
+          : startRecordTurn({
+              sessionId: session.id,
+              timelineKey: session.timelineKey,
+              sessionType: session.sessionType,
+              inbound,
+              created: created!,
+              handles: recordHandles,
+              flush: () => captureHandle.flushNow(),
+            });
         drainCalled = true;
         drainNextQueuedTrigger(session.timelineKey);
-        // Record turn (spec SESSION-RECORDS §3): write a compact session record so
-        // later sessions can answer questions about this work. Runs after drain so
-        // the slot is free; capture handle is still attached (captureHandle.detach
-        // is in .finally, not here) so the record turn's messages are flushed.
-        const proactiveSessionType = config.proactive?.session_type ?? "proactive";
-        await sessionRecordService.runRecordTurn({
-          sessionId: session.id,
-          timelineKey: session.timelineKey,
-          sessionType: session.sessionType,
-          proactiveSessionType,
-          agentName: agentNameForTimeline(session.timelineKey),
-          agent: agent!,
-          draft: recordHandles.draft,
-          gate: recordHandles.gate,
-          buildsOn,
-          config: config.session_records,
-          exemptToolNames: resumeExemptToolNames(
-            config.agent.sessions.resume?.work_gate?.["dm"]?.extra_exempt_tools
-              ?? config.agent.sessions.resume?.work_gate?.["group"]?.extra_exempt_tools
-              ?? [],
-          ),
-          storage,
-          llmScheduler,
-          registry: sessionRegistry,
-          logger,
-          modelInfo: {
-            api: "openai",
-            provider: "openai",
-            model: factory.resolveModelId(session.sessionType, session.timelineKey),
-          },
-        });
-        // Flush the record turn's messages into the durable transcript.
-        await captureHandle.flushNow().catch((err) => {
-          logger.warn("session_record_flush_failed", {
-            sessionId: session.id,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        });
+        await recordTurn;
       })
       .catch(async (error) => {
         // Best-effort transcript flush BEFORE any recovery decision (issue #1 +
@@ -7711,6 +7624,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     async stop() {
       stopPromise ??= (async () => {
         draining = true;
+        // Abort in-flight session-record turns and refuse new ones (spec
+        // SESSION-RECORDS §3.2): each logs session_record_failed{reason:"shutdown"}
+        // and writes nothing; the runs that carry them settle within waitForRuns.
+        sessionRecordService.shutdown();
         // Quiesce the gap-backfetch run BEFORE any pool/storage teardown (#3).
         // `draining` is now true, so the coordinator stops launching new rooms and
         // `commit()` bails before its first write; awaiting `gapBackfetchRun` lets
@@ -7759,6 +7676,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // FOLLOWUP-FOLDING): the runtime is draining, so nothing more folds.
         followUpWatch.clear();
         pendingFollowUps.clear();
+        foldOwners.clear();
         // Abort each caption client's scheduler-admission seam BEFORE awaiting
         // the pool's in-flight workers (#6). `captionPool.stop()` awaits
         // in-flight caption work, and a caption call queued behind a half-open
@@ -8434,11 +8352,6 @@ export async function evaluateResumeGate(args: {
   }
 }
 
-/** The verdict of {@link evaluateFollowUpResumeGate}. */
-export type FollowUpResumeGateVerdict =
-  | { resume: true; row: AgentSessionRow; material: ResumeMaterial }
-  | { resume: false };
-
 /**
  * Cross-field validation for `[agent.sessions.followup]` (spec FOLLOWUP-FOLDING §9) —
  * the rules TypeBox can't express. Factored out for unit-testing; called once at app
@@ -8475,66 +8388,6 @@ export function assertFollowupConfigValid(
           `a lever with no wall-clock lifetime is silently inert; set wall_clock_ms`,
       );
     }
-  }
-}
-
-/**
- * The follow-up settled→resume gate (spec FOLLOWUP-FOLDING §5.3), factored out for
- * unit-testing like {@link evaluateResumeGate}. A deliberate SUBSET of reply-resume's
- * gate: it KEEPS the completed-status check, the synthetic-type exclusion, the
- * capability/context-ceiling gate (an image is token-heavy — a resume that would
- * instantly re-park is pointless), and material viability; it DROPS the work gate
- * (the rationale is inverted — a toolless "look at this" session is exactly what we
- * resume), the time window, the same-user check (structural via the per-sender watch),
- * and the generation-match (the watch names the session directly; single-consumption
- * is the caller's CAS). Throw-safe: ANY unexpected throw degrades to `{resume:false}`
- * (→ native fate), never propagating — a fold-resume must never drop the follow-up.
- */
-export async function evaluateFollowUpResumeGate(args: {
-  sessionId: string;
-  getSession: () => AgentSessionRow | undefined;
-  /**
-   * Resolve the context ceiling for a session type. Optionally receives the
-   * session record's timeline key (spec PER-AGENT-MODEL-OVERRIDES FIX 7) so
-   * the ceiling is resolved against the per-agent model rather than the global
-   * session-type model. Callers that omit `timelineKey` fall back to the
-   * global-only path (backward-compatible).
-   */
-  resolveCeiling: (sessionType: string, timelineKey?: string) => number | undefined;
-  loadMaterial: (row: AgentSessionRow) => Promise<ResumeMaterial | null>;
-  timelineKey: string;
-  logger: Pick<Logger, "warn">;
-}): Promise<FollowUpResumeGateVerdict> {
-  try {
-    const row = args.getSession();
-    // §7.2: only a `completed` row is resumable (failed-resumable/interrupted keep the
-    // console path; discarded is dead; a pruned/missing row → native fate).
-    if (!row || row.status !== "completed") return { resume: false };
-    // §7.3: synthetic worker sessions never arm a watch, but exclude defensively.
-    if (SYNTHETIC_SESSION_TYPES.has(row.session_type)) return { resume: false };
-    // Capability/context-ceiling gate (§5.3 KEEP): a resume that would instantly
-    // re-park is pointless → native fate instead.
-    let ceiling: number | undefined;
-    try {
-      // Thread the row's timeline key so the ceiling uses the per-agent model (FIX 7).
-      ceiling = args.resolveCeiling(row.session_type, row.timeline_key);
-    } catch {
-      ceiling = undefined;
-    }
-    if (ceiling !== undefined && row.context_tokens != null && row.context_tokens >= ceiling) {
-      return { resume: false };
-    }
-    // Material viability (one load of the completed material).
-    const material = await args.loadMaterial(row);
-    if (!material) return { resume: false };
-    return { resume: true, row, material };
-  } catch (error) {
-    args.logger.warn("follow_up_resume_gate_threw", {
-      sessionId: args.sessionId,
-      timelineKey: args.timelineKey,
-      error: error instanceof Error ? error.message : String(error),
-    });
-    return { resume: false };
   }
 }
 

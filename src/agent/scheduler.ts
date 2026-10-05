@@ -1097,7 +1097,12 @@ export class LlmScheduler {
 
 export interface AdmissionOptions {
   group: string;
-  priority: PriorityClass;
+  /**
+   * Admission class. A function is read once per acquire, so a session can
+   * change the class of its later requests (the session-record turn runs at
+   * `interactive` whatever the session's own class, spec SESSION-RECORDS §3.2).
+   */
+  priority: PriorityClass | (() => PriorityClass);
   /** Escalation key registered for the whole wait (§5.5). */
   key?: string;
   /** Per-model probe-backoff-cap override (spec MODEL-FALLBACK §4.1). */
@@ -1187,7 +1192,7 @@ export function withSchedulerAdmission(
       try {
         release = await scheduler.acquire({
           group: options.group,
-          priority: options.priority,
+          priority: typeof options.priority === "function" ? options.priority() : options.priority,
           key: options.key,
           modelKey,
           probeBackoffMaxMs: options.probeBackoffMaxMs,

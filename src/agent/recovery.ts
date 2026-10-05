@@ -529,10 +529,16 @@ export interface ManualResumeDeps {
   releaseTimelineSlot: (timelineKey: string) => void;
   /** Bot user id for a provider account (the provider's post-start `getSelf`). */
   selfUserIdForAccount: (provider: string, accountId: string) => string | undefined;
-  /** One resume attempt (app.ts `resumeSessionRun`, attempt 0). */
+  /**
+   * One resume attempt (app.ts `resumeSessionRun`, attempt 0). `releaseSlot`
+   * frees the timeline slot early (idempotent; the `finally` below then does
+   * nothing): a completed run calls it before its session-record turn, so the
+   * record turn never holds the timeline (spec SESSION-RECORDS §3.2).
+   */
   runAttempt: (
     record: AgentSessionRecord,
     inbound: InboundChatEvent,
+    releaseSlot: () => void,
   ) => Promise<ResumeAttemptResult>;
   markFailedResumable: (sessionId: string, error?: string) => void;
   markDiscarded: (sessionId: string, error?: string) => void;
@@ -651,6 +657,12 @@ export function createManualResumeSession(
           reason: "timeline busy: another session holds this timeline's slot",
         };
       }
+      let slotReleased = false;
+      const releaseSlot = (): void => {
+        if (slotReleased) return;
+        slotReleased = true;
+        deps.releaseTimelineSlot(row.timeline_key);
+      };
       try {
         // Issue #18: the synthetic inbound carries the PERSISTED trigger
         // sender. The selfUserId fallback only covers pre-v18 rows (no
@@ -714,7 +726,7 @@ export function createManualResumeSession(
         // an LLM-layer outcome), exactly the `fatal` class.
         let attemptResult: ResumeAttemptResult;
         try {
-          attemptResult = await deps.runAttempt(record, inbound);
+          attemptResult = await deps.runAttempt(record, inbound, releaseSlot);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           if (deps.isDraining()) {
@@ -775,7 +787,7 @@ export function createManualResumeSession(
             };
         }
       } finally {
-        deps.releaseTimelineSlot(row.timeline_key);
+        releaseSlot();
       }
     } finally {
       inFlight.delete(sessionId);

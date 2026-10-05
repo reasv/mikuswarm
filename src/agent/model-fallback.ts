@@ -109,7 +109,8 @@ export interface BuildModelFallbackOptions {
   scheduler?: LlmScheduler;
   /** Per-candidate admission parameters (group resolved per member from `rate_limit_group`). */
   admission?: {
-    priority: PriorityClass;
+    /** A function is read per request (see `AdmissionOptions.priority` in scheduler.ts). */
+    priority: PriorityClass | (() => PriorityClass);
     key?: string;
     sessionId?: string;
     sessionType?: string;

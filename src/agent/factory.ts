@@ -13,6 +13,7 @@ import { convertToLlm } from "./convert.js";
 import { withStaleThinkingDropped } from "./stale-thinking.js";
 import { makeDeferLoadingInjector, withDeclaredDeferredTools, type DeclaredToolSet } from "./declared-tools.js";
 import { executeSyntheticCalls, type SyntheticCallSpec } from "./synthetic-calls.js";
+import { wrapToolsWithRecordTurnGate, type RecordTurnGate } from "./record-turn.js";
 import { estimateLiveSliceTokens } from "./live-token-estimate.js";
 import { extractLlmRequestClass, withRequestRetry } from "./request-retry.js";
 import {
@@ -315,12 +316,22 @@ export interface CreateAgentOptions {
   route?: (input: { listedSkills: readonly SkillMeta[] }) => Promise<RoutingVerdict | undefined>;
   /**
    * Synthetic tool calls to inject into the start of the live transcript, after
-   * the final user turn (spec §4 / SESSION-RECORDS §4).  Routing preloads are
-   * prepended automatically; this list is appended after them.  W6 uses this to
-   * inject `read_session_record` calls.  Ignored on a resume (the transcript
+   * the final user turn (spec SESSION-RECORDS §4): the app's `read_session_record`
+   * calls. Routing preloads come first; these follow. A promise is awaited after
+   * routing and the context build, right before the kickoff is assembled, so the
+   * caller's selection runs in parallel with both; a rejection injects nothing.
+   * A call to a tool that is still deferred is preceded by a synthetic
+   * `tool_search` select call that loads it. Ignored on a resume (the transcript
    * already carries the original injections).
    */
-  injections?: SyntheticCallSpec[];
+  injections?: SyntheticCallSpec[] | Promise<SyntheticCallSpec[]>;
+  /**
+   * The session's record-turn gate (spec SESSION-RECORDS §3.2), applied to the
+   * final tool list (the caller's tools plus the loading tools the factory adds),
+   * so nothing but `session_record_tool` runs during the record turn and it
+   * never runs outside it.
+   */
+  recordTurnGate?: RecordTurnGate;
   /**
    * Reply-resume continuation (spec RESUMABLE-SESSIONS §9/§11). Set ALONGSIDE
    * `resume` when continuing a COMPLETED session because a user replied to it:
@@ -464,11 +475,16 @@ export interface CreatedAgent {
   renderedInputIds?: string[];
   /**
    * The per-session dynamic-tool registry, when dynamic tools are enabled
-   * (spec DYNAMIC-TOOL-LOADING §7). Callers can use this to load harnessOnly
-   * tools (e.g. session_record_tool) before the record-turn prompt without
-   * re-building tools. Undefined when dynamic tools are off.
+   * (spec DYNAMIC-TOOL-LOADING §7). The record turn loads `session_record_tool`
+   * through it (spec SESSION-RECORDS §3.2). Undefined when dynamic tools are off.
    */
   registry?: DynamicToolRegistry;
+  /**
+   * Change the scheduler admission class of this agent's later requests (read
+   * per request). The record turn raises it to `interactive` (spec
+   * SESSION-RECORDS §3.2). The retry budget stays the session type's own.
+   */
+  setPriority: (priority: PriorityClass) => void;
 }
 
 export class AgentSessionFactory {
@@ -720,6 +736,9 @@ export class AgentSessionFactory {
     const basePriority =
       sessionTypeConfig?.priority ?? defaultPriorityForSessionType(session.sessionType);
     const priority = opts?.priority ?? basePriority;
+    // Admission class of the next request; `setPriority` on the created agent
+    // changes it for the requests that follow (the record turn, §3.2).
+    const admissionPriority: { current: PriorityClass } = { current: priority };
     // Holder for the admission wait of the in-flight attempt (ring
     // attribution, §9.2): the agent issues one request at a time per session,
     // so a single slot per created agent is race-free.
@@ -816,7 +835,7 @@ export class AgentSessionFactory {
         scheduler,
         admission: scheduler
           ? {
-              priority,
+              priority: () => admissionPriority.current,
               key: opts?.escalationKey,
               sessionId: session.id,
               sessionType: session.sessionType,
@@ -1557,7 +1576,7 @@ export class AgentSessionFactory {
     // rate-limiting: 20 events/session prevents log floods while still catching
     // the first burst (spec §6).
     let _truncationLogCount = 0;
-    const wrappedTools = wrapToolsWithResultBudget(prefillCatalog, {
+    const budgetedTools = wrapToolsWithResultBudget(prefillCatalog, {
       resultMaxTokens,
       turnBudget,
       getRunningContext: () => {
@@ -1582,6 +1601,13 @@ export class AgentSessionFactory {
           }
         : undefined,
     });
+    // The record-turn gate (spec SESSION-RECORDS §3.2) wraps the FINAL tool list,
+    // so the loading tools created above obey it like the app's own tools: while
+    // the record turn runs only session_record_tool executes, outside it
+    // session_record_tool never does. Definitions are untouched (wire-stable).
+    const wrappedTools = opts?.recordTurnGate
+      ? wrapToolsWithRecordTurnGate(budgetedTools, opts.recordTurnGate)
+      : budgetedTools;
 
     // The per-session registry (spec §7): immediate = config patterns ∪ the
     // loading tools ∪ any always_loaded skill's declared tools. Resume recomputes
@@ -1602,6 +1628,16 @@ export class AgentSessionFactory {
       for (const skill of workspace.skills.inlined) {
         if (!skill.tools) continue;
         for (const name of matchToolPatterns(catalogNames, skill.tools)) immediate.add(name);
+      }
+      // read_session_record is reactive (spec SESSION-RECORDS §5: a user points at
+      // a bot message with no other cue) and the target of every record injection,
+      // so it is immediate whenever wired, like the loading tools; deployments
+      // replace `immediate` wholesale and must not be able to drop it.
+      if (catalogNames.includes("read_session_record")) immediate.add("read_session_record");
+      // Harness-only tools are never immediate, whatever the config patterns or an
+      // inlined skill say (spec SESSION-RECORDS §3.2): the record turn loads them.
+      for (const tool of wrappedTools) {
+        if (tool.harnessOnly) immediate.delete(tool.name);
       }
       // §4: a skill whose tools patterns match nothing in this session's catalog —
       // not an error (catalogs legitimately vary per agent/session type), but
@@ -1970,43 +2006,48 @@ export class AgentSessionFactory {
       agent.state.messages = [...opts.resume.transcript];
     }
 
-    // W5 synthetic injections (spec §4 / SESSION-RECORDS §4): execute routing
-    // skill preloads + caller injections as real tool calls and build transcript
-    // message pairs.  Only on fresh (non-resume) sessions — a resumed session
-    // already carries the original synthetic pairs in its transcript, and
+    // Synthetic injections (spec SESSION-RECORDS §4): routing skill preloads plus
+    // the caller's injections, executed as real tool calls with the session's own
+    // wrapped tools and stamped with the head model's api/provider/model, then
+    // appended to the kickoff after the final user turn. Fresh sessions only — a
+    // resumed session already carries its pairs in the transcript, and
     // seedFromTranscript re-derives the loaded set from their addedToolNames.
     //
-    // Execution happens AFTER registry.onChange is wired (so load events update
-    // agent.state.tools and park tool-def charges in pendingToolDefTokens), and
-    // AFTER the transcript seed (but the fresh path has no transcript to seed).
-    // The resulting messages are prepended to the kickoff array so the LLM
-    // context reads: [frozenBase] finalTurn → synth_assistant → synth_toolResult
-    // → … → LLM continues.
+    // Execution happens AFTER registry.onChange is wired, so a load updates
+    // agent.state.tools and parks its tool-definition charge in
+    // pendingToolDefTokens before the first request. The caller's injections may
+    // be a promise (record selection running in parallel with routing and the
+    // build); it is awaited only here.
     let syntheticMessages: AgentMessage[] = [];
     if (!opts?.resume && finalTurn !== undefined) {
-      const allSpecs = [...routingSkillSpecs, ...(opts?.injections ?? [])];
+      let injections: SyntheticCallSpec[] = [];
+      if (opts?.injections) {
+        try {
+          injections = await opts.injections;
+        } catch (error) {
+          logger?.warn("synthetic_injections_failed", {
+            sessionId: session.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      const allSpecs = [...routingSkillSpecs, ...withDeferredLoads(injections, registry)];
       if (allSpecs.length > 0) {
-        const synthModelInfo = {
-          api: model.api ?? "unknown",
-          provider: model.provider ?? "unknown",
-          model: model.id,
-        };
-        syntheticMessages = await executeSyntheticCalls(allSpecs, initialTools, synthModelInfo, {
-          registry: registry ?? undefined,
-          logger: this.options.logger,
+        const synthModelInfo = { api: model.api, provider: model.provider, model: model.id };
+        syntheticMessages = await executeSyntheticCalls(allSpecs, wrappedTools, synthModelInfo, {
+          registry,
+          logger,
           sessionId: session.id,
         });
         // Account for synthetic message tokens in the initial context estimate so
         // refreshRunningContext's first-observation seed covers the full kickoff.
         // (built.tokenEstimate already covers finalTurn; synthetics are new.)
-        if (syntheticMessages.length > 0) {
-          const synthSlice = syntheticMessages.filter(isLiveRuntimeMessage);
-          if (synthSlice.length > 0) {
-            try {
-              initialContextEstimate.value += estimateLiveSliceTokens(synthSlice);
-            } catch {
-              /* best-effort; conservative: under-counting only */
-            }
+        const synthSlice = syntheticMessages.filter(isLiveRuntimeMessage);
+        if (synthSlice.length > 0) {
+          try {
+            initialContextEstimate.value += estimateLiveSliceTokens(synthSlice);
+          } catch {
+            /* best-effort; conservative: under-counting only */
           }
         }
       }
@@ -2031,9 +2072,10 @@ export class AgentSessionFactory {
       richTokens: snapshotRichTokens,
       usage,
       renderedInputIds,
-      // Exposed so callers can load harnessOnly tools (e.g. session_record_tool)
-      // via registry.load() before the record turn prompt without re-building tools.
       registry,
+      setPriority: (next: PriorityClass) => {
+        admissionPriority.current = next;
+      },
     };
   }
 
@@ -2343,10 +2385,9 @@ export class AgentSessionFactory {
         for (const name of matchToolPatterns(names, skill.tools)) immediate.add(name);
       }
     }
-    // harnessOnly tools must never appear in the initial wire set: they are not
-    // for the agent (session_record_tool is gate-blocked during a normal run)
-    // and placing them in `immediate` would make them visible before the record
-    // turn's explicit registry.load() step.
+    // Mirrors create(): read_session_record is immediate whenever wired, and
+    // harness-only tools are never immediate (the record turn loads them).
+    if (names.includes("read_session_record")) immediate.add("read_session_record");
     for (const d of defs) {
       if ((d as { harnessOnly?: boolean }).harnessOnly) immediate.delete(d.name);
     }
@@ -2424,6 +2465,33 @@ export function wasRunAborted(agent: {
     break;
   }
   return extractLlmRequestClass(errorMessage) === "aborted";
+}
+
+/**
+ * Injected synthetic calls must reach tools the session has on the wire. A call to
+ * a tool that is still deferred (a deployment whose `immediate` list leaves out
+ * `read_session_record`, say) is preceded by one synthetic `tool_search` select
+ * call that loads it, exactly as the agent itself would have to, so each
+ * transport serializes the load at its native load point. Without dynamic loading
+ * (no registry) every tool is already present and the specs pass through.
+ */
+export function withDeferredLoads(
+  specs: readonly SyntheticCallSpec[],
+  registry: DynamicToolRegistry | undefined,
+): SyntheticCallSpec[] {
+  if (!registry || specs.length === 0) return [...specs];
+  const deferred = [
+    ...new Set(
+      specs
+        .map((spec) => spec.name)
+        .filter((name) => registry.inCatalog(name) && !registry.isLoaded(name)),
+    ),
+  ];
+  if (deferred.length === 0) return [...specs];
+  return [
+    { name: "tool_search", params: { query: `select:${deferred.join(",")}` }, harness: specs[0]!.harness },
+    ...specs,
+  ];
 }
 
 /**

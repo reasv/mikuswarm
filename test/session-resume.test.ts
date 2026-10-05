@@ -537,6 +537,24 @@ function manualResumeHarness(overrides: Partial<ManualResumeDeps> = {}): {
   return { deps, rec };
 }
 
+test("manual resume: a completed run releases the slot early, before its record turn, exactly once (J2)", async () => {
+  let releasesAtRecordTurn = -1;
+  const { deps, rec } = manualResumeHarness({
+    runAttempt: async (_record, _inbound, releaseSlot) => {
+      // The run completed: free the slot, then the record turn runs without it.
+      releaseSlot();
+      releasesAtRecordTurn = rec.slotReleases.length;
+      await new Promise((r) => setTimeout(r, 5));
+      releaseSlot(); // idempotent
+      return { outcome: "completed" };
+    },
+  });
+  const result = await createManualResumeSession(deps)("s-resume0001");
+  assert.deepEqual(result, { ok: true, status: "completed" });
+  assert.equal(releasesAtRecordTurn, 1, "slot already released while the record turn runs");
+  assert.deepEqual(rec.slotReleases, ["matrix:miku:room:!room"], "released exactly once (the finally is a no-op)");
+});
+
 test("manual resume happy path: completes, slot held for the run, sender is the PERSISTED user (#16-#18)", async () => {
   const { deps, rec } = manualResumeHarness();
   const resume = createManualResumeSession(deps);

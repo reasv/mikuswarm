@@ -50,6 +50,18 @@ function clampDescription(description: string): string {
   return `${chars.slice(0, RESULT_DESCRIPTION_MAX_CHARS - 1).join("")}…`;
 }
 
+/**
+ * The result text of a load: the loaded names with clamped descriptions. Shared
+ * with the record turn's synthetic load of `session_record_tool` (spec
+ * SESSION-RECORDS §3.2), which must read exactly like a real `tool_search` result.
+ */
+export function formatLoadedTools(added: readonly Pick<AgentTool, "name" | "description">[]): string {
+  return (
+    `Loaded ${added.length} tool(s) — now directly callable:\n` +
+    added.map((tool) => `- ${tool.name} — ${clampDescription(tool.description)}`).join("\n")
+  );
+}
+
 export function createToolSearchTool(context: ToolSearchContext): AgentTool {
   return {
     name: TOOL_SEARCH_NAME,
@@ -123,12 +135,7 @@ export function createToolSearchTool(context: ToolSearchContext): AgentTool {
       }
 
       const parts: string[] = [];
-      if (added.length > 0) {
-        parts.push(
-          `Loaded ${added.length} tool(s) — now directly callable:\n` +
-            added.map((tool) => `- ${tool.name} — ${clampDescription(tool.description)}`).join("\n"),
-        );
-      }
+      if (added.length > 0) parts.push(formatLoadedTools(added));
       if (alreadyLoaded.length > 0) {
         parts.push(`Already loaded: ${alreadyLoaded.join(", ")}.`);
       }

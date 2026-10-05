@@ -9425,6 +9425,41 @@ export class Storage {
     );
   }
 
+  /**
+   * The sessions behind the newest bot messages of a timeline, for the records
+   * decision point's candidates (spec SESSION-RECORDS §6.2): one row per session
+   * (its newest bot message at or before `toTimestamp`), only sessions that have
+   * a record, newest first, at most `limit`. Read-only.
+   */
+  getRecentRecordedBotSessions(
+    timelineKey: string,
+    toTimestamp: number,
+    limit: number,
+  ): Array<{ sessionId: string; eventId: string; timestamp: number }> {
+    if (limit <= 0) return [];
+    return this.read((db) =>
+      db
+        .prepare(
+          `select session_id as sessionId, event_id as eventId, ts as timestamp from (
+             select te.agent_session_id as session_id, te.id as event_id, te.timestamp as ts,
+                    row_number() over (
+                      partition by te.agent_session_id
+                      order by te.timestamp desc, te.received_at desc, te.id desc
+                    ) as rn
+             from timeline_events te
+             join session_records sr on sr.session_id = te.agent_session_id
+             where te.timeline_key = @timelineKey
+               and te.role = 'assistant'
+               and te.timestamp <= @toTimestamp
+           )
+           where rn = 1
+           order by ts desc, event_id desc
+           limit @limit`,
+        )
+        .all({ timelineKey, toTimestamp, limit }) as Array<{ sessionId: string; eventId: string; timestamp: number }>,
+    );
+  }
+
   // ── Decision evaluations (spec SESSION-RECORDS §8) ───────────────────────────
 
   /**

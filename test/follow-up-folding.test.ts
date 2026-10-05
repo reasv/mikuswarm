@@ -13,9 +13,7 @@ import {
   type FollowUpConfig,
 } from "../src/agent/follow-up-watch.js";
 import { convertToLlm } from "../src/agent/convert.js";
-import { evaluateFollowUpResumeGate, assertFollowupConfigValid } from "../src/app.ts";
-import type { ResumeMaterial } from "../src/agent/index.ts";
-import type { AgentSessionRow } from "../src/storage/index.ts";
+import { assertFollowupConfigValid } from "../src/app.ts";
 import type { CanonicalChatEvent } from "../src/types.js";
 
 const TK = "matrix:miku:room:!room:server.org";
@@ -437,19 +435,18 @@ test("FollowUpWatch: most-recent arm overwrites and resets the GC timer", () => 
   assert.equal(watch.get(TK, "@alice:server.org")?.sessionId, "s2");
 });
 
-test("FollowUpWatch: fold-resume re-arm keeps the chain linear (resume-chain invariance, §7 / #10)", () => {
-  // Models the resume-chain re-arm: `runResumeSession` calls `armFollowUpWatch(inbound,
-  // record.id)` (app.ts) after a settled→resume fold, re-pointing the SAME
-  // (timeline, sender) watch at the RESUMED session id. So a subsequent same-sender
-  // follow-up chains into the resumed session, not the now-consumed original — the
-  // chain stays linear across mixed fresh / reply-resume / follow-up-resume steps.
+test("FollowUpWatch: re-arm after a settled fold keeps the chain linear (§7 / #10)", () => {
+  // Models the chain re-arm: the fresh session a fold-after-settle launches (and a
+  // reply-resume's `runResumeSession`) calls `armFollowUpWatch(inbound, id)` (app.ts),
+  // re-pointing the SAME (timeline, sender) watch at the NEW session id. So a
+  // subsequent same-sender follow-up chains into it, not the settled original.
   const t = fakeTimers();
   const watch = new FollowUpWatch(30_000, t.now, t.schedule, t.cancel);
   // The original trigger launched session s1 → arm names s1.
   watch.arm(TK, "@alice:server.org", { sessionId: "s1", triggerOriginTs: 1_000, armedAtWallClock: 0 });
   assert.equal(watch.get(TK, "@alice:server.org")?.sessionId, "s1");
-  // A quick follow-up settled→resumes s1 as s1prime; runResumeSession re-arms with the
-  // resumed id and re-anchors the user-gap clock to the resume turn's origin ts.
+  // A quick follow-up after s1 settled launches s1prime, which re-arms with its id and
+  // re-anchors the user-gap clock to its trigger's origin ts.
   t.advance(5_000);
   watch.arm(TK, "@alice:server.org", { sessionId: "s1prime", triggerOriginTs: 6_000, armedAtWallClock: 5_000 });
   // Most-recent-wins: the watch now names the resumed session, and the next follow-up
@@ -529,144 +526,6 @@ test("convertToLlm: an interjection WITH imageBlocks carries real image content 
   assert.equal(content[1].mimeType, "image/png");
 });
 
-// ── evaluateFollowUpResumeGate (§5.3) ────────────────────────────────────────
-
-function completedRow(over: Partial<AgentSessionRow> = {}): AgentSessionRow {
-  return {
-    id: "s1",
-    timeline_key: TK,
-    session_type: "default",
-    status: "completed",
-    model_id: "test-model",
-    trigger_event_id: "t1",
-    trigger_external_id: "$t1",
-    trigger_body: "look at this",
-    trigger_sender_id: "@alice:server.org",
-    trigger_sender_display_name: "Alice",
-    context_snapshot_json: "[]",
-    context_dump_path: null,
-    transcript_json: "[]",
-    token_estimate: 100,
-    llm_requests: 1,
-    usage_input_tokens: 10,
-    usage_output_tokens: 10,
-    usage_cache_read_tokens: 0,
-    usage_cache_write_tokens: 0,
-    usage_cost: 0,
-    context_tokens: 500,
-    resume_generation: 0,
-    no_reply: 0,
-    error: null,
-    created_at: 0,
-    started_at: 0,
-    updated_at: 0,
-    completed_at: 0,
-    chat_upper_bound_ts: 0,
-    ...over,
-  } as AgentSessionRow;
-}
-
-const MATERIAL: ResumeMaterial = { snapshot: [], transcript: [{ role: "user", content: "x" } as any] };
-const okGate = {
-  resolveCeiling: () => undefined,
-  loadMaterial: async () => MATERIAL,
-  timelineKey: TK,
-  logger: { warn() {} },
-};
-
-test("evaluateFollowUpResumeGate: a completed, viable row resumes — NO work gate", async () => {
-  // A toolless pure-chat session (the work gate would REJECT this for reply-resume) is
-  // exactly what a follow-up resumes — the gate must NOT scan for work (§5.3).
-  const verdict = await evaluateFollowUpResumeGate({
-    sessionId: "s1",
-    getSession: () => completedRow(),
-    ...okGate,
-  });
-  assert.equal(verdict.resume, true);
-});
-
-test("evaluateFollowUpResumeGate: only `completed` is resumable", async () => {
-  for (const status of ["discarded", "failed-resumable", "interrupted", "running"] as const) {
-    const verdict = await evaluateFollowUpResumeGate({
-      sessionId: "s1",
-      getSession: () => completedRow({ status }),
-      ...okGate,
-    });
-    assert.equal(verdict.resume, false, `status ${status} must not resume`);
-  }
-  // A pruned / missing row → no resume.
-  assert.equal(
-    (await evaluateFollowUpResumeGate({ sessionId: "s1", getSession: () => undefined, ...okGate })).resume,
-    false,
-  );
-});
-
-test("evaluateFollowUpResumeGate: synthetic worker session types are excluded", async () => {
-  for (const sessionType of ["summarize", "condense", "diary"]) {
-    const verdict = await evaluateFollowUpResumeGate({
-      sessionId: "s1",
-      getSession: () => completedRow({ session_type: sessionType }),
-      ...okGate,
-    });
-    assert.equal(verdict.resume, false, `${sessionType} must not resume`);
-  }
-});
-
-test("evaluateFollowUpResumeGate: capability/context-ceiling gate (KEEP, §5.3)", async () => {
-  // At/over the ceiling → a resume would instantly re-park → native fate instead.
-  const atCeiling = await evaluateFollowUpResumeGate({
-    sessionId: "s1",
-    getSession: () => completedRow({ context_tokens: 1000 }),
-    ...okGate,
-    resolveCeiling: () => 1000,
-  });
-  assert.equal(atCeiling.resume, false);
-  // Comfortably under → resumes.
-  const underCeiling = await evaluateFollowUpResumeGate({
-    sessionId: "s1",
-    getSession: () => completedRow({ context_tokens: 500 }),
-    ...okGate,
-    resolveCeiling: () => 1000,
-  });
-  assert.equal(underCeiling.resume, true);
-});
-
-test("evaluateFollowUpResumeGate: missing/corrupt material → no resume", async () => {
-  const verdict = await evaluateFollowUpResumeGate({
-    sessionId: "s1",
-    getSession: () => completedRow(),
-    ...okGate,
-    loadMaterial: async () => null,
-  });
-  assert.equal(verdict.resume, false);
-});
-
-test("evaluateFollowUpResumeGate: ANY throw degrades to no-resume, never propagates (throw-safe)", async () => {
-  let warned = false;
-  const verdict = await evaluateFollowUpResumeGate({
-    sessionId: "s1",
-    getSession: () => {
-      throw new Error("db exploded");
-    },
-    resolveCeiling: () => undefined,
-    loadMaterial: async () => MATERIAL,
-    timelineKey: TK,
-    logger: { warn: () => { warned = true; } },
-  });
-  assert.equal(verdict.resume, false);
-  assert.equal(warned, true);
-  // A ceiling-resolution throw is individually contained → gate stays inert, not failed.
-  const ceilingThrew = await evaluateFollowUpResumeGate({
-    sessionId: "s1",
-    getSession: () => completedRow({ context_tokens: 999_999 }),
-    ...okGate,
-    resolveCeiling: () => {
-      throw new Error("ceiling lookup failed");
-    },
-  });
-  assert.equal(ceilingThrew.resume, true, "a ceiling throw is treated as 'no ceiling', not a gate failure");
-});
-
 // ── foldFollowUp precedence (faithful model, §6 single-consumption + §5 routing) ──
 //
 // Models the synchronous `foldFollowUp` fork in handleInbound (src/app.ts): the guard
@@ -680,7 +539,7 @@ test("evaluateFollowUpResumeGate: ANY throw degrades to no-resume, never propaga
 // to, and that it is consumed exactly once), NOT the live dispatch. Deliberately OUT of
 // the model's scope (the real function fires these as detached promises / side effects in
 // closures that have no unit harness):
-//   • the steer→resume fallback when the owner settled mid-download (`steerFollowUp`);
+//   • the steer→fold-after-settle fallback when the owner settled mid-download (`steerFollowUp`);
 //   • the park→drain on go-live (`drainPendingFollowUpsIntoSession`);
 //   • the native-fate redispatch vs inert action (`revertFollowUpToNativeFate`) — the
 //     DECISION it keys on is covered separately by `nativeFateAction` below, but the
