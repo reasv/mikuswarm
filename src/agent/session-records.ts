@@ -17,6 +17,7 @@ import type { PriorityClass } from "./scheduler.js";
 import { buildSyntheticCallFromResult, type HarnessMarker } from "./synthetic-calls.js";
 import { hasResumableWork } from "./work-gate.js";
 import { SYNTHETIC_SESSION_TYPES } from "./recovery.js";
+import { extractLlmRequestClass, isRefusalSignal } from "./request-retry.js";
 import { formatLoadedTools } from "../tools/tool-search.js";
 
 // ── Prompt (spec §3.2) ────────────────────────────────────────────────────────
@@ -111,16 +112,19 @@ export type RecordTurnFailure =
 
 /**
  * Why a record turn that ended on its own (no abort of ours) wrote nothing. A
- * hard refusal is the `refusal` stop reason (Anthropic; pi-ai maps it to an
- * error and keeps the raw reason) or a provider content filter; a budget gate
- * surfaces as the factory's pre-flight message; any other error is an LLM error;
- * no error at all means the model stopped without finalizing.
+ * refusal is Layer 0's `refusal` class (its class marker on the error), or the
+ * same provider signals read directly (`isRefusalSignal`: the raw stop reason,
+ * else pi-ai's exact refusal text); a budget gate surfaces as the factory's
+ * pre-flight message; any other error is an LLM error; no error at all means the
+ * model stopped without finalizing.
  */
 export function classifyUnfinalizedRecordTurn(
   rawStopReason: string | undefined,
   errorMessage: string | undefined,
 ): Exclude<RecordTurnFailure, "timeout" | "max_turns" | "shutdown"> {
-  if (rawStopReason === "refusal" || (errorMessage && /refus|content_filter/i.test(errorMessage))) return "refusal";
+  if (extractLlmRequestClass(errorMessage) === "refusal" || isRefusalSignal(rawStopReason, errorMessage)) {
+    return "refusal";
+  }
   if (errorMessage && /cost limit exceeded|budget exhausted/i.test(errorMessage)) return "budget_blocked";
   if (errorMessage && errorMessage.length > 0) return "llm_error";
   return "not_finalized";
@@ -154,6 +158,11 @@ export interface StartRecordTurnParams {
   registry?: DynamicToolRegistry;
   /** The created agent's admission-class setter (raised to interactive). */
   setPriority?: (priority: PriorityClass) => void;
+  /**
+   * The created agent's refusal-fallover switch: turned off for the turn, so a
+   * refusal fails it at once instead of moving to another chain member (§3.2).
+   */
+  setRefusalFallover?: (enabled: boolean) => void;
   /**
    * Persist the turn's messages (the run's transcript capture flush). Awaited
    * before the in-flight entry resolves, so a waiter (a reply-resume loading the
@@ -287,6 +296,9 @@ export class SessionRecordService {
     // It extends the interactive rollout that just finished and must land while
     // that cache is warm; triggers may be waiting on it (§3.2).
     params.setPriority?.("interactive");
+    // A refused record turn writes no record (spec §3.2): no fallover to
+    // another chain member, so the refusal ends the turn at once.
+    params.setRefusalFallover?.(false);
 
     // A steer that landed after the rollout's last turn would otherwise be fed
     // into the record turn's loop. The session is over: clear the queue. The app
@@ -356,6 +368,7 @@ export class SessionRecordService {
       unsubscribe();
       handles.gate.active = false;
       entry.abort = undefined;
+      params.setRefusalFallover?.(true);
     }
 
     if (abortReason && !finalized) {

@@ -485,6 +485,13 @@ export interface CreatedAgent {
    * SESSION-RECORDS §3.2). The retry budget stays the session type's own.
    */
   setPriority: (priority: PriorityClass) => void;
+  /**
+   * Whether a refused request of this agent may fall over to the next chain
+   * member (read per request; default on, ARCHITECTURE.md §8a "Refusals"). The
+   * record turn turns it off: a refused record turn writes no record (spec
+   * SESSION-RECORDS §3.2).
+   */
+  setRefusalFallover: (enabled: boolean) => void;
 }
 
 export class AgentSessionFactory {
@@ -739,6 +746,9 @@ export class AgentSessionFactory {
     // Admission class of the next request; `setPriority` on the created agent
     // changes it for the requests that follow (the record turn, §3.2).
     const admissionPriority: { current: PriorityClass } = { current: priority };
+    // Refusal fallover of the next request; `setRefusalFallover` on the created
+    // agent changes it (the record turn turns it off, §8a "Refusals").
+    const refusalFallover: { enabled: boolean } = { enabled: true };
     // Holder for the admission wait of the in-flight attempt (ring
     // attribution, §9.2): the agent issues one request at a time per session,
     // so a single slot per created agent is race-free.
@@ -1177,6 +1187,7 @@ export class AgentSessionFactory {
         // survives (budget-violation pre-flight never calls resetServedModel →
         // getServedModel() returns undefined there as desired).
         getRequestedModel: () => requestedMember.logicalId,
+        refusalFallover: () => refusalFallover.enabled,
         getServedModel: () => servedModelForAttempt,
         resetServedModel: () => { servedModelForAttempt = undefined; },
         // Observability tap (spec LLM-FAILURE-HANDLING §4.2): raw attempt
@@ -2075,6 +2086,9 @@ export class AgentSessionFactory {
       registry,
       setPriority: (next: PriorityClass) => {
         admissionPriority.current = next;
+      },
+      setRefusalFallover: (enabled: boolean) => {
+        refusalFallover.enabled = enabled;
       },
     };
   }
