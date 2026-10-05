@@ -225,13 +225,24 @@ export class SessionRecordService {
 
   /**
    * Start the record turn of a just-settled run. Returns undefined (nothing
-   * registered) when the session is not eligible; otherwise the in-flight entry
+   * registered) when the session is not eligible or `session_record_tool` is not
+   * in its catalog (logged `session_record_skipped` {reason:"tool_unavailable"});
+   * otherwise the in-flight entry
    * is registered before this returns, and the promise resolves when the turn
    * is over.
    */
   start(params: StartRecordTurnParams): Promise<void> | undefined {
     const { sessionId, sessionType, proactiveSessionType, config, agent, exemptToolNames } = params;
     if (!isEligibleForRecord(sessionType, proactiveSessionType, config, agent.state.messages, exemptToolNames)) {
+      return undefined;
+    }
+    // A session-type tools allowlist or disabled_tools can take the record tool out
+    // of the session's catalog; the turn could only fail then.
+    const inCatalog = params.registry
+      ? params.registry.inCatalog(RECORD_TOOL)
+      : (agent.state.tools ?? []).some((tool) => tool.name === RECORD_TOOL);
+    if (!inCatalog) {
+      params.logger.info("session_record_skipped", { sessionId, reason: "tool_unavailable" });
       return undefined;
     }
     const timeoutMs = config?.timeout_ms ?? DEFAULT_TIMEOUT_MS;

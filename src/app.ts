@@ -5978,6 +5978,16 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     });
   }
 
+  /**
+   * Whether a tool is in a session's catalog: built for it (disabled_tools and
+   * feature gates already applied by buildSessionTools) and kept by the session
+   * type's tools allowlist (the factory's filterTools).
+   */
+  function inSessionCatalog(tools: readonly { name: string }[], sessionType: string, name: string): boolean {
+    const allow = factory.resolveSessionType(sessionType)?.tools;
+    return tools.some((tool) => tool.name === name) && (!allow || allow.includes(name));
+  }
+
   /** Recent-chat window for the records point's non-reply state (§6.2). */
   const RECORDS_RECENT_CHAT_WINDOW = 40;
   /** Messages kept before a candidate's bot message in its recent_chat. */
@@ -6865,8 +6875,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // Session records to start with (spec SESSION-RECORDS §6/§7): planned in
       // parallel with routing and the build, awaited inside create() right before
       // the kickoff is assembled, and executed there with the session's own tools.
-      // A proactive check-in has no request to match records against.
-      const injections = proactive
+      // A proactive check-in has no request to match records against; a session
+      // whose catalog lacks read_session_record (session-type tools allowlist,
+      // disabled_tools) could not execute an injection, so it plans none and
+      // waits for nothing.
+      const injections = proactive || !inSessionCatalog(tools, session.sessionType, "read_session_record")
         ? undefined
         : planRecordInjections(inbound, session, ownerSessionId).catch((error) => {
             logger.warn("records_injection_plan_failed", {

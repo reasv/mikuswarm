@@ -162,7 +162,12 @@ function stubAgent(messages: AgentMessage[]) {
     release = resolve;
   });
   const agent = {
-    state: { messages, errorMessage: undefined as string | undefined, model: { api: "openai-completions", provider: "p", id: "m" } },
+    state: {
+      messages,
+      errorMessage: undefined as string | undefined,
+      model: { api: "openai-completions", provider: "p", id: "m" },
+      tools: [{ name: "session_record_tool" }],
+    },
     hasQueuedMessages: () => false,
     clearAllQueues: () => {},
     subscribe: () => () => {},
@@ -199,6 +204,20 @@ test("SessionRecordService.start: an ineligible session registers nothing", () =
   const { agent } = stubAgent(emptyTranscript());
   assert.equal(svc.start(startParams({ agent, logger })), undefined);
   assert.equal(svc.isInFlight("s1"), false);
+});
+
+test("SessionRecordService.start: no record tool in the catalog → skipped, nothing registered (Z2)", () => {
+  const svc = new SessionRecordService();
+  const { logger, lines } = quietLogger();
+  const { agent } = stubAgent(makeTranscriptWithTool("web_fetch"));
+  (agent.state as { tools: unknown[] }).tools = [{ name: "web_fetch" }];
+  assert.equal(svc.start(startParams({ agent, logger })), undefined);
+  assert.equal(svc.isInFlight("s1"), false);
+  assert.ok(lines.some((l) => l.message === "session_record_skipped" && l.fields?.reason === "tool_unavailable"));
+  // Under dynamic loading the registry's catalog decides.
+  const registry = { inCatalog: () => false } as unknown as DynamicToolRegistry;
+  const { agent: second } = stubAgent(makeTranscriptWithTool("web_fetch"));
+  assert.equal(svc.start(startParams({ agent: second, logger, registry })), undefined);
 });
 
 test("SessionRecordService.start: the in-flight entry is registered before start returns (L5)", async () => {

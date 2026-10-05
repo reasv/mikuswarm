@@ -336,6 +336,48 @@ test("app: a reply to a bot message injects that session's record (kickoff regre
   }
 });
 
+test("app: no record turn when session_record_tool is not in the catalog (Z2)", async () => {
+  const h = await startHarness({
+    script: chatScript({ recordTurn: () => assert.fail("no record turn expected") }),
+    toml: `
+[agent]
+disabled_tools = ["session_record_tool"]
+`,
+  });
+  try {
+    h.say("[work] look it up", { mention: true });
+    const [a] = await settled(h, 1);
+    assert.ok(hasLog(h, "session_record_skipped", { sessionId: a!.id, reason: "tool_unavailable" }));
+    assert.equal(h.llm.requests.filter(isRecordTurnRequest).length, 0);
+    assert.equal(records(h).length, 0);
+  } finally {
+    await h.stop();
+  }
+});
+
+test("app: no injection (and no wait) when read_session_record is not in the catalog (Z2)", async () => {
+  const h = await startHarness({
+    script: chatScript({ recordTurn: () => ({ ...finalize("slow record"), delayMs: 1500 }) }),
+    toml: `
+[agent.session_types.default]
+tools = ["send_message", "search_memory", "session_record_tool"]
+`,
+  });
+  try {
+    h.say("[work] first", { mention: true });
+    await h.until(() => h.llm.requests.some(isRecordTurnRequest), "record turn started");
+    const t0 = Date.now();
+    h.say("what did you find", { mention: true, replyTo: h.sends.at(-1)!.externalId });
+    await h.until(() => h.llm.requests.some((r) => !isRecordTurnRequest(r) && triggerText(r).includes("what did you find")), "reply request");
+    assert.ok(Date.now() - t0 < 1200, "the reply did not wait for the in-flight record");
+    await settled(h, 2);
+    assert.equal(injectedCall(firstRequestFor(h, "what did you find")), undefined, "nothing injected");
+    assert.equal(records(h).length, 1, "the record itself is still written");
+  } finally {
+    await h.stop();
+  }
+});
+
 test("app: a reply that arrives while the record is being written waits for it", async () => {
   const h = await startHarness({ script: chatScript({ recordTurn: () => ({ ...finalize("slow record"), delayMs: 600 }) }) });
   try {
