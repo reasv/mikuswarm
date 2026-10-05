@@ -2,6 +2,10 @@ import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { IChatProvider, OutboundTarget } from "../types.js";
 import type { AgentSessionRecord, SessionRunLifecycle } from "./session-manager.js";
+import type { Logger } from "../observability/logger.js";
+import type { RedoRequest, SessionRedoControl } from "./redo-signal.js";
+import { isPostingTool } from "../tools/side-effects.js";
+import { FORCED_COMPLETION_PROMPTS, currentContractAttempt, type ForcedCompletionMarker } from "./contract.js";
 import {
   classifyLlmError,
   extractLlmRequestClass,
@@ -63,7 +67,29 @@ export interface SessionRunnerOptions {
    * meaningless — typing is simply never started.
    */
   suppressTyping?: boolean;
+  /**
+   * Session redo (spec REFUSAL-HANDLING §8.4): after every settle the runner
+   * takes a pending request from `control` (before the send-contract check) and
+   * hands it to `onRedo`, which forks the session (and, for a refusal, pins the
+   * redo model); on `continue` the runner resets the nudge budget and continues
+   * the agent from the forked transcript. A redo-requesting tool also aborts the
+   * run; that abort is never read as an operator Stop. Absent = no redo.
+   */
+  redo?: {
+    control: SessionRedoControl;
+    onRedo(req: RedoRequest, agent: Agent): Promise<RedoOutcome>;
+  };
+  /**
+   * `[agent.sessions].forced_completion_redo` (spec §7.5): when the nudges run
+   * out, request a same-model `contract` redo through `redo.onRedo`, once per
+   * failure point (the span since the last delivered message). Needs `redo`.
+   */
+  contractRedo?: boolean;
+  logger?: Logger;
 }
+
+/** What the runner does after `onRedo` (CONTRACT "Redo loop"). */
+export type RedoOutcome = { action: "continue" } | { action: "give_up"; noReply: boolean };
 
 // matrix-sdk sends typing notices to the homeserver with a fixed 4s server-side
 // expiry (`TYPING_NOTICE_TIMEOUT`), and internally dedups repeated calls,
@@ -99,7 +125,11 @@ export class SessionRunner {
     lifecycle?: SessionRunLifecycle,
   ): Promise<SessionRunResult> {
     let retries = 0;
+    let nudges = 0;
     let typingInterval: NodeJS.Timeout | undefined;
+    // Failure points (index after the last delivered message) a send-contract
+    // redo already covered: one redo each (spec §7.5, owner decision 14).
+    const contractRedone = new Set<number>();
     // Mark the session logically running for the WHOLE duration of run() — not
     // just while a prompt is streaming. `interrupt()` gates on this so a Stop
     // landing in the inter-turn gap (where `agent.signal` is transiently absent)
@@ -125,30 +155,73 @@ export class SessionRunner {
       } else {
         await continueAgent(agent);
       }
-      await waitForAgentIdle(agent);
-      throwIfLlmFailure(agent, lifecycle);
 
-      while (
-        !isTerminallyValid(agent.state.messages) &&
-        retries < maxRetries &&
-        // Authoritative termination signal: an operator Stop flips the session's
-        // interrupt state (#1). Break even if the just-resolved turn settled
-        // normally (`stopReason:"stop"`) a hair before the abort landed, so we
-        // never issue an extra forced-completion turn after Stop.
-        !lifecycle?.isInterrupted() &&
-        // Fast path / fallback when no lifecycle is wired (e.g. summarization
-        // path, unit tests): pi-agent-core resolves an aborted run with a
-        // synthetic `stopReason:"aborted"` turn (#5). A drain-caused
-        // scheduler-stop admission rejection (class-tagged `aborted` but with
-        // `stopReason:"error"`) is handled one step earlier by
-        // `throwIfLlmFailure`, which throws BEFORE this loop is entered (#2), so
-        // it can never reach forced completion.
-        !wasAborted(agent.state.messages)
-      ) {
-        retries += 1;
-        await forceCompletion(agent);
+      for (;;) {
         await waitForAgentIdle(agent);
+
+        // A redo request filed during the run (the gate, spec §8.4) is taken
+        // before anything reads the settled turn: the run was aborted on purpose
+        // and its tail is about to be discarded. An operator Stop still wins.
+        const pending = !lifecycle?.isInterrupted() ? this.options.redo?.control.take() : undefined;
+        if (pending) {
+          const outcome = await this.redo(pending, agent, session);
+          if (outcome.action === "give_up") return { sessionId: session.id, noReply: outcome.noReply, retries: nudges };
+          // The nudge counter resets on a refusal redo; a contract redo starts its
+          // own budget (spec §8.4 "Forced completion", §7.5).
+          retries = 0;
+          await continueAgent(agent);
+          continue;
+        }
+
         throwIfLlmFailure(agent, lifecycle);
+        if (
+          isTerminallyValid(agent.state.messages) ||
+          // Authoritative termination signal: an operator Stop flips the session's
+          // interrupt state (#1). Break even if the just-resolved turn settled
+          // normally (`stopReason:"stop"`) a hair before the abort landed, so we
+          // never issue an extra forced-completion turn after Stop.
+          lifecycle?.isInterrupted() ||
+          // Fast path / fallback when no lifecycle is wired (e.g. summarization
+          // path, unit tests): pi-agent-core resolves an aborted run with a
+          // synthetic `stopReason:"aborted"` turn (#5). A drain-caused
+          // scheduler-stop admission rejection (class-tagged `aborted` but with
+          // `stopReason:"error"`) is handled one step earlier by
+          // `throwIfLlmFailure`, which throws BEFORE this check (#2), so it can
+          // never reach forced completion.
+          wasAborted(agent.state.messages)
+        ) {
+          break;
+        }
+
+        this.logFailedAttempt(agent, session);
+        if (retries < maxRetries) {
+          retries += 1;
+          nudges += 1;
+          await forceCompletion(agent, retries);
+          continue;
+        }
+
+        // Nudges exhausted. One same-model redo per failure point (spec §7.5);
+        // a second exhaustion in the same span gives up as before.
+        if (this.options.contractRedo && this.options.redo) {
+          const point = failurePoint(agent.state.messages);
+          if (!contractRedone.has(point)) {
+            contractRedone.add(point);
+            const outcome = await this.redo({ kind: "contract" }, agent, session);
+            if (outcome.action === "continue") {
+              retries = 0;
+              await continueAgent(agent);
+              continue;
+            }
+            return { sessionId: session.id, noReply: outcome.noReply, retries: nudges };
+          }
+        }
+        this.options.logger?.info("contract_exhausted", {
+          sessionId: session.id,
+          nudges,
+          redone: contractRedone.size > 0,
+        });
+        break;
       }
 
       const noReply = !isTerminallyValid(agent.state.messages) ||
@@ -156,7 +229,7 @@ export class SessionRunner {
       return {
         sessionId: session.id,
         noReply,
-        retries,
+        retries: nudges,
       };
     } finally {
       // The run has settled: clear the logically-running flag so a late Stop is
@@ -168,24 +241,59 @@ export class SessionRunner {
       }
     }
   }
+
+  /** Hand a redo request to `onRedo`; a throwing handler gives up silently (logged). */
+  private async redo(req: RedoRequest, agent: Agent, session: AgentSessionRecord): Promise<RedoOutcome> {
+    const handler = this.options.redo;
+    if (!handler) return { action: "give_up", noReply: true };
+    try {
+      return await handler.onRedo(req, agent);
+    } catch (error) {
+      this.options.logger?.error("redo_failed", {
+        sessionId: session.id,
+        kind: req.kind,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { action: "give_up", noReply: true };
+    }
+  }
+
+  /** `contract_attempt`: one line per failed send-contract attempt (spec §7.1). */
+  private logFailedAttempt(agent: Agent, session: AgentSessionRecord): void {
+    const logger = this.options.logger;
+    if (!logger) return;
+    try {
+      const attempt = currentContractAttempt(agent.state.messages);
+      if (!attempt || attempt.primaryType === null) return;
+      logger.info("contract_attempt", {
+        sessionId: session.id,
+        attempt: attempt.attemptNo,
+        variant: attempt.variant,
+        type: attempt.primaryType,
+        types: attempt.failureTypes,
+        model: attempt.servedModel ?? attempt.wireModel,
+      });
+    } catch {
+      /* diagnostics only */
+    }
+  }
 }
 
-async function forceCompletion(agent: Agent): Promise<void> {
+/**
+ * Inject corrective nudge `attempt` (1-based within the current budget). The
+ * prompt texts are the shared constants of `contract.ts`, and the turn carries a
+ * `forced_completion` harness marker so the send-contract derivation reads it
+ * exactly (spec REFUSAL-HANDLING §7.1).
+ */
+async function forceCompletion(agent: Agent, attempt: number): Promise<void> {
   if (lastMessageRole(agent.state.messages) === "assistant") {
-    const alreadySent = hasSendMessageCall(agent.state.messages);
-    const content = alreadySent
-      ? "You already sent a message but your turn did not end cleanly. Either:\n" +
-        "- Call send_message again with your follow-up and final=true to end your turn, OR\n" +
-        "- Call no_reply if you have nothing more to say.\n\n" +
-        "Text you write outside of send_message is not visible to users."
-      : "Your turn ended without sending a message. You must end every turn by either:\n" +
-        "- Calling send_message with your response, OR\n" +
-        "- Calling no_reply if you have nothing to say.\n\n" +
-        "Text you write outside of send_message is not visible to users.";
+    const variant = hasSendMessageCall(agent.state.messages) ? "sent_not_final" : "not_sent";
+    const harness: ForcedCompletionMarker = { kind: "forced_completion", attempt, variant };
     await promptAgent(agent, {
       role: "user",
-      content,
+      content: FORCED_COMPLETION_PROMPTS.current[variant],
       timestamp: Date.now(),
+      harness,
     });
     return;
   }
@@ -297,6 +405,21 @@ function extractTextFromBlocks(blocks: Array<{ type: string; text?: string }>): 
     .filter((block): block is { type: "text"; text: string } => block?.type === "text")
     .map((block) => block.text)
     .join("");
+}
+
+/**
+ * The current send-contract failure point (spec §7.5): the index just after
+ * the last delivered message (a posting tool call with a non-error result), or
+ * 0. Indices before a fork point never move, so the key survives the redo.
+ */
+function failurePoint(messages: unknown[]): number {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i] as { role?: unknown; isError?: unknown; toolName?: unknown };
+    if (m?.role === "toolResult" && m.isError !== true && typeof m.toolName === "string" && isPostingTool(m.toolName)) {
+      return i + 1;
+    }
+  }
+  return 0;
 }
 
 function hasSendMessageCall(messages: unknown[]): boolean {

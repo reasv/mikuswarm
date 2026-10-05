@@ -2224,6 +2224,10 @@ export const AppConfigSchema = StrictObject({
       max_concurrent_dm: Type.Number({ minimum: 1 }),
       max_queued_per_timeline: Type.Optional(Type.Number({ minimum: 1 })),
       forced_completion_retries: Type.Number({ minimum: 0 }),
+      // After the forced-completion nudges run out, discard back to the fork point
+      // and redo once per failure point on the same model with its own nudge
+      // budget (spec REFUSAL-HANDLING §7.5). Default false (00-defaults.toml).
+      forced_completion_redo: Type.Optional(Type.Boolean()),
       // Co-target coalescing window (spec DUPLICATE-REPLY-MITIGATION §8): the max
       // age difference between a new reply and a running session's trigger for the
       // two to coalesce (both replied to the SAME message → the second is steered
@@ -2276,10 +2280,6 @@ export const AppConfigSchema = StrictObject({
     // Tool-result context budget (spec TOOL-RESULT-BUDGET §7). All three knobs
     // ship in 00-defaults.toml; see AgentToolsSchema above for per-key docs.
     tools: Type.Optional(AgentToolsSchema),
-    // After the forced-completion nudges run out, discard back to the fork point
-    // and redo once on the same model with its own nudge budget (spec
-    // REFUSAL-HANDLING §7.5). Default false (00-defaults.toml).
-    forced_completion_redo: Type.Optional(Type.Boolean()),
   }),
   // NOT StrictObject: `models` is a dictionary (arbitrary model names) with a
   // required `default` entry. A strict `{ default }` arm would reject every

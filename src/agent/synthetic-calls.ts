@@ -7,14 +7,19 @@ import type { DynamicToolRegistry } from "./dynamic-tools.js";
 /**
  * Harness-made message marker (CONTRACT decision 5).
  *
- * Carried on every assistant and toolResult message the harness synthesises.
+ * Carried on every assistant and toolResult message the harness synthesises,
+ * and on the harness's own user turns (record turn, forced-completion nudges).
  * pi-agent-core ignores unknown top-level fields; the marker persists through
  * transcript serialisation and is available to the console and W6.
  */
 export type HarnessMarker =
   | { kind: "injection"; decisionGroup?: string } // synthetic call/result at session start
   | { kind: "record_turn" }                       // the record-turn user prompt
-  | { kind: "record_load" };                      // synthetic load of session_record_tool
+  | { kind: "record_load" }                       // synthetic load of session_record_tool
+  // A forced-completion corrective user turn (spec REFUSAL-HANDLING §7.1):
+  // `attempt` = the nudge number n (the ending that follows is attempt n),
+  // `variant` = which corrective prompt was sent.
+  | { kind: "forced_completion"; attempt: number; variant: "not_sent" | "sent_not_final" };
 
 /**
  * Specification for one synthetic tool call.

@@ -9928,10 +9928,13 @@ export class Storage {
     );
   }
 
-  /** Persist a session's send-contract outcome (spec REFUSAL-HANDLING §7.1). */
+  /**
+   * Persist a session's send-contract outcome (spec REFUSAL-HANDLING §7.1). A
+   * null outcome = no run reached a verdict (aborted/failed), still stamped.
+   */
   setAgentSessionContract(
     sessionId: string,
-    contract: { outcome: ContractOutcome; nudges: number; version: number },
+    contract: { outcome: ContractOutcome | null; nudges: number; version: number },
   ): Promise<void> {
     return this.write((db) => {
       const result = db
@@ -9942,6 +9945,126 @@ export class Storage {
         )
         .run({ id: sessionId, ...contract });
       this.warnIfNoSessionRow("setAgentSessionContract", sessionId, result.changes);
+    });
+  }
+
+  /**
+   * Replace a session's derived send-contract record in one transaction (spec
+   * REFUSAL-HANDLING §7.1, DECISION-MODEL §5.8): its `contract_attempts` rows are
+   * deleted and `attempts` inserted, and the outcome, nudge count and derivation
+   * version are stamped. A re-derivation (a resumed session's second completion,
+   * a version bump) therefore never leaves stale rows. With `onlyIfStale`,
+   * nothing is written when the row already carries `version` or higher, so the
+   * history reconciliation never overwrites a live completion's write. Resolves
+   * whether it wrote.
+   */
+  replaceSessionContract(
+    sessionId: string,
+    contract: {
+      attempts: Omit<ContractAttemptInsert, "agentSessionId">[];
+      outcome: ContractOutcome | null;
+      nudges: number;
+      version: number;
+    },
+    opts: { onlyIfStale?: boolean } = {},
+  ): Promise<boolean> {
+    return this.write((db) => {
+      const insert = db.prepare(
+        `insert into contract_attempts
+           (agent_session_id, branch_no, redo_no, attempt_no, ts, served_model, wire_model,
+            variant, failure_types_json, primary_type)
+         values
+           (@agentSessionId, @branchNo, @redoNo, @attemptNo, @ts, @servedModel, @wireModel,
+            @variant, @failureTypesJson, @primaryType)`,
+      );
+      return db.transaction((): boolean => {
+        const row = db
+          .prepare(`select contract_version as v from agent_sessions where id = ?`)
+          .get(sessionId) as { v: number | null } | undefined;
+        if (!row) {
+          this.warnIfNoSessionRow("replaceSessionContract", sessionId, 0);
+          return false;
+        }
+        if (opts.onlyIfStale && row.v !== null && row.v >= contract.version) return false;
+        db.prepare(`delete from contract_attempts where agent_session_id = ?`).run(sessionId);
+        for (const a of contract.attempts) {
+          insert.run({
+            agentSessionId: sessionId,
+            branchNo: a.branchNo ?? 0,
+            redoNo: a.redoNo ?? 0,
+            attemptNo: a.attemptNo,
+            ts: a.ts ?? null,
+            servedModel: a.servedModel ?? null,
+            wireModel: a.wireModel ?? null,
+            variant: a.variant,
+            failureTypesJson: JSON.stringify(a.failureTypes),
+            primaryType: a.primaryType ?? null,
+          });
+        }
+        db.prepare(
+          `update agent_sessions
+              set contract_outcome = @outcome, contract_nudges = @nudges, contract_version = @version
+            where id = @id`,
+        ).run({ id: sessionId, outcome: contract.outcome, nudges: contract.nudges, version: contract.version });
+        return true;
+      })();
+    });
+  }
+
+  /**
+   * One keyset page of sessions the send-contract reconciliation still has to
+   * derive (spec REFUSAL-HANDLING §7.1): a persisted transcript, a missing or
+   * lower `contract_version`, not mid-run, and not a synthetic generation type.
+   * Ordered by rowid; pass the last `rowid` back as `afterRowid`.
+   */
+  listContractReconcileBatch(opts: {
+    version: number;
+    afterRowid: number;
+    limit: number;
+    excludeSessionTypes: readonly string[];
+  }): Array<{ rowid: number; id: string; status: string; transcript_json: string }> {
+    return this.read((db) => {
+      const types = [...opts.excludeSessionTypes];
+      const placeholders = types.map(() => "?").join(", ");
+      return db
+        .prepare(
+          `select s.rowid as rowid, s.id as id, s.status as status, p.transcript_json as transcript_json
+             from agent_sessions s
+             join agent_session_payloads p on p.session_id = s.id
+            where s.rowid > ?
+              and p.transcript_json is not null
+              and (s.contract_version is null or s.contract_version < ?)
+              and s.status not in ('created', 'running', 'resuming')
+              ${types.length > 0 ? `and s.session_type not in (${placeholders})` : ""}
+            order by s.rowid
+            limit ?`,
+        )
+        .all(opts.afterRowid, opts.version, ...types, opts.limit) as Array<{
+        rowid: number;
+        id: string;
+        status: string;
+        transcript_json: string;
+      }>;
+    });
+  }
+
+  /** How many sessions {@link listContractReconcileBatch} would still visit (progress logs). */
+  countContractReconcilePending(version: number, excludeSessionTypes: readonly string[]): number {
+    return this.read((db) => {
+      const types = [...excludeSessionTypes];
+      const placeholders = types.map(() => "?").join(", ");
+      const row = db
+        .prepare(
+          `select count(*) as n
+             from agent_sessions s
+             join agent_session_payloads p on p.session_id = s.id
+            where p.transcript_json is not null
+              and (s.contract_version is null or s.contract_version < ?)
+              and s.status not in ('created', 'running', 'resuming')
+              ${types.length > 0 ? `and s.session_type not in (${placeholders})` : ""}`,
+        )
+        .get(version, ...types) as { n: number };
+      return row.n;
     });
   }
 
