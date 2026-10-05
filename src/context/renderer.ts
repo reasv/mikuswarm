@@ -38,6 +38,34 @@ const MAX_COMPACT_MEDIA_CAPTION = 200;
 /** Hint appended after truncated tweet text/notes (payload.textTruncated). */
 const X_FETCH_TRUNCATION_HINT = "[truncated — full text available via the x_fetch tool]";
 
+/**
+ * Every element name this renderer writes into the agent's context. The
+ * send-contract `context_mimicry` detector (spec REFUSAL-HANDLING §7.2,
+ * `agent/contract.ts`) matches against this list, so a tag added here is
+ * detected without touching the detector; test/contract-events.test.ts fails
+ * when a tag written below is missing from it.
+ */
+export const RENDERED_MESSAGE_TAGS: readonly string[] = [
+  "message",
+  "reply_to",
+  "attachment",
+  "handled_by_session",
+  "cross_channel_note",
+  "reactions",
+  "link_preview",
+  "linked_media",
+  "preview_media",
+  "tweet_media",
+  "community_note",
+  "poll",
+  "youtube_video",
+  "transcript",
+  "board",
+  "thread",
+  "post",
+  "omitted",
+];
+
 export function renderMessage(event: CanonicalChatEvent, tier: RenderTier): string {
   return tier === "rich" ? renderRichMessage(event) : renderCompactMessage(event);
 }
