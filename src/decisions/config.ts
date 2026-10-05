@@ -16,8 +16,8 @@ export const DEFAULT_TIMEOUT_MS = 3000;
 export const DEFAULT_MIN_CONFIDENCE = 0.6;
 export const DEFAULT_STATE_MAX_TOKENS = 8000;
 
-export type DecisionPointName = "routing";
-export const DECISION_POINT_NAMES: readonly DecisionPointName[] = ["routing"];
+export type DecisionPointName = "routing" | "records";
+export const DECISION_POINT_NAMES: readonly DecisionPointName[] = ["routing", "records"];
 
 export function isDecisionModel(model: ModelConfig | undefined): boolean {
   return model?.api === DECISION_API;
@@ -66,6 +66,11 @@ export interface PointSettings {
   stateMaxTokens: number;
   minStateTokens: number;
   minConfidence: number;
+  /**
+   * Records point only: resolved `inject_threshold` (config `[decisions.records].inject_threshold`).
+   * Other points leave this undefined.
+   */
+  injectThreshold?: number;
   /** Per-member threshold overrides (`[decisions.calibration.<member>]`). */
   calibration: Record<string, Record<string, number>>;
   persona: string;
@@ -81,7 +86,7 @@ export function pointSettings(decisions: DecisionsRawConfig, point: DecisionPoin
   if (!raw || raw.enabled !== true) return undefined;
   const model = raw.model ?? decisions.model;
   if (!model) return undefined;
-  return {
+  const base: PointSettings = {
     point,
     model,
     timeoutMs: raw.timeout_ms ?? decisions.timeout_ms ?? DEFAULT_TIMEOUT_MS,
@@ -91,6 +96,14 @@ export function pointSettings(decisions: DecisionsRawConfig, point: DecisionPoin
     calibration: decisions.calibration ?? {},
     persona: decisions.persona ?? "",
   };
+  if (point === "records") {
+    // `inject_threshold` is records-specific; surface it for the point's resolve().
+    const recordsRaw = raw as { inject_threshold?: number };
+    if (recordsRaw.inject_threshold !== undefined) {
+      base.injectThreshold = recordsRaw.inject_threshold;
+    }
+  }
+  return base;
 }
 
 /**
@@ -263,6 +276,34 @@ function validateEffective(
     }
     if (!chainMembers.has(member)) {
       opts.warn?.("decisions_calibration_unused", { where, member });
+    }
+  }
+
+  // Records point: validate ranges and emit a capacity warning when the decision
+  // chain's rate-limit group is too narrow for the expected parallel load.
+  const records = decisions.records;
+  if (records?.enabled === true) {
+    const inject = records.inject_threshold ?? 0.6;
+    if (inject < 0 || inject > 1) {
+      throw new Error(`${where}.records.inject_threshold must be in 0..1`);
+    }
+    const candidates = records.candidates ?? 3;
+    const maxInflightNeeded = candidates + 2; // records candidates + routing
+    const recordsModel = records.model ?? decisions.model;
+    if (recordsModel && config.models[recordsModel]) {
+      const group =
+        config.models[recordsModel]!.rate_limit_group ??
+        `decision:${recordsModel}`;
+      const maxInFlight = config.rate_limits?.llm?.[group]?.max_in_flight;
+      if (maxInFlight !== undefined && maxInFlight < maxInflightNeeded) {
+        opts.warn?.("decisions_records_capacity_low", {
+          where,
+          group,
+          maxInFlight,
+          needed: maxInflightNeeded,
+          hint: `raise [rate_limits.llm.${group}].max_in_flight to at least ${maxInflightNeeded}`,
+        });
+      }
     }
   }
 

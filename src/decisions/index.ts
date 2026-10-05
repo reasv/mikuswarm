@@ -24,6 +24,7 @@ export {
 export {
   DecisionEngine,
   type DecisionAttribution,
+  type DecisionEvaluationRow,
   type DecisionOutcome,
   type DecisionPoint,
   type EvaluateContext,
@@ -42,3 +43,19 @@ export {
   type RoutingInput,
   type RoutingVerdict,
 } from "./points/routing.js";
+export {
+  recordsPoint,
+  type RecordsChatMessage,
+  type RecordsInput,
+  type RecordsRequest,
+  type RecordsVerdict,
+} from "./points/records.js";
+export {
+  DEFAULT_RECORDS_CANDIDATES,
+  DEFAULT_RECORDS_MAX_INJECTED,
+  selectRecordsToInject,
+  type RecordsCandidate,
+  type SelectRecordsContext,
+  type SelectRecordsInput,
+  type SelectRecordsResult,
+} from "./points/records-select.js";

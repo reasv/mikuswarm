@@ -1045,6 +1045,17 @@ const DecisionRoutingSchema = StrictObject({
   difficulty: Type.Optional(RoutingDifficultySchema),
 });
 
+const DecisionRecordsSchema = StrictObject({
+  ...DecisionPointCommonFields,
+  // Probability threshold for a record to be injected. Default 0.6.
+  inject_threshold: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+  // Maximum bot-message sessions checked as candidates (besides the reply target).
+  // Default 3.
+  candidates: Type.Optional(Type.Integer({ minimum: 0, maximum: 20 })),
+  // Maximum records injected into a single session. Default 2.
+  max_injected: Type.Optional(Type.Integer({ minimum: 0, maximum: 10 })),
+});
+
 const DecisionsSchema = StrictObject({
   // Master switch. Off (default) = no decision model is ever called and every
   // point behaves exactly as without this feature.
@@ -1064,6 +1075,7 @@ const DecisionsSchema = StrictObject({
   // ("min_confidence") overrides it for every point, "<point>.<name>" for one.
   calibration: Type.Optional(Type.Record(Type.String(), Type.Record(Type.String(), Type.Number({ minimum: 0, maximum: 1 })))),
   routing: Type.Optional(DecisionRoutingSchema),
+  records: Type.Optional(DecisionRecordsSchema),
 });
 
 const AgentModelsSchema = StrictObject({
