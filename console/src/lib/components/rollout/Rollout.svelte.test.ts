@@ -84,6 +84,13 @@ test('renders inline decision cards with group summaries from real engine rows',
 	// Expanded: per-candidate answers with the noul probability.
 	await page.getByText('injected ses_v8n2ke', { exact: true }).click();
 	await expect.element(page.getByText('p=0.83', { exact: true })).toBeInTheDocument();
+
+	// Expanded routing card: the per-label answers, the selected task and skill marked.
+	await page.getByText('image · image-chat · +image-generation', { exact: true }).click();
+	const labels = page.getByTestId('routing-labels');
+	await expect.element(labels.getByText('image 91%', { exact: true })).toHaveAttribute('title', 'selected');
+	await expect.element(labels.getByText('research 12%', { exact: true })).toHaveAttribute('title', 'not selected');
+	await expect.element(labels.getByText('image-generation 84%', { exact: true })).toHaveAttribute('title', 'selected');
 });
 
 // ── Resume turn test (pre-existing) ──────────────────────────────────────────

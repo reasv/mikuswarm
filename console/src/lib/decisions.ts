@@ -5,10 +5,12 @@ import type { DecisionEvaluation } from '$lib/schemas';
  * columns hold exactly what the engine writes (src/decisions/registry.ts):
  *
  * - `verdictJson`: the point's `describe(verdict)`. Routing:
- *   `{ task, difficulty?, models?, thinkingLevel?, skills?, tailFiles? }`.
+ *   `{ task, tasks?, difficulty?, models?, thinkingLevel?, skills?, tailFiles? }`
+ *   (`tasks` = every selected task, multi-label; `task` = the first of them).
  *   Records: `{ inject, relevance, candidateSessionId }`.
  * - `answersJson`: the parsed answer map keyed by question name, e.g.
- *   `{ task: { type: 'choice', choice, probabilities, confidence } }` or
+ *   routing's `{ task__<key>: { type: 'noul', noul }, skill__<name>: …,
+ *   difficulty: { type: 'score', … } }` (older rows: one `task` choice) or
  *   `{ relevant: { type: 'noul', noul } }`. Null when no member answered.
  *
  * Every reader is defensive: a malformed or missing column degrades to null /
@@ -22,6 +24,8 @@ export type DecisionAnswer =
 
 export interface RoutingVerdict {
 	task: string;
+	/** Every selected task (multi-label); `[task]` for rows written before multi-label routing. */
+	tasks: string[];
 	difficulty?: number;
 	models: string[];
 	thinkingLevel?: string;
@@ -105,14 +109,46 @@ export function answerLabel(a: DecisionAnswer): string {
 export function parseRoutingVerdict(json: string | null | undefined): RoutingVerdict | null {
 	const v = parse(json);
 	if (!isObject(v) || typeof v.task !== 'string') return null;
+	const tasks = strings(v.tasks);
 	return {
 		task: v.task,
+		tasks: tasks.length > 0 ? tasks : [v.task],
 		...(num(v.difficulty) !== null ? { difficulty: v.difficulty as number } : {}),
 		models: strings(v.models),
 		...(typeof v.thinkingLevel === 'string' ? { thinkingLevel: v.thinkingLevel } : {}),
 		skills: strings(v.skills),
 		tailFiles: strings(v.tailFiles)
 	};
+}
+
+/** One routing question's answer: a task or skill key, its probability, whether the verdict selected it. */
+export interface RoutingLabelAnswer {
+	key: string;
+	probability: number;
+	selected: boolean;
+}
+
+/**
+ * The routing point's per-label answers (one `noul` per task, `task__<key>`, and
+ * per preloadable skill, `skill__<name>`), highest probability first, each
+ * marked when the row's verdict selected it. Empty for older single-choice rows.
+ */
+export function routingLabelAnswers(row: DecisionEvaluation): { tasks: RoutingLabelAnswer[]; skills: RoutingLabelAnswer[] } {
+	const verdict = parseRoutingVerdict(row.verdictJson);
+	const tasks: RoutingLabelAnswer[] = [];
+	const skills: RoutingLabelAnswer[] = [];
+	for (const [name, a] of Object.entries(parseAnswers(row.answersJson))) {
+		if (a.type !== 'noul') continue;
+		if (name.startsWith('task__')) {
+			const key = name.slice('task__'.length);
+			tasks.push({ key, probability: a.noul, selected: verdict?.tasks.includes(key) ?? false });
+		} else if (name.startsWith('skill__')) {
+			const key = name.slice('skill__'.length);
+			skills.push({ key, probability: a.noul, selected: verdict?.skills.includes(key) ?? false });
+		}
+	}
+	const byP = (x: RoutingLabelAnswer, y: RoutingLabelAnswer) => y.probability - x.probability;
+	return { tasks: tasks.sort(byP), skills: skills.sort(byP) };
 }
 
 export function parseRecordsVerdict(json: string | null | undefined): RecordsVerdict | null {
@@ -125,9 +161,9 @@ export function parseRecordsVerdict(json: string | null | undefined): RecordsVer
 	};
 }
 
-/** One routing verdict as a short label: task, difficulty, models, skills. */
+/** One routing verdict as a short label: tasks, difficulty, models, skills. */
 export function routingLabel(v: RoutingVerdict): string {
-	const parts = [v.task];
+	const parts = [v.tasks.join(' + ')];
 	if (v.difficulty !== undefined) parts.push(`difficulty ${v.difficulty}`);
 	if (v.models.length > 0) parts.push(v.models.join(' → '));
 	if (v.thinkingLevel) parts.push(`thinking ${v.thinkingLevel}`);

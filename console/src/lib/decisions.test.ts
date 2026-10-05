@@ -8,6 +8,7 @@ import {
 	parseAnswers,
 	parseRecordsVerdict,
 	parseRoutingVerdict,
+	routingLabelAnswers,
 	rowTopConfidence,
 	rowVerdictLabel,
 	summarizeDecisionGroup
@@ -26,11 +27,42 @@ describe('decision rows as the engine writes them', () => {
 	it('parses the routing verdict (the point describe output)', () => {
 		expect(parseRoutingVerdict(routing.verdictJson)).toEqual({
 			task: 'image',
+			tasks: ['image'],
 			models: ['image-chat'],
 			skills: ['image-generation'],
 			tailFiles: []
 		});
 		expect(rowVerdictLabel(routing)).toBe('image · image-chat · +image-generation');
+	});
+
+	it('reads multi-label routing: every selected task, and the per-label answers', () => {
+		const multi = {
+			...routing,
+			verdictJson: JSON.stringify({ task: 'image', tasks: ['image', 'research'], models: ['image-chat'] }),
+			answersJson: JSON.stringify({
+				task__research: { type: 'noul', noul: 0.7 },
+				task__image: { type: 'noul', noul: 0.91 },
+				task__coding: { type: 'noul', noul: 0.05 },
+				'skill__web-research': { type: 'noul', noul: 0.2 },
+				difficulty: { type: 'score', score: 2, probabilities: { '2': 0.8 }, confidence: 0.8 }
+			})
+		};
+		expect(parseRoutingVerdict(multi.verdictJson)?.tasks).toEqual(['image', 'research']);
+		expect(rowVerdictLabel(multi)).toBe('image + research · image-chat');
+		expect(routingLabelAnswers(multi)).toEqual({
+			tasks: [
+				{ key: 'image', probability: 0.91, selected: true },
+				{ key: 'research', probability: 0.7, selected: true },
+				{ key: 'coding', probability: 0.05, selected: false }
+			],
+			skills: [{ key: 'web-research', probability: 0.2, selected: false }]
+		});
+		// A row written before multi-label routing: `tasks` falls back to its single task.
+		expect(parseRoutingVerdict('{"task":"other"}')?.tasks).toEqual(['other']);
+		expect(routingLabelAnswers(routing).tasks.map((t) => [t.key, t.selected])).toEqual([
+			['image', true],
+			['research', false]
+		]);
 	});
 
 	it('parses the answer map keyed by question name', () => {

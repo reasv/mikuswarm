@@ -9,6 +9,7 @@
 		fallbackReasonsLabel,
 		parseAnswers,
 		parseRecordsVerdict,
+		routingLabelAnswers,
 		rowVerdictLabel,
 		summarizeDecisionGroup
 	} from '$lib/decisions';
@@ -99,6 +100,7 @@
 			{#each evaluations as row, i (row.id)}
 				{@const answers = Object.entries(parseAnswers(row.answersJson))}
 				{@const recordsVerdict = row.point === 'records' ? parseRecordsVerdict(row.verdictJson) : null}
+				{@const labels = row.point === 'routing' ? routingLabelAnswers(row) : null}
 				<div class="space-y-1.5">
 					<div class="flex flex-wrap items-center gap-x-2 font-mono text-[11px]">
 						{#if row.candidateSessionId}
@@ -113,6 +115,26 @@
 							>{row.source}{row.reason ? ` (${row.reason})` : ''}</span
 						>
 					</div>
+
+					{#if labels && labels.tasks.length + labels.skills.length > 0}
+						<div data-testid="routing-labels" class="space-y-0.5 text-[11px]">
+							{#each [{ name: 'Tasks', list: labels.tasks }, { name: 'Skills', list: labels.skills }] as group (group.name)}
+								{#if group.list.length > 0}
+									<div class="flex flex-wrap items-center gap-1">
+										<span class="text-[10px] tracking-wide text-muted-foreground uppercase">{group.name}</span>
+										{#each group.list as l (l.key)}
+											<span
+												class="rounded px-1 font-mono text-[10px] {l.selected
+													? 'bg-violet-500/25 text-violet-200'
+													: 'bg-muted text-muted-foreground'}"
+												title={l.selected ? 'selected' : 'not selected'}>{l.key} {pct(l.probability)}</span
+											>
+										{/each}
+									</div>
+								{/if}
+							{/each}
+						</div>
+					{/if}
 
 					{#if answers.length > 0}
 						<div>
