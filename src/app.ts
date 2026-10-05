@@ -6050,6 +6050,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           session.timelineKey,
           inbound.event.timestamp,
           candidatesLimit + exclude.size + sessionRecordService.inFlightCount,
+          agentName,
         )
         .filter((row) => !exclude.has(row.sessionId) && !sessionRecordService.isInFlight(row.sessionId))
         .filter((row) => ownRecord(row.sessionId) !== undefined)

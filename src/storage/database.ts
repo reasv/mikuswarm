@@ -38,6 +38,12 @@ export interface StorageOptions {
 export const MAX_REDECRYPT_ATTEMPTS = 12;
 
 /**
+ * Clock-skew slack for getRecentRecordedBotSessions' walk floor: a recorded
+ * session's bot messages carry provider timestamps, its creation time is ours.
+ */
+const RECORDED_SESSION_FLOOR_SLACK_MS = 24 * 60 * 60 * 1000;
+
+/**
  * Sentinel `redecrypt_attempts` value marking a row permanently retired from the
  * re-decryption rotation regardless of {@link MAX_REDECRYPT_ATTEMPTS} (e.g. a UTD
  * row with no resolvable room/event id, which can never be re-fetched). Chosen
@@ -9492,35 +9498,71 @@ export class Storage {
    * The sessions behind the newest bot messages of a timeline, for the records
    * decision point's candidates (spec SESSION-RECORDS §6.2): one row per session
    * (its newest bot message at or before `toTimestamp`), only sessions that have
-   * a record, newest first, at most `limit`. Read-only.
+   * a record visible to `agent` (a record with no agent, or no `agent` given,
+   * matches any), newest first, at most `limit`. Read-only.
+   *
+   * Bounded: the timeline's bot messages of recorded sessions are walked
+   * newest-first over the (timeline_key, timestamp, …) index, stopping after
+   * `limit` sessions or once every recorded session of the timeline was found, and
+   * never below the earliest recorded session's creation time (minus a skew slack),
+   * so the cost tracks recency rather than the room's whole history.
    */
   getRecentRecordedBotSessions(
     timelineKey: string,
     toTimestamp: number,
     limit: number,
+    agent?: string | null,
   ): Array<{ sessionId: string; eventId: string; timestamp: number }> {
     if (limit <= 0) return [];
-    return this.read((db) =>
-      db
+    return this.read((db) => {
+      const out: Array<{ sessionId: string; eventId: string; timestamp: number }> = [];
+      const agentArg = agent ?? null;
+      // The recorded sessions of this timeline: how many there are (the walk stops
+      // once all were found) and the earliest creation time among them (no bot
+      // message of a recorded session predates it, modulo clock skew between the
+      // provider's timestamps and ours, hence the slack). Without a creation time
+      // for every one there is no floor.
+      const stats = db
         .prepare(
-          `select session_id as sessionId, event_id as eventId, ts as timestamp from (
-             select te.agent_session_id as session_id, te.id as event_id, te.timestamp as ts,
-                    row_number() over (
-                      partition by te.agent_session_id
-                      order by te.timestamp desc, te.received_at desc, te.id desc
-                    ) as rn
-             from timeline_events te
-             join session_records sr on sr.session_id = te.agent_session_id
-             where te.timeline_key = @timelineKey
-               and te.role = 'assistant'
-               and te.timestamp <= @toTimestamp
-           )
-           where rn = 1
-           order by ts desc, event_id desc
-           limit @limit`,
+          `select count(*) as n, count(a.id) as known, min(a.created_at) as earliest
+           from session_records sr left join agent_sessions a on a.id = sr.session_id
+           where sr.timeline_key = @timelineKey
+             and (sr.agent is null or @agent is null or sr.agent = @agent)`,
         )
-        .all({ timelineKey, toTimestamp, limit }) as Array<{ sessionId: string; eventId: string; timestamp: number }>,
-    );
+        .get({ timelineKey, agent: agentArg }) as { n: number; known: number; earliest: number | null };
+      if (stats.n === 0) return out;
+      const floor =
+        stats.known === stats.n && stats.earliest !== null
+          ? stats.earliest - RECORDED_SESSION_FLOOR_SLACK_MS
+          : Number.MIN_SAFE_INTEGER;
+      const want = Math.min(limit, stats.n);
+      const seen = new Set<string>();
+      const walk = db
+        .prepare(
+          `select te.id, te.timestamp, te.agent_session_id from timeline_events te
+           where te.timeline_key = @timelineKey
+             and te.timestamp <= @toTimestamp and te.timestamp >= @floor
+             and te.role = 'assistant' and te.agent_session_id is not null
+             and exists (
+               select 1 from session_records sr
+               where sr.session_id = te.agent_session_id
+                 and (sr.agent is null or @agent is null or sr.agent = @agent)
+             )
+           order by te.timestamp desc, te.received_at desc, te.id desc`,
+        )
+        .iterate({ timelineKey, toTimestamp, floor, agent: agentArg }) as IterableIterator<{
+        id: string;
+        timestamp: number;
+        agent_session_id: string;
+      }>;
+      for (const row of walk) {
+        if (seen.has(row.agent_session_id)) continue;
+        seen.add(row.agent_session_id);
+        out.push({ sessionId: row.agent_session_id, eventId: row.id, timestamp: row.timestamp });
+        if (out.length >= want) break;
+      }
+      return out;
+    });
   }
 
   // ── Decision evaluations (spec SESSION-RECORDS §8) ───────────────────────────

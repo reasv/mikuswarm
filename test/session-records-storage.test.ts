@@ -341,3 +341,79 @@ test("migration: a v23 database migrates to v24 with the fresh-DB shape, rows ke
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// ── getRecentRecordedBotSessions (bounded newest-first walk) ──────────────────
+
+test("getRecentRecordedBotSessions: one row per recorded session, newest first", async () => {
+  await withStorage(async (storage) => {
+    const room = "matrix:a:room:!r:x";
+    await storage.write((db) => {
+      const ins = db.prepare(
+        `insert into timeline_events (id, timeline_key, provider, role, sender_id, sender_display_name,
+           body, timestamp, received_at, agent_session_id, agent_session_generation, event_json,
+           enrichment_status, sender_is_bot, sender_is_webhook, created_at, updated_at)
+         values (?, ?, 'matrix', ?, 's', 's', 'b', ?, ?, ?, 0, '{}', 'complete', 0, 0, 0, 0)`,
+      );
+      const rows: Array<[string, string, "user" | "assistant", number, string | null]> = [
+        ["u1", room, "user", 100, null],
+        ["a1", room, "assistant", 110, "sA"],
+        ["a2", room, "assistant", 120, "sA"], // sA's newest bot message
+        ["a3", room, "assistant", 130, "sB"], // sB has no record
+        ["a4", room, "assistant", 140, "sC"], // sC's record belongs to another agent
+        ["a5", room, "assistant", 150, "sD"],
+        ["u2", room, "user", 155, "sE"], // non-assistant rows never count
+        ["a6", room, "assistant", 160, "sF"], // after the trigger
+        ["x1", "matrix:a:room:!other:x", "assistant", 145, "sG"], // other timeline
+      ];
+      for (const [id, tk, role, ts, sid] of rows) ins.run(id, tk, role, ts, ts, sid);
+    });
+    for (const [sid, agent] of [["sA", "miku"], ["sC", "chen"], ["sD", null], ["sE", "miku"], ["sF", "miku"], ["sG", "miku"]] as const) {
+      await storage.upsertSessionRecord({ session_id: sid, timeline_key: sid === "sG" ? "matrix:a:room:!other:x" : room, agent, text: "r", token_count: 1, created_at: 1 });
+    }
+    await storage.waitForIdle();
+    const ids = (limit: number, agent?: string | null, to = 155) =>
+      storage.getRecentRecordedBotSessions(room, to, limit, agent).map((r) => `${r.sessionId}@${r.eventId}`);
+    assert.deepEqual(ids(10, "miku"), ["sD@a5", "sA@a2"], "own + agentless records, newest bot message each");
+    assert.deepEqual(ids(10), ["sD@a5", "sC@a4", "sA@a2"], "no agent → every record");
+    assert.deepEqual(ids(1, "miku"), ["sD@a5"], "limit");
+    assert.deepEqual(ids(10, "miku", 115), ["sA@a1"], "up to the trigger timestamp");
+    assert.deepEqual(ids(0, "miku"), []);
+    assert.deepEqual(storage.getRecentRecordedBotSessions("matrix:a:room:!none:x", 1000, 5, "miku"), []);
+  });
+});
+
+test("getRecentRecordedBotSessions: the walk stops at the recorded sessions' creation floor", async () => {
+  await withStorage(async (storage) => {
+    const room = "matrix:a:room:!r:x";
+    const day = 24 * 60 * 60 * 1000;
+    const t0 = 10 * day;
+    await storage.write((db) => {
+      const ins = db.prepare(
+        `insert into timeline_events (id, timeline_key, provider, role, sender_id, sender_display_name,
+           body, timestamp, received_at, agent_session_id, agent_session_generation, event_json,
+           enrichment_status, sender_is_bot, sender_is_webhook, created_at, updated_at)
+         values (?, ?, 'matrix', 'assistant', 's', 's', 'b', ?, ?, ?, 0, '{}', 'complete', 0, 0, 0, 0)`,
+      );
+      ins.run("old", room, t0 - 3 * day, t0 - 3 * day, "sOld"); // before every session's creation
+      ins.run("a1", room, t0 - 60_000, t0, "s1"); // provider clock a minute behind ours
+    });
+    for (const id of ["sOld", "s1", "sGhost"]) {
+      await storage.insertAgentSession({ id, timelineKey: room, sessionType: "default", status: "completed", createdAt: t0, updatedAt: t0 });
+      await storage.upsertSessionRecord({ session_id: id, timeline_key: room, agent: "miku", text: "r", token_count: 1, created_at: t0 });
+    }
+    await storage.waitForIdle();
+    // sGhost never posted here; the walk stops at the floor (creation − slack),
+    // so sOld (a message from before any recorded session existed) is out of range.
+    assert.deepEqual(
+      storage.getRecentRecordedBotSessions(room, t0 + day, 5, "miku").map((r) => r.sessionId),
+      ["s1"],
+    );
+    // A recorded session without an agent_sessions row disables the floor.
+    await storage.upsertSessionRecord({ session_id: "sNoRow", timeline_key: room, agent: "miku", text: "r", token_count: 1, created_at: t0 });
+    await storage.waitForIdle();
+    assert.deepEqual(
+      storage.getRecentRecordedBotSessions(room, t0 + day, 5, "miku").map((r) => r.sessionId),
+      ["s1", "sOld"],
+    );
+  });
+});
