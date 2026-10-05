@@ -1158,6 +1158,69 @@ export const BehaviourSeriesPoint = Schema.Struct({
 });
 export type BehaviourSeriesPoint = Schema.Schema.Type<typeof BehaviourSeriesPoint>;
 
+/** One headline rate over the window, all groups combined, with its buckets (the overview chart). */
+export const BehaviourOverviewMetric = Schema.Struct({
+	id: Schema.String,
+	count: Schema.Number,
+	denominator: Schema.Number,
+	rate: Schema.NullOr(Schema.Number),
+	points: Schema.Array(
+		Schema.Struct({
+			bucket: Schema.Number,
+			count: Schema.Number,
+			denominator: Schema.Number,
+			rate: Schema.NullOr(Schema.Number)
+		})
+	)
+});
+export type BehaviourOverviewMetric = Schema.Schema.Type<typeof BehaviourOverviewMetric>;
+
+/** A metric the chart can plot, with its total in the window (0 = nothing recorded). */
+export const BehaviourChartOption = Schema.Struct({
+	/** A headline rate id, or `mix:<family>` (one line per key). */
+	id: Schema.String,
+	label: Schema.String,
+	/** rate | count */
+	kind: Schema.String,
+	count: Schema.Number,
+	denominator: Schema.NullOr(Schema.Number)
+});
+export type BehaviourChartOption = Schema.Schema.Type<typeof BehaviourChartOption>;
+
+/** A keyed family per scorecard group (failure types, after the correction, no_reply intent, judged refusal reasons). */
+export const BehaviourMixTable = Schema.Struct({
+	id: Schema.String,
+	label: Schema.String,
+	keys: Schema.Array(Schema.String),
+	rows: Schema.Array(
+		Schema.Struct({
+			group: Schema.String,
+			total: Schema.Number,
+			counts: Schema.Record({ key: Schema.String, value: Schema.Number })
+		})
+	)
+});
+export type BehaviourMixTable = Schema.Schema.Type<typeof BehaviourMixTable>;
+
+/** A config entry's wire model id and configured family. */
+export const BehaviourModelInfo = Schema.Struct({
+	id: Schema.NullOr(Schema.String),
+	family: Schema.NullOr(Schema.String)
+});
+export type BehaviourModelInfo = Schema.Schema.Type<typeof BehaviourModelInfo>;
+
+/** The offline audit's backlog, counted in the background (stages in processing order). */
+export const AuditBacklogProgress = Schema.Struct({
+	countedAt: Schema.Number,
+	sessions: Schema.Number,
+	prioritySessions: Schema.Number,
+	stages: Schema.Array(
+		Schema.Struct({ id: Schema.String, label: Schema.String, done: Schema.Number, remaining: Schema.Number })
+	),
+	current: Schema.NullOr(Schema.String)
+});
+export type AuditBacklogProgress = Schema.Schema.Type<typeof AuditBacklogProgress>;
+
 const BehaviourCount = Schema.Struct({ key: Schema.String, count: Schema.Number });
 const BehaviourCheckBreakdown = Schema.Struct({
 	code: Schema.String,
@@ -1247,15 +1310,25 @@ export const ModelBehaviourResponse = Schema.Struct({
 		task: Schema.NullOr(Schema.String),
 		selected: Schema.NullOr(Schema.String)
 	}),
-	metric: Schema.String,
+	/** A headline rate id, `mix:<family>`, or null for the overview. */
+	metric: Schema.NullOr(Schema.String),
 	rates: Schema.Array(BehaviourRateDefinition),
+	/** Every plottable metric with its total in the window. */
+	charts: Schema.optional(Schema.Array(BehaviourChartOption)),
 	scorecard: Schema.Array(BehaviourScorecardRow),
+	/** Every headline rate over time, all groups combined (the default chart). */
+	overview: Schema.optional(Schema.Struct({ bucketMs: Schema.Number, metrics: Schema.Array(BehaviourOverviewMetric) })),
 	series: Schema.Struct({
-		metric: Schema.String,
+		metric: Schema.NullOr(Schema.String),
+		/** rate (one line per group) | count (a family: one line per key, `group` = the key) */
+		kind: Schema.optional(Schema.String),
 		bucketMs: Schema.Number,
 		points: Schema.Array(BehaviourSeriesPoint)
 	}),
 	breakdown: BehaviourBreakdown,
+	mix: Schema.optional(Schema.Array(BehaviourMixTable)),
+	/** Wire id and configured family of each config entry shown. */
+	models: Schema.optional(Schema.Record({ key: Schema.String, value: BehaviourModelInfo })),
 	markers: Schema.Array(BehaviourMarker),
 	incidents: BehaviourIncidentPage,
 	facets: Schema.Struct({
@@ -1264,6 +1337,8 @@ export const ModelBehaviourResponse = Schema.Struct({
 		models: Schema.Array(Schema.String),
 		tasks: Schema.Array(Schema.String)
 	}),
-	pendingHours: Schema.Number
+	pendingHours: Schema.Number,
+	/** The offline audit's backlog progress; null when the audit worker does not run. */
+	audit: Schema.optional(Schema.NullOr(AuditBacklogProgress))
 });
 export type ModelBehaviourResponse = Schema.Schema.Type<typeof ModelBehaviourResponse>;

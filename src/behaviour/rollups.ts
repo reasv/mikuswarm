@@ -332,6 +332,7 @@ function accumulateRefusal(
 ): void {
   acc.add(agent, r.site, model, r.kind === "hard" ? "refusals_hard" : "refusals_judged", 1, tasks);
   acc.add(agent, r.site, model, familyMetric("refusal_reason", r.reason), 1, tasks);
+  if (r.kind !== "hard") acc.add(agent, r.site, model, familyMetric("judged_refusal_reason", r.reason), 1, tasks);
   acc.add(agent, r.site, model, familyMetric("refusal_method", r.method), 1, tasks);
   acc.add(agent, r.site, model, familyMetric("refusal_outcome", r.outcome), 1, tasks);
   if (r.outcome === "redo") acc.add(agent, r.site, model, "refusal_redos", 1, tasks);
@@ -441,6 +442,7 @@ function accumulateSession(
     if (intent !== undefined && !intentAnchors.has(anchor)) {
       intentAnchors.add(anchor);
       add(model, familyMetric("no_reply_intent", intent));
+      add(model, "no_reply_intent_judged");
     }
     const fired = firedChecks(d.verdict_json);
     for (const f of fired) {
@@ -487,6 +489,35 @@ function accumulateSession(
     if (!isContinuationChunk(m.id)) add(model, "messages_sent");
     add(model, "message_tokens", countTokens(m.body));
   }
+}
+
+/**
+ * Version of what {@link computeHourRollups} counts. Bump it when a metric is added
+ * or redefined: at start the service marks every hour that already has rollup rows
+ * dirty once (stored as `model_behaviour_rollup_version` in `metadata`), so the
+ * background drain recomputes history with the new definitions.
+ */
+export const MODEL_BEHAVIOUR_ROLLUP_VERSION = 2;
+const ROLLUP_VERSION_KEY = "model_behaviour_rollup_version";
+
+/**
+ * Mark every computed hour dirty when the stored rollup version differs from
+ * {@link MODEL_BEHAVIOUR_ROLLUP_VERSION}, then store the version. One index scan of
+ * the rollup table's hours; hours never computed are dirty already. Returns
+ * whether it re-marked.
+ */
+export function ensureRollupVersion(db: Database.Database, now = Date.now()): boolean {
+  const row = db.prepare(`select value from metadata where key = ?`).get(ROLLUP_VERSION_KEY) as { value: string } | undefined;
+  if (row?.value === String(MODEL_BEHAVIOUR_ROLLUP_VERSION)) return false;
+  const fresh = db.prepare(`select 1 from model_behaviour_rollups limit 1`).get() === undefined;
+  if (!fresh) {
+    db.exec(`insert or ignore into model_behaviour_dirty_hours (hour) select distinct hour from model_behaviour_rollups`);
+  }
+  db.prepare(
+    `insert into metadata (key, value, updated_at) values (?, ?, ?)
+     on conflict(key) do update set value = excluded.value, updated_at = excluded.updated_at`,
+  ).run(ROLLUP_VERSION_KEY, String(MODEL_BEHAVIOUR_ROLLUP_VERSION), now);
+  return !fresh;
 }
 
 /** Replace one hour's rollup rows (inside the caller's transaction). */
@@ -576,9 +607,17 @@ export class ModelBehaviourRollups {
     return this.flush();
   }
 
-  /** Start the background drain (idempotent). */
+  /** Start the background drain (idempotent); re-marks history once after a rollup version bump. */
   start(): void {
     if (this.timer) return;
+    void this.options.storage
+      .write((db) => ensureRollupVersion(db))
+      .then((remarked) => {
+        if (remarked) this.options.logger?.info("model_behaviour_rollups_remarked", { version: MODEL_BEHAVIOUR_ROLLUP_VERSION });
+      })
+      .catch((error: unknown) => {
+        this.options.logger?.warn("model_behaviour_rollup_failed", { error: error instanceof Error ? error.message : String(error) });
+      });
     this.timer = setInterval(() => void this.drainOnce(), this.intervalMs);
     this.timer.unref?.();
     void this.drainOnce();

@@ -185,9 +185,13 @@ Unreleased section; it is not part of any release's notes.
 
 - **Model behaviour page** (`/models` in the console): per-model refusal rates,
   send-contract failures and recoveries, style hits, revisions and redos, with
-  trends, a breakdown, an incident log linking into sessions, and markers for
-  config, code and prompt changes. `[models.<key>].family` groups entries by
-  underlying model. The session view shows redo branches with a switcher, check
+  an overview of every rate over time, a chart for any rate or for the mix of
+  failure types, after-correction verdicts, `no_reply` intent and judged refusal
+  reasons, per-model mix tables, a breakdown, an incident log linking into
+  sessions, and markers for config, code and prompt changes. The scorecard sorts
+  by any column and names models by config key, wire model id or both. The
+  family toggle groups entries by `[models.<key>].family`, else by the wire model
+  id they serve. The session view shows redo branches with a switcher, check
   cards on judged messages and endings, nudge cards and refusal markers, and the
   session list shows refused, redone, nudged, revised and unjudged counts.
   Database schema v26 adds the statistics tables, filled from history in the

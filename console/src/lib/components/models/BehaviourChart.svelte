@@ -1,30 +1,46 @@
 <script lang="ts">
-	import type { BehaviourMarker, BehaviourRateDefinition, BehaviourSeriesPoint } from '$lib/schemas';
-	import { buildBehaviourChart, chartX, formatRate } from '$lib/model-behaviour-view';
+	import type { BehaviourChartOption, BehaviourMarker, BehaviourRateDefinition, BehaviourSeriesPoint } from '$lib/schemas';
+	import { buildBehaviourChart, chartX, emptyChartReason, formatCount, formatRate } from '$lib/model-behaviour-view';
 	import { niceTicks } from '$lib/spend-chart';
 	import { cn } from '$lib/utils';
 
 	// Over time (spec REFUSAL-HANDLING §12.3 §2, §12.4): the selected metric, one
-	// line per group, with change markers (a deploy's changes collapse into one
-	// marker; hovering lists them). Inline SVG with a real y axis, like the usage
-	// page's spend chart; no charting dependency.
+	// line per group (a rate) or per key (a keyed family's counts, e.g. failure
+	// types), with change markers (a deploy's changes collapse into one marker;
+	// hovering lists them). Inline SVG with a real y axis, like the usage page's
+	// spend chart; no charting dependency. An empty metric says why it is empty.
 	let {
 		points,
 		rate,
+		option,
+		kind = 'rate',
 		since,
 		until,
 		bucketMs,
 		markers,
-		selected
+		selected,
+		labelOf = (g: string) => g || '(unknown)',
+		scope
 	}: {
 		points: readonly BehaviourSeriesPoint[];
 		rate: BehaviourRateDefinition | undefined;
+		/** The metric's totals in the window (the empty-state wording). */
+		option?: BehaviourChartOption;
+		kind?: string;
 		since: number;
 		until: number;
 		bucketMs: number;
 		markers: readonly BehaviourMarker[];
 		selected: string | null;
+		labelOf?: (group: string) => string;
+		/** What a family chart covers ("model_b", "all groups"). */
+		scope?: string;
 	} = $props();
+
+	const isCount = $derived(kind === 'count');
+	const fmt = (v: number) => (isCount ? formatCount(v) : rate ? formatRate(v, rate) : String(v));
+	const title = $derived(option?.label ?? rate?.label ?? '');
+	const denominatorName = $derived(rate?.denominator.replace(/_/g, ' '));
 
 	const PALETTE = ['#6366f1', '#22c55e', '#f59e0b', '#ec4899', '#0ea5e9', '#a855f7', '#ef4444', '#14b8a6', '#84cc16', '#d946ef'];
 	const VIEW_W = 760;
@@ -53,16 +69,21 @@
 
 {#if model.lines.length === 0}
 	<div class="rounded-lg border border-dashed p-3 text-xs text-muted-foreground" data-testid="chart-empty">
-		Nothing to plot for {rate?.label ?? 'this metric'} in this window.
+		<span class="font-medium text-foreground">{title}</span>{#if scope}<span> · {scope}</span>{/if}:
+		{emptyChartReason(option, denominatorName)}
 		{#if model.markers.length > 0}({model.markers.length} change {model.markers.length === 1 ? 'marker' : 'markers'}){/if}
 	</div>
 {:else}
 	<div class="rounded-lg border p-3">
 		<div class="mb-2 flex flex-wrap gap-2 text-[10px]">
-			<span class="font-semibold text-foreground">{rate?.label ?? ''}</span>
+			<span class="font-semibold text-foreground">{title}</span>
+			{#if scope}<span class="text-muted-foreground">{scope}</span>{/if}
+			{#if option && option.kind === 'rate' && option.count === 0}
+				<span class="text-muted-foreground italic" data-testid="chart-none-recorded">{emptyChartReason(option, denominatorName)}</span>
+			{/if}
 			{#each model.lines as l (l.group)}
-				<span class={cn('flex items-center gap-1 font-mono', selected && selected !== l.group && 'opacity-50')}>
-					<span class="inline-block size-2 rounded-sm" style={`background:${colorOf.get(l.group)}`}></span>{l.group || '(unknown)'}
+				<span class={cn('flex items-center gap-1 font-mono', !isCount && selected && selected !== l.group && 'opacity-50')}>
+					<span class="inline-block size-2 rounded-sm" style={`background:${colorOf.get(l.group)}`}></span>{isCount ? l.group : labelOf(l.group)}
 				</span>
 			{/each}
 		</div>
@@ -71,7 +92,7 @@
 				{#each axis.ticks as t (t)}
 					<line x1={PAD.left} x2={VIEW_W - PAD.right} y1={y(t)} y2={y(t)} class="stroke-border" stroke-width="1" />
 					<text x={PAD.left - 6} y={y(t) + 3} text-anchor="end" class="fill-muted-foreground" font-size="9">
-						{rate ? formatRate(t, rate) : t}
+						{fmt(t)}
 					</text>
 				{/each}
 				{#each model.buckets as b, i (b)}
@@ -83,13 +104,13 @@
 					<polyline
 						fill="none"
 						stroke={colorOf.get(l.group)}
-						stroke-width={selected === l.group ? 2.5 : 1.5}
-						opacity={selected && selected !== l.group ? 0.35 : 1}
+						stroke-width={!isCount && selected === l.group ? 2.5 : 1.5}
+						opacity={!isCount && selected && selected !== l.group ? 0.35 : 1}
 						points={l.points.map((p) => `${mid(p.bucket)},${y(p.rate)}`).join(' ')}
 					/>
 					{#each l.points as p (p.bucket)}
 						<circle cx={mid(p.bucket)} cy={y(p.rate)} r="2" fill={colorOf.get(l.group)}>
-							<title>{l.group}: {rate ? formatRate(p.rate, rate) : p.rate}</title>
+							<title>{isCount ? l.group : labelOf(l.group)}: {fmt(p.rate)}</title>
 						</circle>
 					{/each}
 				{/each}

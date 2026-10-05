@@ -9,10 +9,19 @@ import type Database from "better-sqlite3";
 import type { Storage } from "../storage/index.js";
 import { MODEL_BEHAVIOUR_HOUR_MS } from "../storage/model-behaviour-schema.js";
 import { listBehaviourChanges } from "./changes.js";
-import { HEADLINE_RATES, MODEL_BEHAVIOUR_METRIC_FAMILIES, headlineRate, type HeadlineRate } from "./metrics.js";
+import {
+  HEADLINE_RATES,
+  MIX_FAMILIES,
+  MODEL_BEHAVIOUR_METRIC_FAMILIES,
+  headlineRate,
+  mixMetricId,
+  type HeadlineRate,
+} from "./metrics.js";
 import { firedChecks, sessionTasks } from "./rollups.js";
 import type {
+  AuditBacklogProgress,
   BehaviourBreakdown,
+  BehaviourChartOption,
   BehaviourChangeEvent,
   BehaviourCheckBreakdown,
   BehaviourCount,
@@ -21,6 +30,9 @@ import type {
   BehaviourIncidentRow,
   BehaviourIncidentType,
   BehaviourMarker,
+  BehaviourMixTable,
+  BehaviourModelInfo,
+  BehaviourOverviewMetric,
   BehaviourRateCell,
   BehaviourScorecardRow,
   BehaviourSeriesPoint,
@@ -45,9 +57,17 @@ export const BEHAVIOUR_GROUP_BYS: readonly BehaviourGroupBy[] = ["model", "agent
 
 export interface ModelBehaviourReadContext {
   storage: Storage;
-  /** `[models.<key>].family`, else the key itself. */
+  /** The family a config entry groups under: `[models.<key>].family`, else its wire model id, else the key. */
   familyOf(model: string): string;
   agentForTimelineKey(timelineKey: string | null): string | null;
+  /** A config entry's wire model id and configured family, for the page's labels. */
+  modelInfo?(model: string): BehaviourModelInfo;
+  /** Kind of a check code (`style` feeds the style breakdown). */
+  checkKind?(code: string): string | undefined;
+  /** Dirty rollup hours left (a cheap count). */
+  pendingHours?(): number;
+  /** The offline audit's latest backlog count, when the worker runs (counted in the background). */
+  auditProgress?(): AuditBacklogProgress | null;
 }
 
 export interface ModelBehaviourQuery {
@@ -58,7 +78,12 @@ export interface ModelBehaviourQuery {
   site?: string | null;
   task?: string | null;
   selected?: string | null;
-  /** Headline rate id for the series; default the first rate. */
+  /**
+   * What the chart plots: a headline rate id (one line per group), `mix:<family>`
+   * (one line per key of a keyed family, for the selected group or everything
+   * under the filters), or absent for the overview (every headline rate, all
+   * groups combined).
+   */
   metric?: string | null;
   incidentType?: BehaviourIncidentType | null;
   cursor?: string | null;
@@ -292,10 +317,16 @@ function groupMembers(groupBy: BehaviourGroupBy, family: boolean, value: string,
   return [value];
 }
 
-export function readModelBehaviour(
-  ctx: ModelBehaviourReadContext & { checkKind?(code: string): string | undefined; pendingHours?(): number },
-  query: ModelBehaviourQuery,
-): ModelBehaviourResponse {
+/** The chart's metric: a headline rate, a mix family, or null (the overview). */
+function chartMetric(metric: string | null | undefined): { id: string; rate: HeadlineRate } | { id: string; family: string } | null {
+  if (!metric) return null;
+  const rate = headlineRate(metric);
+  if (rate) return { id: rate.id, rate };
+  const mix = MIX_FAMILIES.find((f) => mixMetricId(f.family) === metric);
+  return mix ? { id: metric, family: mix.family } : null;
+}
+
+export function readModelBehaviour(ctx: ModelBehaviourReadContext, query: ModelBehaviourQuery): ModelBehaviourResponse {
   const now = query.now ?? Date.now();
   const since = behaviourWindowSince(query.window, now);
   const until = now;
@@ -310,7 +341,7 @@ export function readModelBehaviour(
     task: query.task ?? null,
     selected: query.selected ?? null,
   };
-  const rate = headlineRate(query.metric ?? "") ?? HEADLINE_RATES[0]!;
+  const chosen = chartMetric(query.metric);
   const base: Scope = { since, until, agent: filters.agent, site: filters.site, task: filters.task };
 
   return ctx.storage.read((db) => {
@@ -357,23 +388,25 @@ export function readModelBehaviour(
       }))
       .sort((a, b) => b.volume.requests - a.volume.requests || b.volume.sessions - a.volume.sessions || (a.group < b.group ? -1 : 1));
 
-    // Series: the selected rate per bucket and group.
+    // Overview (the default chart): every headline rate per bucket, all groups combined.
     const bucketMs = behaviourBucketMs(query.window);
-    // One line per group, like the scorecard; the selection only scopes the sections below it.
-    const seriesRows = rollupSums(db, base, ["bucket", groupBy], { names: [...rate.numerator, rate.denominator] }, bucketMs);
-    const byBucket = new Map<string, { bucket: number; group: string; sums: Map<string, number> }>();
-    for (const row of seriesRows) {
-      const group = groupOf(row);
+    const overviewSums = new Map<number, Map<string, number>>();
+    for (const row of rollupSums(db, base, ["bucket"], { names: RATE_METRICS }, bucketMs)) {
       const bucket = Number(row.bucket);
-      const k = `${bucket}\u0000${group}`;
-      let entry = byBucket.get(k);
-      if (!entry) byBucket.set(k, (entry = { bucket, group, sums: new Map() }));
-      const metric = String(row.metric);
-      entry.sums.set(metric, (entry.sums.get(metric) ?? 0) + Number(row.value));
+      let m = overviewSums.get(bucket);
+      if (!m) overviewSums.set(bucket, (m = new Map()));
+      m.set(String(row.metric), (m.get(String(row.metric)) ?? 0) + Number(row.value));
     }
-    const points: BehaviourSeriesPoint[] = [...byBucket.values()]
-      .map(({ bucket, group, sums }) => ({ bucket, group, ...rateOf(rate, sums) }))
-      .sort((a, b) => a.bucket - b.bucket || (a.group < b.group ? -1 : 1));
+    const buckets = [...overviewSums.keys()].sort((a, b) => a - b);
+    const allGroups = new Map<string, number>();
+    for (const sums of cur.values()) for (const [m, v] of sums) allGroups.set(m, (allGroups.get(m) ?? 0) + v);
+    const overview: BehaviourOverviewMetric[] = HEADLINE_RATES.map((r) => ({
+      id: r.id,
+      ...rateOf(r, allGroups),
+      points: buckets
+        .map((bucket) => ({ bucket, ...rateOf(r, overviewSums.get(bucket)) }))
+        .filter((p) => p.denominator > 0 || p.count > 0),
+    }));
 
     // Breakdown for the selected group (or everything under the filters).
     const scoped: Scope = { ...base, restrict };
@@ -384,6 +417,95 @@ export function readModelBehaviour(
       bySite.set(String(row.site), (bySite.get(String(row.site)) ?? 0) + Number(row.value));
     }
     const breakdown = breakdownFrom(totals, bySite, (code) => ctx.checkKind?.(code));
+    const familyTotal = (family: string) => {
+      let n = 0;
+      for (const [metric, value] of totals) if (metric.startsWith(`${family}:`)) n += value;
+      return n;
+    };
+
+    // Every plottable metric with its total in the window, so an empty one reads as empty.
+    const charts: BehaviourChartOption[] = [
+      ...overview.map((o) => ({
+        id: o.id,
+        label: headlineRate(o.id)!.label,
+        kind: "rate" as const,
+        count: o.count,
+        denominator: o.denominator,
+      })),
+      ...MIX_FAMILIES.map((f) => ({
+        id: mixMetricId(f.family),
+        label: f.label,
+        kind: "count" as const,
+        count: familyTotal(f.family),
+        denominator: null,
+      })),
+    ];
+
+    // Series of the chosen metric: a rate per bucket and group (one line per group,
+    // like the scorecard), or a keyed family's counts per bucket and key over the
+    // selected group (or everything under the filters).
+    let points: BehaviourSeriesPoint[] = [];
+    if (chosen && "rate" in chosen) {
+      const rate = chosen.rate;
+      const seriesRows = rollupSums(db, base, ["bucket", groupBy], { names: [...rate.numerator, rate.denominator] }, bucketMs);
+      const byBucket = new Map<string, { bucket: number; group: string; sums: Map<string, number> }>();
+      for (const row of seriesRows) {
+        const group = groupOf(row);
+        const bucket = Number(row.bucket);
+        const k = `${bucket}\u0000${group}`;
+        let entry = byBucket.get(k);
+        if (!entry) byBucket.set(k, (entry = { bucket, group, sums: new Map() }));
+        const metric = String(row.metric);
+        entry.sums.set(metric, (entry.sums.get(metric) ?? 0) + Number(row.value));
+      }
+      points = [...byBucket.values()]
+        .map(({ bucket, group, sums }) => ({ bucket, group, ...rateOf(rate, sums) }))
+        .sort((a, b) => a.bucket - b.bucket || (a.group < b.group ? -1 : 1));
+    } else if (chosen) {
+      const prefix = `${chosen.family}:`;
+      const byKey = new Map<string, BehaviourSeriesPoint>();
+      for (const row of rollupSums(db, scoped, ["bucket"], { prefixes: [chosen.family] }, bucketMs)) {
+        const bucket = Number(row.bucket);
+        const group = String(row.metric).slice(prefix.length);
+        const k = `${bucket}\u0000${group}`;
+        const p = byKey.get(k) ?? { bucket, group, count: 0, denominator: 0, rate: 0 };
+        p.count += Number(row.value);
+        p.rate = p.count;
+        byKey.set(k, p);
+      }
+      points = [...byKey.values()]
+        .filter((p) => p.count !== 0)
+        .sort((a, b) => a.bucket - b.bucket || (a.group < b.group ? -1 : 1));
+    }
+
+    // Mix tables: each keyed family per scorecard group (how sends failed, what the
+    // audit found after the correction, no_reply intent, judged refusal reasons).
+    const mixSums = foldSums(rollupSums(db, base, [groupBy], { prefixes: MIX_FAMILIES.map((f) => f.family) }), groupOf);
+    const mix: BehaviourMixTable[] = MIX_FAMILIES.map((f) => {
+      const prefix = `${f.family}:`;
+      const keyTotals = new Map<string, number>();
+      const rows = scorecard.map(({ group }) => {
+        const counts: Record<string, number> = {};
+        let total = 0;
+        for (const [metric, value] of mixSums.get(group) ?? []) {
+          if (!metric.startsWith(prefix) || value === 0) continue;
+          const key = metric.slice(prefix.length);
+          counts[key] = (counts[key] ?? 0) + value;
+          total += value;
+          keyTotals.set(key, (keyTotals.get(key) ?? 0) + value);
+        }
+        return { group, total, counts };
+      });
+      const keys = [...keyTotals.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).map(([k]) => k);
+      return { id: f.family, label: f.label, keys, rows };
+    });
+
+    // Wire ids and families of the config entries on the page (the label switch).
+    const models: Record<string, BehaviourModelInfo> = {};
+    if (ctx.modelInfo) {
+      const shown = [...facetModels, ...scorecard.flatMap((r) => r.members), ...(groupBy === "model" && !family ? scorecard.map((r) => r.group) : [])];
+      for (const m of new Set(shown)) if (m !== "") models[m] = ctx.modelInfo(m);
+    }
 
     // Markers touching what the chart displays (every scorecard group).
     const shownGroups = scorecard.map((r) => r.group);
@@ -416,15 +538,20 @@ export function readModelBehaviour(
       groupBy,
       family,
       filters,
-      metric: rate.id,
+      metric: chosen?.id ?? null,
       rates: HEADLINE_RATES.map((r) => ({ ...r, numerator: [...r.numerator] })),
+      charts,
       scorecard,
-      series: { metric: rate.id, bucketMs, points },
+      overview: { bucketMs, metrics: overview },
+      series: { metric: chosen?.id ?? null, kind: chosen && "family" in chosen ? "count" : "rate", bucketMs, points },
       breakdown,
+      mix,
+      models,
       markers,
       incidents,
       facets,
       pendingHours: ctx.pendingHours?.() ?? 0,
+      audit: ctx.auditProgress?.() ?? null,
     };
   });
 }
@@ -644,22 +771,46 @@ function incidentFor(db: Database.Database, ctx: ModelBehaviourReadContext, s: C
   };
 }
 
+/** A decision row's `verdict_json` names at least one fired check (`{ fired: [...] }` or a bare array). */
+const FIRED_SQL = `(case when json_valid(d.verdict_json) then
+     case json_type(d.verdict_json) when 'array' then json_array_length(d.verdict_json)
+                                    when 'object' then coalesce(json_array_length(d.verdict_json, '$.fired'), 0)
+                                    else 0 end
+   else 0 end) > 0`;
+
+/**
+ * The SQL evidence of each incident type, so the candidate walk visits only
+ * sessions that can match (a type filter narrows the scan itself, never just the
+ * rows of a fixed-size scan). Mirrors {@link incidentFor}'s `types`.
+ */
+const INCIDENT_TYPE_SQL: Record<BehaviourIncidentType, string> = {
+  refusal: `exists (select 1 from refusal_events r where r.agent_session_id = s.id)`,
+  nudge: `(coalesce(s.contract_nudges, 0) > 0
+           or exists (select 1 from contract_attempts a where a.agent_session_id = s.id and a.attempt_no > 0))`,
+  redo: `(exists (select 1 from agent_session_branches b where b.session_id = s.id)
+          or exists (select 1 from refusal_events r where r.agent_session_id = s.id and r.outcome = 'redo'))`,
+  revision: `exists (select 1 from decision_evaluations d where d.agent_session_id = s.id and d.point = 'checks'
+                       and d.consequence in ('revise', 'overridden'))`,
+  // A judged ending counts only when it fired: the offline audit writes an unfired
+  // row for nearly every ending, which must not make every session a candidate.
+  ending: `exists (select 1 from decision_evaluations d where d.agent_session_id = s.id and d.point = 'checks'
+                     and d.checkpoint = 'ending' and ${FIRED_SQL})`,
+};
+
 function listIncidentsInDb(db: Database.Database, ctx: ModelBehaviourReadContext, q: IncidentQuery): BehaviourIncidentPage {
   const limit = Math.min(Math.max(1, Math.floor(q.limit) || INCIDENT_PAGE_DEFAULT), INCIDENT_PAGE_MAX);
   let cursor = parseCursor(q.cursor);
   const rows: BehaviourIncidentRow[] = [];
+  const evidence = q.type !== null
+    ? INCIDENT_TYPE_SQL[q.type]
+    : `(${Object.values(INCIDENT_TYPE_SQL).join("\n          or ")})`;
   const stmt = db.prepare(
     `select s.id, s.created_at, s.timeline_key, s.session_type, s.initial_preloads, s.contract_outcome, s.contract_nudges,
             coalesce((select m.display_name from room_metadata m where m.timeline_key = s.timeline_key), s.timeline_key) as room_label
        from agent_sessions s
       where s.created_at >= @since and s.created_at < @until
         and (@cts is null or s.created_at < @cts or (s.created_at = @cts and s.id < @cid))
-        and (coalesce(s.contract_nudges, 0) > 0
-          or exists (select 1 from refusal_events r where r.agent_session_id = s.id)
-          or exists (select 1 from contract_attempts a where a.agent_session_id = s.id and a.attempt_no > 0)
-          or exists (select 1 from agent_session_branches b where b.session_id = s.id)
-          or exists (select 1 from decision_evaluations d where d.agent_session_id = s.id and d.point = 'checks'
-                       and (d.consequence in ('revise', 'overridden') or d.checkpoint = 'ending')))
+        and ${evidence}
       order by s.created_at desc, s.id desc
       limit @batch`,
   );

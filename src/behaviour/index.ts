@@ -14,19 +14,17 @@ import { PromptChangeTracker } from "./prompt-changes.js";
 import { readBehaviourIncidents, readModelBehaviour, type ModelBehaviourQuery } from "./read.js";
 import { ModelBehaviourRollups } from "./rollups.js";
 import { buildBehaviourSnapshot, snapshotHash, type CodeVersion } from "./snapshot.js";
-import type { BehaviourIncidentPage, ModelBehaviourResponse } from "./types.js";
+import type { AuditBacklogProgress, BehaviourIncidentPage, BehaviourModelInfo, ModelBehaviourResponse } from "./types.js";
 import { resolveCodeVersion } from "./version.js";
 
 export * from "./types.js";
-export { HEADLINE_RATES, MODEL_BEHAVIOUR_METRICS, MODEL_BEHAVIOUR_METRIC_FAMILIES } from "./metrics.js";
+export { HEADLINE_RATES, MIX_FAMILIES, MODEL_BEHAVIOUR_METRICS, MODEL_BEHAVIOUR_METRIC_FAMILIES, mixMetricId } from "./metrics.js";
 export { buildBehaviourSnapshot, snapshotHash, type BehaviourSnapshot } from "./snapshot.js";
 export { diffBehaviourSnapshots, listBehaviourChanges, recordBehaviourSnapshot } from "./changes.js";
-export { ModelBehaviourRollups, computeHourRollups } from "./rollups.js";
+export { MODEL_BEHAVIOUR_ROLLUP_VERSION, ModelBehaviourRollups, computeHourRollups, ensureRollupVersion } from "./rollups.js";
 export { PromptChangeTracker } from "./prompt-changes.js";
 export { BEHAVIOUR_GROUP_BYS, BEHAVIOUR_WINDOWS, type ModelBehaviourQuery } from "./read.js";
 export { resolveCodeVersion } from "./version.js";
-
-/** Rollup hours a read recomputes before answering (the background drain does the rest). */
 
 /** What the console server needs. */
 export interface ModelBehaviourApi {
@@ -46,9 +44,21 @@ export interface ModelBehaviourServiceOptions {
   rollupIntervalMs?: number;
 }
 
+/**
+ * The family a config entry groups under on the page: `[models.<key>].family` when
+ * set, else its wire model id (`[models.<key>].id`), so entries serving the same
+ * upstream model (a direct and a proxied route, say) group together with no extra
+ * config; a key no longer configured stays on its own.
+ */
+export function behaviourFamilyOf(models: Record<string, { id?: string; family?: string } | undefined>, key: string): string {
+  const entry = models[key];
+  return entry?.family ?? entry?.id ?? key;
+}
+
 export class ModelBehaviourService implements ModelBehaviourApi {
   readonly rollups: ModelBehaviourRollups;
   readonly prompts: PromptChangeTracker;
+  private auditProgress: (() => AuditBacklogProgress | null) | undefined;
 
   constructor(private readonly options: ModelBehaviourServiceOptions) {
     const checkKind = (code: string, agent: string | null) => options.catalogue.get(code, agent)?.kind;
@@ -112,14 +122,21 @@ export class ModelBehaviourService implements ModelBehaviourApi {
     }
   }
 
+  /** The offline audit worker's progress source (set when the worker runs). */
+  setAuditProgressSource(source: (() => AuditBacklogProgress | null) | undefined): void {
+    this.auditProgress = source;
+  }
+
   private readContext() {
-    const models = this.options.config.models as Record<string, { family?: string } | undefined>;
+    const models = this.options.config.models as Record<string, { id?: string; family?: string } | undefined>;
     return {
       storage: this.options.storage,
       agentForTimelineKey: this.options.agentForTimelineKey,
-      familyOf: (model: string) => models[model]?.family ?? model,
+      familyOf: (model: string) => behaviourFamilyOf(models, model),
+      modelInfo: (model: string): BehaviourModelInfo => ({ id: models[model]?.id ?? null, family: models[model]?.family ?? null }),
       checkKind: (code: string) => this.options.catalogue.get(code)?.kind,
       pendingHours: () => this.rollups.pendingHours(),
+      auditProgress: () => this.auditProgress?.() ?? null,
     };
   }
 

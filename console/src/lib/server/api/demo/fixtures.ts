@@ -1346,7 +1346,7 @@ function sessionDecisionsFixture(id: string, now: number): unknown {
 /** The demo session with a refusal redo, a hard refusal and a nudge. */
 export const DEMO_REFUSAL_SESSION = 'ses_rf7w3k';
 const TIME_KEYS = new Set([
-	'ts', 'timestamp', 'createdAt', 'startedAt', 'updatedAt', 'completedAt', 'since', 'until', 'bucket'
+	'ts', 'timestamp', 'createdAt', 'startedAt', 'updatedAt', 'completedAt', 'since', 'until', 'bucket', 'countedAt'
 ]);
 
 /** Shift every epoch-ms field named in TIME_KEYS by `delta` (deep copy). */
@@ -1372,11 +1372,17 @@ function refusalSessionDecisions(now: number): unknown {
 	return shiftTimes(demoRefusalSession.decisions, now - 9 * MIN - completed);
 }
 
-/** The behaviour sample, moved forward by whole weeks (keeps hour/day/week alignment). */
-function modelBehaviourFixture(now: number): Record<string, unknown> {
+/**
+ * The behaviour sample, moved forward by whole weeks (keeps hour/day/week
+ * alignment). The sample is the overview; a chart pick (`metric`) swaps in that
+ * metric's series, which the generator stored beside it (`demoSeries`).
+ */
+function modelBehaviourFixture(now: number, metric: string | null = null): Record<string, unknown> {
 	const WEEK = 7 * DAY;
 	const delta = Math.floor((now - demoModelBehaviour.until) / WEEK) * WEEK;
-	return shiftTimes(demoModelBehaviour, delta) as Record<string, unknown>;
+	const { demoSeries, ...body } = demoModelBehaviour as typeof demoModelBehaviour & { demoSeries?: Record<string, unknown> };
+	const series = metric ? demoSeries?.[metric] : undefined;
+	return shiftTimes(series ? { ...body, metric, series } : body, delta) as Record<string, unknown>;
 }
 
 // ── Routing ─────────────────────────────────────────────────────────────────
@@ -1422,7 +1428,7 @@ export function resolveFixture(pathname: string, params: URLSearchParams): unkno
 		case '/api/cost-overview':
 			return costOverviewFixture();
 		case '/api/models/behaviour':
-			return modelBehaviourFixture(now);
+			return modelBehaviourFixture(now, params.get('metric'));
 		case '/api/models/behaviour/incidents':
 			return modelBehaviourFixture(now).incidents;
 	}

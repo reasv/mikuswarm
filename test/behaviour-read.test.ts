@@ -7,10 +7,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { SessionManager } from "../src/agent/index.js";
-import { ModelBehaviourService } from "../src/behaviour/index.js";
+import { ModelBehaviourService, behaviourFamilyOf } from "../src/behaviour/index.js";
 import { recordBehaviourChanges } from "../src/behaviour/changes.js";
-import { collapseMarkers, readBehaviourIncidents, readModelBehaviour, type ModelBehaviourQuery } from "../src/behaviour/read.js";
-import { ModelBehaviourRollups } from "../src/behaviour/rollups.js";
+import {
+  INCIDENT_SCAN_CAP,
+  collapseMarkers,
+  readBehaviourIncidents,
+  readModelBehaviour,
+  type ModelBehaviourQuery,
+} from "../src/behaviour/read.js";
+import { MODEL_BEHAVIOUR_ROLLUP_VERSION, ModelBehaviourRollups, ensureRollupVersion } from "../src/behaviour/rollups.js";
 import type { BehaviourChangeEvent } from "../src/behaviour/types.js";
 import type { Logger } from "../src/observability/index.js";
 import { createObservabilityServer } from "../src/observability/server/index.js";
@@ -62,7 +68,9 @@ test("scorecard: one row per model, rates with raw counts, min-sample flag", asy
     assert.equal(b.cells.messages_with_style_hit!.rate, 0.5);
     assert.equal(b.cells.style_hits_per_1k_tokens!.rate, (1 / 7) * 1000);
     assert.equal(b.cells.refusals_judged_per_request!.rate, 0);
-    assert.equal(r.rates.length, 9);
+    assert.equal(r.rates.length, 12);
+    assert.equal(b.cells.failed_attempts_per_session!.count, 1);
+    assert.equal(a.cells.failed_attempts_per_session!.count, 4);
     assert.deepEqual(r.facets, {
       agents: ["agent_a", "agent_b"],
       sites: ["caption", "default", "proactive"],
@@ -142,7 +150,10 @@ test("series: the selected rate per bucket and group; bucket width by window", a
     );
     assert.equal(readModelBehaviour(ctxFor(storage), q({ window: "7d" })).series.bucketMs, 24 * HOUR);
     assert.equal(readModelBehaviour(ctxFor(storage), q({ window: "all" })).series.bucketMs, 7 * 24 * HOUR);
-    assert.equal(readModelBehaviour(ctxFor(storage), q({ metric: "nope" })).metric, "refusals_hard_per_request");
+    // An unknown metric (or none) is the overview: no per-group series.
+    const overview = readModelBehaviour(ctxFor(storage), q({ metric: "nope" }));
+    assert.equal(overview.metric, null);
+    assert.deepEqual(overview.series.points, []);
   });
 });
 
@@ -318,4 +329,177 @@ test("reads never recompute: pending hours are served later by the drain", async
     await storage.waitForIdle();
     storage.close();
   }
+});
+
+/** Judged rows on s1 as the live gate and the offline audit write them (no chat text). */
+async function addJudgedRows(storage: Storage): Promise<void> {
+  // A judged refusal the offline audit found on model_b (group prefix `audit:`), and
+  // one the live gate found; the no_reply intent of a judged ending after a nudge.
+  for (const [group, reason] of [["audit:g7", "safety"], ["g8", "distillation"]] as const) {
+    const id = await storage.insertDecisionEvaluation({
+      ts: H + 6_000, decision_group: group, point: "checks", agent_session_id: "s1", source: "model",
+      verdict_json: JSON.stringify({ fired: [{ code: "op_refusal", kind: "refusal" }], results: [] }),
+      checkpoint: "send", branch_no: 0, tool_call_id: `tc-${group}`, consequence: "observed",
+    });
+    await storage.insertRefusalEvent({
+      ts: H + 6_100, agentSessionId: "s1", site: "default", servedModel: "model_b", kind: "soft", checkCode: "op_refusal",
+      reason, method: "judged", source: "message", probability: 0.9, checkpoint: "send", outcome: "observed",
+      decisionEvaluationId: id,
+    });
+  }
+  await storage.insertDecisionEvaluation({
+    ts: H + 6_200, decision_group: "audit:g9", point: "checks", agent_session_id: "s1", source: "model",
+    verdict_json: JSON.stringify({
+      fired: [{ code: "no_reply_intent", kind: "contract" }],
+      results: [{ id: "no_reply_intent__text", code: "no_reply_intent", choice: "abandoned_written_reply", fired: true }],
+    }),
+    checkpoint: "ending", branch_no: 0, tool_call_id: "nr1", consequence: "observed",
+  });
+  await new ModelBehaviourRollups({ storage, agentForTimelineKey: agentFor }).flush();
+}
+
+test("chart: the overview by default, every metric selectable with its total, keyed families per key", async () => {
+  await withData(async (storage) => {
+    const r = readModelBehaviour(ctxFor(storage), q());
+    assert.equal(r.metric, null);
+    assert.equal(r.overview.bucketMs, HOUR);
+    assert.equal(r.overview.metrics.length, r.rates.length);
+    const nudged = r.overview.metrics.find((m) => m.id === "nudged_per_session")!;
+    assert.deepEqual([nudged.count, nudged.denominator], [2, 3]);
+    assert.deepEqual(nudged.points, [{ bucket: H, count: 2, denominator: 3, rate: 2 / 3 }]);
+    // An empty metric is explicit: a zero count over a real denominator.
+    const judged = r.charts.find((c) => c.id === "refusals_judged_per_request")!;
+    assert.deepEqual([judged.kind, judged.count, judged.denominator], ["rate", 0, 4]);
+    assert.deepEqual(
+      r.charts.filter((c) => c.kind === "count").map((c) => [c.id, c.count]),
+      [["mix:failure_type", 5], ["mix:after_correction", 0], ["mix:no_reply_intent", 0], ["mix:judged_refusal_reason", 0]],
+    );
+
+    const types = readModelBehaviour(ctxFor(storage), q({ metric: "mix:failure_type" }));
+    assert.equal(types.metric, "mix:failure_type");
+    assert.equal(types.series.kind, "count");
+    assert.deepEqual(types.series.points.map((p) => [p.bucket, p.group, p.count]), [[H, "empty", 4], [H, "text_only", 1]]);
+    // A family's series follows the selected group.
+    const typesB = readModelBehaviour(ctxFor(storage), q({ metric: "mix:failure_type", selected: "model_b" }));
+    assert.deepEqual(typesB.series.points.map((p) => [p.group, p.count]), [["text_only", 1]]);
+    assert.equal(typesB.charts.find((c) => c.id === "mix:failure_type")!.count, 1);
+  });
+});
+
+test("judged refusals from the live gate and the offline audit; mix tables per group", async () => {
+  await withData(async (storage) => {
+    await addJudgedRows(storage);
+    const r = readModelBehaviour(ctxFor(storage), q());
+    const b = r.scorecard.find((row) => row.group === "model_b")!;
+    assert.equal(b.cells.refusals_judged_per_request!.count, 2);
+    assert.equal(b.cells.no_reply_abandoned_per_judged!.rate, 1);
+    const mix = Object.fromEntries(r.mix.map((t) => [t.id, t]));
+    assert.deepEqual(Object.keys(mix), ["failure_type", "after_correction", "no_reply_intent", "judged_refusal_reason"]);
+    assert.deepEqual(mix.judged_refusal_reason!.keys, ["distillation", "safety"]);
+    assert.deepEqual(
+      mix.judged_refusal_reason!.rows.map((row) => [row.group, row.total, row.counts]),
+      [["model_a", 0, {}], ["model_b", 2, { distillation: 1, safety: 1 }], ["cap_model", 0, {}]],
+    );
+    assert.deepEqual(mix.failure_type!.rows.find((row) => row.group === "model_a")!.counts, { empty: 4 });
+    assert.deepEqual(mix.no_reply_intent!.rows.find((row) => row.group === "model_b")!.counts, { abandoned_written_reply: 1 });
+    // The hard refusal reason stays out of the judged family.
+    assert.deepEqual(r.breakdown.refusals.byReason, [{ key: "distillation", count: 2 }, { key: "safety", count: 2 }]);
+    const series = readModelBehaviour(ctxFor(storage), q({ metric: "mix:judged_refusal_reason" }));
+    assert.deepEqual(series.series.points.map((p) => [p.group, p.count]), [["distillation", 1], ["safety", 1]]);
+  });
+});
+
+test("family: the configured family, else the wire model id; labels carry both", async () => {
+  const models = { model_a: { id: "vendor/one" }, model_b: { id: "vendor/one" }, cap_model: { id: "vendor/cap", family: "captioners" } };
+  assert.equal(behaviourFamilyOf(models, "model_a"), "vendor/one");
+  assert.equal(behaviourFamilyOf(models, "cap_model"), "captioners");
+  assert.equal(behaviourFamilyOf(models, "gone"), "gone");
+  await withData(async (storage) => {
+    const service = new ModelBehaviourService({
+      storage,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      config: { models } as any,
+      catalogue: { all: () => [], get: () => undefined, enabledFor: () => [] },
+      agentForTimelineKey: agentFor,
+    });
+    const fam = await service.read(q({ family: true }));
+    assert.deepEqual(fam.scorecard.map((row) => [row.group, row.members]), [
+      ["vendor/one", ["model_a", "model_b"]],
+      ["captioners", ["cap_model"]],
+    ]);
+    const plain = await service.read(q());
+    assert.deepEqual(plain.models, {
+      cap_model: { id: "vendor/cap", family: "captioners" },
+      model_a: { id: "vendor/one", family: null },
+      model_b: { id: "vendor/one", family: null },
+    });
+    const sel = await service.incidents(q({ family: true, selected: "vendor/one", window: "all" }));
+    assert.deepEqual(sel.rows.map((row) => row.sessionId), ["s2", "s1"]);
+  });
+});
+
+test("incident type filter narrows the walk itself: sparse types are found past many other sessions", async () => {
+  await withData(async (storage) => {
+    // Newer than s1/s2: sessions the audit judged with nothing fired (an unfired
+    // ending row each), and nudged-only sessions, together past the scan cap.
+    const n = INCIDENT_SCAN_CAP + 50;
+    for (let i = 0; i < n; i++) {
+      const id = `x${String(i).padStart(4, "0")}`;
+      await addSession(storage, id, { key: KEY_A, type: "default", createdAt: H + 10_000 + i });
+      await storage.insertDecisionEvaluation({
+        ts: H + 10_000 + i, decision_group: `audit:e${i}`, point: "checks", agent_session_id: id, source: "model",
+        verdict_json: JSON.stringify({ fired: [], results: [] }), checkpoint: "ending", branch_no: 0, tool_call_id: `nr${i}`,
+        consequence: "observed",
+      });
+      if (i % 10 === 0) await storage.setAgentSessionContract(id, { outcome: "recovered", nudges: 1, version: 1 });
+    }
+    const ctx = ctxFor(storage);
+    const refusals = readBehaviourIncidents(ctx, q({ window: "all", incidentType: "refusal" }));
+    assert.deepEqual(refusals.rows.map((r) => r.sessionId), ["s1"]);
+    assert.equal(refusals.nextCursor, null);
+    const redos = readBehaviourIncidents(ctx, q({ window: "all", incidentType: "redo" }));
+    assert.deepEqual(redos.rows.map((r) => r.sessionId), ["s2", "s1"]);
+    const nudges = readBehaviourIncidents(ctx, q({ window: "all", incidentType: "nudge", limit: 100 }));
+    assert.equal(nudges.rows.length, Math.ceil(n / 10) + 2);
+    assert.ok(nudges.rows.every((r) => r.types.includes("nudge")));
+    // Unfiltered: the unfired endings are not incidents, so the list is the same sessions.
+    const all = readBehaviourIncidents(ctx, q({ window: "all", limit: 100 }));
+    assert.deepEqual(all.rows.map((r) => r.sessionId), nudges.rows.map((r) => r.sessionId));
+    assert.equal(readBehaviourIncidents(ctx, q({ window: "all", incidentType: "ending" })).rows.length, 0);
+    await addJudgedRows(storage);
+    const endings = readBehaviourIncidents(ctx, q({ window: "all", incidentType: "ending" }));
+    assert.deepEqual(endings.rows.map((r) => [r.sessionId, r.types.includes("ending")]), [["s1", true]]);
+    // The same filter over HTTP (the console's query string).
+    const server = createObservabilityServer({
+      config: { enabled: true, bind: "127.0.0.1", port: 0 },
+      storage,
+      factory: {} as never,
+      sessions: new SessionManager(),
+      workspaceRoot: "/tmp",
+      logger: silentLogger,
+      modelBehaviour: { read: async (query) => readModelBehaviour(ctx, query), incidents: async (query) => readBehaviourIncidents(ctx, query) },
+    });
+    await server.start();
+    try {
+      const base = `http://127.0.0.1:${server.address()}`;
+      const body = (await (await fetch(`${base}/api/models/behaviour?window=all&type=refusal`)).json()) as { incidents: { rows: Array<{ sessionId: string }> } };
+      assert.deepEqual(body.incidents.rows.map((r) => r.sessionId), ["s1"]);
+      const unfiltered = (await (await fetch(`${base}/api/models/behaviour?window=all`)).json()) as { incidents: { rows: unknown[] } };
+      assert.equal(unfiltered.incidents.rows.length, 25);
+    } finally {
+      await server.stop();
+    }
+  });
+});
+
+test("rollup version: a bump re-marks computed hours once", async () => {
+  await withData(async (storage) => {
+    const pending = () => storage.read((db) => db.prepare(`select count(*) as n from model_behaviour_dirty_hours`).get() as { n: number }).n;
+    assert.equal(pending(), 0);
+    assert.equal(await storage.write((db) => ensureRollupVersion(db)), true);
+    assert.equal(pending(), 1);
+    assert.equal(await storage.write((db) => ensureRollupVersion(db)), false);
+    const stored = storage.read((db) => db.prepare(`select value from metadata where key = 'model_behaviour_rollup_version'`).get() as { value: string });
+    assert.equal(stored.value, String(MODEL_BEHAVIOUR_ROLLUP_VERSION));
+  });
 });

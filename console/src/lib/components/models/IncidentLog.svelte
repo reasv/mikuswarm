@@ -1,19 +1,22 @@
 <script lang="ts">
 	import type { BehaviourIncidentRow } from '$lib/schemas';
-	import { INCIDENT_TYPES, incidentHref } from '$lib/model-behaviour-view';
+	import { INCIDENT_TYPES, INCIDENT_TYPE_LABELS, incidentHref } from '$lib/model-behaviour-view';
 	import { cn } from '$lib/utils';
 
 	// Incident log (spec REFUSAL-HANDLING §12.3 §4): newest first, one row per
 	// session (its refusals, nudges, redos, revisions and judged endings grouped),
 	// each linking to the session at the branch and tool call where it happened.
-	// Filterable by type; cursor-paginated ("load more" appends the next page).
+	// Filterable by type (the buttons are worded like the chips they select on; the
+	// server narrows its session walk to that type); cursor-paginated ("load more"
+	// appends the next page, also after a page that found nothing yet).
 	let {
 		rows,
 		hasMore,
 		loadingMore = false,
 		type,
 		onType,
-		onLoadMore
+		onLoadMore,
+		labelOf = (m: string) => m
 	}: {
 		rows: readonly BehaviourIncidentRow[];
 		hasMore: boolean;
@@ -21,7 +24,16 @@
 		type: string | null;
 		onType: (type: string | null) => void;
 		onLoadMore: () => void;
+		/** A model's display name (the label switch). */
+		labelOf?: (model: string) => string;
 	} = $props();
+	const CHIP_OF_TYPE: Record<string, Array<keyof BehaviourIncidentRow['chips']>> = {
+		refusal: ['refused'],
+		nudge: ['nudged'],
+		redo: ['redone'],
+		revision: ['revised', 'overridden'],
+		ending: ['endings']
+	};
 
 	const CHIP_LABELS: Array<[keyof BehaviourIncidentRow['chips'], string]> = [
 		['refused', 'refused'],
@@ -43,15 +55,29 @@
 		{#each INCIDENT_TYPES as t (t)}
 			<button
 				type="button"
+				aria-pressed={type === t}
+				data-testid={`incident-type-${t}`}
 				class={cn('rounded px-2 py-0.5', type === t ? 'bg-muted font-medium' : 'text-muted-foreground hover:bg-muted/60')}
-				onclick={() => onType(t)}>{t}</button
+				onclick={() => onType(type === t ? null : t)}>{INCIDENT_TYPE_LABELS[t]}</button
 			>
 		{/each}
 	</div>
 	{#if rows.length === 0}
 		<div class="rounded-lg border border-dashed p-3 text-xs text-muted-foreground" data-testid="incidents-empty">
-			No incidents in this window.
+			{#if type}
+				No {INCIDENT_TYPE_LABELS[type as keyof typeof INCIDENT_TYPE_LABELS] ?? type} incidents {hasMore ? 'among the sessions looked at so far' : 'in this window'}.
+			{:else}
+				No incidents {hasMore ? 'among the sessions looked at so far' : 'in this window'}.
+			{/if}
 		</div>
+		{#if hasMore}
+			<button
+				type="button"
+				class="rounded border px-2 py-1 text-xs hover:bg-muted disabled:opacity-50"
+				disabled={loadingMore}
+				onclick={onLoadMore}>{loadingMore ? 'Loading…' : 'Look further back'}</button
+			>
+		{/if}
 	{:else}
 		<div class="overflow-x-auto rounded-lg border">
 			<table class="w-full text-xs" data-testid="incidents">
@@ -77,12 +103,17 @@
 							<td class="px-2 py-1 font-mono text-[10px]">{row.agent ?? '—'}</td>
 							<td class="max-w-[12rem] truncate px-2 py-1" title={row.timelineKey}>{row.roomLabel}</td>
 							<td class="px-2 py-1 font-mono text-[10px]">{row.site}</td>
-							<td class="px-2 py-1 font-mono text-[10px]">{row.models.join(', ') || '—'}</td>
+							<td class="px-2 py-1 font-mono text-[10px]">{row.models.map(labelOf).join(', ') || '—'}</td>
 							<td class="px-2 py-1">
 								<span class="flex flex-wrap gap-1">
 									{#each CHIP_LABELS as [key, label] (key)}
 										{#if row.chips[key] > 0}
-											<span class="rounded bg-muted px-1 font-mono text-[9px]">{label} {row.chips[key]}</span>
+											<span
+												class={cn(
+													'rounded bg-muted px-1 font-mono text-[9px]',
+													type && CHIP_OF_TYPE[type]?.includes(key) && 'bg-sky-500/20 text-sky-700 dark:text-sky-300'
+												)}>{label} {row.chips[key]}</span
+											>
 										{/if}
 									{/each}
 								</span>
