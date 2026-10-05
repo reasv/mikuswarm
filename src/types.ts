@@ -144,6 +144,12 @@ export interface AttachmentMeta {
 
 export interface ReplyContext {
   externalId?: string;
+  /**
+   * The quoted message's agent session (spec SESSION-RECORDS §5) when it is a
+   * bot message sent from a session; rendered so a reply to a bot message
+   * carries the `read_session_record` argument in the quote itself.
+   */
+  agentSessionId?: string;
   sender?: SenderInfo;
   body?: string;
   htmlBody?: string;

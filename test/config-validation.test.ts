@@ -1411,3 +1411,41 @@ candidates = 100
     );
   });
 });
+
+// [session_records] (spec SESSION-RECORDS §10): valid values parse; bounds and
+// unknown keys are rejected like any other block.
+test("config: [session_records] parses with valid values", async () => {
+  const toml = `${BASE_CONFIG}
+[session_records]
+enabled = false
+max_tokens = 800
+max_turns = 2
+inject_on_reply = false
+timeout_ms = 30000
+`;
+  await withConfigDir(toml, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    assert.equal(config.session_records?.enabled, false);
+    assert.equal(config.session_records?.max_tokens, 800);
+    assert.equal(config.session_records?.max_turns, 2);
+    assert.equal(config.session_records?.inject_on_reply, false);
+    assert.equal(config.session_records?.timeout_ms, 30000);
+  });
+});
+
+for (const [line, label] of [
+  ["max_tokens = 10", "max_tokens below its minimum"],
+  ["max_turns = 0", "max_turns below 1"],
+  ["timeout_ms = 10", "timeout_ms below 1000"],
+  ["inject_on_mention = true", "an unknown key"],
+] as const) {
+  test(`config: [session_records] rejects ${label}`, async () => {
+    const toml = `${BASE_CONFIG}
+[session_records]
+${line}
+`;
+    await withConfigDir(toml, async (dir) => {
+      await assert.rejects(() => loadConfig(dir, { env: false }), /session_records|Invalid config/i);
+    });
+  });
+}

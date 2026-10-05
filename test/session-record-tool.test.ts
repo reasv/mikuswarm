@@ -4,6 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createSessionRecordTool, SummaryDraft } from "../src/tools/session-record-tool.ts";
+import { runToolViaPi, resultText } from "./helpers/pi-tool-exec.ts";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -15,6 +16,11 @@ function makeTool(maxTokens = 200) {
 
 async function call(tool: ReturnType<typeof createSessionRecordTool>, args: object) {
   return tool.execute("tc1", args, undefined as never);
+}
+
+/** Through pi's real tool execution: the wire-level toolResult (isError, terminate effect). */
+async function callViaPi(tool: ReturnType<typeof createSessionRecordTool>, args: Record<string, unknown>) {
+  return runToolViaPi([tool], "session_record_tool", args);
 }
 
 // ── flags ────────────────────────────────────────────────────────────────────
@@ -44,10 +50,11 @@ test("session_record_tool: create writes text to draft", async () => {
   assert.ok(draft.getContent().includes("Hello world."));
 });
 
-test("session_record_tool: create without file_text returns error", async () => {
+test("session_record_tool: create without file_text is an error on the wire", async () => {
   const { tool } = makeTool();
-  const res = await call(tool, { command: "create" });
+  const res = await callViaPi(tool, { command: "create" });
   assert.equal(res.isError, true);
+  assert.match(resultText(res), /create requires file_text/);
 });
 
 // ── token budget ─────────────────────────────────────────────────────────────
@@ -64,22 +71,20 @@ test("session_record_tool: create that exceeds budget is reverted atomically", a
   // Set a tiny token limit (10 tokens). A long file_text will exceed it.
   const { draft, tool } = makeTool(1);
   const longText = "x ".repeat(500); // Well over 1 token.
-  const res = await call(tool, { command: "create", file_text: longText });
+  const res = await callViaPi(tool, { command: "create", file_text: longText });
   assert.equal(res.isError, true);
   // Draft must be reverted — still uncreated.
   assert.equal(draft.isCreated(), false);
-  // Error text mentions "token budget" or "overage".
-  const text = res.content[0].type === "text" ? (res.content[0] as { text: string }).text : "";
-  assert.ok(text.includes("token"), `error should mention tokens: ${text}`);
+  const text = resultText(res);
+  assert.ok(text.includes("token budget"), `error should mention the token budget: ${text}`);
 });
 
-test("session_record_tool: budget error carries details with overage", async () => {
+test("session_record_tool: budget error states the overage", async () => {
   const { tool } = makeTool(1);
-  const res = await call(tool, { command: "create", file_text: "x ".repeat(100) });
+  const res = await callViaPi(tool, { command: "create", file_text: "x ".repeat(100) });
   assert.equal(res.isError, true);
-  const details = res.details as Record<string, unknown> | null;
-  assert.ok(details !== null, "details should be present on budget error");
-  assert.ok(typeof details.overage === "number" && (details.overage as number) > 0);
+  const m = /limit 1 \((\d+) over\)/.exec(resultText(res));
+  assert.ok(m && Number(m[1]) > 0, `expected the overage in: ${resultText(res)}`);
 });
 
 test("session_record_tool: budget applies per-edit — second edit can fail and first survives", async () => {
@@ -88,7 +93,7 @@ test("session_record_tool: budget applies per-edit — second edit can fail and 
   const res1 = await call(tool, { command: "create", file_text: "Short." });
   assert.ok(!res1.isError);
 
-  const res2 = await call(tool, {
+  const res2 = await callViaPi(tool, {
     command: "str_replace",
     old_str: "Short.",
     new_str: "w ".repeat(500),
@@ -160,9 +165,9 @@ test("session_record_tool: create with finalize:true terminates if within budget
 test("session_record_tool: budget error with finalize:true does not terminate", async () => {
   // Over budget errors should never terminate — the agent needs to recover.
   const { tool } = makeTool(1);
-  const res = await call(tool, { command: "create", file_text: "x ".repeat(100), finalize: true });
+  const res = await callViaPi(tool, { command: "create", file_text: "x ".repeat(100), finalize: true });
   assert.equal(res.isError, true);
-  assert.ok(!res.terminate, "budget error must not terminate even with finalize:true");
+  assert.equal(res.modelRequests, 2, "budget error must not terminate even with finalize:true");
 });
 
 // ── view on empty draft ───────────────────────────────────────────────────────
@@ -173,4 +178,20 @@ test("session_record_tool: view on empty draft returns placeholder message", asy
   assert.ok(!res.isError);
   const text = res.content[0].type === "text" ? (res.content[0] as { text: string }).text : "";
   assert.ok(text.includes("empty"), `expected 'empty' in view-empty response: ${text}`);
+});
+
+test("session_record_tool: str_replace on a missing string is an error on the wire", async () => {
+  const { tool } = makeTool(200);
+  await call(tool, { command: "create", file_text: "Line one." });
+  const res = await callViaPi(tool, { command: "str_replace", old_str: "absent", new_str: "x" });
+  assert.equal(res.isError, true);
+  assert.match(resultText(res), /old_str was not found/);
+});
+
+test("session_record_tool: finalize terminates the pi run without error", async () => {
+  const { tool } = makeTool(200);
+  await call(tool, { command: "create", file_text: "Line one." });
+  const res = await callViaPi(tool, { command: "finalize" });
+  assert.equal(res.isError, false);
+  assert.equal(res.modelRequests, 1, "finalize must end the run");
 });

@@ -12,6 +12,8 @@ export { SummaryDraft };
  * Behaviour:
  *   - Per-edit token budget: a mutation that would exceed `maxTokens` is atomically
  *     reverted and the error states the overage (current − limit).
+ *   - Every failure THROWS (pi-agent-core marks a tool result `isError` only on
+ *     a throw); a failed edit never terminates, even with `finalize: true`.
  *   - `finalize` on an empty draft is the "nothing worth recording" skip —
  *     terminates with no row written (caller inspects draft.isCreated()).
  *   - `finalize` on a non-empty draft terminates with terminate: true.
@@ -83,7 +85,7 @@ export function createSessionRecordTool(options: {
             : "(draft is empty — use create first)";
           return { content: [{ type: "text", text }], details: { command: "view" }, terminate: finalize };
         } catch (err) {
-          return errorResult(err);
+          throw toolError(err);
         }
       }
 
@@ -101,45 +103,37 @@ export function createSessionRecordTool(options: {
       try {
         if (args.command === "create") {
           if (args.file_text === undefined) {
-            return { content: [{ type: "text", text: "Error: create requires file_text." }], details: null, isError: true };
+            throw new Error("create requires file_text: session_record_tool(command: \"create\", file_text: \"...\").");
           }
           draft.create(args.file_text);
         } else if (args.command === "str_replace") {
           if (args.old_str === undefined) {
-            return { content: [{ type: "text", text: "Error: str_replace requires old_str." }], details: null, isError: true };
+            throw new Error("str_replace requires old_str (and new_str); command \"view\" shows the draft.");
           }
           draft.strReplace(args.old_str, args.new_str ?? "");
         } else {
           // insert
           if (args.insert_line === undefined) {
-            return { content: [{ type: "text", text: "Error: insert requires insert_line." }], details: null, isError: true };
+            throw new Error("insert requires insert_line (0 = before the first line) and new_str.");
           }
           draft.insert(args.insert_line, args.new_str ?? "");
         }
       } catch (err) {
         draft.restore(snapshot);
-        return errorResult(err);
+        throw toolError(err);
       }
 
-      // Token budget enforcement: revert atomically if over budget.
+      // Token budget enforcement: revert atomically if over budget. Thrown, so
+      // the call is an error on the wire and a `finalize: true` on it does not
+      // terminate.
       const currentTokens = draft.getTokenCount();
       if (currentTokens > maxTokens) {
         draft.restore(snapshot);
         const overage = currentTokens - maxTokens;
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                `Error: session record would exceed token budget. ` +
-                `Current: ${currentTokens} tokens, limit: ${maxTokens} tokens ` +
-                `(${overage} over). Shorten the record and try again.`,
-            },
-          ],
-          details: { command: args.command, tokens: currentTokens, limit: maxTokens, overage },
-          isError: true,
-          // Do NOT terminate even if finalize was true — the error needs handling.
-        };
+        throw new Error(
+          `the session record would exceed its token budget: ${currentTokens} tokens, ` +
+            `limit ${maxTokens} (${overage} over). The edit was reverted; shorten it and try again.`,
+        );
       }
 
       return {
@@ -159,7 +153,7 @@ export function createSessionRecordTool(options: {
   return tool;
 }
 
-function errorResult(err: unknown): { content: [{ type: "text"; text: string }]; details: null; isError: true } {
-  const message = err instanceof Error ? err.message : String(err);
-  return { content: [{ type: "text", text: `Error: ${message}` }], details: null, isError: true };
+/** A draft failure as a thrown tool error (pi marks `isError` only on a throw). */
+function toolError(err: unknown): Error {
+  return new Error(err instanceof Error ? err.message : String(err));
 }

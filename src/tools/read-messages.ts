@@ -40,17 +40,29 @@ function fmtTs(timestamp: number): string {
   }
 }
 
+/**
+ * The bracketed sender tag: `[you]` for own messages, plus the message's
+ * `agent_session_id` when it was sent from a session, so the
+ * `read_session_record` argument is in sight here too (spec SESSION-RECORDS §5).
+ */
+function senderTag(isSelf: boolean | undefined, agentSessionId: string | undefined): string {
+  const tags: string[] = [];
+  if (isSelf) tags.push("you");
+  if (agentSessionId) tags.push(`agent_session_id: ${agentSessionId}`);
+  return tags.length > 0 ? ` [${tags.join(", ")}]` : "";
+}
+
 /** Format a list of CanonicalChatEvents from storage as a simple text listing. */
 function formatStorageEvents(events: CanonicalChatEvent[]): string {
   if (events.length === 0) return "No messages found.";
   return events
     .map((e) => {
       const sender = e.sender.displayName ?? e.sender.username ?? e.sender.id;
-      const self = e.sender.isSelf ? " [you]" : "";
+      const tag = senderTag(e.sender.isSelf, e.agentSessionId);
       const note = e.crossChannel
         ? ` [cross-channel note: ${e.crossChannel.note}]`
         : "";
-      return `[${fmtTs(e.timestamp)}] ${sender}${self}: ${e.body}${note}`;
+      return `[${fmtTs(e.timestamp)}] ${sender}${tag}: ${e.body}${note}`;
     })
     .join("\n");
 }
@@ -269,8 +281,12 @@ export function createReadMessagesTool(context: ReadMessagesToolContext): AgentT
             : undefined;
           if (editedBody !== undefined) summary.body = editedBody;
           const senderLabel = summary.sender.displayName ?? summary.sender.id;
+          const sessionIds = activeTimelineKey
+            ? context.storage?.getAgentSessionIdsByExternalIds(activeTimelineKey, [summary.externalId])
+            : undefined;
+          const tag = senderTag(false, sessionIds?.get(summary.externalId));
           return {
-            content: [{ type: "text", text: `[${fmtTs(summary.timestamp)}] ${senderLabel}: ${summary.body}` }],
+            content: [{ type: "text", text: `[${fmtTs(summary.timestamp)}] ${senderLabel}${tag}: ${summary.body}` }],
             details: summary,
           };
         }
@@ -288,9 +304,15 @@ export function createReadMessagesTool(context: ReadMessagesToolContext): AgentT
           };
         }
 
+        const sessionIds = activeTimelineKey
+          ? context.storage?.getAgentSessionIdsByExternalIds(
+              activeTimelineKey,
+              result.messages.map((m) => m.externalId),
+            )
+          : undefined;
         const lines = result.messages.map((m) => {
           const sender = m.sender.displayName ?? m.sender.id;
-          return `[${fmtTs(m.timestamp)}] ${sender}: ${m.body}`;
+          return `[${fmtTs(m.timestamp)}] ${sender}${senderTag(false, sessionIds?.get(m.externalId))}: ${m.body}`;
         });
 
         const pagination: string[] = [];

@@ -183,6 +183,7 @@ function renderReply(reply: ReplyContext): string {
   }
   if (reply.timestamp) pairs.push(["time", formatAgentTimestamp(reply.timestamp)]);
   if (reply.externalId) pairs.push(["external_id", reply.externalId]);
+  if (reply.agentSessionId) pairs.push(["agent_session_id", reply.agentSessionId]);
 
   const innerParts: string[] = [];
   if (reply.body && reply.body.trim().length > 0) innerParts.push(escapeXml(reply.body));

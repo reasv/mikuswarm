@@ -100,7 +100,7 @@ export function createToolSearchTool(context: ToolSearchContext): AgentTool {
         if (terms.length === 0) throw new Error("Empty tool_search query.");
         const maxResults = args.max_results ?? DEFAULT_MAX_RESULTS;
         // Harness-only tools are excluded from tool_search (CONTRACT §2).
-      const scored = registry
+        const scored = registry
           .deferredTools()
           .filter((tool) => !(tool as { harnessOnly?: boolean }).harnessOnly)
           .map((tool) => {

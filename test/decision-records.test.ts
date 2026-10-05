@@ -97,6 +97,31 @@ test("records state: record is clipped with marker when it cannot fit", () => {
   assert.match(s.record, /\[record truncated\]$/, "truncation marker present");
 });
 
+test("records state: the record's own bot message survives packing at its place", () => {
+  // The record's message is the oldest of 30; a tight budget drops the old chat
+  // but never that message, and it keeps its timeline position (first).
+  const many: RecordsInput["recentChat"] = [
+    { from: "Miku", text: "Found X and Y.", self: true, ofRecord: true },
+    ...Array.from({ length: 29 }, (_, i) => ({ from: "User", text: `message ${i} ${"pad ".repeat(10)}` })),
+  ];
+  const s = recordsPoint.state(input({ recentChat: many }), 120) as any;
+  assert.ok(s.recent_chat.length < 30, "packed");
+  assert.deepEqual(s.recent_chat[0], { from: "Miku", text: "Found X and Y.", self: true });
+  assert.match(s.recent_chat.at(-1).text, /^message 28/, "newest kept");
+  assert.ok(!JSON.stringify(s).includes("ofRecord"), "the marker is never sent");
+  assert.equal(s.record, input().record, "record kept whole");
+});
+
+test("records state: a long record is clipped around the record's own message", () => {
+  const chat: RecordsInput["recentChat"] = [
+    { from: "Miku", text: "Done, see the file.", self: true, ofRecord: true },
+    { from: "User", text: "thanks" },
+  ];
+  const s = recordsPoint.state(input({ recentChat: chat, record: "r".repeat(20_000) }), 300) as any;
+  assert.deepEqual(s.recent_chat, [{ from: "Miku", text: "Done, see the file.", self: true }]);
+  assert.match(s.record, /record truncated\]$/);
+});
+
 test("records state: recent_chat packed newest-first when budget is tight", () => {
   // 30 messages × ~8 tokens each ≈ 240 tokens; with record+request ≈ 260 total.
   // Budget=50 forces packNewest to drop oldest messages.
@@ -150,8 +175,8 @@ test("records resolve: custom inject_threshold on settings", () => {
 });
 
 test("records resolve: threshold calibrated via ThresholdFn", () => {
-  // ThresholdFn overrides "relevant" → 0.9
-  const highThreshold = (name: string, value: number) => (name === "relevant" ? 0.9 : value);
+  // Calibration is keyed by the threshold name, like routing's min_confidence.
+  const highThreshold = (name: string, value: number) => (name === "inject_threshold" ? 0.9 : value);
   const v = recordsPoint.resolve({ relevant: noul(0.8) }, input(), highThreshold, settings);
   assert.equal(v?.inject, false, "0.8 below calibrated 0.9");
   const above = recordsPoint.resolve({ relevant: noul(0.95) }, input(), highThreshold, settings);
@@ -465,6 +490,51 @@ test("engine + records: stateJson matches sent body in the client shrink-and-reb
   assert.ok(row.stateJson.length < bigRecord.length, "record was clipped by the budget");
 });
 
+test("engine + records: after a fall-over, stateJson is the state the serving member received", async () => {
+  // The head fails with a 500; the chain falls over to a member with a smaller
+  // state budget, which gets a differently clipped state. The row must carry
+  // that member's state, not the head's.
+  const calls: Array<{ model: string; state: unknown }> = [];
+  const { fn } = fakeFetch([
+    (call) => {
+      calls.push({ model: call.body.model, state: call.body.state });
+      return j(500, { error: "upstream down" });
+    },
+    (call) => {
+      calls.push({ model: call.body.model, state: call.body.state });
+      return j(200, relevantBody(0.8));
+    },
+  ]);
+  const config = baseConfig({
+    models: {
+      decider: decider({ fallback: ["backup"] }),
+      backup: decider({ id: "vendor/backup-1", decision: { state_budget_tokens: 1500 } }),
+    },
+    decisions: { enabled: true, model: "decider", records: { enabled: true, min_state_tokens: 100 } },
+  });
+  const { engine, evaluations } = makeEngine(config, fn);
+  await engine.evaluate(recordsPoint, input({ record: "r".repeat(30000) }), ctx);
+  assert.equal(evaluations.length, 1);
+  const row = evaluations[0]!;
+  assert.equal(row.source, "model");
+  assert.equal(row.servedModel, "backup");
+  const served = calls.filter((c) => c.model === "vendor/backup-1").at(-1)!;
+  const head = calls.find((c) => c.model === "vendor/decider-1")!;
+  assert.ok(head, "the head was tried first");
+  assert.notEqual(JSON.stringify(head.state), JSON.stringify(served.state), "the two members got different states");
+  assert.equal(row.stateJson, JSON.stringify(served.state));
+});
+
+test("engine + records: calibration overrides inject_threshold per serving member", async () => {
+  const { fn } = fakeFetch([() => j(200, relevantBody(0.8))]);
+  const config = recordsConfig();
+  config.decisions.calibration = { decider: { "records.inject_threshold": 0.9 } };
+  const { engine } = makeEngine(config, fn);
+  const out = await engine.evaluate(recordsPoint, input(), ctx);
+  assert.equal(out.source, "model");
+  assert.equal(out.verdict.inject, false, "0.8 is below the calibrated 0.9");
+});
+
 test("engine + records: no-request fallbacks (disabled) have stateJson=null and questionsJson=null", async () => {
   // Disabled point never sends a request; spec §8 says state/questions must be null.
   const config = recordsConfig();
@@ -514,8 +584,9 @@ test("selectRecordsToInject: injects candidates above threshold, sorted by relev
   assert.equal(result.decisionGroup, evaluations[0]!.decisionGroup);
 });
 
-test("selectRecordsToInject: reply target at low relevance injected via fallback (CONTRACT decision 8)", async () => {
-  // Relevance 0.3 (below threshold) but isReplyTarget=true → fallback injects it
+test("selectRecordsToInject: a reply target the model judges below threshold is not injected", async () => {
+  // Relevance 0.3 is a confident model verdict (below threshold), not a failure,
+  // so the reply-target fallback does not apply.
   const body = relevantBody(0.3);
   const { fn } = fakeFetch([() => j(200, body)]);
   const config = recordsConfig();
@@ -630,7 +701,9 @@ test("validateDecisionsConfig: records capacity warning when max_in_flight is to
     decisions: {
       enabled: true,
       model: "decider",
-      records: { enabled: true, candidates: 3 }, // needs 3+2=5 in flight
+      // reply target + 3 candidates, plus routing on the same chain: 5 in flight
+      records: { enabled: true, candidates: 3 },
+      routing: { enabled: true },
     },
   };
   const warnings: Array<[string, Record<string, unknown>]> = [];
@@ -640,6 +713,46 @@ test("validateDecisionsConfig: records capacity warning when max_in_flight is to
   assert.equal(cap![1]["maxInFlight"], 2);
   assert.equal(cap![1]["needed"], 5);
   assert.match(String(cap![1]["hint"]), /max_in_flight/);
+});
+
+test("validateDecisionsConfig: records capacity uses the scheduler default for an implicit group", () => {
+  // No [rate_limits.llm."decision:decider"] at all: the implicit group runs at
+  // the scheduler default of 2, below the 4 records requests of one trigger.
+  const config: any = {
+    models: { decider: decider() },
+    decisions: { enabled: true, model: "decider", records: { enabled: true, candidates: 3 } },
+  };
+  const warnings: Array<[string, Record<string, unknown>]> = [];
+  validateDecisionsConfig(config, { warn: (e, f) => warnings.push([e, f]) });
+  const cap = warnings.find(([e]) => e === "decisions_records_capacity_low");
+  assert.ok(cap, "capacity warning emitted for the implicit group");
+  assert.equal(cap![1]["group"], "decision:decider");
+  assert.equal(cap![1]["maxInFlight"], 2);
+  assert.equal(cap![1]["needed"], 4);
+});
+
+test("validateDecisionsConfig: routing on its own chain does not load the records group", () => {
+  const config: any = {
+    models: { decider: decider(), router: decider() },
+    rate_limits: { llm: { "decision:decider": { max_in_flight: 4 } } },
+    decisions: {
+      enabled: true,
+      model: "decider",
+      records: { enabled: true, candidates: 3 },
+      routing: { enabled: true, model: "router" },
+    },
+  };
+  const warnings: Array<[string, Record<string, unknown>]> = [];
+  validateDecisionsConfig(config, { warn: (e, f) => warnings.push([e, f]) });
+  assert.equal(warnings.find(([e]) => e === "decisions_records_capacity_low"), undefined);
+});
+
+test("validateDecisionsConfig: min_confidence under [decisions.records] is rejected", () => {
+  const config: any = {
+    models: { decider: decider() },
+    decisions: { enabled: true, model: "decider", records: { enabled: true, min_confidence: 0.7 } },
+  };
+  assert.throws(() => validateDecisionsConfig(config), /records\.min_confidence .*inject_threshold/);
 });
 
 test("validateDecisionsConfig: no capacity warning when max_in_flight is sufficient", () => {

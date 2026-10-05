@@ -2070,20 +2070,21 @@ const SeedingSchema = StrictObject({
   update_unmodified: Type.Optional(Type.Boolean()),
 });
 
-// Session records (spec SESSION-RECORDS §8, CONTRACT §7). Default-on; absent block
+// Session records (spec SESSION-RECORDS §3, §6.1, §10). Default-on; absent block
 // behaves as enabled = true with all defaults from 00-defaults.toml.
 const SessionRecordsSchema = StrictObject({
-  // Master switch: when false, no record is written and no injection occurs.
+  // Master switch: when false, no record turn runs and no record is injected.
   enabled: Type.Optional(Type.Boolean()),
-  // Token cap for a single session record (summary_tool analogue). Default 1500.
+  // session_record_tool draft budget (per-edit check, like summary_tool). Default 1500.
   max_tokens: Type.Optional(Type.Integer({ minimum: 64 })),
-  // Max assistant turns the harness waits for session_record_tool finalization.
-  // Default 4. Exceeding this: record turn aborts without writing a row.
+  // Record-turn assistant turns allowed before giving up without a record (§3.2).
+  // Default 4.
   max_turns: Type.Optional(Type.Integer({ minimum: 1 })),
-  // When true (default), an available record is injected at the start of a reply
-  // session for the same timeline key (same as inject_on_reply in spec §5).
+  // When true (default), a reply to a bot message injects that message's session
+  // record into the new session (spec §6.1, the no-decision-model rule).
   inject_on_reply: Type.Optional(Type.Boolean()),
-  // Timeout for the entire record turn in milliseconds. Default 60000.
+  // Record production deadline in ms; past it the record is abandoned and waiting
+  // triggers proceed without it (§3.2). Default 60000.
   timeout_ms: Type.Optional(Type.Integer({ minimum: 1000 })),
 });
 
@@ -2346,7 +2347,7 @@ export const AppConfigSchema = StrictObject({
   // Default mode: "reconcile". Default update_unmodified: true. Absent block behaves
   // as mode="reconcile", update_unmodified=true (the safe, full-feature default).
   seeding: Type.Optional(SeedingSchema),
-  // Session records (spec SESSION-RECORDS §8). Default-on; absent block = all defaults.
+  // Session records (spec SESSION-RECORDS §10). Default-on; absent block = all defaults.
   session_records: Type.Optional(SessionRecordsSchema),
 });
 

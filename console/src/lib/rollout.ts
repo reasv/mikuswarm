@@ -1,4 +1,5 @@
 import type { ContextMessageWire, DecisionEvaluation, ImageRef } from '$lib/schemas';
+import { groupDecisions } from '$lib/decisions';
 
 /**
  * Helpers for the rollout renderer (spec §10b). The persisted transcript holds
@@ -239,11 +240,57 @@ export function isHarnessMessage(m: RolloutMsg): boolean {
 /**
  * One item in the flat render plan built by `buildRolloutPlan`. Either a normal
  * rollout message (by index into the original array) or a decision-group card to
- * insert inline.
+ * insert inline. `injected` (records point) is what the rollout shows was
+ * injected for the group; undefined when the rollout has no messages yet.
  */
 export type RenderItem =
 	| { type: 'message'; index: number; msg: RolloutMsg }
-	| { type: 'decision'; decisionGroup: string; evaluations: DecisionEvaluation[] };
+	| {
+			type: 'decision';
+			decisionGroup: string;
+			evaluations: DecisionEvaluation[];
+			injected?: string[];
+	  };
+
+/** One harness `read_session_record` injection whose result was not an error. */
+interface RecordInjection {
+	sessionId: string;
+	decisionGroup?: string;
+	text: string;
+}
+
+function recordInjections(msgs: readonly RolloutMsg[]): RecordInjection[] {
+	const results = collectToolResults(msgs);
+	const out: RecordInjection[] = [];
+	for (const m of msgs) {
+		const h = getHarness(m);
+		if (h?.kind !== 'injection' || m.role !== 'assistant') continue;
+		for (const block of assistantBlocks(m.content)) {
+			if (block.type !== 'toolCall' || block.name !== 'read_session_record') continue;
+			const args = block.arguments as Record<string, unknown> | null | undefined;
+			const sessionId = args && typeof args.session_id === 'string' ? args.session_id : null;
+			const result = results.get(block.id);
+			// A failed injection (the record vanished, the session was not visible)
+			// gave the session nothing: it is not a record given.
+			if (!sessionId || !result || result.isError === true) continue;
+			out.push({ sessionId, decisionGroup: h.decisionGroup, text: contentText(result.content) });
+		}
+	}
+	return out;
+}
+
+/**
+ * Per decision group, the session ids the transcript shows were injected for it
+ * (successful harness `read_session_record` calls carrying that group).
+ */
+export function injectedByDecisionGroup(messages: readonly unknown[]): Map<string, string[]> {
+	const out = new Map<string, string[]>();
+	for (const inj of recordInjections(messages.map(asMsg))) {
+		if (!inj.decisionGroup) continue;
+		out.set(inj.decisionGroup, [...(out.get(inj.decisionGroup) ?? []), inj.sessionId]);
+	}
+	return out;
+}
 
 /**
  * Build the flat render plan for a rollout: interleave decision cards at the right
@@ -261,68 +308,42 @@ export function buildRolloutPlan(
 	messages: readonly RolloutMsg[],
 	evaluations: readonly DecisionEvaluation[]
 ): RenderItem[] {
-	// Group evaluations by decisionGroup.
-	const groupMap = new Map<string, DecisionEvaluation[]>();
-	for (const ev of evaluations) {
-		const arr = groupMap.get(ev.decisionGroup) ?? [];
-		arr.push(ev);
-		groupMap.set(ev.decisionGroup, arr);
+	const groupMap = groupDecisions(evaluations);
+	const injectedByGroup = injectedByDecisionGroup(messages);
+	const card = (dg: string, evs: DecisionEvaluation[]): RenderItem => ({
+		type: 'decision',
+		decisionGroup: dg,
+		evaluations: evs,
+		...(messages.length > 0 ? { injected: injectedByGroup.get(dg) ?? [] } : {})
+	});
+
+	const matched = new Set<string>();
+	for (const m of messages) {
+		const h = getHarness(m);
+		if (h?.kind === 'injection' && h.decisionGroup) matched.add(h.decisionGroup);
 	}
 
-	// Find the index of the first non-harness-injection message ("turn 1").
-	// The record-turn user prompt is NOT turn 1 (it's at the end), so filter
-	// based on the injection kind specifically.
-	let turn1Index = messages.length; // default: no real turns
-	for (let i = 0; i < messages.length; i++) {
-		const h = getHarness(messages[i]);
-		if (!h || h.kind !== 'injection') {
-			turn1Index = i;
-			break;
-		}
-	}
-
-	// Track which groups have been placed.
 	const placed = new Set<string>();
-
-	// Build the plan.
 	const plan: RenderItem[] = [];
 
-	// Before turn 1: insert groups with no matching injection.
+	// Groups with no matching injection come first, before turn 1.
 	for (const [dg, evs] of groupMap) {
-		const hasMatch = messages.some((m) => {
-			const h = getHarness(m);
-			return h?.kind === 'injection' && h.decisionGroup === dg;
-		});
-		if (!hasMatch) {
-			plan.push({ type: 'decision', decisionGroup: dg, evaluations: evs });
-			placed.add(dg);
-		}
+		if (matched.has(dg)) continue;
+		plan.push(card(dg, evs));
+		placed.add(dg);
 	}
 
 	for (let i = 0; i < messages.length; i++) {
 		const msg = messages[i];
 		const h = getHarness(msg);
-
-		// If this is a harness injection with a decisionGroup, and that group has not
-		// been placed yet, insert its card right before this message.
+		// A matched group's card goes right before its first injection.
 		if (h?.kind === 'injection' && h.decisionGroup && !placed.has(h.decisionGroup)) {
 			const evs = groupMap.get(h.decisionGroup);
 			if (evs) {
-				plan.push({ type: 'decision', decisionGroup: h.decisionGroup, evaluations: evs });
+				plan.push(card(h.decisionGroup, evs));
 				placed.add(h.decisionGroup);
 			}
 		}
-
-		// Before turn 1: insert any groups that weren't placed above (redundant safety).
-		if (i === turn1Index) {
-			for (const [dg, evs] of groupMap) {
-				if (!placed.has(dg)) {
-					plan.push({ type: 'decision', decisionGroup: dg, evaluations: evs });
-					placed.add(dg);
-				}
-			}
-		}
-
 		plan.push({ type: 'message', index: i, msg });
 	}
 
@@ -330,33 +351,19 @@ export function buildRolloutPlan(
 }
 
 /**
- * Extract the records given to a session from its transcript: pairs of
- * (harness-injection toolCall, toolResult) where the call name is
- * `read_session_record`. Returns `{ sessionId, text }` for each.
+ * The records given to a session (spec SESSION-RECORDS §8): its harness
+ * `read_session_record` injections that succeeded, with the text the session
+ * saw. Failed injections are left out.
  */
 export function extractRecordsGiven(
 	transcript: readonly unknown[]
 ): Array<{ sessionId: string; text: string }> {
-	const msgs = transcript.map(asMsg);
-	const results = collectToolResults(msgs);
-	const out: Array<{ sessionId: string; text: string }> = [];
-	for (const m of msgs) {
-		const h = getHarness(m);
-		if (h?.kind !== 'injection') continue;
-		if (m.role !== 'assistant') continue;
-		const blocks = assistantBlocks(m.content);
-		for (const block of blocks) {
-			if (block.type !== 'toolCall') continue;
-			if (block.name !== 'read_session_record') continue;
-			const args = block.arguments as Record<string, unknown> | null | undefined;
-			const sessionId = args && typeof args.session_id === 'string' ? args.session_id : null;
-			if (!sessionId) continue;
-			const result = results.get(block.id);
-			const text = result ? contentText(result.content) : '';
-			out.push({ sessionId, text });
-		}
-	}
-	return out;
+	return recordInjections(transcript.map(asMsg)).map(({ sessionId, text }) => ({ sessionId, text }));
+}
+
+/** Whether the transcript holds the record turn's harness prompt. */
+export function hasRecordTurn(transcript: readonly unknown[]): boolean {
+	return transcript.some((m) => getHarness(asMsg(m))?.kind === 'record_turn');
 }
 
 /**

@@ -53,18 +53,21 @@ Unreleased section; it is not part of any release's notes.
   health strike. Each decision model gets its own rate-limit group, so its 429s never pause
   chat. Spend is recorded as usage class `decision` (with OpenRouter's reported cost), billed
   to the session's payee like a tool call, and `[[limits]].classes` accepts `"decision"`.
-  Every evaluation logs `decision_evaluated`. Configured under `[decisions]`, with per-agent
-  overrides in `[agents.<name>.decisions]`. See ARCHITECTURE.md §8h.
+  Every evaluation logs `decision_evaluated` and is stored in the `decision_evaluations` table
+  with its verdict, its answers and probabilities, the state and questions sent (capped), the
+  serving member and version, latency and cost; the console shows each one in the session
+  view. Configured under `[decisions]`, with per-agent overrides in
+  `[agents.<name>.decisions]`. See ARCHITECTURE.md §8h.
 - **Decision-model routing** (`[decisions.routing]`, off by default): when a human starts a
   chat session, the decision model classifies the request into operator-defined task
   categories (and optionally a difficulty level) and picks the listed skill it needs. A
   category can name a model preference cascade (`models = [...]`, tried before normal
   selection, with per-user affordability and health checks; when every entry is exhausted
   selection is unchanged), a `thinking_level`, skills to preload, and extra `tail_files`.
-  Preloaded skills have their tools loaded before the first turn and their instructions
-  rendered next to the tail instructions, without changing the cached prompt prefix; resumes
-  re-apply them. Low confidence or any decision-model failure leaves the session exactly as
-  before. Database schema v22 adds `agent_sessions.initial_preloads`.
+  Preloaded skills are loaded by synthetic `load_skill` calls at the start of the session's
+  transcript, so the cached prompt prefix is unchanged and a resume finds them already
+  loaded. Low confidence or any decision-model failure leaves the session exactly as before.
+  Database schema v22 adds `agent_sessions.initial_preloads`.
 - **Model prompts** (off by default): a model can carry its own system-prompt preamble and
   tail, defined as named `[model_prompts.<name>]` profiles and assigned with
   `[models.*].model_prompt`. The preamble is placed at the very start of the system prompt,
@@ -79,29 +82,37 @@ Unreleased section; it is not part of any release's notes.
   Usage rows record the profile and a hash of the text sent, and the console session panel
   lists them. Database schema v23 adds `usage_events.model_prompt` and `model_prompt_hash`.
   See ARCHITECTURE.md §8 "Model prompts".
-- **Session records**: every chat-lane or proactive session that did tool work writes a
-  compact record of its work in one extra turn immediately after it completes, while the
-  prompt cache is warm. The record is written with `session_record_tool` (a `summary_tool`
-  variant, always deferred) at interactive priority, bounded by `[session_records].timeout_ms`
-  (default 60 s) and `max_turns` (default 4). A reply to a bot message automatically injects
-  that message's session record into the new session's context via a synthetic
-  `read_session_record` tool call. The agent can fetch any record on demand with
-  `read_session_record(session_id)` (immediate tool, in every session) and drill into the raw
-  rollout with `read_session_transcript(session_id)` (deferred, behind the `sessions` skill).
-  Database schema v24 adds `session_records` and `decision_evaluations`. The observability
-  console shows the record and decision evaluations in the session detail panel.
-  Reply-to-continue (`[agent.sessions.resume]`) is now off by default; the code stays for
-  deployments that opt in.
-- **Decision-model records point** (`[decisions.records]`, off by default): when a decision
-  model is configured, the reply-injects rule is replaced with a judgement over the last
-  `candidates` bot-message sessions (default 3). Records with `relevant` score above
-  `inject_threshold` (default 0.6) are injected, highest-confidence first, up to
-  `max_injected` (default 2).
-- **Routing preloads via synthetic calls**: decision-model routing now injects preloaded skills
-  as synthetic `load_skill` calls at the start of the transcript rather than rendering them
-  into a satellite block. Resumes re-derive the loaded set from the transcript without a
-  separate preload step. Database schema v22 (`initial_preloads`) is unchanged; the `tools`
-  field written by older versions is loaded on resume for compatibility and never written again.
+- **Session records** (`[session_records]`, on by default): every chat or proactive session
+  that did tool work writes a compact record of that work in one extra turn right after it
+  completes, while the prompt cache is warm. Tools that only talk in the room or steer the
+  session (the resume work gate's exempt set, which now also holds `no_reply`, `load_skill`
+  and `tool_search`) do not count as work. The record is written with `session_record_tool`,
+  a harness-only tool the agent cannot use outside that turn, at interactive priority and
+  bounded by `timeout_ms` (default 60 s) and `max_turns` (default 4); a session with nothing
+  worth recording writes none. A reply to a bot message injects that message's session record
+  into the new session as a synthetic `read_session_record` call and its result
+  (`inject_on_reply`, default on); if the record is still being written, the reply waits for
+  it, up to `timeout_ms`. The agent can read any record of its own on demand with
+  `read_session_record(session_id)` (an immediate tool in chat and proactive sessions) and
+  open the full rollout with `read_session_transcript(session_id)` (deferred, in the
+  `sessions` skill). Database schema v24 adds `session_records` and `decision_evaluations`.
+  In the console, the session view shows the session's record, the records it was given, and
+  the record turn with its harness prompt collapsed; every decision gets an inline card in
+  the rollout and an entry in the details pane's Decisions list.
+- **Decision-model records point** (`[decisions.records]`, off by default; needs `[decisions]`
+  enabled): the decision model judges which session records a new session needs, for every
+  trigger, replies or not. The candidates are the replied-to message's session and the
+  sessions behind the last `candidates` bot messages (default 3), each only if it has a
+  record; every candidate is its own request, sent in parallel with routing. A record whose
+  `relevant` probability is at or above `inject_threshold` (default 0.6) is injected, most
+  relevant first, up to `max_injected` (default 2); a replied-to record judged below the
+  threshold is left out. When the point is off or fails as a whole, the reply rule applies. A
+  failed evaluation of the replied-to record injects it, and a failed evaluation of any other
+  candidate injects nothing. `[decisions.calibration.<model>]` can override the threshold per
+  decision model with `records.inject_threshold` (or `inject_threshold`); `min_confidence` is
+  rejected under `[decisions.records]`, because its one question carries no separate
+  confidence. Startup logs `decisions_records_capacity_low` when a decision model's
+  rate-limit group admits fewer requests at once than one trigger can send.
 - **OpenAI Responses API prefill**: `[models.<name>.prefill]` forces a required `analysis` argument on every tool call via strict JSON schema `pattern`, anchoring persona adherence on GPT-6 Sol/Luna. Includes `no_reply` tool, `drop_reasoning` option, and per-serving-member gating via `onPayload`. See spec/OPENAI-PREFILL.md.
 - **Captioning via OpenAI Responses API**: `[models.*]` with `api = "openai-responses"` can now serve as a caption model for images. Incomplete, refused, and unsupported-modality results are classified as content failures. (Port of MR !1 captioning code by contributor nopm.)
 
@@ -137,6 +148,17 @@ Unreleased section; it is not part of any release's notes.
 
 ### Changed
 
+- **A reply to the bot always triggers.** A reply to a bot message starts a session like a
+  mention does, whatever `[agent.sessions.resume]` says. Before, a reply without a mention
+  (such as a Discord reply with the ping turned off) triggered only where resume was on.
+- **Resume is off by default** (`[agent.sessions.resume].enabled`, both `dm` and `group`). A
+  reply now starts a fresh session that is given the replied-to session's record. A
+  deployment that turns resume back on gets the earlier behaviour: a reply that resumes a
+  session injects nothing, and the resumed run writes a new record when it ends.
+- **A follow-up to a finished session starts a fresh session.** A follow-up message folded
+  into a session that has already completed now starts a new session with that session's
+  record injected, waiting for the record if it is still being written. Before, it resumed the
+  completed session. Folding into a running or not-yet-started session is unchanged.
 - **Prefill: past `analysis` arguments are no longer replayed to the model.** They stay in the stored transcript; the wire history is stripped deterministically so prompt caching is unaffected.
 - **Silence is now a tool call.** `no_reply` is part of every chat session's tool set
   (next to `send_message`, same session-type filtering, always in the initial set

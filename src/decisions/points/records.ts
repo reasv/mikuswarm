@@ -25,6 +25,13 @@ export interface RecordsChatMessage {
   from: string;
   text: string;
   self?: true;
+  /**
+   * Marks the record's own bot message (never sent: the state shows it only as
+   * a `self` message where it sat). Packing always keeps it and budgets the
+   * record around it, so a long chat never drops the one message the record
+   * belongs to.
+   */
+  ofRecord?: true;
 }
 
 /**
@@ -44,7 +51,8 @@ export interface RecordsInput {
   /**
    * Recent chat messages before the request, oldest first. Used in the
    * non-reply state. The record's bot message appears inline here where it
-   * actually sat in the timeline; it is never re-presented as a reply target.
+   * actually sat in the timeline (marked `ofRecord`, so packing keeps it); it is
+   * never re-presented as a reply target.
    */
   recentChat?: RecordsChatMessage[];
   /** The session record text to judge for relevance. */
@@ -110,31 +118,35 @@ export const recordsPoint: DecisionPoint<RecordsInput, RecordsVerdict> = {
 
     // Non-reply framing: the record's bot message appears inline in recent_chat.
     const recentChat = (input.recentChat ?? []).map((m) => ({
-      from: m.from,
-      text: clipText(m.text, CHAT_TEXT_CLIP),
-      ...(m.self ? { self: true as const } : {}),
+      message: {
+        from: m.from,
+        text: clipText(m.text, CHAT_TEXT_CLIP),
+        ...(m.self ? { self: true as const } : {}),
+      },
+      pinned: m.ofRecord === true,
     }));
+    type Entry = (typeof recentChat)[number];
+    const pinned = recentChat.filter((entry) => entry.pinned);
+    const others = recentChat.filter((entry) => !entry.pinned);
+    // Rebuild in timeline order so the pinned message sits where it actually was.
+    const build = (kept: Entry[], record: string) => {
+      const keep = new Set<Entry>([...pinned, ...kept]);
+      return {
+        request: clippedRequest,
+        recent_chat: recentChat.filter((entry) => keep.has(entry)).map((entry) => entry.message),
+        record,
+      };
+    };
 
-    const buildWithChat = (chat: typeof recentChat) => ({
-      request: clippedRequest,
-      recent_chat: chat,
-      record: input.record,
-    });
-    const buildWithChatClipped = (chat: typeof recentChat, rec: string) => ({
-      request: clippedRequest,
-      recent_chat: chat,
-      record: rec,
-    });
-
-    // Pack newest-first, then try to fit the record whole.
-    const packed = packNewest(recentChat, budgetTokens, buildWithChat);
-    const withPacked = buildWithChat(packed);
-    const packedTokens = roughTokens(JSON.stringify(withPacked));
-    if (packedTokens <= budgetTokens) return withPacked;
-
-    // Record doesn't fit whole: clip it.
-    const record = clipRecord(input.record, budgetTokens, () => buildWithChatClipped(packed, ""));
-    return buildWithChatClipped(packed, record);
+    // The fixed part (request + the record's own message) and the record come
+    // first; the record is clipped only when it cannot fit beside them. The rest
+    // of the chat is packed newest-first into what remains.
+    let record = input.record;
+    if (roughTokens(JSON.stringify(build([], record))) > budgetTokens) {
+      record = clipRecord(input.record, budgetTokens, () => build([], ""));
+    }
+    const packed = packNewest(others, budgetTokens, (kept) => build(kept, record));
+    return build(packed, record);
   },
 
   resolve(
@@ -147,9 +159,10 @@ export const recordsPoint: DecisionPoint<RecordsInput, RecordsVerdict> = {
     if (!answer || answer.type !== "noul") return null;
     // `settings.injectThreshold` is populated by pointSettings() for the records
     // point (from config `[decisions.records].inject_threshold`). Calibration
-    // keys are `records.relevant` → `relevant` (spec §6.2 "Verdict").
+    // follows the threshold-name convention: `records.inject_threshold`, then
+    // the bare `inject_threshold` (spec §6.2 "Verdict").
     const baseThreshold = settings.injectThreshold ?? DEFAULT_INJECT_THRESHOLD;
-    const injectThreshold = threshold("relevant", baseThreshold);
+    const injectThreshold = threshold("inject_threshold", baseThreshold);
     return {
       inject: answer.noul >= injectThreshold,
       relevance: answer.noul,
