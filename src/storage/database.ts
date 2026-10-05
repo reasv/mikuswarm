@@ -89,6 +89,12 @@ export interface ReplyContextRow {
   html_body?: string | null;
   timestamp?: number | null;
   created_at: number;
+  /**
+   * Read-time only (never a column): the quoted message's `agent_session_id`
+   * when it is a stored bot message sent from a session, resolved by
+   * `getEnrichmentData`.
+   */
+  reply_agent_session_id?: string;
 }
 
 export interface LinkPreviewRow {
@@ -3835,6 +3841,7 @@ export class Storage {
       const replyContexts = new Map<string, ReplyContextRow>();
       const linkPreviews = new Map<string, LinkPreviewRow[]>();
       const mediaAssets = new Map<string, MediaAssetRow[]>();
+      let lookupBotSession: ReturnType<typeof botSessionIdLookup> | undefined;
 
       const batchSize = 500;
       for (let i = 0; i < eventIds.length; i += batchSize) {
@@ -3842,9 +3849,21 @@ export class Storage {
         const placeholders = batch.map(() => "?").join(", ");
 
         const rcRows = db.prepare(
-          `select * from reply_contexts where event_id in (${placeholders})`,
-        ).all(...batch) as ReplyContextRow[];
-        for (const row of rcRows) replyContexts.set(row.event_id, row);
+          `select rc.*, e.timeline_key as quote_timeline_key
+           from reply_contexts rc
+           left join timeline_events e on e.id = rc.event_id
+           where rc.event_id in (${placeholders})`,
+        ).all(...batch) as (ReplyContextRow & { quote_timeline_key: string | null })[];
+        for (const { quote_timeline_key: quoteKey, ...row } of rcRows) {
+          // The quoted message's session id when it is a bot message sent from a
+          // session (spec SESSION-RECORDS §5: the read_session_record argument is
+          // in sight on the quote too, not only on the original message).
+          const sessionId =
+            quoteKey && row.reply_external_id
+              ? (lookupBotSession ??= botSessionIdLookup(db))(quoteKey, row.reply_external_id)
+              : undefined;
+          replyContexts.set(row.event_id, sessionId ? { ...row, reply_agent_session_id: sessionId } : row);
+        }
 
         const lpRows = db.prepare(
           `select * from link_previews where event_id in (${placeholders})
@@ -8061,6 +8080,50 @@ export class Storage {
   }
 
   /**
+   * One session's metadata columns only, without the context/transcript
+   * payload blobs (the per-call gate of `read_session_record` needs the
+   * timeline key and status, never the multi-MB rollout).
+   */
+  getAgentSessionMeta(id: string): AgentSessionMetaRow | undefined {
+    return this.read((db) =>
+      db
+        .prepare(`select ${AGENT_SESSION_META_COLUMNS} from agent_sessions where id = ?`)
+        .get(id) as AgentSessionMetaRow | undefined,
+    );
+  }
+
+  /** A session's persisted transcript JSON (the payload table only), or null when absent. */
+  getAgentSessionTranscriptJson(id: string): string | null {
+    const row = this.read((db) =>
+      db
+        .prepare(`select transcript_json from agent_session_payloads where session_id = ?`)
+        .get(id) as { transcript_json: string | null } | undefined,
+    );
+    return row?.transcript_json ?? null;
+  }
+
+  /**
+   * The `agent_session_id` of each stored bot message among `externalIds` in
+   * the room of `timelineKey` (its threads included, scoped like
+   * {@link getEditedBody}). Messages without one (human messages, or bot
+   * messages not sent from a session) are absent from the map. Used to show
+   * the session id beside bot messages fetched from the provider by
+   * `read_messages`, which carry no session attribution of their own.
+   */
+  getAgentSessionIdsByExternalIds(timelineKey: string, externalIds: readonly string[]): Map<string, string> {
+    const out = new Map<string, string>();
+    if (externalIds.length === 0) return out;
+    this.read((db) => {
+      const lookup = botSessionIdLookup(db);
+      for (const externalId of new Set(externalIds)) {
+        const sessionId = lookup(timelineKey, externalId);
+        if (sessionId) out.set(externalId, sessionId);
+      }
+    });
+    return out;
+  }
+
+  /**
    * Persist a routed session's initial preloads (ARCHITECTURE.md §8h). Written
    * once at creation, after the placeholder insert (FIFO on the single-writer
    * queue), so a later resume re-applies exactly the same loaded tool set.
@@ -11068,7 +11131,7 @@ ${TOOL_INVOCATIONS_SCHEMA}
 -- Unified usage ledger (spec USAGE-COST-LIMITS §3): one row per billable event
 -- across all consumer classes, the source of truth for cross-cutting usage
 -- queries. Mirrors tool_invocations (one-to-one) and adds per-request agent-loop
--- rows + caption + embedding. DDL shared with the v25-to-v26 migration step.
+-- rows + caption + embedding. DDL shared with the v24-to-v25 migration step.
 ${USAGE_EVENTS_SCHEMA}
 ${RETRIEVAL_SCHEMA}
 ${CHAT_SEARCH_SCHEMA}
@@ -12114,4 +12177,37 @@ function runMigrations(db: Database.Database, isFresh: boolean): void {
     // compile-time integer constant, so interpolation here is safe.
     db.pragma(`user_version = ${LATEST_SCHEMA_VERSION}`);
   })();
+}
+
+/**
+ * A lookup for the `agent_session_id` of the stored bot message `externalId`
+ * in the room of `timelineKey` (threads included; an exact room-key row wins,
+ * scoped like `Storage.getEditedBody`). Undefined for human messages and for
+ * bot messages not sent from a session. One prepared statement per lookup
+ * function, so batch callers create it once.
+ */
+function botSessionIdLookup(
+  db: Database.Database,
+): (timelineKey: string, externalId: string) => string | undefined {
+  const stmt = db.prepare(
+    `select agent_session_id from timeline_events
+     where provider = @provider and external_id = @externalId
+       and agent_session_id is not null
+       and (timeline_key = @roomKey
+            or timeline_key like @threadPrefix escape '\\')
+     order by case when timeline_key = @roomKey then 0 else 1 end
+     limit 1`,
+  );
+  return (timelineKey, externalId) => {
+    const parsed = parseTimelineKey(timelineKey);
+    if (!parsed) return undefined;
+    const roomKey = buildTimelineKey({ ...parsed, threadId: undefined });
+    const row = stmt.get({
+      provider: parsed.provider,
+      externalId,
+      roomKey,
+      threadPrefix: threadKeyLikePattern(roomKey),
+    }) as { agent_session_id: string } | undefined;
+    return row?.agent_session_id;
+  };
 }

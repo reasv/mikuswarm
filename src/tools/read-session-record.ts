@@ -2,8 +2,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { Storage } from "../storage/index.js";
 import type { ChannelVisibilityResolver } from "../visibility/index.js";
-import { shapeContentBlocks } from "../agent/tool-result-budget.js";
-import { estimateTokens } from "../context/tokens.js";
+import { estimateTokens, truncateToTokens } from "../context/tokens.js";
 
 /**
  * Context injected by the session assembly (W6 wires the real values;
@@ -30,42 +29,55 @@ export interface ReadSessionRecordToolContext {
   isRecordInFlight?: (sessionId: string) => boolean;
 }
 
-// ── Visibility check ─────────────────────────────────────────────────────────
+// ── Shared lookup + gate ─────────────────────────────────────────────────────
+//
+// Every failure THROWS: pi-agent-core marks a tool result `isError` only when
+// `execute` throws (a returned result is always a success on the wire). Each
+// message names the exact next call that recovers (CLAUDE.md "Errors as
+// backstop and UX").
 
 /**
- * Apply the same gate as `read_messages` to a session timeline key.
- * Returns an error string when access is denied, undefined when allowed.
+ * Resolve a session by id and apply the `read_messages` visibility gate plus
+ * the own-agent filter. Metadata only: the transcript blob is never loaded here.
  */
-function checkSessionVisibility(
-  sessionTimelineKey: string,
-  context: ReadSessionRecordToolContext,
-): string | undefined {
+function resolveReadableSession(sessionId: string, context: ReadSessionRecordToolContext) {
+  const session = context.storage.getAgentSessionMeta(sessionId);
+  if (!session) {
+    throw new Error(
+      `No session "${sessionId}". Pass the agent_session_id attribute of a bot message exactly ` +
+        `as shown (<message ... agent_session_id="...">, also on <reply_to> quotes and in read_messages output).`,
+    );
+  }
   if (context.visibilityResolver && context.currentTimelineKey) {
-    const mode = context.visibilityResolver.modeFor(sessionTimelineKey);
+    const mode = context.visibilityResolver.modeFor(session.timeline_key);
     if (
       mode === "isolated" &&
-      !context.visibilityResolver.sameChannel(sessionTimelineKey, context.currentTimelineKey)
+      !context.visibilityResolver.sameChannel(session.timeline_key, context.currentTimelineKey)
     ) {
-      return "Cannot access this session: it is in an isolated channel and this session is not in it.";
+      throw new Error(
+        `Session "${sessionId}" belongs to an isolated channel this session is not in; ` +
+          "its record and transcript are private to that channel.",
+      );
     }
   }
-  return undefined;
+  if (context.currentAgentName != null && context.resolveAgentForTimeline) {
+    const sessionAgent = context.resolveAgentForTimeline(session.timeline_key);
+    if (sessionAgent !== null && sessionAgent !== context.currentAgentName) {
+      throw new Error(
+        `Session "${sessionId}" was run by another agent; only your own sessions can be read.`,
+      );
+    }
+  }
+  return session;
 }
 
-/**
- * Check that `sessionAgentName` matches the current agent (multi-agent filter).
- * In single-agent mode (null currentAgentName) always allowed.
- */
-function checkAgentOwnership(
-  sessionTimelineKey: string,
-  context: ReadSessionRecordToolContext,
-): string | undefined {
-  if (context.currentAgentName == null || !context.resolveAgentForTimeline) return undefined;
-  const sessionAgent = context.resolveAgentForTimeline(sessionTimelineKey);
-  if (sessionAgent !== null && sessionAgent !== context.currentAgentName) {
-    return "Cannot access this session: it belongs to a different agent.";
+function parseBuildsOn(raw: string): string[] {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string") : [];
+  } catch {
+    return [];
   }
-  return undefined;
 }
 
 // ── read_session_record ──────────────────────────────────────────────────────
@@ -74,95 +86,46 @@ export function createReadSessionRecordTool(context: ReadSessionRecordToolContex
   return {
     name: "read_session_record",
     label: "Read session record",
+    // Situation first (always-on definition): the moment of need is a user
+    // pointing at an earlier bot message.
     description:
-      "Read the record for an earlier session. " +
-      "Bot messages carry `agent_session_id`; pass it here. " +
-      "Returns what was found or done, sources, and any open threads. " +
-      "For the raw transcript, load the `sessions` skill and call `read_session_transcript`.",
+      "Someone asks about an earlier bot message (\"where did you get that?\", \"post the second one\", " +
+      "\"what did you find?\"): pass that message's agent_session_id to get the session's record: " +
+      "sources, artifacts (paths, message ids), open threads. One session per call.",
     parameters: Type.Object({
-      session_id: Type.String({ description: "The agent_session_id from a bot message." }),
+      session_id: Type.String({ description: "The agent_session_id attribute of the bot message." }),
     }),
     execute: async (_toolCallId, params) => {
       const { session_id } = params as { session_id: string };
+      resolveReadableSession(session_id, context);
 
-      // Look up the session row to get its timeline key.
-      const session = context.storage.getAgentSession(session_id);
-      if (!session) {
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                `No session found with id "${session_id}". ` +
-                "Verify the agent_session_id from the bot message XML attribute.",
-            },
-          ],
-          details: null,
-          isError: true,
-        };
+      if (context.isRecordInFlight?.(session_id)) {
+        throw new Error(
+          `The record of session "${session_id}" is still being written. ` +
+            `Call read_session_record(session_id: "${session_id}") again in a few seconds.`,
+        );
       }
 
-      // Visibility and ownership checks (same gate as read_messages).
-      const visErr = checkSessionVisibility(session.timeline_key, context);
-      if (visErr) {
-        return { content: [{ type: "text", text: visErr }], details: null, isError: true };
-      }
-      const ownErr = checkAgentOwnership(session.timeline_key, context);
-      if (ownErr) {
-        return { content: [{ type: "text", text: ownErr }], details: null, isError: true };
-      }
-
-      // Check in-flight first (the record is being written right now).
-      const isInFlight = context.isRecordInFlight?.(session_id) ?? false;
-      if (isInFlight) {
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                "The session record is still being written. Try again in a moment.",
-            },
-          ],
-          details: null,
-          isError: true,
-        };
-      }
-
-      // Look up the record.
       const record = context.storage.getSessionRecord(session_id);
       if (!record) {
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                `No record for session "${session_id}". ` +
-                "This session either did no tool work (its messages are all there is) " +
-                "or the record was not written. " +
-                "To inspect the raw rollout, load the `sessions` skill and call `read_session_transcript`.",
-            },
-          ],
-          details: null,
-        };
+        throw new Error(
+          `No record for session "${session_id}": it did no tool work worth recording (its messages ` +
+            "in the chat are all there is), or its record was not written. Its raw tool calls, if any: " +
+            `read_session_transcript(session_id: "${session_id}") (sessions skill).`,
+        );
       }
 
-      // Parse builds_on.
-      let buildsOn: string[] = [];
-      try {
-        buildsOn = JSON.parse(record.builds_on) as string[];
-        if (!Array.isArray(buildsOn)) buildsOn = [];
-      } catch {
-        buildsOn = [];
-      }
-
-      const parts: string[] = [];
-      parts.push(record.text);
+      const buildsOn = parseBuildsOn(record.builds_on);
+      const parts: string[] = [record.text];
       if (buildsOn.length > 0) {
-        parts.push(`\nBuilds on: ${buildsOn.join(", ")} (call read_session_record for each to follow the chain).`);
+        parts.push(
+          `\n\nBuilds on earlier session(s): ${buildsOn.join(", ")}. ` +
+            "Each has its own record; read_session_record one of them to follow the chain one hop.",
+        );
       }
       parts.push(
-        `\nFor the raw tool calls: load the \`sessions\` skill and call ` +
-          `read_session_transcript(session_id: "${session_id}").`,
+        `\n\nRaw tool calls behind this record: read_session_transcript(session_id: "${session_id}", ` +
+          "query: \"<term>\") (sessions skill).",
       );
 
       return {
@@ -175,64 +138,144 @@ export function createReadSessionRecordTool(context: ReadSessionRecordToolContex
 
 // ── read_session_transcript ──────────────────────────────────────────────────
 
-/** Max token budget per individual tool-result when rendering the transcript. */
+/** Token allowance for one call's result (its head, or the windows around query matches). */
 const TRANSCRIPT_RESULT_MAX_TOKENS = 512;
-/** Max token budget for one call's arguments (a file write or a heredoc can be huge). */
+/** Token allowance for one call's arguments (a file write or a heredoc can be huge). */
 const TRANSCRIPT_ARGS_MAX_TOKENS = 256;
-/** Max total output tokens for a transcript response. */
+/** Total output bound of one transcript response; further calls page via `offset`. */
 const TRANSCRIPT_MAX_OUTPUT_TOKENS = 4000;
+/** Characters of context kept on each side of a query match inside a result. */
+const MATCH_WINDOW_CHARS = 300;
 
-type TranscriptMessage = {
-  role?: string;
-  type?: string;
-  content?: unknown[];
-  harness?: unknown;
-  stopReason?: string;
+type TranscriptEntry = {
+  /** 1-indexed assistant turn (assistant messages with at least one tool call). */
+  turn: number;
+  isHarness: boolean;
+  name: string;
+  argsJson: string;
+  /** Result text, or undefined when no toolResult message was found for the call. */
+  resultText: string | undefined;
+  resultIsError: boolean;
 };
 
-type ToolCallBlock = { type: "toolCall"; id?: string; name?: string; arguments?: unknown };
-type ToolResultBlock = { type: "toolResult"; toolCallId?: string; content?: { type: string; text?: string }[] };
-type ThinkingBlock = { type: "thinking" };
+/** Flatten a pi transcript into one entry per tool call, in rollout order. */
+function collectEntries(messages: unknown[]): { entries: TranscriptEntry[]; totalTurns: number } {
+  // pi toolResult messages carry `toolCallId` at the MESSAGE level; content
+  // blocks are text/image only.
+  const results = new Map<string, { text: string; isError: boolean }>();
+  for (const msg of messages) {
+    const m = msg as Record<string, unknown>;
+    if (m?.["role"] !== "toolResult" || typeof m["toolCallId"] !== "string") continue;
+    const content = Array.isArray(m["content"]) ? (m["content"] as { type?: string; text?: string }[]) : [];
+    results.set(m["toolCallId"], {
+      text: content.filter((b) => b?.type === "text").map((b) => b.text ?? "").join("\n"),
+      isError: m["isError"] === true,
+    });
+  }
 
-function isThinkingBlock(b: unknown): b is ThinkingBlock {
-  return typeof b === "object" && b !== null && (b as Record<string, unknown>).type === "thinking";
+  const entries: TranscriptEntry[] = [];
+  let turn = 0;
+  for (const msg of messages) {
+    const m = msg as { role?: string; content?: unknown; harness?: unknown };
+    if (m?.role !== "assistant" || !Array.isArray(m.content)) continue;
+    const calls = (m.content as { type?: string; id?: string; name?: string; arguments?: unknown }[])
+      .filter((b) => b?.type === "toolCall");
+    if (calls.length === 0) continue;
+    turn++;
+    for (const call of calls) {
+      const result = call.id ? results.get(call.id) : undefined;
+      entries.push({
+        turn,
+        isHarness: typeof m.harness === "object" && m.harness !== null,
+        name: call.name ?? "(unknown)",
+        argsJson: call.arguments !== undefined ? JSON.stringify(call.arguments) : "",
+        resultText: result?.text,
+        resultIsError: result?.isError ?? false,
+      });
+    }
+  }
+  return { entries, totalTurns: turn };
 }
 
-/** Render one tool-call + result pair as a bounded text block. */
-function renderToolPair(
-  call: ToolCallBlock,
-  result: ToolResultBlock | undefined,
-  resultAllowance: number,
-): string {
-  const name = call.name ?? "(unknown)";
-  const argsText = call.arguments !== undefined ? clipText(JSON.stringify(call.arguments), Math.min(TRANSCRIPT_ARGS_MAX_TOKENS, resultAllowance)) : "";
-  let out = `TOOL CALL: ${name}\n`;
-  if (argsText) out += `ARGS: ${argsText}\n`;
-
-  if (!result) {
-    out += "RESULT: (not found)\n";
-    return out;
+/** All match offsets of `needle` (already lowercased) in `haystack`. */
+function matchOffsets(haystack: string, needle: string): number[] {
+  const lower = haystack.toLowerCase();
+  const out: number[] = [];
+  for (let at = lower.indexOf(needle); at >= 0; at = lower.indexOf(needle, at + needle.length)) {
+    out.push(at);
   }
-
-  const resultContent = result.content ?? [];
-  const textBlocks = resultContent
-    .filter((b): b is { type: "text"; text: string } => (b as { type?: string }).type === "text")
-    .map((b) => b.text ?? "");
-  const rawText = textBlocks.join("\n");
-
-  if (rawText.length === 0) {
-    out += "RESULT: (no text content)\n";
-    return out;
-  }
-
-  out += `RESULT:\n${clipText(rawText, resultAllowance)}\n`;
   return out;
 }
 
-/** Clip text to a token allowance with the tool-result budget's truncation marker. */
-function clipText(text: string, allowance: number): string {
-  const shaped = shapeContentBlocks([{ type: "text", text }], allowance, "per-result", false);
-  return shaped.content.filter((b) => b.type === "text").map((b) => (b as { text: string }).text).join("");
+/**
+ * A long result with query matches: windows of context around each match
+ * (overlapping windows merged), as many as fit `allowance`. Honest about what
+ * was left out: the count of matches not shown and how to reach them.
+ */
+function renderMatchWindows(text: string, needle: string, offsets: number[], allowance: number): string {
+  const windows: { from: number; to: number; matches: number }[] = [];
+  for (const at of offsets) {
+    const from = Math.max(0, at - MATCH_WINDOW_CHARS);
+    const to = Math.min(text.length, at + needle.length + MATCH_WINDOW_CHARS);
+    const last = windows[windows.length - 1];
+    if (last && from <= last.to) {
+      last.to = Math.max(last.to, to);
+      last.matches++;
+    } else {
+      windows.push({ from, to, matches: 1 });
+    }
+  }
+  const parts: string[] = [];
+  let used = 0;
+  let shownMatches = 0;
+  for (const w of windows) {
+    const piece =
+      `[chars ${w.from}–${w.to} of ${text.length}]\n` +
+      `${w.from > 0 ? "…" : ""}${text.slice(w.from, w.to)}${w.to < text.length ? "…" : ""}`;
+    const cost = estimateTokens(piece);
+    if (parts.length > 0 && used + cost > allowance) break;
+    parts.push(parts.length === 0 && cost > allowance ? truncateToTokens(piece, allowance) : piece);
+    used += cost;
+    shownMatches += w.matches;
+  }
+  const hidden = offsets.length - shownMatches;
+  if (hidden > 0) {
+    parts.push(
+      `[${hidden} more match(es) in this result not shown; a longer, more specific query reaches them]`,
+    );
+  }
+  return parts.join("\n");
+}
+
+/** One call rendered: name, clipped arguments, and its result (windows or head). */
+function renderEntry(entry: TranscriptEntry, needle: string | undefined): string {
+  let out = `TOOL CALL: ${entry.name}\n`;
+  if (entry.argsJson) {
+    const argsTokens = estimateTokens(entry.argsJson);
+    out +=
+      argsTokens > TRANSCRIPT_ARGS_MAX_TOKENS
+        ? `ARGS: ${truncateToTokens(entry.argsJson, TRANSCRIPT_ARGS_MAX_TOKENS)}… [arguments clipped: ~${TRANSCRIPT_ARGS_MAX_TOKENS} of ~${argsTokens} tokens]\n`
+        : `ARGS: ${entry.argsJson}\n`;
+  }
+  if (entry.resultText === undefined) return `${out}RESULT: (no result recorded)\n`;
+  if (entry.resultText.length === 0) return `${out}RESULT: (no text content)\n`;
+
+  const label = entry.resultIsError ? "RESULT (error)" : "RESULT";
+  const total = estimateTokens(entry.resultText);
+  if (total <= TRANSCRIPT_RESULT_MAX_TOKENS) return `${out}${label}:\n${entry.resultText}\n`;
+
+  const offsets = needle ? matchOffsets(entry.resultText, needle) : [];
+  if (offsets.length > 0) {
+    return (
+      `${out}${label} (~${total} tokens; ${offsets.length} match(es), shown in context):\n` +
+      `${renderMatchWindows(entry.resultText, needle!, offsets, TRANSCRIPT_RESULT_MAX_TOKENS)}\n`
+    );
+  }
+  return (
+    `${out}${label}:\n${truncateToTokens(entry.resultText, TRANSCRIPT_RESULT_MAX_TOKENS)}…\n` +
+    `[result clipped: first ~${TRANSCRIPT_RESULT_MAX_TOKENS} of ~${total} tokens. Pass query: "<term>" ` +
+    "to see the passages around a term anywhere in this result.]\n"
+  );
 }
 
 export function createReadSessionTranscriptTool(context: ReadSessionRecordToolContext): AgentTool {
@@ -240,206 +283,120 @@ export function createReadSessionTranscriptTool(context: ReadSessionRecordToolCo
     name: "read_session_transcript",
     label: "Read session transcript",
     description:
-      "Read the raw tool calls and results from an earlier session's rollout. " +
-      "Filter by `query` (case-insensitive substring of tool name, args, or result) " +
-      "or `range` ([firstTurn, lastTurn], 1-indexed). " +
-      "Use read_session_record first for the summary; drill into this for specific calls.",
+      "The raw tool calls (arguments + results) of an earlier session, for what its record " +
+      "does not say (\"where exactly did you get that?\"). `query` keeps only calls whose name, " +
+      "arguments or result contain it, and shows the passages around each match in long results. " +
+      "`range` limits to turns; `offset` pages through long listings.",
     parameters: Type.Object({
-      session_id: Type.String({ description: "The agent_session_id." }),
+      session_id: Type.String({ description: "The agent_session_id of the session." }),
       query: Type.Optional(
         Type.String({
           maxLength: 500,
           description:
-            "Case-insensitive substring filter on tool name, arguments, or result text. " +
-            "Omit to see all tool calls.",
+            "Case-insensitive text to find in tool names, arguments or results (a URL, file name, " +
+            "title, keyword). Omit to list every call.",
         }),
       ),
       range: Type.Optional(
         Type.Array(Type.Integer({ minimum: 1, maximum: 10000 }), {
           minItems: 2,
           maxItems: 2,
-          description:
-            "Inclusive [first, last] turn numbers (1-indexed assistant turns). " +
-            "Omit to see all turns.",
+          description: "Inclusive [first, last] turn numbers (1-indexed turns with tool calls).",
+        }),
+      ),
+      offset: Type.Optional(
+        Type.Integer({
+          minimum: 0,
+          description: "Skip this many matching calls; the previous response's last line gives the value.",
         }),
       ),
     }),
     execute: async (_toolCallId, params) => {
-      const args = params as { session_id: string; query?: string; range?: [number, number] };
+      const args = params as { session_id: string; query?: string; range?: [number, number]; offset?: number };
       const { session_id } = args;
+      const session = resolveReadableSession(session_id, context);
 
-      // Session existence check.
-      const session = context.storage.getAgentSession(session_id);
-      if (!session) {
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                `No session found with id "${session_id}". ` +
-                "Verify the agent_session_id from the bot message XML attribute.",
-            },
-          ],
-          details: null,
-          isError: true,
-        };
+      const transcriptJson = context.storage.getAgentSessionTranscriptJson(session_id);
+      if (!transcriptJson) {
+        throw new Error(
+          session.status === "running" || session.status === "created" || session.status === "resuming"
+            ? `Session "${session_id}" is still running; its transcript is stored when it ends. Try again shortly.`
+            : `No transcript was stored for session "${session_id}"; read_session_record(session_id: ` +
+              `"${session_id}") is all there is.`,
+        );
       }
-
-      // Visibility and ownership checks.
-      const visErr = checkSessionVisibility(session.timeline_key, context);
-      if (visErr) return { content: [{ type: "text", text: visErr }], details: null, isError: true };
-      const ownErr = checkAgentOwnership(session.timeline_key, context);
-      if (ownErr) return { content: [{ type: "text", text: ownErr }], details: null, isError: true };
-
-      // Load transcript.
-      if (!session.transcript_json) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `No transcript for session "${session_id}". The session may still be running or it was not persisted.`,
-            },
-          ],
-          details: null,
-        };
-      }
-
-      let messages: TranscriptMessage[];
+      let messages: unknown[];
       try {
-        messages = JSON.parse(session.transcript_json) as TranscriptMessage[];
-        if (!Array.isArray(messages)) messages = [];
+        const parsed = JSON.parse(transcriptJson) as unknown;
+        messages = Array.isArray(parsed) ? parsed : [];
       } catch {
+        throw new Error(`The stored transcript of session "${session_id}" is unreadable (corrupt JSON).`);
+      }
+
+      const { entries, totalTurns } = collectEntries(messages);
+      const range = args.range;
+      if (range && range[0] > range[1]) {
+        throw new Error(`range [${range[0]}, ${range[1]}] is reversed; pass [${range[1]}, ${range[0]}].`);
+      }
+      const needle = args.query?.trim().toLowerCase() || undefined;
+      const matching = entries.filter(
+        (e) =>
+          (!range || (e.turn >= range[0] && e.turn <= range[1])) &&
+          (!needle ||
+            e.name.toLowerCase().includes(needle) ||
+            e.argsJson.toLowerCase().includes(needle) ||
+            (e.resultText?.toLowerCase().includes(needle) ?? false)),
+      );
+      const offset = args.offset ?? 0;
+      if (matching.length > 0 && offset >= matching.length) {
+        throw new Error(
+          `offset ${offset} is past the last matching call (${matching.length} match); ` +
+            `pass an offset below ${matching.length}, or omit it to start from the first.`,
+        );
+      }
+
+      const header =
+        `Session ${session_id}: ${entries.length} tool call(s) over ${totalTurns} turn(s)` +
+        (range ? `; turns ${range[0]}–${range[1]}` : "") +
+        (needle ? `; query "${args.query!.trim()}"` : "") +
+        `; ${matching.length} matching call(s).`;
+      if (matching.length === 0) {
+        const hint =
+          entries.length === 0
+            ? " The session made no tool calls; its chat messages are all there is."
+            : ` Turns run 1–${totalTurns}; omit query/range to list every call.`;
         return {
-          content: [{ type: "text", text: `Could not parse transcript for session "${session_id}".` }],
-          details: null,
-          isError: true,
+          content: [{ type: "text", text: header + hint }],
+          details: { session_id, totalTurns, totalCalls: entries.length, matching: 0, shown: 0 },
         };
       }
-
-      // Extract assistant turns (with tool calls), ignoring thinking blocks.
-      // Build an index of toolResults keyed by toolCallId for quick lookup.
-      //
-      // Real pi-agent-core toolResult messages carry toolCallId at the MESSAGE
-      // level (not inside a content block): { role: "toolResult", toolCallId, content: [...] }.
-      // The previous per-block scan never found anything because content blocks are
-      // TextContent/ImageContent only — there is no inner toolResult-typed block.
-      const resultIndex = new Map<string, ToolResultBlock>();
-      for (const msg of messages) {
-        const m = msg as Record<string, unknown>;
-        if (m["role"] === "toolResult" && typeof m["toolCallId"] === "string") {
-          const content = Array.isArray(m["content"])
-            ? (m["content"] as { type: string; text?: string }[])
-            : [];
-          resultIndex.set(m["toolCallId"], {
-            type: "toolResult",
-            toolCallId: m["toolCallId"],
-            content,
-          });
-        }
-      }
-
-      // Collect turns: each assistant message with tool calls is one "turn".
-      type TurnEntry = {
-        turnIndex: number;    // 1-indexed
-        isHarness: boolean;
-        calls: ToolCallBlock[];
-      };
-      const turns: TurnEntry[] = [];
-      let assistantTurnCount = 0;
-      for (const msg of messages) {
-        if (msg.role === "assistant" && Array.isArray(msg.content)) {
-          const calls = msg.content
-            .filter((b): b is ToolCallBlock => (b as { type?: string }).type === "toolCall")
-            .filter((b) => !isThinkingBlock(b));
-          if (calls.length === 0) continue;
-          assistantTurnCount++;
-          turns.push({
-            turnIndex: assistantTurnCount,
-            isHarness: typeof msg.harness === "object" && msg.harness !== null,
-            calls,
-          });
-        }
-      }
-
-      const totalTurns = turns.length;
-      const totalCalls = turns.reduce((n, t) => n + t.calls.length, 0);
-
-      // Apply range filter.
-      let filtered = turns;
-      const range = args.range;
-      if (range) {
-        const [from, to] = range;
-        filtered = turns.filter((t) => t.turnIndex >= from && t.turnIndex <= to);
-      }
-
-      // Apply query filter (case-insensitive substring over name, args, result).
-      const query = args.query?.toLowerCase().trim();
-      if (query) {
-        filtered = filtered
-          .map((turn) => {
-            const matchedCalls = turn.calls.filter((call) => {
-              const name = (call.name ?? "").toLowerCase();
-              const argsStr = JSON.stringify(call.arguments ?? "").toLowerCase();
-              if (name.includes(query) || argsStr.includes(query)) return true;
-              const res = call.id ? resultIndex.get(call.id) : undefined;
-              if (!res) return false;
-              const resText = (res.content ?? [])
-                .filter((b) => (b as { type?: string }).type === "text")
-                .map((b) => ((b as { text?: string }).text ?? "").toLowerCase())
-                .join(" ");
-              return resText.includes(query);
-            });
-            return matchedCalls.length > 0 ? { ...turn, calls: matchedCalls } : null;
-          })
-          .filter((t): t is NonNullable<typeof t> => t !== null);
-      }
-
-      // Build output — bounded by TRANSCRIPT_MAX_OUTPUT_TOKENS.
-      const headerParts: string[] = [`Session: ${session_id}`];
-      headerParts.push(`Turns with tool calls: ${totalTurns}, total calls: ${totalCalls}`);
-      if (range) headerParts.push(`Showing turns ${range[0]}–${range[1]}`);
-      if (query) headerParts.push(`Filtered by query: "${args.query}"`);
-      if (filtered.length === 0) {
-        headerParts.push("No matching tool calls found.");
-      }
-      const header = headerParts.join(" | ");
 
       const parts: string[] = [header];
-      let budgetRemaining = TRANSCRIPT_MAX_OUTPUT_TOKENS - estimateTokens(header);
-
-      for (const turn of filtered) {
-        if (budgetRemaining <= 0) {
-          parts.push("[output truncated — use `range` or `query` to narrow]");
-          break;
-        }
+      let budget = TRANSCRIPT_MAX_OUTPUT_TOKENS - estimateTokens(header);
+      let lastTurn = -1;
+      let shown = 0;
+      for (const entry of matching.slice(offset)) {
         const turnLabel =
-          `\n--- Turn ${turn.turnIndex}${turn.isHarness ? " [harness]" : ""} ---\n`;
-        budgetRemaining -= estimateTokens(turnLabel);
-        parts.push(turnLabel);
-
-        for (const call of turn.calls) {
-          if (budgetRemaining <= 0) {
-            parts.push("[truncated]");
-            break;
-          }
-          const res = call.id ? resultIndex.get(call.id) : undefined;
-          const rendered = renderToolPair(call, res, Math.min(TRANSCRIPT_RESULT_MAX_TOKENS, budgetRemaining));
-          budgetRemaining -= estimateTokens(rendered);
-          parts.push(rendered);
-        }
+          entry.turn !== lastTurn ? `\n--- Turn ${entry.turn}${entry.isHarness ? " [harness]" : ""} ---\n` : "";
+        const rendered = turnLabel + renderEntry(entry, needle);
+        const cost = estimateTokens(rendered);
+        // Always show at least one call; past that, stop before the bound.
+        if (shown > 0 && cost > budget) break;
+        parts.push(rendered);
+        budget -= cost;
+        lastTurn = entry.turn;
+        shown++;
       }
-
-      if (filtered.length > 0 && budgetRemaining > 0 && (query || range)) {
-        const hint =
-          `\nShown: ${filtered.length} turn(s). ` +
-          (range ? "Adjust range to see other turns. " : "") +
-          (query ? "Adjust query to see other calls." : "");
-        parts.push(hint);
-      }
+      const end = offset + shown;
+      parts.push(
+        end < matching.length
+          ? `\n[Shown matching calls ${offset + 1}–${end} of ${matching.length}. Next page: the same call with offset: ${end}.]`
+          : `\n[Shown matching calls ${offset + 1}–${end} of ${matching.length}; that is all.]`,
+      );
 
       return {
         content: [{ type: "text", text: parts.join("") }],
-        details: { session_id, totalTurns, totalCalls, shown: filtered.length },
+        details: { session_id, totalTurns, totalCalls: entries.length, matching: matching.length, offset, shown },
       };
     },
   };

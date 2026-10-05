@@ -48,6 +48,7 @@ export function mergeEnrichmentIntoEvent(
 
     merged.replyTo = {
       externalId: replyContext.reply_external_id ?? undefined,
+      agentSessionId: replyContext.reply_agent_session_id,
       sender: replyContext.sender_id
         ? {
             id: replyContext.sender_id,
