@@ -330,7 +330,7 @@ interface Located {
   loc: number;
 }
 
-type ChronItem = { kind: "message"; m: unknown; loc: number } | { kind: "fork"; reason: string; branchNo: number };
+export type ChronItem = { kind: "message"; m: unknown; loc: number } | { kind: "fork"; reason: string; branchNo: number };
 
 /**
  * Rebuild the order in which messages were produced from the live transcript
@@ -340,7 +340,7 @@ type ChronItem = { kind: "message"; m: unknown; loc: number } | { kind: "fork"; 
  * newest-first recovers every earlier list, and each message keeps the branch
  * it finally landed in.
  */
-function chronology(transcript: readonly unknown[], branches: readonly ContractBranchInput[]): ChronItem[] {
+export function chronology(transcript: readonly unknown[], branches: readonly ContractBranchInput[]): ChronItem[] {
   const sorted = [...branches].sort((a, b) => a.branchNo - b.branchNo);
   let cur: Located[] = transcript.map((m) => ({ m, loc: 0 }));
   const steps: { branch: ContractBranchInput; after: Located[] }[] = [];

@@ -25,13 +25,14 @@
 import { nanoid } from "nanoid";
 import type { AppConfig } from "../config/index.js";
 import type { PriorityClass } from "../agent/scheduler.js";
-import { checksPointKnobs, decisionsFor, type ChecksPointKnobs } from "../decisions/config.js";
-import type { DecisionEngine, DecisionEvaluationRow } from "../decisions/registry.js";
+import { checksPointKnobs, decisionsFor, type ChecksPointKnobs, type DecisionPointName } from "../decisions/config.js";
+import type { DecisionEngine, DecisionEvaluationRow, DecisionPoint } from "../decisions/registry.js";
 import {
   assignItemIds,
   checksPoint,
   planCheckCalls,
   type CheckItem,
+  type ChecksCallInput,
   type ChecksCallVerdict,
   type PlannedCall,
 } from "../decisions/points/checks.js";
@@ -119,6 +120,32 @@ export interface CheckEvaluatorOptions {
   isPayeeOverBudget?: (sessionId: string) => boolean;
   logger?: Logger;
   now?: () => number;
+  /**
+   * Where judged questions run (default: the `checks` point, the live gate).
+   * The offline audit (spec REFUSAL-HANDLING §7.6, §10.2) runs the same
+   * questions under its own point: its chain and timeout, the `audit` ledger
+   * class, background priority. Rows are written as check verdicts
+   * (`point = 'checks'`) either way; `groupPrefix` marks the audit's groups.
+   */
+  judging?: {
+    point: DecisionPointName;
+    usageClass?: "decision" | "audit";
+    priority?: PriorityClass;
+    /** Hard per-call timeout (default: the checkpoint rule of the live gate). */
+    timeoutMs?: number;
+    /** Prefix of every evaluation's `decisionGroup` (e.g. `audit:`). */
+    groupPrefix?: string;
+    /** The log event of a recorded evaluation (default `check_gate_evaluated`). */
+    logEvent?: string;
+  };
+}
+
+/** Options of one {@link CheckEvaluator.start}. */
+export interface CheckStartOptions {
+  /** Run pattern and word-list detection (default true). */
+  patterns?: boolean;
+  /** Only checks of these kinds take part (default every kind). */
+  kinds?: readonly CheckKind[];
 }
 
 /** Which source texts the patterns read, per checkpoint. */
@@ -150,7 +177,7 @@ interface CallRecord {
  * evaluation is never recorded.
  */
 export class CheckEvaluation {
-  readonly decisionGroup = nanoid();
+  readonly decisionGroup: string;
   readonly startedAt: number;
   /** Enabled checks that took part (pattern hits, judged questions). */
   readonly checks: CheckDefinition[] = [];
@@ -170,8 +197,10 @@ export class CheckEvaluation {
     readonly subject: CheckSubject,
     readonly deadlineMs: number,
     now: number,
+    groupPrefix = "",
   ) {
     this.startedAt = now;
+    this.decisionGroup = `${groupPrefix}${nanoid()}`;
   }
 
   get checkpoint(): Checkpoint {
@@ -199,7 +228,22 @@ export interface RecordOutcome {
 }
 
 export class CheckEvaluator {
-  constructor(private readonly options: CheckEvaluatorOptions) {}
+  private readonly pointName: DecisionPointName;
+  private readonly point: DecisionPoint<ChecksCallInput, ChecksCallVerdict>;
+
+  constructor(private readonly options: CheckEvaluatorOptions) {
+    this.pointName = options.judging?.point ?? "checks";
+    this.point =
+      this.pointName === "checks"
+        ? checksPoint
+        : {
+            ...checksPoint,
+            name: this.pointName,
+            // Calibration names the check (`checks.<code>` or a bare `<code>`) under any point.
+            resolve: (answers, input, threshold, settings) =>
+              checksPoint.resolve(answers, input, (name, value) => threshold(`checks.${name}`, threshold(name, value)), settings),
+          };
+  }
 
   get catalogue(): CheckCatalogue {
     return this.options.catalogue;
@@ -216,7 +260,7 @@ export class CheckEvaluator {
 
   /** True when judged checks run for the agent (both enables and a model). */
   judgedEnabled(agent: string | null): boolean {
-    return this.options.engine?.isEnabled("checks", agent) ?? false;
+    return this.options.engine?.isEnabled(this.pointName, agent) ?? false;
   }
 
   /**
@@ -239,9 +283,17 @@ export class CheckEvaluator {
   }
 
   /** Start an evaluation: patterns now, judged calls in the background. */
-  start(scope: CheckScope, subject: CheckSubject, anchor: CheckAnchor): CheckEvaluation {
+  start(scope: CheckScope, subject: CheckSubject, anchor: CheckAnchor, opts: CheckStartOptions = {}): CheckEvaluation {
     const checkpoint = anchor.checkpoint;
-    const evaluation = new CheckEvaluation(scope, anchor, subject, this.deadlineMs(checkpoint, scope.agent), this.now());
+    const evaluation = new CheckEvaluation(
+      scope,
+      anchor,
+      subject,
+      this.deadlineMs(checkpoint, scope.agent),
+      this.now(),
+      this.options.judging?.groupPrefix,
+    );
+    const runPatterns = opts.patterns ?? true;
     const knobs = this.knobs(scope.agent);
     const judgedOn = this.judgedEnabled(scope.agent);
     const { sources, context } = subject;
@@ -251,13 +303,14 @@ export class CheckEvaluator {
 
     const raw: Array<Omit<CheckItem, "id">> = [];
     for (const check of this.options.catalogue.enabledFor(checkpoint, scope.agent)) {
+      if (opts.kinds && !opts.kinds.includes(check.kind)) continue;
       const hasQuestions = check.questions.length > 0;
       const shortStyle = check.kind === "style" && messageChars < (check.minChars ?? knobs.styleMinChars);
       // A style check with questions skips a short message entirely; a
       // pattern-only check is free and ignores the floor (spec §6.3).
       if (shortStyle && hasQuestions) continue;
       let took = false;
-      for (const source of PATTERN_SOURCES[checkpoint]) {
+      for (const source of runPatterns ? PATTERN_SOURCES[checkpoint] : []) {
         if (!hasSource(sources, source)) continue;
         const matched = firstPatternMatch(check, sourceText(sources, source));
         if (matched === undefined) continue;
@@ -345,9 +398,11 @@ export class CheckEvaluator {
     // The deadline only stops the waiting; the call itself may finish later and
     // is still recorded (§6.3). Unless `[decisions.checks].timeout_ms` is set,
     // a call may run for twice its checkpoint's deadline.
+    const judging = this.options.judging;
     const configuredTimeout = decisionsFor(this.options.config as AppConfig, scope.agent).checks?.timeout_ms;
-    const callTimeoutMs = configuredTimeout ?? evaluation.deadlineMs * CALL_TIMEOUT_DEADLINE_FACTOR;
-    const members = engine.usableMembers("checks", scope.agent, attribution);
+    const callTimeoutMs = judging?.timeoutMs ?? configuredTimeout ?? evaluation.deadlineMs * CALL_TIMEOUT_DEADLINE_FACTOR;
+    const usageClass = judging?.usageClass ?? "decision";
+    const members = engine.usableMembers(this.pointName, scope.agent, attribution, usageClass);
     const checksByCode = new Map(evaluation.checks.map((c) => [c.code, c]));
     const plan: PlannedCall[] = planCheckCalls(items, members[0], checkpoint, subject.sources, checksByCode);
     const context = { ...subject.context, checkpoint };
@@ -357,7 +412,7 @@ export class CheckEvaluator {
         const record: Partial<CallRecord> & { verdict: ChecksCallVerdict } = { verdict: { results: [] } };
         try {
           const outcome = await engine.evaluate(
-            checksPoint,
+            this.point,
             {
               items: call.items,
               shape: call.shape,
@@ -370,10 +425,11 @@ export class CheckEvaluator {
             {
               agentName: scope.agent,
               attribution,
-              priority: CHECKPOINT_PRIORITY[checkpoint],
+              priority: judging?.priority ?? CHECKPOINT_PRIORITY[checkpoint],
               signal: evaluation.controller.signal,
               decisionGroup: evaluation.decisionGroup,
               timeoutMs: callTimeoutMs,
+              usageClass,
               onEvaluation: (row) => {
                 record.row = row;
               },
@@ -479,7 +535,8 @@ export class CheckEvaluator {
     }
     // A judged check links to the row of the call whose answer fired it.
     for (const call of evaluation.calls) {
-      await insert({ ...toInsert(call.row), ...anchorFields }, firedCodes(call));
+      // A check verdict whichever point judged it (the audit runs under its own).
+      await insert({ ...toInsert(call.row), point: "checks", ...anchorFields }, firedCodes(call));
     }
     if (evaluation.budgetRow) await insert({ ...toInsert(evaluation.budgetRow), ...anchorFields }, []);
 
@@ -519,7 +576,7 @@ export class CheckEvaluator {
       }
     }
 
-    this.options.logger?.info("check_gate_evaluated", {
+    this.options.logger?.info(this.options.judging?.logEvent ?? "check_gate_evaluated", {
       sessionId: scope.sessionId ?? undefined,
       site: scope.site,
       checkpoint: anchor.checkpoint,

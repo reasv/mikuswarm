@@ -107,6 +107,17 @@ export const MODEL_BEHAVIOUR_METRIC_FAMILIES = {
   check_hits: { source: "distinct (judged call, check) pairs per fired check code, every kind", model: "as style_hits" },
   check_revisions: { source: "fired codes of decision rows whose consequence is revise, per distinct judged call", model: "as style_hits" },
   check_overrides: { source: "fired codes of decision rows whose consequence is overridden, per distinct judged call", model: "as style_hits" },
+  after_correction: {
+    source:
+      "session_audits (audit send_contract, status done): per nudged run, what happened to the message (§7.3: same, " +
+      "minor_rewording, parts_removed, rewritten_same_substance, different_substance, switched_to_no_reply, nothing, " +
+      "or uncertain below min_confidence)",
+    model: "the served model of the run's first failed attempt, else the session's model at it",
+  },
+  no_reply_intent: {
+    source: "decision rows of point checks: the no_reply_intent choice (§7.4), once per judged ending",
+    model: "as style_hits",
+  },
 } as const satisfies Record<string, MetricDefinition>;
 
 export type ModelBehaviourMetricFamily = keyof typeof MODEL_BEHAVIOUR_METRIC_FAMILIES;
