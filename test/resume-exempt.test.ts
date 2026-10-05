@@ -9,31 +9,35 @@ import { BUILTIN_RESUME_EXEMPT_TOOL_NAMES } from "../src/tools/resume-exempt.ts"
 // `pins`, `create_poll`, `poll_vote`) are only included when `target.roomId` is
 // truthy — so a first probe with a falsy roomId would have permanently poisoned
 // the memoized cache, silently making pure-chat sessions resumable. These tests
-// lock in the context-free derivation and that all eleven names (including the six
+// lock in the context-free derivation and that all fifteen names (including the six
 // room-scoped ones) are present without any context.
 
-// The spec §7a built-in exempt set, verbatim.
+// The spec §7a + SESSION-RECORDS CONTRACT §4 built-in exempt set, verbatim.
 const SPEC_EXEMPT = [
   "create_poll",
   "delegate_to_session",
   "delete_message",
   "edit_message",
+  "load_skill",
   "media",
+  "no_reply",
   "pins",
   "poll_vote",
   "react",
   "send_message",
+  "session_record_tool",
   "set_profile",
   "spawn_session",
+  "tool_search",
 ] as const;
 
 // The six tools that `buildSessionTools` only wires when `target.roomId` is truthy
 // — the exact ones a falsy-roomId probe would have dropped (issue #6 root cause).
 const ROOM_SCOPED_EXEMPT = ["react", "edit_message", "delete_message", "pins", "create_poll", "poll_vote"] as const;
 
-test("issue #6: built-in resume-exempt set equals exactly the 11 spec tools", () => {
+test("issue #6: built-in resume-exempt set equals exactly the 15 spec tools", () => {
   assert.deepEqual([...BUILTIN_RESUME_EXEMPT_TOOL_NAMES].sort(), [...SPEC_EXEMPT].sort());
-  assert.equal(BUILTIN_RESUME_EXEMPT_TOOL_NAMES.size, 11);
+  assert.equal(BUILTIN_RESUME_EXEMPT_TOOL_NAMES.size, 15);
 });
 
 test("issue #6: the room-scoped exempt tools are present WITHOUT any roomId/target context", () => {
@@ -50,7 +54,7 @@ test("issue #6: the room-scoped exempt tools are present WITHOUT any roomId/targ
 });
 
 test("issue #6: the built-in set is stable across reads (no first-probe poisoning)", () => {
-  // A module-level constant computed once; repeated reads return the same eleven
+  // A module-level constant computed once; repeated reads return the same fifteen
   // names regardless of access order. (Contrast the old lazily-memoized probe,
   // whose result depended on the FIRST caller's context.)
   const first = [...BUILTIN_RESUME_EXEMPT_TOOL_NAMES].sort();

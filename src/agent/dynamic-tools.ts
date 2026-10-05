@@ -215,6 +215,20 @@ export interface DeferredToolLike {
   description: string;
 }
 
+/**
+ * Filter a deferred tool list to exclude harness-only tools
+ * (spec SESSION-RECORDS, CONTRACT §2). Harness-only tools are always deferred
+ * (to keep the declared wire array byte-stable) but must never appear in the
+ * rendered index, skill patterns, or tool_search results.
+ */
+export function filterHarnessOnlyFromIndex(
+  deferred: readonly DeferredToolLike[],
+): DeferredToolLike[] {
+  return deferred.filter(
+    (tool) => !(tool as { harnessOnly?: boolean }).harnessOnly,
+  );
+}
+
 export type DeferredIndexMode = "orphans" | "names" | "descriptions" | "none";
 
 /** Truncation width for "descriptions" mode (spec §8). */

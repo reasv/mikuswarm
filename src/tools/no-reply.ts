@@ -17,6 +17,9 @@ export function createNoReplyTool(): AgentTool {
     description:
       "End your turn without posting anything. Call this instead of send_message when you have nothing to say.",
     parameters: Type.Object({}),
+    // Pure control-flow: calling no_reply does no stateful work a fresh session
+    // would lack (spec SESSION-RECORDS CONTRACT §4).
+    resumeWorkExempt: true,
     execute: async (): Promise<AgentToolResult<{ noReply: true }>> => ({
       content: [{ type: "text", text: "NO_REPLY_CALLED" }],
       details: { noReply: true },

@@ -49,6 +49,9 @@ export function createLoadSkillTool(context: LoadSkillContext): AgentTool {
     label: "Load skill",
     description: LOAD_SKILL_DESCRIPTION,
     parameters: LOAD_SKILL_PARAMETERS,
+    // Pure control-flow: loading a skill does no stateful work a fresh session
+    // would lack (spec SESSION-RECORDS CONTRACT §4).
+    resumeWorkExempt: true,
     execute: async (_toolCallId, params) => {
       const { name } = params as { name: string };
       const registry = context.getRegistry();
@@ -88,7 +91,12 @@ export function createLoadSkillTool(context: LoadSkillContext): AgentTool {
         throw new Error(`Skill "${name}" could not be read from ${meta.path}.`);
       }
 
-      const { added, alreadyLoaded, unknown } = registry.load(registry.matchCatalog(patterns));
+      // Harness-only tools cannot be claimed by skill patterns (CONTRACT §2).
+      const matchedNames = registry.matchCatalog(patterns).filter((toolName) => {
+        const tool = registry.catalogTools.find((t) => t.name === toolName);
+        return !(tool as (typeof tool & { harnessOnly?: boolean }) | undefined)?.harnessOnly;
+      });
+      const { added, alreadyLoaded, unknown } = registry.load(matchedNames);
       const addedNames = added.map((tool) => tool.name);
 
       context.logger?.info("skill_loaded", {

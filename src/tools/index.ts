@@ -79,3 +79,9 @@ export { createLoadSkillTool, loadSkillToolDefinition, type LoadSkillContext } f
 export { createToolSearchTool, toolSearchToolDefinition, type ToolSearchContext } from "./tool-search.js";
 export { createCrossChannelTools, type CrossChannelToolContext } from "./cross-channel.js";
 export { createNoReplyTool } from "./no-reply.js";
+export { createSessionRecordTool } from "./session-record-tool.js";
+export {
+  createReadSessionRecordTool,
+  createReadSessionTranscriptTool,
+  type ReadSessionRecordToolContext,
+} from "./read-session-record.js";

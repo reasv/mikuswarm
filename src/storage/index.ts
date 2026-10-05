@@ -68,6 +68,10 @@ export {
   type UserIdentityAliasRow,
   USER_IDENTITY_ALIAS_BOUND,
   type SeedLedgerRow,
+  type SessionRecordInsert,
+  type SessionRecordRow,
+  type DecisionEvaluationInsert,
+  type DecisionEvaluationRow,
 } from "./database.js";
 // Re-export DmOptout + cross-channel helper return types implicitly — callers
 // destructure from the Storage methods directly.

@@ -52,6 +52,7 @@ import {
   DynamicToolRegistry,
   matchToolPatterns,
   renderDeferredToolsIndex,
+  filterHarnessOnlyFromIndex,
   wrapEditorWithSkillActivation,
   type DeferredIndexMode,
 } from "./dynamic-tools.js";
@@ -1599,8 +1600,10 @@ export class AgentSessionFactory {
       // inside ContextBuilder.build) so both stay byte-identical.
       const deferred = registry.deferredTools();
       workspace.dynamicTools = {
+        // Harness-only tools are excluded from the rendered index (CONTRACT §2):
+        // they are deferred for wire-array stability but must not be shown.
         indexText: renderDeferredToolsIndex(
-          deferred,
+          filterHarnessOnlyFromIndex(deferred),
           [...workspace.skills.listed, ...workspace.skills.inlined],
           dynCfg?.index ?? "orphans",
         ),
@@ -2207,7 +2210,7 @@ export class AgentSessionFactory {
         previewTools = split.initial;
         workspace.dynamicTools = {
           indexText: renderDeferredToolsIndex(
-            split.deferred,
+            filterHarnessOnlyFromIndex(split.deferred),
             [...workspace.skills.listed, ...workspace.skills.inlined],
             split.index,
           ),

@@ -12,6 +12,11 @@ import { createSetProfileTool } from "./set-profile.js";
 import { createSpawnSessionTool } from "./spawn-session.js";
 import { createDelegateToSessionTool } from "./delegate.js";
 import { createMediaTool } from "./media.js";
+// SESSION-RECORDS CONTRACT §4: control tools that count as resumeWorkExempt.
+import { createNoReplyTool } from "./no-reply.js";
+import { createLoadSkillTool } from "./load-skill.js";
+import { createToolSearchTool } from "./tool-search.js";
+import { createSessionRecordTool, SummaryDraft } from "./session-record-tool.js";
 
 // =============================================================================
 // Context-free built-in resume-work-exempt tool set (spec RESUMABLE-SESSIONS §7a).
@@ -47,6 +52,9 @@ import { createMediaTool } from "./media.js";
  * the omission direction is safe (an un-listed exempt tool degrades to "counts as
  * work" → FRESH, the spec's safe failure direction).
  */
+// CRITICAL: this enumeration is CONTEXT-FREE and must include every factory
+// that carries (or may carry) `resumeWorkExempt: true`. The 4 new entries
+// (SESSION-RECORDS CONTRACT §4) use stub contexts derived below.
 const RESUME_EXEMPT_TOOL_FACTORIES: ReadonlyArray<(context: never) => AgentTool> = [
   createSendMessageTool,
   createReactTool,
@@ -59,6 +67,12 @@ const RESUME_EXEMPT_TOOL_FACTORIES: ReadonlyArray<(context: never) => AgentTool>
   createSpawnSessionTool,
   createDelegateToSessionTool,
   createMediaTool,
+  // Control tools (CONTRACT §4): pure control-flow, no stateful work.
+  createNoReplyTool as unknown as (context: never) => AgentTool,
+  createLoadSkillTool as unknown as (context: never) => AgentTool,
+  createToolSearchTool as unknown as (context: never) => AgentTool,
+  // session_record_tool: harness-only + resumeWorkExempt.
+  (() => createSessionRecordTool({ draft: new SummaryDraft(), maxTokens: 1500 })) as (context: never) => AgentTool,
 ];
 
 /**
