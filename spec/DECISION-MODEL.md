@@ -463,7 +463,8 @@ Each point states: **when** it runs (the trigger condition is always a cheap mec
   - when no selected task names models, the difficulty axis applies, as it does for `other` today.
 - **Skills.** The `skill` `choice` likewise becomes one `noul` per listed skill, so a request can preload several; the union with the tasks' static skills is preloaded as today.
 - **Persistence.** The selected task keys are stored with the routing state (`SessionRoutingState.tasks`, on `agent_sessions.initial_preloads`), so statistics and refusal rules read them without parsing evaluation rows; a resume keeps them. Sessions routed before this change get theirs from the routing row's verdict (`task`) in `decision_evaluations` during the statistics backfill.
-- **Scope unchanged.** Routing still runs only for fresh human-triggered chat-lane sessions. Proactive and bot-triggered sessions have no tasks; statistics separate them by site, not by task.
+- **Scope unchanged.** Routing still runs only for fresh human-triggered chat-lane sessions.
+- **Built-in `proactive` task** (owner, 2026-10-05). A proactive session has no request to classify, so it always carries one built-in task, `proactive`, assigned without a decision call. Like `other`, the key is reserved: config cannot define it, and it maps to nothing (the session type's own model applies). Refusal rules and statistics match it like any task. Classifying a proactive session's output instead was considered and dropped: it is nearly always just a chat message. Bot-triggered sessions remain taskless.
 - **Statistics.** A session counts under each of its tasks, so per-task totals overlap; the console says so wherever it shows a task breakdown.
 
 ### 5.2 Continuation — where does this message go?

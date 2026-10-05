@@ -69,6 +69,7 @@ Today the code cannot tell refusal reasons apart, cannot see soft refusals, keep
 17. **Change markers** on the trend charts: wanted (§12.4).
 18. **The page is passive**: no alerts or notifications for now.
 19. **Tasks are multi-label** (DECISION-MODEL §5.1a): a request may select several tasks, and some tasks exist only as labels.
+20. **Proactive sessions always carry a built-in `proactive` task** (DECISION-MODEL §5.1a), so rules and statistics can select them by task as well as by site.
 
 ## 4. Checks
 
@@ -316,7 +317,7 @@ on_exhausted = "send_last"        # chat sites: "send_last" (default) | "withhol
 ```
 
 - **Sites** are session-type names plus the internal sites (`record_turn`, `summarize`, `condense`, `diary`, `caption`).
-- **Tasks**: the task keys the routing point gave the session (`[decisions.routing.tasks.<key>]`, operator-defined, or `other`), the same classification that already picks the session's model cascade. Tasks are multi-label (DECISION-MODEL §5.1a); the condition matches when any of the session's tasks is listed. A refused request of a given kind can so be sent to a model suited to that kind. A session without a routing verdict (routing off, routing fell back, internal sites) has no task, and a rule with `tasks` never matches it. Startup validation: every listed key exists in the routing tasks of each agent the rule applies to (agents may replace their task list, DECISION-MODEL §4). A redo keeps the session's routed skills and tail files; only the model changes.
+- **Tasks**: the task keys the routing point gave the session (`[decisions.routing.tasks.<key>]`, operator-defined, `other`, or the built-in `proactive`), the same classification that already picks the session's model cascade. Tasks are multi-label (DECISION-MODEL §5.1a); the condition matches when any of the session's tasks is listed. A refused request of a given kind can so be sent to a model suited to that kind. A session without a routing verdict and not proactive (routing off, routing fell back, bot-triggered, internal sites) has no task, and a rule with `tasks` never matches it. Startup validation: every listed key exists in the routing tasks of each agent the rule applies to (agents may replace their task list, DECISION-MODEL §4). A redo keeps the session's routed skills and tail files; only the model changes.
 - **Precedence**: the first matching rule in file order (authored order, like PER-USER-LIMITS).
 - **Composition**: a matching rule **replaces** the implicit chain fallover for that refusal. With no matching rule, a hard refusal keeps today's implicit fallover and a soft refusal is recorded only.
 - **Gates**: a rule's model passes the usual gates (health, budget, per-user limits, context fits, capability). An entry that fails them is skipped. The redo is billed to the session's payee and counts on the redo model's caps.
