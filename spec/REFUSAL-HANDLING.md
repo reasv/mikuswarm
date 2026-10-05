@@ -1,6 +1,6 @@
 # Refusal handling, output checks and session redo
 
-**Status**: PROPOSAL, revision 3 (2026-10-05), ready for implementation. Revision 1 was the owner's direction of the same day; revision 2 folded in a review pass, the owner's answers to it, and the send-contract diagnostics and console design added by the owner; revision 3 settles the pre-implementation questions (§3 decisions 21–26, §16). What remains in §15 is calibration done during implementation.
+**Status**: PROPOSAL, revision 3 (2026-10-05), ready for implementation. Revision 1 was the owner's direction of the same day; revision 2 folded in a review pass, the owner's answers to it, and the send-contract diagnostics and console design added by the owner; revision 3 settles the pre-implementation questions (§3 decisions 21–27, §16). What remains in §15 is calibration done during implementation.
 **Builds on**: the shipped `refusal` error class (ARCHITECTURE.md §8a "Refusals"): hard refusals are recognized from the provider's stop reason, are never a health strike, are never retried on the member that refused, fall over to the next chain member, and log `llm_refusal`. The session-record turn opts out of that implicit fallover.
 **Supersedes**:
 - the "Refusal handling" direction in spec/SESSION-RECORDS.md §9, which this document expands;
@@ -23,6 +23,7 @@
 - **Phasing** (§16.1): deployed phase by phase; the unbuilt DECISION-MODEL and SESSION-RECORDS pieces are built inside the phase that first needs them.
 - `on_exhausted = "withhold"` settles as `NO_REPLY` with no notice (§8.2).
 - Defaults for the remaining implementer choices (§16.2).
+- **Model prompts on every switch** (§8.3, owner decision 27): rule models' preambles and tails are resolved for the session, not only its heads' chains.
 
 ### What changed in revision 2
 
@@ -87,6 +88,7 @@ Today the code cannot tell refusal reasons apart, cannot see soft refusals, keep
 24. **Phases are deployed as they land**, each in a working state (§16).
 25. **Prerequisites are built inside the phase that first needs them**, not as separate work first: the tool side-effect list in phase 1, judge-shaped state in phase 3, multi-label tasks before the rules' `tasks` condition is enabled, the audit worker in phase 6 (§16).
 26. **The starter style catalogue** starts from the not-X-but-Y contrast, em-dashes, "I hope this helps" sign-offs, sycophantic openers and "delve"-style vocabulary, plus the workspace template's existing style rules (§4.5).
+27. **Every model switch uses the serving model's own model prompts**: a refusal redo, a later rule entry, the sticky pin and its fallback get the preamble and tail configured for that model, exactly like chain fallover (§8.3).
 
 ## 4. Checks
 
@@ -380,7 +382,9 @@ When every entry of the rule has refused:
 
 ### 8.3 Stickiness
 
-After a redo the session stays on the redo model for the rest of the session (owner decision 1), for hard refusals handled by a rule too. Today the `refused` set lasts one request, so the next request returns to the model that refused. A sticky refusal pins the session's chain to the rule entry that succeeded (with that entry's own chain fallback as usual). The redo request resolves the new model's per-model preamble and tail (MODEL-PROMPTS) like any request on that model.
+After a redo the session stays on the redo model for the rest of the session (owner decision 1), for hard refusals handled by a rule too. Today the `refused` set lasts one request, so the next request returns to the model that refused. A sticky refusal pins the session's chain to the rule entry that succeeded (with that entry's own chain fallback as usual).
+
+**Model prompts on every switch** (owner decision 27). Every request uses the per-model preamble and tail (MODEL-PROMPTS) of the member that actually serves it, whatever caused the switch: chain fallover, a rule entry, the next rule entry after another refusal, the sticky pin, the pinned entry's own fallback, and the record turn after a pin. Today a session resolves model prompts once, at start, only for the members reachable from its heads (`loadSessionModelPrompts`, `factory.ts`), and applies them per attempt through `wrapMember`. A rule's models are usually outside those chains, so they must join the resolved set: the session resolves the prompts of every model (and its chain) named by a rule that can match it (its site, agent and, from phase 4, tasks), alongside its heads. A member without a resolved prompt must never be served silently without its configured preamble; a missing source logs `model_prompt_source_missing` as today. The ledger row of a redo request carries the redo member's `model_prompt` and `model_prompt_hash`.
 
 ### 8.4 Redo mechanics
 
@@ -540,7 +544,7 @@ None that block implementation. Calibrated during implementation:
 
 Each phase is deployed as it lands, in a working state (owner decision 24). Pieces of other specs that are not built yet are built inside the phase that first needs them (owner decision 25).
 
-1. **Hard refusals end to end.** Provider categories (the pi-ai patch: `category` and `usage` on the refusal, §5.1), the built-in API-signal catalogue and custom mappings, `refusal_events`, `[[refusal_fallback]]` rules without the `tasks` condition, hard-refusal redo (re-issue on the rule's model), stickiness, `on_exhausted`, mechanical-job redo, the refused-attempt ledger rows. Builds the **tool side-effect list** (redo-safe vs irreversible, shared with SESSION-RECORDS §9).
+1. **Hard refusals end to end.** Provider categories (the pi-ai patch: `category` and `usage` on the refusal, §5.1), the built-in API-signal catalogue and custom mappings, `refusal_events`, `[[refusal_fallback]]` rules without the `tasks` condition, hard-refusal redo (re-issue on the rule's model), stickiness, `on_exhausted`, mechanical-job redo, the refused-attempt ledger rows, rule models' model prompts (§8.3, with a test that a redo to a model outside the session's chains is served with its preamble and tail). Builds the **tool side-effect list** (redo-safe vs irreversible, shared with SESSION-RECORDS §9).
 2. **Send-contract mechanics.** Tagged corrective prompts, `deriveContractEvents`, `contract_attempts`, the history backfill, the nudge redo (§7.5). Builds the model-free part of DECISION-MODEL §5.8 (contract counters).
 3. **The gate, observe-only.** Judged checks at every checkpoint, recording only; endings without a send; statistics. Builds **judge-shaped state** (DECISION-MODEL §3.8) with the reasoning sources (§5.5).
 4. **Blocking refusal checks.** Soft-refusal redo with discard and fork, sibling handling (§8.4), branches, and the console's branch switcher and gate cards. Builds **multi-label tasks** and the built-in `proactive` task (DECISION-MODEL §5.1a) and enables the rules' `tasks` condition.
