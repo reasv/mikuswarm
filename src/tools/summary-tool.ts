@@ -39,6 +39,12 @@ export class SummaryDraft {
     return estimateTokens(this.content);
   }
 
+  /** Back to empty and not created (a discarded attempt is written again). */
+  reset(): void {
+    this.content = "";
+    this.created = false;
+  }
+
   create(content: string): void {
     if (this.created) {
       throw new SummaryDraftError("Draft already created. Use str_replace or insert to modify.");

@@ -40,7 +40,7 @@ import { stampServedModel } from "./contract.js";
 import type { ForkChange, ForkContext } from "./fork.js";
 import { readFile } from "node:fs/promises";
 import type { Storage, Summary } from "../storage/index.js";
-import type { SessionRoutingState } from "../storage/database.js";
+import type { RefusalPin, SessionRoutingState } from "../storage/database.js";
 import type { Logger } from "../observability/logger.js";
 import type { SessionLiveEventBus } from "../observability/live-events.js";
 import type { LlmRequestRing } from "./request-ring.js";
@@ -432,6 +432,13 @@ export interface CreateAgentOptions {
    * Absent = the factory creates one; either way it is `CreatedAgent.redoControl`.
    */
   redoControl?: SessionRedoControl;
+  /**
+   * Start the session pinned to a refusal rule's entry (spec REFUSAL-HANDLING
+   * §8.3): a mechanical job re-run after its output (or failed rollout) was
+   * judged a refusal (§5.2.3–4). Every request goes to this model's chain, with
+   * its model prompts, as for a sticky pin. Ignored when the model is unknown.
+   */
+  refusalPin?: RefusalPin;
   /**
    * Per-user limits selection input (spec PER-USER-LIMITS §6). Supplied ONLY for a
    * human-triggered agent-loop session whose trigger ctx resolved to an ACTIVE
@@ -932,7 +939,8 @@ export class AgentSessionFactory {
     // preamble and tail (§8.3, owner decision 27).
     const refusalRules = this.options.refusals?.rules ?? [];
     const refusalAgent = this.options.resolveAgentName?.(session.timelineKey) ?? null;
-    const resumedPin = opts?.resume ? this.options.storage?.getAgentSessionRefusalPin?.(session.id) : undefined;
+    const resumedPin =
+      opts?.refusalPin ?? (opts?.resume ? this.options.storage?.getAgentSessionRefusalPin?.(session.id) : undefined);
     const refusalHeads = [
       ...refusalRuleModels(refusalRules, {
         // A chat session may end in a record turn (site `record_turn`); a job never does.

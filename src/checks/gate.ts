@@ -710,6 +710,8 @@ export interface BackgroundJobScope {
   agent?: string | null;
   sessionId?: string | null;
   sessionType?: string | null;
+  /** The session's task keys (a session-bound artifact, e.g. the record); default taskless. */
+  tasks?: string[] | null;
   servedModel?: string;
   wireModel?: string;
   /**
@@ -758,7 +760,7 @@ export function createBackgroundChecks(
         sessionId: job.sessionId ?? null,
         sessionType: job.sessionType ?? null,
         timelineKey: job.timelineKey,
-        tasks: null,
+        tasks: job.tasks && job.tasks.length > 0 ? [...job.tasks] : null,
       };
       const evaluation = evaluator.start(
         scope,

@@ -56,16 +56,15 @@ const usage = { input_tokens: 900, output_tokens: 4, cost: 0.000036 };
 const fetchImpl = (async (_url: string, init: RequestInit) => {
   const body = JSON.parse(String(init.body)) as { state: any; questions: Record<string, unknown> };
   const served = "vendor/decider-1-20261001";
-  if ("task" in body.questions) {
+  if ("task__image" in body.questions) {
+    // Multi-label routing (DECISION-MODEL §5.1a): one noul per task and per skill.
     return json(200, {
       model: served,
       answers: {
-        task: { choice: "image", confidence: 0.91, probabilities: { image: 0.86, research: 0.1, other: 0.04 } },
-        skill: {
-          choice: "image-generation",
-          confidence: 0.84,
-          probabilities: { "image-generation": 0.81, "web-research": 0.12, none: 0.07 },
-        },
+        task__image: { noul: 0.91 },
+        task__research: { noul: 0.12 },
+        "skill__image-generation": { noul: 0.84 },
+        "skill__web-research": { noul: 0.1 },
       },
       usage: { ...usage, input_tokens: 1840 },
     });
@@ -188,10 +187,11 @@ test("console demo decision rows match what the real engine writes", { skip: !ex
   const routing = rows.find((r) => r.point === "routing")!;
   assert.deepEqual(JSON.parse(routing.verdictJson!), {
     task: "image",
+    tasks: ["image"],
     models: ["image-chat"],
     skills: ["image-generation"],
   });
-  assert.equal(JSON.parse(routing.answersJson!).task.type, "choice");
+  assert.equal(JSON.parse(routing.answersJson!).task__image.type, "noul");
   const failed = rows.find((r) => r.candidateSessionId === "ses_q7m1td")!;
   assert.equal(failed.source, "heuristic");
   assert.equal(failed.reason, "error");

@@ -76,6 +76,8 @@ import {
 import { attachSessionCapture, type SessionCaptureHandle } from "./agent/session-capture.js";
 import { createRedoHandler } from "./agent/redo.js";
 import { createSoftRefusalRedoHandler } from "./refusals/soft-redo.js";
+import { JobSoftRefusalRedo, decideSessionArtifactRefusal } from "./refusals/jobs.js";
+import { forkSession } from "./agent/fork.js";
 import { createActingPolicy } from "./checks/acting-policy.js";
 import { createRevisePolicyPart, priorRejections } from "./checks/revise.js";
 import { ContractReconciler, persistSessionContract } from "./agent/contract-store.js";
@@ -326,6 +328,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // overrides, kind/remedy pairs, regexes, per-agent codes; rule models, agents,
   // sites and reasons. Built once here; consumers read this catalogue.
   const checkCatalogue = buildCheckCatalogue(config);
+  // `[[refusal_fallback]]` in authored order (spec REFUSAL-HANDLING §8.1), shared
+  // by the factory (sessions), the worker pools (jobs) and the record turn.
+  const refusalRules = normalizeRefusalRules(config);
   validateRefusalRules(config, checkCatalogue);
   // [fxtwitter.tool] cross-field sanity (same fail-fast convention): the
   // per-window default must fit under the per-window hard cap, which must fit
@@ -1607,6 +1612,31 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         "default",
       config.models,
     ).map((m) => m.logicalId),
+    // A judged refusal of a caption re-captions on a soft refusal rule's model
+    // (spec REFUSAL-HANDLING §5.2.3); only when a soft rule admits the site.
+    softRefusal: (asset) => {
+      const checks = backgroundChecksRef.current;
+      if (!checks || refusalRules.length === 0) return undefined;
+      const modality = asset.media_type;
+      const redo = new JobSoftRefusalRedo({
+        checks,
+        rules: refusalRules,
+        site: "caption",
+        agent: asset.timeline_key ? agentNameForTimeline(asset.timeline_key) : null,
+        // The entry must exist and take this lane's modality (its chain's health
+        // and budget are handled by the caption call's own fallback).
+        usable: (model) => config.models[model]?.input_modalities.includes(modality as "image") ?? false,
+        chainOf: (model) => {
+          try {
+            return resolveModelChain(model, config.models).map((m) => m.logicalId);
+          } catch {
+            return [model];
+          }
+        },
+        logger: logger.child("checks"),
+      });
+      return redo.active ? redo : undefined;
+    },
     onCaptioned: (asset, result) =>
       void backgroundChecksRef.current?.artifact({
         site: "caption",
@@ -2019,7 +2049,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     resolveWorkspaceRoot: (timelineKey) => resolveWorkspaceForTimeline(timelineKey)?.workspaceRoot,
     // Refusal handling (spec REFUSAL-HANDLING §8): the one check catalogue built
     // above classifies hard refusals; the rules may redo them on another model.
-    refusals: { catalogue: checkCatalogue, rules: normalizeRefusalRules(config) },
+    refusals: { catalogue: checkCatalogue, rules: refusalRules },
     // Per-agent model override ladder (spec PER-AGENT-MODEL-OVERRIDES §4/§8).
     // Only active in agents mode (agentWorkspaces.length > 0); in legacy mode the
     // resolver is absent → factory falls back to the global-only path (§2).
@@ -2549,6 +2579,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // can be constructed before mirrorWorker exists.
         isMirroredTimeline: (tk) => mirrorWorkerRef?.isMirroredTimeline(tk) ?? false,
         outputChecks: backgroundChecksRef.current,
+        refusals: { rules: refusalRules, agentFor: agentNameForTimeline },
         onComplete: (jobId, summaryId) => {
           logger.info("summarization_job_complete", { jobId, summaryId });
           // The job is terminal — drop any sticky escalation pinned to it (§5.5).
@@ -2825,6 +2856,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // for channels whose mode is not "shared" as `excluded`.
         visibilityResolver,
         outputChecks: backgroundChecksRef.current,
+        refusals: { rules: refusalRules, agentFor: agentNameForTimeline },
         logger: logger.child("diary"),
       })
     : null;
@@ -6267,7 +6299,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     inbound: InboundChatEvent;
     created: Pick<
       Awaited<ReturnType<typeof factory.create>>,
-      "agent" | "registry" | "setPriority" | "setRefusalFallover" | "setRefusalSite" | "gate"
+      "agent" | "registry" | "setPriority" | "setRefusalFallover" | "setRefusalSite" | "gate" | "refusal" | "forkContext"
     >;
     handles: SessionRecordHandles;
     /** The run's capture flush (`captureHandle.flushNow`). */
@@ -6291,6 +6323,37 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       flush: args.flush,
       // The written record is judged as an artifact (spec REFUSAL-HANDLING §5.2.3).
       onRecordWritten: (text) => void args.created.gate?.judgeArtifact("session_record", text, { site: "record_turn" }),
+      // A soft rule that could act on the record turn: the record is judged
+      // before it is written, a judged refusal reruns the turn on the rule's
+      // model, every entry spent = no record (spec REFUSAL-HANDLING §5.2.3).
+      judgeRecord: async (text) => {
+        const { refusal, gate } = args.created;
+        const checks = backgroundChecksRef.current;
+        if (!gate || !checks || !refusal.softRuleCouldMatch()) return undefined;
+        let decision: "accept" | "rerun" | "exhausted" = "accept";
+        const servedModel = refusal.servingModel();
+        await checks.artifact({
+          site: "record_turn",
+          kind: "session_record",
+          text,
+          timelineKey: args.timelineKey,
+          agent: gate.scope.agent,
+          sessionId: args.sessionId,
+          sessionType: args.sessionType,
+          tasks: refusal.tasks(),
+          ...(servedModel ? { servedModel } : {}),
+          act: (verdict, { late }) => {
+            const taken = decideSessionArtifactRefusal(refusal, verdict, late, logger.child("checks"));
+            decision = taken.decision;
+            return taken.act;
+          },
+        });
+        return decision;
+      },
+      discardTurn: async (startIndex) => {
+        const fork = args.created.forkContext({ storage, flushTranscript: args.flush, logger });
+        await forkSession(fork, { index: startIndex }, { reason: "refusal_redo", toModel: args.created.refusal.pinnedModel() });
+      },
       logger,
     });
   }

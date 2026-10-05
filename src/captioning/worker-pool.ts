@@ -73,6 +73,8 @@ export interface CaptionWorkerPoolOptions {
   captionModelIds?: string[];
   /** Output checks on each persisted caption (spec REFUSAL-HANDLING §5.2.3); see CaptionWorkerOptions. */
   onCaptioned?: CaptionWorkerOptions["onCaptioned"];
+  /** Soft refusals of captions (spec REFUSAL-HANDLING §5.2.3), see {@link CaptionWorkerOptions.softRefusal}. */
+  softRefusal?: CaptionWorkerOptions["softRefusal"];
   logger: { info(msg: string, data?: Record<string, unknown>): void; warn(msg: string, data?: Record<string, unknown>): void; error(msg: string, data?: Record<string, unknown>): void };
 }
 
@@ -228,6 +230,7 @@ export class CaptionWorkerPool {
             })
         : undefined,
       ...(this.options.onCaptioned ? { onCaptioned: this.options.onCaptioned } : {}),
+      ...(this.options.softRefusal ? { softRefusal: this.options.softRefusal } : {}),
     });
 
     for (const asset of claimed) {

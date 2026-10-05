@@ -19,6 +19,9 @@ import { buildDiaryHeader, draftBeginsWithHeader } from "./header.js";
 import { recentMemoryWindow } from "./recent-window.js";
 import type { ChannelVisibilityResolver } from "../visibility/index.js";
 import type { BackgroundChecks } from "../checks/gate.js";
+import type { RefusalRule } from "../checks/types.js";
+import type { RefusalPin } from "../storage/database.js";
+import { JobSoftRefusalRedo } from "../refusals/jobs.js";
 
 export interface DiaryWorkerPoolOptions {
   storage: Storage;
@@ -73,6 +76,12 @@ export interface DiaryWorkerPoolOptions {
    * path. Observe-only; absent = no checks.
    */
   outputChecks?: BackgroundChecks;
+  /**
+   * Refusal rules (spec REFUSAL-HANDLING §8.1): with `outputChecks`, a judged
+   * refusal of an entry or of a failed run reruns the job on a matching soft
+   * rule's model. Absent = observe-only checks.
+   */
+  refusals?: { rules: readonly RefusalRule[]; agentFor?: (timelineKey: string) => string | null };
   logger: Logger;
 }
 
@@ -396,156 +405,205 @@ export class DiaryWorkerPool {
     });
 
     const perSessionBudget = config.per_session_budget_tokens ?? DEFAULT_PER_SESSION_BUDGET;
-    const draft = new SummaryDraft();
-    const diaryTool = createDiaryTool({ draft, perSessionBudget, requiredHeader: header });
+    // One run on a fresh synthetic session (pinned to a refusal rule's entry
+    // for a soft-refusal rerun, spec REFUSAL-HANDLING §5.2.4).
+    const runAttempt = async (pin: RefusalPin | undefined) => {
+      const draft = new SummaryDraft();
+      const diaryTool = createDiaryTool({ draft, perSessionBudget, requiredHeader: header });
 
-    const syntheticTrigger: CanonicalChatEvent = {
-      id: `diary:${job.summaryId}`,
-      timelineKey: job.timelineKey,
-      provider: "system",
-      role: "user",
-      sender: { id: "system", displayName: "Diary" },
-      body: "Write your diary entry.",
-      timestamp: job.latestTimestamp,
-      receivedAt: Date.now(),
-    };
-    const syntheticSession: AgentSessionRecord = {
-      // Unique per attempt: each diary run is a separately inspectable session, and
-      // reusing the summary id across retries would collide on the PRIMARY KEY.
-      id: `s-${nanoid(10)}`,
-      timelineKey: job.timelineKey,
-      sessionType: "diary",
-      status: "running",
-      trigger: {
-        provider: "system",
+      const syntheticTrigger: CanonicalChatEvent = {
+        id: `diary:${job.summaryId}`,
         timelineKey: job.timelineKey,
-        event: syntheticTrigger,
-      },
-      createdAt: Date.now(),
+        provider: "system",
+        role: "user",
+        sender: { id: "system", displayName: "Diary" },
+        body: "Write your diary entry.",
+        timestamp: job.latestTimestamp,
+        receivedAt: Date.now(),
+      };
+      const syntheticSession: AgentSessionRecord = {
+        // Unique per attempt: each diary run is a separately inspectable session, and
+        // reusing the summary id across retries would collide on the PRIMARY KEY.
+        id: `s-${nanoid(10)}`,
+        timelineKey: job.timelineKey,
+        sessionType: "diary",
+        status: "running",
+        trigger: {
+          provider: "system",
+          timelineKey: job.timelineKey,
+          event: syntheticTrigger,
+        },
+        createdAt: Date.now(),
+      };
+
+      // Thread `job.timelineKey` for per-agent model resolution (spec PER-AGENT-MODEL-OVERRIDES §4/§8).
+      const modelId = factory.resolveModelId("diary", job.timelineKey);
+      const sessionStartedAt = Date.now();
+      await storage.insertAgentSession({
+        id: syntheticSession.id,
+        timelineKey: job.timelineKey,
+        sessionType: "diary",
+        status: "running",
+        modelId,
+        triggerEventId: syntheticTrigger.id,
+        triggerBody: syntheticTrigger.body,
+        createdAt: sessionStartedAt,
+        startedAt: sessionStartedAt,
+        updatedAt: sessionStartedAt,
+      });
+
+      const sessionType = factory.resolveSessionType("diary");
+      const instruction = (sessionType?.session_instruction ?? DEFAULT_DIARY_INSTRUCTION)
+        .replaceAll("{{room}}", roomLabel)
+        .replaceAll("{{date}}", targetDate)
+        .replaceAll("{{header}}", header);
+
+      const continuityBlock = continuity.trim().length > 0 ? continuity : "(no earlier diary entries yet)";
+      // The kickoff is recent-memory window + instruction only (spec
+      // DIARY-CONTEXT-PARITY §3): the range's raw events live in the built
+      // prefix as real chat turns, not rendered into this final turn. The
+      // recent-diary window deliberately stays HERE (final-turn packaging),
+      // not as the interactive-style diary layer after the system prompt —
+      // maintainer decision; it keeps the generation builds' "no memory
+      // entries in the prefix" rule clean.
+      const kickoff =
+        `<your_recent_memory>\n${continuityBlock}\n</your_recent_memory>\n\n` +
+        instruction;
+
+      let agentError: unknown;
+      let servedModel: string | undefined;
+      // Set when a refusal rule's entries were all exhausted (spec REFUSAL-HANDLING
+      // §8.2): the entry is not written and the job is not re-run.
+      let refusalExhausted = false;
+      // The run's messages, kept for the rollout check of a failed run.
+      let runMessages: readonly unknown[] | undefined;
+      try {
+        // Diary-range build (spec DIARY-CONTEXT-PARITY §3): the summarize-style
+        // prefix — system prompt, prior chunks' summaries bounded at the range
+        // START (the range's own already-persisted summary excluded), the range's
+        // raw events as real chat turns — ending in a popped `satellite` final
+        // turn, exactly like the summarize worker's cutoff build. The build also
+        // yields a real snapshot, so diary sessions gain context_snapshot_json
+        // observability parity with summarize sessions.
+        const { agent, finalTurn, snapshot, tokenEstimate, usage, refusal } = await factory.create(syntheticSession, [diaryTool], {
+          diaryRange: {
+            earliestTimestamp: job.earliestTimestamp,
+            latestTimestamp: job.latestTimestamp,
+            summaryId: job.summaryId,
+          },
+          ...(pin ? { refusalPin: pin } : {}),
+        });
+        // Resolve the cost ceiling ONCE per run (spec SESSION-COST-LIMITS §3/§6) so
+        // the settle log's spend-vs-ceiling line is self-contained. Diary sessions
+        // get the §2.2 hard cap (no soft-warn watcher), but the ceiling they were
+        // measured against must still be logged rather than a misleading null.
+        const costCeiling = factory.resolveSessionCostCeiling(syntheticSession.sessionType);
+        const capture = attachSessionCapture(agent, {
+          storage,
+          sessionId: syntheticSession.id,
+          snapshot,
+          tokenEstimate,
+          usage,
+          timelineKey: syntheticSession.timelineKey,
+          sessionType: syntheticSession.sessionType,
+          // Thread `syntheticSession.timelineKey` for per-agent model resolution (spec §4/§8).
+          model: factory.resolveModelId(syntheticSession.sessionType, syntheticSession.timelineKey),
+          maxSessionCostUsd: costCeiling,
+          logger,
+        });
+        this.activeAgents.add(agent);
+        try {
+          // Drain gate: stop() may have fired between create and prompt (the
+          // agent was not yet in activeAgents for the abort sweep).
+          if (!this.running) throw new WorkerDrainAbortError("pool draining before run start");
+          // Deliver the popped satellite final turn followed by the kickoff,
+          // mirroring the summarize worker's `[finalTurn, instruction]` shape.
+          const promptInput = finalTurn
+            ? [finalTurn, { role: "user", content: kickoff, timestamp: syntheticTrigger.timestamp }]
+            : kickoff;
+          await agent.prompt(promptInput as any);
+          await agent.waitForIdle();
+          // Outcome bifurcation (spec LLM-FAILURE-HANDLING §7): a DRAIN abort
+          // (this agent was swept by stop()) returns the job to 'pending' with its
+          // claim-time attempts increment compensated; a CAP abort stays semantic.
+          // We test the explicit drain-swept set rather than `!this.running` so a
+          // cap abort that settles WHILE stop() is in progress is not misread as a
+          // drain (issue #13).
+          if (wasRunAborted(agent) && this.drainSwept.has(agent)) {
+            throw new WorkerDrainAbortError(agent.state.errorMessage ?? "pool draining");
+          }
+          // pi-agent-core resolves the run promise even when the cap-driven abort
+          // (§8c) or a stream error fires — it synthesizes a final message with
+          // stopReason "aborted"/"error" and sets `state.errorMessage` rather than
+          // throwing. Surface that as a throw HERE so a runaway/errored run routes to
+          // the failure → retry path below instead of committing a partial draft. A
+          // clean completion (including the legitimate empty-draft skip) leaves
+          // `errorMessage` unset and does not throw. Environmental LLM failures
+          // can no longer reach this point — absorbed (unbounded) at Layer-0.
+          assertRunSettledCleanly(agent);
+        } catch (err) {
+          refusalExhausted = refusal?.lastHardOutcome() === "exhausted_no_output";
+          try {
+            await capture.flushNow();
+          } catch (flushErr) {
+            logger.error("session capture: error-path flush failed", {
+              sessionId: syntheticSession.id,
+              error: flushErr instanceof Error ? flushErr.message : String(flushErr),
+            });
+          }
+          throw err;
+        } finally {
+          this.activeAgents.delete(agent);
+          capture.detach();
+          runMessages = agent.state.messages;
+          servedModel = refusal?.servingModel();
+        }
+      } catch (err) {
+        agentError = err;
+      }
+      return { draft, syntheticSession, agentError, refusalExhausted, runMessages, servedModel };
     };
 
-    // Thread `job.timelineKey` for per-agent model resolution (spec PER-AGENT-MODEL-OVERRIDES §4/§8).
-    const modelId = factory.resolveModelId("diary", job.timelineKey);
-    const sessionStartedAt = Date.now();
-    await storage.insertAgentSession({
-      id: syntheticSession.id,
-      timelineKey: job.timelineKey,
-      sessionType: "diary",
-      status: "running",
-      modelId,
-      triggerEventId: syntheticTrigger.id,
-      triggerBody: syntheticTrigger.body,
-      createdAt: sessionStartedAt,
-      startedAt: sessionStartedAt,
-      updatedAt: sessionStartedAt,
-    });
-
-    const sessionType = factory.resolveSessionType("diary");
-    const instruction = (sessionType?.session_instruction ?? DEFAULT_DIARY_INSTRUCTION)
-      .replaceAll("{{room}}", roomLabel)
-      .replaceAll("{{date}}", targetDate)
-      .replaceAll("{{header}}", header);
-
-    const continuityBlock = continuity.trim().length > 0 ? continuity : "(no earlier diary entries yet)";
-    // The kickoff is recent-memory window + instruction only (spec
-    // DIARY-CONTEXT-PARITY §3): the range's raw events live in the built
-    // prefix as real chat turns, not rendered into this final turn. The
-    // recent-diary window deliberately stays HERE (final-turn packaging),
-    // not as the interactive-style diary layer after the system prompt —
-    // maintainer decision; it keeps the generation builds' "no memory
-    // entries in the prefix" rule clean.
-    const kickoff =
-      `<your_recent_memory>\n${continuityBlock}\n</your_recent_memory>\n\n` +
-      instruction;
-
-    let agentError: unknown;
-    // Set when a refusal rule's entries were all exhausted (spec REFUSAL-HANDLING
-    // §8.2): the entry is not written and the job is not re-run.
-    let refusalExhausted = false;
-    // The run's messages, kept for the rollout check of a failed run.
-    let runMessages: readonly unknown[] | undefined;
-    try {
-      // Diary-range build (spec DIARY-CONTEXT-PARITY §3): the summarize-style
-      // prefix — system prompt, prior chunks' summaries bounded at the range
-      // START (the range's own already-persisted summary excluded), the range's
-      // raw events as real chat turns — ending in a popped `satellite` final
-      // turn, exactly like the summarize worker's cutoff build. The build also
-      // yields a real snapshot, so diary sessions gain context_snapshot_json
-      // observability parity with summarize sessions.
-      const { agent, finalTurn, snapshot, tokenEstimate, usage, refusal } = await factory.create(syntheticSession, [diaryTool], {
-        diaryRange: {
-          earliestTimestamp: job.earliestTimestamp,
-          latestTimestamp: job.latestTimestamp,
-          summaryId: job.summaryId,
-        },
+    // A judged refusal of the entry (or of a run that wrote none) reruns the
+    // job on a refusal rule's model (spec REFUSAL-HANDLING §5.2.3–4); every
+    // entry spent = no entry.
+    const softRedo = this.jobSoftRefusal(job);
+    let attempt = await runAttempt(undefined);
+    // The final attempt's output was already judged (no fire-and-forget check below).
+    let judged = false;
+    while (softRedo && !(attempt.agentError instanceof WorkerDrainAbortError) && !attempt.refusalExhausted) {
+      const created = attempt.draft.isCreated();
+      const content = attempt.draft.getContent();
+      const valid = !attempt.agentError && (!created || draftBeginsWithHeader(content, header));
+      const scope = {
+        ...diaryCheckScope(job, attempt.syntheticSession, attempt.runMessages),
+        ...(attempt.servedModel ? { servedModel: attempt.servedModel } : {}),
+      };
+      const decision =
+        valid && created && content.trim().length > 0
+          ? await softRedo.artifact({ ...scope, kind: "diary", text: content })
+          : (!valid || !created) && attempt.runMessages && attempt.runMessages.length > 0
+            ? await softRedo.rollout({ ...scope, kind: "diary", messages: attempt.runMessages })
+            : ({ action: "accept" } as const);
+      judged = true;
+      if (decision.action === "accept") break;
+      await storage.updateAgentSessionStatus(attempt.syntheticSession.id, "discarded", {
+        completedAt: Date.now(),
+        error: `discarded: judged a refusal (${decision.checkCode})`,
       });
-      // Resolve the cost ceiling ONCE per run (spec SESSION-COST-LIMITS §3/§6) so
-      // the settle log's spend-vs-ceiling line is self-contained. Diary sessions
-      // get the §2.2 hard cap (no soft-warn watcher), but the ceiling they were
-      // measured against must still be logged rather than a misleading null.
-      const costCeiling = factory.resolveSessionCostCeiling(syntheticSession.sessionType);
-      const capture = attachSessionCapture(agent, {
-        storage,
-        sessionId: syntheticSession.id,
-        snapshot,
-        tokenEstimate,
-        usage,
-        timelineKey: syntheticSession.timelineKey,
-        sessionType: syntheticSession.sessionType,
-        // Thread `syntheticSession.timelineKey` for per-agent model resolution (spec §4/§8).
-        model: factory.resolveModelId(syntheticSession.sessionType, syntheticSession.timelineKey),
-        maxSessionCostUsd: costCeiling,
-        logger,
-      });
-      this.activeAgents.add(agent);
-      try {
-        // Drain gate: stop() may have fired between create and prompt (the
-        // agent was not yet in activeAgents for the abort sweep).
-        if (!this.running) throw new WorkerDrainAbortError("pool draining before run start");
-        // Deliver the popped satellite final turn followed by the kickoff,
-        // mirroring the summarize worker's `[finalTurn, instruction]` shape.
-        const promptInput = finalTurn
-          ? [finalTurn, { role: "user", content: kickoff, timestamp: syntheticTrigger.timestamp }]
-          : kickoff;
-        await agent.prompt(promptInput as any);
-        await agent.waitForIdle();
-        // Outcome bifurcation (spec LLM-FAILURE-HANDLING §7): a DRAIN abort
-        // (this agent was swept by stop()) returns the job to 'pending' with its
-        // claim-time attempts increment compensated; a CAP abort stays semantic.
-        // We test the explicit drain-swept set rather than `!this.running` so a
-        // cap abort that settles WHILE stop() is in progress is not misread as a
-        // drain (issue #13).
-        if (wasRunAborted(agent) && this.drainSwept.has(agent)) {
-          throw new WorkerDrainAbortError(agent.state.errorMessage ?? "pool draining");
-        }
-        // pi-agent-core resolves the run promise even when the cap-driven abort
-        // (§8c) or a stream error fires — it synthesizes a final message with
-        // stopReason "aborted"/"error" and sets `state.errorMessage` rather than
-        // throwing. Surface that as a throw HERE so a runaway/errored run routes to
-        // the failure → retry path below instead of committing a partial draft. A
-        // clean completion (including the legitimate empty-draft skip) leaves
-        // `errorMessage` unset and does not throw. Environmental LLM failures
-        // can no longer reach this point — absorbed (unbounded) at Layer-0.
-        assertRunSettledCleanly(agent);
-      } catch (err) {
-        refusalExhausted = refusal?.lastHardOutcome() === "exhausted_no_output";
-        try {
-          await capture.flushNow();
-        } catch (flushErr) {
-          logger.error("session capture: error-path flush failed", {
-            sessionId: syntheticSession.id,
-            error: flushErr instanceof Error ? flushErr.message : String(flushErr),
-          });
-        }
-        throw err;
-      } finally {
-        this.activeAgents.delete(agent);
-        capture.detach();
-        runMessages = agent.state.messages;
+      if (decision.action === "exhausted") {
+        // Never a refusal written into the diary (spec §8.2): no entry, no re-run.
+        logger.warn("diary_refusal_exhausted", { summaryId: job.summaryId, timelineKey: job.timelineKey, rule: decision.rule });
+        await storage.setDiaryStatus(job.summaryId, "failed");
+        this.options.onError?.(job.summaryId, new Error("refusal rule exhausted"));
+        this.emit(job, "failed", "failed");
+        return;
       }
-    } catch (err) {
-      agentError = err;
+      logger.info("diary_refusal_redo", { summaryId: job.summaryId, timelineKey: job.timelineKey, model: decision.pin.model });
+      attempt = await runAttempt(decision.pin);
+      judged = false;
     }
+    const { draft, syntheticSession, agentError, refusalExhausted, runMessages } = attempt;
 
     // Drain abort (spec LLM-FAILURE-HANDLING §7): not judged — the job returns
     // to 'pending' with its claim-time diary_attempts increment compensated.
@@ -572,7 +630,7 @@ export class DiaryWorkerPool {
       await storage.updateAgentSessionStatus(syntheticSession.id, "completed", { completedAt: Date.now() });
       if (created && content.trim().length > 0) {
         await memoryWriter.appendEntry(targetDate, content);
-        void this.options.outputChecks?.artifact({ ...diaryCheckScope(job, syntheticSession, runMessages), kind: "diary", text: content });
+        if (!judged) void this.options.outputChecks?.artifact({ ...diaryCheckScope(job, syntheticSession, runMessages), kind: "diary", text: content });
         logger.info("diary_entry_written", {
           summaryId: job.summaryId,
           timelineKey: job.timelineKey,
@@ -584,7 +642,7 @@ export class DiaryWorkerPool {
         // finalize on an empty draft = the agent judged "nothing worth recording".
         logger.info("diary_entry_empty", { summaryId: job.summaryId, timelineKey: job.timelineKey });
         // A run that never created a draft may have declined the task (§5.2.4).
-        if (!created && runMessages && runMessages.length > 0) {
+        if (!judged && !created && runMessages && runMessages.length > 0) {
           void this.options.outputChecks?.rollout({
             ...diaryCheckScope(job, syntheticSession, runMessages),
             kind: "diary",
@@ -610,7 +668,7 @@ export class DiaryWorkerPool {
     });
     // A run that produced no entry is judged for a refusal before its re-run
     // (spec REFUSAL-HANDLING §5.2.4); observe-only, the re-run is unchanged.
-    if (runMessages && runMessages.length > 0) {
+    if (!judged && runMessages && runMessages.length > 0) {
       void this.options.outputChecks?.rollout({
         ...diaryCheckScope(job, syntheticSession, runMessages),
         kind: "diary",
@@ -642,6 +700,28 @@ export class DiaryWorkerPool {
         writeError: writeErr instanceof Error ? writeErr.message : String(writeErr),
       });
     }
+  }
+
+  /** The job's soft-refusal walk, when output checks are wired and a soft rule admits the diary site. */
+  private jobSoftRefusal(job: DiaryJob): JobSoftRefusalRedo | undefined {
+    const { outputChecks, refusals, factory } = this.options;
+    if (!outputChecks || !refusals || refusals.rules.length === 0) return undefined;
+    const redo = new JobSoftRefusalRedo({
+      checks: outputChecks,
+      rules: refusals.rules,
+      site: "diary",
+      agent: refusals.agentFor?.(job.timelineKey) ?? null,
+      usable: (model) => factory.refusalEntryViable(model),
+      chainOf: (model) => {
+        try {
+          return factory.resolveModelChainLogicalIdsForModel(model);
+        } catch {
+          return [model];
+        }
+      },
+      logger: this.options.logger,
+    });
+    return redo.active ? redo : undefined;
   }
 
   /**
