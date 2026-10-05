@@ -1985,6 +1985,18 @@ export class AgentSessionFactory {
     // loaded set without any explicit loadInitial call.
     const routingSkillSpecs: SyntheticCallSpec[] = [];
     let routedSatellite: RoutedSatellite | undefined;
+    // A task without a routing verdict (a proactive session's built-in task) is
+    // persisted too, so the model behaviour statistics and the audit see it.
+    if (!opts?.resume && !routing && sessionTasks && sessionTasks.length > 0) {
+      void this.options.storage
+        ?.setSessionInitialPreloads(session.id, { skills: [], tasks: sessionTasks })
+        .catch((error) =>
+          logger?.warn("routing_preloads_persist_failed", {
+            sessionId: session.id,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+    }
     if (!opts?.resume && routing) {
       // Tail files only — skills are no longer inlined into the satellite.
       routedSatellite =

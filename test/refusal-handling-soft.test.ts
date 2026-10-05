@@ -537,6 +537,8 @@ test("tasks: a proactive session carries the built-in `proactive` task; rules ma
       const { refusals } = await settled(storage, "s12");
       assert.equal(refusals[0]!.rule_name, "proactive_only");
       assert.equal(refusals[0]!.tasks_json, JSON.stringify(["proactive"]));
+      // Persisted like a routed task (statistics, audit, resume).
+      assert.deepEqual(storage.getSessionInitialPreloads("s12")?.tasks, ["proactive"]);
       // A default session is taskless: the tasks rule never matches it.
       const plain = await create("s12b");
       assert.equal(plain.refusal.tasks(), null);
