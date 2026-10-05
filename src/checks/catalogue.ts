@@ -81,12 +81,23 @@ export function firstPatternMatch(check: CheckDefinition, text: string): string 
   return words ? text.match(words)?.[0] : undefined;
 }
 
+/**
+ * Whether a check's questions may be asked over `text`: true without a
+ * prefilter, else when one of its prefilter patterns matches. A prefilter only
+ * gates the questions; it never decides the check.
+ */
+export function prefilterAllows(check: CheckDefinition, text: string): boolean {
+  if (!check.prefilter || check.prefilter.length === 0) return true;
+  return check.prefilter.some((pattern) => pattern.test(text));
+}
+
 function cloneCheck(check: CheckDefinition): CheckDefinition {
   return {
     ...check,
     checkpoints: [...check.checkpoints],
     apiSignals: check.apiSignals.map((s) => ({ ...s })),
     patterns: check.patterns.map((p) => new RegExp(p.source, p.flags)),
+    ...(check.prefilter ? { prefilter: check.prefilter.map((p) => new RegExp(p.source, p.flags)) } : {}),
     words: [...check.words],
     questions: check.questions.map((q) => ({ ...q, criteria: { ...q.criteria } })),
   };
@@ -121,20 +132,20 @@ function applyCheckConfig(
   const checkpoints = (raw.checkpoints ?? base?.checkpoints ?? DEFAULT_CHECKPOINTS[kind]).map((c) =>
     oneOf(c, CHECKPOINTS, "checkpoint", where),
   );
-  const patterns =
-    raw.patterns === undefined
-      ? (base?.patterns ?? [])
-      : raw.patterns.map((source, i) => {
-          try {
-            return compileCheckPattern(source);
-          } catch (err) {
-            throw new Error(
-              `${where}.patterns[${i}]: invalid regular expression ${JSON.stringify(source)}: ${
-                err instanceof Error ? err.message : String(err)
-              }`,
-            );
-          }
-        });
+  const compileAll = (sources: readonly string[], field: string) =>
+    sources.map((source, i) => {
+      try {
+        return compileCheckPattern(source);
+      } catch (err) {
+        throw new Error(
+          `${where}.${field}[${i}]: invalid regular expression ${JSON.stringify(source)}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    });
+  const patterns = raw.patterns === undefined ? (base?.patterns ?? []) : compileAll(raw.patterns, "patterns");
+  const prefilter = raw.prefilter === undefined ? base?.prefilter : compileAll(raw.prefilter, "prefilter");
   const questions =
     raw.questions === undefined
       ? (base?.questions ?? [])
@@ -171,6 +182,7 @@ function applyCheckConfig(
             ...(s.category !== undefined ? { category: s.category === "" ? null : s.category } : {}),
           })),
     patterns,
+    ...(prefilter && prefilter.length > 0 ? { prefilter } : {}),
     words: raw.words ?? base?.words ?? [],
     minChars: raw.min_chars ?? base?.minChars,
     questions,
@@ -198,6 +210,9 @@ function validateCheck(def: CheckDefinition, where: string): void {
   }
   if (def.minChars !== undefined && def.kind !== "style") {
     throw new Error(`${where}: min_chars applies only to style checks`);
+  }
+  if (def.prefilter && def.prefilter.length > 0 && def.questions.length === 0) {
+    throw new Error(`${where}: prefilter gates questions; a check without questions cannot have one`);
   }
   if (def.checkpoints.length === 0) {
     throw new Error(`${where}: checkpoints must not be empty (set enabled = false to turn the check off)`);

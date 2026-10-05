@@ -25,7 +25,8 @@
  *   refuses every request that is not to a configured endpoint.
  */
 import Database from "better-sqlite3";
-import { assistantText, buildCheckState, type CheckContext, type CheckSources } from "../checks/state.js";
+import { prefilterAllows } from "../checks/catalogue.js";
+import { assistantText, buildCheckState, type CheckContext, type CheckSources, type StateMessage } from "../checks/state.js";
 import type { CheckCatalogue, CheckDefinition, CheckQuestion, CheckSource, Checkpoint } from "../checks/types.js";
 import { BUILTIN_REFUSAL_REASONS } from "../checks/types.js";
 import { classifyApiRefusal } from "../refusals/signals.js";
@@ -162,7 +163,7 @@ export interface CalibrationItem {
 }
 
 /** Deterministic PRNG (mulberry32). */
-function random(seed: number): () => number {
+export function seededRandom(seed: number): () => number {
   let a = seed >>> 0;
   return () => {
     a = (a + 0x6d2b79f5) >>> 0;
@@ -194,7 +195,7 @@ export interface SampleOptions {
 export interface SampleResult {
   items: CalibrationItem[];
   knownPositives: CalibrationItem[];
-  /** Outputs eligible for sampling (the check's source present). */
+  /** Outputs eligible for sampling (the check's source present, and its prefilter matching). */
   eligible: number;
   sessions: number;
 }
@@ -213,9 +214,13 @@ function contentOf(m: unknown): Record<string, unknown> | undefined {
 }
 
 /**
- * Sample the outputs `check` judges at `checkpoint` that carry `source`
- * (reservoir sampling, seeded), and collect the known positives.
+ * The key of a check row's anchor, as {@link scanSessions} gives each output:
+ * `<session>|<tool call id>`, or `<session>|#<attempt>` for an ending without a call.
  */
+export function anchorKey(sessionId: string, toolCallId: string | null | undefined, attemptNo: number | null | undefined): string {
+  return toolCallId ? `${sessionId}|${toolCallId}` : `${sessionId}|#${attemptNo ?? 0}`;
+}
+
 /** The anchors a check fired on, from soft refusal events linked to their check rows. */
 function firedAnchors(db: Database.Database, code: string): { sessions: Set<string>; anchors: Set<string> } {
   const rows = db
@@ -229,20 +234,29 @@ function firedAnchors(db: Database.Database, code: string): { sessions: Set<stri
   const anchors = new Set<string>();
   for (const r of rows) {
     sessions.add(r.s);
-    anchors.add(r.t ? `${r.s}|${r.t}` : `${r.s}|#${r.a ?? 0}`);
+    anchors.add(anchorKey(r.s, r.t, r.a));
   }
   return { sessions, anchors };
 }
 
-export function sampleCalibrationItems(db: Database.Database, opts: SampleOptions): SampleResult {
-  const rand = random(opts.seed);
-  const reservoir: CalibrationItem[] = [];
-  const knownPositives: CalibrationItem[] = [];
-  let eligible = 0;
-  let sessions = 0;
+/** One chat session's outputs at a checkpoint (branch 0, as the audit sees them). */
+export interface ScannedSession {
+  id: string;
+  transcript: unknown[];
+  request: StateMessage[];
+  /** Every output at the checkpoint, with its anchor key ({@link anchorKey}). */
+  outputs: Array<{ item: CalibrationItem; anchor: string }>;
+}
+
+/**
+ * Walk the chat sessions with a readable transcript (generation sessions never),
+ * oldest first, yielding each one's outputs at `checkpoint`.
+ */
+export function* scanSessions(
+  db: Database.Database,
+  opts: { checkpoint: Extract<Checkpoint, "send" | "ending">; since?: number; sessions?: ReadonlySet<string> },
+): Generator<ScannedSession> {
   const types = [...SYNTHETIC_SESSION_TYPES];
-  // Anchors (session + tool call id, or session + ending attempt) the check fired on.
-  const fired = opts.firedOnly ? firedAnchors(db, opts.check.code) : undefined;
   const rows = db
     .prepare(
       `select s.id, s.created_at, s.trigger_body, s.trigger_sender_display_name, s.trigger_sender_id, p.transcript_json
@@ -253,45 +267,76 @@ export function sampleCalibrationItems(db: Database.Database, opts: SampleOption
     )
     .iterate(opts.since ?? 0, ...types) as IterableIterator<SessionScanRow>;
   for (const row of rows) {
-    if (fired && !fired.sessions.has(row.id)) continue;
+    if (opts.sessions && !opts.sessions.has(row.id)) continue;
     const transcript = parseTranscript(row.transcript_json);
     if (!transcript) continue;
-    sessions += 1;
     const request = row.trigger_body
       ? [{ from: row.trigger_sender_display_name ?? row.trigger_sender_id ?? "user", text: row.trigger_body }]
       : [];
     const counters = new Map<string, number>();
+    const outputs: ScannedSession["outputs"] = [];
     for (const item of checkItems(transcript)) {
       if (item.checkpoint !== opts.checkpoint) continue;
-      const text = item.sources[opts.source];
-      if (typeof text !== "string" || !text.trim()) continue;
-      if (fired && !fired.anchors.has(item.toolCallId ? `${row.id}|${item.toolCallId}` : `${row.id}|#${item.attemptNo ?? 0}`)) continue;
       const base = item.toolCallId ?? `${item.action}:${item.attemptNo ?? 0}`;
       const n = (counters.get(base) ?? 0) + 1;
       counters.set(base, n);
-      const candidate: CalibrationItem = {
-        id: `${row.id}:${base}${n > 1 ? `:${n}` : ""}`,
-        sessionId: row.id,
-        checkpoint: item.checkpoint,
-        context: {
+      outputs.push({
+        anchor: anchorKey(row.id, item.toolCallId, item.attemptNo),
+        item: {
+          id: `${row.id}:${base}${n > 1 ? `:${n}` : ""}`,
+          sessionId: row.id,
           checkpoint: item.checkpoint,
-          request,
-          action: item.action,
-          ...(item.nudges ? { nudges: item.nudges } : {}),
-          ...(item.firstAttempt ? { firstAttempt: item.firstAttempt } : {}),
+          context: {
+            checkpoint: item.checkpoint,
+            request,
+            action: item.action,
+            ...(item.nudges ? { nudges: item.nudges } : {}),
+            ...(item.firstAttempt ? { firstAttempt: item.firstAttempt } : {}),
+          },
+          sources: item.sources,
         },
-        sources: item.sources,
-      };
+      });
+    }
+    yield { id: row.id, transcript, request, outputs };
+  }
+}
+
+/**
+ * Sample the outputs `check` judges at `checkpoint` that carry `source` (and
+ * match the check's prefilter, when it has one) by seeded reservoir sampling,
+ * and collect the known positives.
+ */
+export function sampleCalibrationItems(db: Database.Database, opts: SampleOptions): SampleResult {
+  const rand = seededRandom(opts.seed);
+  const reservoir: CalibrationItem[] = [];
+  const knownPositives: CalibrationItem[] = [];
+  let eligible = 0;
+  let sessions = 0;
+  // Anchors (session + tool call id, or session + ending attempt) the check fired on.
+  const fired = opts.firedOnly ? firedAnchors(db, opts.check.code) : undefined;
+  const scan = scanSessions(db, {
+    checkpoint: opts.checkpoint,
+    ...(opts.since !== undefined ? { since: opts.since } : {}),
+    ...(fired ? { sessions: fired.sessions } : {}),
+  });
+  for (const session of scan) {
+    sessions += 1;
+    for (const { item, anchor } of session.outputs) {
+      const text = item.sources[opts.source];
+      if (typeof text !== "string" || !text.trim()) continue;
+      if (!prefilterAllows(opts.check, text)) continue;
+      if (fired && !fired.anchors.has(anchor)) continue;
       eligible += 1;
-      if (reservoir.length < opts.sample) reservoir.push(candidate);
+      if (reservoir.length < opts.sample) reservoir.push(item);
       else {
         const j = Math.floor(rand() * eligible);
-        if (j < opts.sample) reservoir[j] = candidate;
+        if (j < opts.sample) reservoir[j] = item;
       }
     }
     // Known positives: a hard refusal this check's API signals map, with text the question can read.
     if (opts.check.kind !== "refusal") continue;
-    transcript.forEach((m, index) => {
+    const { id, request } = session;
+    session.transcript.forEach((m, index) => {
       const o = contentOf(m);
       if (o?.["role"] !== "assistant" || typeof o["rawStopReason"] !== "string") return;
       const classified = classifyApiRefusal(
@@ -307,8 +352,8 @@ export function sampleCalibrationItems(db: Database.Database, opts: SampleOption
       const text = assistantText(m);
       if (!text) return;
       knownPositives.push({
-        id: `${row.id}:refused:${index}`,
-        sessionId: row.id,
+        id: `${id}:refused:${index}`,
+        sessionId: id,
         checkpoint: opts.checkpoint,
         context: { checkpoint: opts.checkpoint, request, action: opts.checkpoint === "send" ? "send_message" : "exhausted" },
         sources: { [opts.source]: text },
@@ -719,8 +764,8 @@ export function formatReport(report: CalibrationReport): string {
   return `${lines.join("\n")}\n`;
 }
 
-/** The report as JSON (the same fields; still no message text). */
-export function reportJson(report: CalibrationReport): string {
+/** A report as JSON (the same fields; still no message text). */
+export function reportJson(report: object): string {
   return `${JSON.stringify(report, null, 2)}\n`;
 }
 

@@ -10,6 +10,7 @@ import {
   compileCheckPattern,
   compileWordList,
   firstPatternMatch,
+  prefilterAllows,
 } from "../src/checks/catalogue.js";
 import {
   BUILTIN_CHECKS,
@@ -30,7 +31,7 @@ const question = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
-test("built-ins: the seven refusal checks, enabled, redo, all checkpoints", () => {
+test("built-ins: the eight refusal checks, enabled, redo, all checkpoints", () => {
   const catalogue = build({});
   const refusal = catalogue.all().filter((c) => c.kind === "refusal");
   assert.deepEqual(
@@ -38,6 +39,7 @@ test("built-ins: the seven refusal checks, enabled, redo, all checkpoints", () =
     [
       ["refusal_distillation", "distillation"],
       ["refusal_safety", "safety"],
+      ["refusal_sexual_content", "sexual_content"],
       ["refusal_privacy", "privacy"],
       ["refusal_copyright", "copyright"],
       ["refusal_persona", "persona"],
@@ -60,7 +62,7 @@ test("built-ins: the seven refusal checks, enabled, redo, all checkpoints", () =
     BUILTIN_CHECKS.length,
     BUILTIN_REFUSAL_CHECKS.length + BUILTIN_STYLE_CHECKS.length + BUILTIN_CONTRACT_CHECKS.length,
   );
-  assert.equal(BUILTIN_STYLE_CHECKS.length, 11, "the starter style catalogue (§4.5)");
+  assert.equal(BUILTIN_STYLE_CHECKS.length, 9, "the starter style catalogue (§4.5)");
 });
 
 test("override: a built-in is overridden field by field, the rest kept", () => {
@@ -180,6 +182,9 @@ test("validation: startup errors name the table", () => {
     [{ x: { kind: "contract", min_chars: 10 } }, /min_chars applies only to style checks/],
     [{ x: { kind: "style", checkpoints: [] } }, /checkpoints must not be empty/],
     [{ refusal_safety: { kind: "style" } }, /cannot change the kind of check "refusal_safety"/],
+    [{ x: { kind: "style", prefilter: ["(unclosed"], questions: [question()] } }, /\[checks\.x\]\.prefilter\[0\]: invalid regular expression/],
+    [{ x: { kind: "style", prefilter: ["ok"] } }, /prefilter gates questions; a check without questions cannot have one/],
+    [{ style_load_bearing: { questions: [] } }, /\[checks\.style_load_bearing\]: prefilter gates questions/],
   ];
   for (const [checks, re] of cases) {
     assert.throws(() => build({ checks }), re, JSON.stringify(checks));
@@ -230,5 +235,26 @@ test("catalogueReasons: built-in and operator reasons across agents", () => {
     agents: { agent_a: { workspace_root: "/a", checks: { refusal_custom: { reason: "policy_y" } } } },
   });
   const reasons = catalogueReasons(catalogue, ["agent_a"]);
-  for (const r of ["distillation", "unclear", "policy_x", "policy_y"]) assert.ok(reasons.has(r), r);
+  for (const r of ["distillation", "sexual_content", "unclear", "policy_x", "policy_y"]) assert.ok(reasons.has(r), r);
+});
+
+test("prefilter: compiled like patterns, overridden wholesale, gates without deciding", () => {
+  const catalogue = build({
+    checks: {
+      style_gated: { kind: "style", prefilter: ["(?i)\\bfoo\\b", "bar"], questions: [question()] },
+      style_load_bearing: { prefilter: ["(?i)structural"] },
+    },
+    agents: { agent_a: { workspace_root: "/a", checks: { style_gated: { enabled: false } } } },
+  });
+  const gated = catalogue.get("style_gated")!;
+  assert.deepEqual(gated.prefilter!.map((p) => [p.source, p.flags]), [["\\bfoo\\b", "iu"], ["bar", "u"]]);
+  assert.equal(prefilterAllows(gated, "a FOO here"), true);
+  assert.equal(prefilterAllows(gated, "a bar"), true);
+  assert.equal(prefilterAllows(gated, "a Bar"), false, "no (?i): case-sensitive");
+  assert.equal(firstPatternMatch(gated, "a foo here"), undefined, "a prefilter hit never decides the check");
+  assert.equal(catalogue.get("style_gated", "agent_a")!.prefilter!.length, 2, "per-agent entries keep the prefilter");
+  // A built-in's prefilter is replaced wholesale; a check without one is never gated.
+  assert.deepEqual(catalogue.get("style_load_bearing")!.prefilter!.map((p) => p.source), ["structural"]);
+  assert.equal(prefilterAllows(catalogue.get("style_not_x_but_y")!, "anything"), true);
+  assert.equal(build({}).get("style_load_bearing")!.prefilter!.length, 1, "the built-in module is untouched");
 });

@@ -332,6 +332,33 @@ test("style floor: style checks skip short messages; pattern-only style checks a
   long.storage.close();
 });
 
+test("prefilter: questions are asked only when a prefilter matches their source; a hit never decides", async () => {
+  const styleQ = { source: "message", instructions: "`message` is figurative.", criteria: { true: "t", false: "f" }, threshold: 0.8 };
+  const t = await setup({
+    answer: () => ({ noul: 0.1 }),
+    checks: {
+      op_refusal: opRefusal({ prefilter: ["(?i)\\bnope\\b"] }),
+      style_gated: { kind: "style", min_chars: 0, prefilter: ["(?i)load[- ]?bearing"], questions: [styleQ] },
+    },
+  });
+  const [wrapped] = wrapToolsWithOutputGate([sendTool([])], t.gate);
+  // No prefilter matches: no question, no call, nothing fires, nothing recorded.
+  await wrapped!.execute("c1", { message: "Sure, here it is.", analysis: "Help them." } as any, undefined, undefined);
+  for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(t.server.calls.length, 0);
+  assert.equal(rows(t.storage).length, 0);
+  // Each question is gated on its own source: the refusal check's analysis question only.
+  await wrapped!.execute("c2", { message: "That detail is Load-Bearing.", analysis: "Nope, decline." } as any, undefined, undefined);
+  await until(() => rows(t.storage).length === 1, "the call row");
+  assert.deepEqual(Object.keys(t.server.calls[0]!.body.questions), ["op_refusal__analysis", "style_gated__message"]);
+  // A prefilter hit alone fires nothing: the answers are low.
+  const [row] = rows(t.storage);
+  assert.equal(row!.source, "model");
+  assert.deepEqual(JSON.parse(row!.verdict_json!).fired, []);
+  assert.equal(t.storage.listRefusalEvents(SESSION).length, 0);
+  t.storage.close();
+});
+
 test("calibration: [decisions.calibration.<member>] \"checks.<code>\" overrides the check's thresholds", async () => {
   const t = await setup({
     answer: () => ({ noul: 0.9 }),

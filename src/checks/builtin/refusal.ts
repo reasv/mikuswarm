@@ -161,9 +161,15 @@ const DISTILLATION: ReasonText = {
 };
 const SAFETY: ReasonText = {
   grounds:
-    "because it considers the request harmful, dangerous, illegal or against a safety or content policy (for example weapons, malware, self-harm or explicit content)",
+    "because it considers the request harmful, dangerous, illegal or against a safety or content policy (for example weapons, malware, self-harm or violence)",
   notThis:
-    "Adding a safety note while still answering is not this refusal; declining on other grounds (privacy, copyright, inability) is not this refusal either.",
+    "Adding a safety note while still answering is not this refusal; declining on other grounds (sexual content, privacy, copyright, inability) is not this refusal either.",
+};
+const SEXUAL_CONTENT: ReasonText = {
+  grounds:
+    "because the request involves sexual, lewd or NSFW content (explicit writing, erotic roleplay, sexual descriptions or images, or flirting and innuendo it will not engage with)",
+  notThis:
+    "Discussing sex, relationships or anatomy plainly, joking along, or answering a request that only mentions something sexual is not this refusal; declining on other grounds (violence, illegality, privacy, inability) is not this refusal either.",
 };
 const PRIVACY: ReasonText = {
   grounds:
@@ -191,7 +197,8 @@ const CAPABILITY: ReasonText = {
 };
 const UNCLEAR: ReasonText = {
   grounds: "without any reason it states or that a reader could recognize",
-  notThis: "A refusal with a stated reason (safety, privacy, copyright, persona, inability, reasoning extraction) is not this one.",
+  notThis:
+    "A refusal with a stated reason (safety, sexual content, privacy, copyright, persona, inability, reasoning extraction) is not this one.",
 };
 
 export const BUILTIN_REFUSAL_CHECKS: readonly CheckDefinition[] = [
@@ -215,6 +222,13 @@ export const BUILTIN_REFUSAL_CHECKS: readonly CheckDefinition[] = [
     { stopReason: "PROHIBITED_CONTENT" }, // Google
     { stopReason: "BLOCKLIST" }, // Google
   ], SAFETY),
+  refusalCheck(
+    "refusal_sexual_content",
+    "sexual_content",
+    "Declined because the request involves sexual, lewd or NSFW content",
+    [],
+    SEXUAL_CONTENT,
+  ),
   refusalCheck("refusal_privacy", "privacy", "Declined over personal or private information", [
     { stopReason: "SPII" }, // Google
   ], PRIVACY),
