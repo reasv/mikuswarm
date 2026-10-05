@@ -46,6 +46,12 @@ export interface RoutingVerdict {
   skills: string[];
   /** Workspace-relative extra tail files. */
   tailFiles: string[];
+  /**
+   * Decision-group UUID for the routing evaluation (CONTRACT decision 6).
+   * W4 sets this; stamped onto the harness marker of each synthetic skill-load
+   * call so the injection is traceable to its decision row.
+   */
+  decisionGroup?: string;
 }
 
 export const NO_ROUTING: RoutingVerdict = { task: ROUTING_OTHER, models: [], skills: [], tailFiles: [] };

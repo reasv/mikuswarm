@@ -11,7 +11,8 @@ import type { ContextMessage } from "../context/builder.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import { convertToLlm } from "./convert.js";
 import { withStaleThinkingDropped } from "./stale-thinking.js";
-import { makeDeferLoadingInjector, renderLoadedToolDefinitions, withDeclaredDeferredTools, type DeclaredToolSet } from "./declared-tools.js";
+import { makeDeferLoadingInjector, withDeclaredDeferredTools, type DeclaredToolSet } from "./declared-tools.js";
+import { executeSyntheticCalls, type SyntheticCallSpec } from "./synthetic-calls.js";
 import { estimateLiveSliceTokens } from "./live-token-estimate.js";
 import { extractLlmRequestClass, withRequestRetry } from "./request-retry.js";
 import {
@@ -29,7 +30,6 @@ import {
 import { loadWorkspace, renderSystemPrompt } from "../workspace/index.js";
 import type { WorkspaceContent, SessionTypeConfig, SkillMeta, RoutedSatellite } from "../workspace/types.js";
 import type { RoutingVerdict } from "../decisions/points/routing.js";
-import { parseFrontmatter, frontmatterToolPatterns } from "../workspace/skills.js";
 import { resolveWorkspacePath } from "../tools/workspace.js";
 import { loadModelPrompts, withModelPrompt, type ResolvedModelPrompt } from "./model-prompts.js";
 import { readFile } from "node:fs/promises";
@@ -314,6 +314,14 @@ export interface CreateAgentOptions {
    */
   route?: (input: { listedSkills: readonly SkillMeta[] }) => Promise<RoutingVerdict | undefined>;
   /**
+   * Synthetic tool calls to inject into the start of the live transcript, after
+   * the final user turn (spec §4 / SESSION-RECORDS §4).  Routing preloads are
+   * prepended automatically; this list is appended after them.  W6 uses this to
+   * inject `read_session_record` calls.  Ignored on a resume (the transcript
+   * already carries the original injections).
+   */
+  injections?: SyntheticCallSpec[];
+  /**
    * Reply-resume continuation (spec RESUMABLE-SESSIONS §9/§11). Set ALONGSIDE
    * `resume` when continuing a COMPLETED session because a user replied to it:
    * instead of `continue()`-ing the seeded transcript (the failure-recovery
@@ -411,8 +419,19 @@ export interface CreatedAgent {
    * (summarization) — popped off the frozen prefix (§2b). The caller kicks the loop
    * with it via `agent.prompt(...)`, making it the first turn of the live transcript.
    * Undefined in resume mode (the caller appends a new user turn instead).
+   *
+   * For callers that support synthetic injections (live chat-lane sessions), use
+   * {@link kickoff} instead: it is the full kickoff array `[finalTurn,
+   * ...syntheticMessages]` already assembled.
    */
   finalTurn?: AgentMessage;
+  /**
+   * Full kickoff array for the runner: `[finalTurn, ...syntheticMessages]` when
+   * there is a final turn (fresh + resume-continuation builds), or `undefined` in
+   * failure-recovery continue-mode.  Workers that manage their own prompt calls
+   * may use `finalTurn` directly; all live chat-lane callers should use this.
+   */
+  kickoff?: AgentMessage[];
   /**
    * Frozen context **prefix** for persistence (spec §3 / §10a): `built.messages`
    * minus the final live user turn (the trailing `triggerGroup`/`satellite`).
@@ -1611,27 +1630,21 @@ export class AgentSessionFactory {
     }
     // Decision-model routing preloads (ARCHITECTURE.md §8h). Applied AFTER the
     // deferred-tools index above, so the system prompt (and the cached prefix) is
-    // byte-identical to an unrouted session's. A fresh routed session loads its
-    // skills' tools before the first turn and persists the set; a resume re-applies
-    // the persisted set (with the transcript's own loads) so it recomputes the same.
+    // byte-identical to an unrouted session's. Skill preloads now enter the
+    // transcript as synthetic load_skill calls (W5) rather than as satellite text
+    // or registry.loadInitial().  On resume, seedFromTranscript picks up the
+    // addedToolNames from those synthetic toolResult messages and re-derives the
+    // loaded set without any explicit loadInitial call.
+    const routingSkillSpecs: SyntheticCallSpec[] = [];
     let routedSatellite: RoutedSatellite | undefined;
-    if (opts?.resume) {
-      if (persistedRouting && registry) registry.loadInitial(persistedRouting.tools);
-    } else if (routing) {
+    if (!opts?.resume && routing) {
+      // Tail files only — skills are no longer inlined into the satellite.
       routedSatellite =
-        routing.skills.length > 0 || routing.tailFiles.length > 0
-          ? await this.buildRoutedSatellite(routing, {
-              workspace,
-              workspaceRoot,
-              registry,
-              sessionId: session.id,
-              declaredDeferred: modelConfig.compat?.declare_deferred_tools === true,
-            })
+        routing.tailFiles.length > 0
+          ? await this.buildRoutedSatellite(routing, { workspace, workspaceRoot, sessionId: session.id })
           : { preloadedSkills: [], tailFiles: [] };
-      const preloadedTools = routedSatellite.preloadedSkills.flatMap((skill) => skill.tools);
       const state: SessionRoutingState = {
-        skills: routedSatellite.preloadedSkills.map((skill) => skill.name),
-        tools: preloadedTools,
+        skills: routing.skills,
         ...(routedHead ? { model: routedHead } : {}),
         ...(userSelection && routedCascade.length > 0 ? { cascade: routedCascade } : {}),
         ...(routedThinking ? { thinkingLevel: routedThinking } : {}),
@@ -1649,11 +1662,23 @@ export class AgentSessionFactory {
       logger?.info("routing_applied", {
         sessionId: session.id,
         task: routing.task,
-        skills: routedSatellite.preloadedSkills.map((skill) => skill.name),
-        tools: preloadedTools,
-        tailFiles: routedSatellite.tailFiles.map((file) => file.source),
+        skills: routing.skills,
+        tailFiles: routing.tailFiles,
         thinkingLevel: routedThinking,
       });
+      // One synthetic load_skill spec per preloaded skill.  They are executed
+      // below (after agent + registry.onChange are both wired) so the registry
+      // load, tool-definition charge, and harness marker all land correctly.
+      for (const name of routing.skills) {
+        routingSkillSpecs.push({
+          name: "load_skill",
+          params: { name },
+          harness: {
+            kind: "injection",
+            ...(routing.decisionGroup ? { decisionGroup: routing.decisionGroup } : {}),
+          },
+        });
+      }
     }
     // The session's initial wire tool set: immediate-only under dynamic loading,
     // the full wrapped catalog otherwise.
@@ -1931,9 +1956,61 @@ export class AgentSessionFactory {
       agent.state.messages = [...opts.resume.transcript];
     }
 
+    // W5 synthetic injections (spec §4 / SESSION-RECORDS §4): execute routing
+    // skill preloads + caller injections as real tool calls and build transcript
+    // message pairs.  Only on fresh (non-resume) sessions — a resumed session
+    // already carries the original synthetic pairs in its transcript, and
+    // seedFromTranscript re-derives the loaded set from their addedToolNames.
+    //
+    // Execution happens AFTER registry.onChange is wired (so load events update
+    // agent.state.tools and park tool-def charges in pendingToolDefTokens), and
+    // AFTER the transcript seed (but the fresh path has no transcript to seed).
+    // The resulting messages are prepended to the kickoff array so the LLM
+    // context reads: [frozenBase] finalTurn → synth_assistant → synth_toolResult
+    // → … → LLM continues.
+    let syntheticMessages: AgentMessage[] = [];
+    if (!opts?.resume && finalTurn !== undefined) {
+      const allSpecs = [...routingSkillSpecs, ...(opts?.injections ?? [])];
+      if (allSpecs.length > 0) {
+        const synthModelInfo = {
+          api: model.api ?? "unknown",
+          provider: model.provider ?? "unknown",
+          model: model.id,
+        };
+        syntheticMessages = await executeSyntheticCalls(allSpecs, initialTools, synthModelInfo, {
+          registry: registry ?? undefined,
+          logger: this.options.logger,
+          sessionId: session.id,
+        });
+        // Account for synthetic message tokens in the initial context estimate so
+        // refreshRunningContext's first-observation seed covers the full kickoff.
+        // (built.tokenEstimate already covers finalTurn; synthetics are new.)
+        if (syntheticMessages.length > 0) {
+          const synthSlice = syntheticMessages.filter(isLiveRuntimeMessage);
+          if (synthSlice.length > 0) {
+            try {
+              initialContextEstimate.value += estimateLiveSliceTokens(synthSlice);
+            } catch {
+              /* best-effort; conservative: under-counting only */
+            }
+          }
+        }
+      }
+    }
+
+    // Build the kickoff array.  Workers that use finalTurn directly keep working;
+    // live chat-lane callers should use kickoff (= finalTurn + synthetics).
+    const kickoff =
+      finalTurn !== undefined
+        ? syntheticMessages.length > 0
+          ? [finalTurn, ...syntheticMessages]
+          : [finalTurn]
+        : undefined;
+
     return {
       agent,
       finalTurn,
+      kickoff,
       snapshot,
       tokenEstimate: snapshotTokenEstimate,
       compactTokens: snapshotCompactTokens,
@@ -2084,58 +2161,21 @@ export class AgentSessionFactory {
   }
 
   /**
-   * Resolve a routing verdict's skills and tail files (ARCHITECTURE.md §8h): each
-   * skill must be a LISTED skill of this workspace (an inlined one is already in
-   * the system prompt; an unknown one is skipped with a warning). Bodies are read
-   * live from disk like `load_skill`; the skill's tool patterns are loaded into
-   * the registry before the first turn. Tail files that cannot be read are skipped.
+   * Resolve a routing verdict's tail files (ARCHITECTURE.md §8h).
+   *
+   * Skill preloads moved to synthetic load_skill calls (W5): this method now only
+   * reads and returns the tail files; the `preloadedSkills` field is always empty
+   * (`never[]`).  Tail files that cannot be read are skipped with a warning.
    */
   private async buildRoutedSatellite(
     routing: RoutingVerdict,
     ctx: {
       workspace: WorkspaceContent;
       workspaceRoot: string;
-      registry: DynamicToolRegistry | undefined;
       sessionId: string;
-      declaredDeferred: boolean;
     },
   ): Promise<RoutedSatellite> {
     const logger = this.options.logger;
-    const preloadedSkills: RoutedSatellite["preloadedSkills"] = [];
-    for (const name of routing.skills) {
-      const meta = ctx.workspace.skills.listed.find((skill) => skill.name === name);
-      if (!meta) {
-        logger?.warn("routing_skill_unknown", { sessionId: ctx.sessionId, skill: name });
-        continue;
-      }
-      let body: string | undefined;
-      let patterns = meta.tools ?? [];
-      try {
-        const absolute = resolveWorkspacePath(ctx.workspaceRoot, meta.path);
-        if (absolute === null) throw new Error("outside workspace");
-        const raw = await readFile(absolute, "utf-8");
-        const parsed = parseFrontmatter(raw);
-        body = parsed ? parsed.body : raw;
-        if (parsed) patterns = frontmatterToolPatterns(parsed.frontmatter) ?? [];
-      } catch (error) {
-        logger?.warn("routing_skill_unreadable", {
-          sessionId: ctx.sessionId,
-          skill: name,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        continue;
-      }
-      const tools = ctx.registry ? ctx.registry.loadInitial(ctx.registry.matchCatalog(patterns)) : [];
-      const definitions =
-        ctx.declaredDeferred && ctx.registry && tools.length > 0
-          ? renderLoadedToolDefinitions(
-              ctx.registry.catalogTools.filter((tool) => tools.includes(tool.name)) as unknown as Parameters<
-                typeof renderLoadedToolDefinitions
-              >[0],
-            )
-          : undefined;
-      preloadedSkills.push({ name, body: body.trim(), tools, ...(definitions ? { toolDefinitions: definitions } : {}) });
-    }
     const tailFiles: RoutedSatellite["tailFiles"] = [];
     for (const source of routing.tailFiles) {
       try {
@@ -2150,7 +2190,7 @@ export class AgentSessionFactory {
         });
       }
     }
-    return { preloadedSkills, tailFiles };
+    return { preloadedSkills: [], tailFiles };
   }
 
   /**

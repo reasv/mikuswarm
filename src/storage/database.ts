@@ -1187,12 +1187,15 @@ export interface ToolInvocationInput {
 /**
  * What decision-model routing decided for a session (ARCHITECTURE.md §8h),
  * persisted in `agent_sessions.initial_preloads` so a resume keeps it: the
- * preloaded skills and their tools, the routed head model (no per-user limits),
- * the routed cascade (per-user limits), and the routed thinking level.
+ * preloaded skills, the routed head model (no per-user limits), the routed
+ * cascade (per-user limits), and the routed thinking level.
+ *
+ * `tools` was removed in W5: tool loading now happens via synthetic `load_skill`
+ * calls in the live transcript, derived on resume by `seedFromTranscript`.
+ * Old rows that still carry a `tools` array parse fine; the field is ignored.
  */
 export interface SessionRoutingState {
   skills: string[];
-  tools: string[];
   model?: string;
   cascade?: string[];
   thinkingLevel?: string;
@@ -8072,9 +8075,10 @@ export class Storage {
     try {
       const parsed = JSON.parse(row.initial_preloads) as Record<string, unknown>;
       const strings = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
+      // `tools` was stored by sessions created before W5; it is ignored now
+      // (tool loading is derived from transcript `addedToolNames` instead).
       return {
         skills: strings(parsed["skills"]),
-        tools: strings(parsed["tools"]),
         ...(typeof parsed["model"] === "string" ? { model: parsed["model"] } : {}),
         ...(Array.isArray(parsed["cascade"]) ? { cascade: strings(parsed["cascade"]) } : {}),
         ...(typeof parsed["thinkingLevel"] === "string" ? { thinkingLevel: parsed["thinkingLevel"] } : {}),

@@ -84,16 +84,18 @@ export class SessionRunner {
 
   /**
    * Drive a session run to a terminal state. `kickoff` is the frozen final user
-   * turn for a fresh session; `undefined` means **continue-mode** (resume-in-place,
-   * spec §6.2): the transcript was seeded from the persisted record and the run
-   * re-issues from its current tail via `agent.continue()` — redoing the exact
-   * request that failed rather than starting a new turn.
+   * turn for a fresh session (or an array of `[finalTurn, ...syntheticMessages]`
+   * when W5 synthetic injections are present); `undefined` means
+   * **continue-mode** (resume-in-place, spec §6.2): the transcript was seeded
+   * from the persisted record and the run re-issues from its current tail via
+   * `agent.continue()` — redoing the exact request that failed rather than
+   * starting a new turn.
    */
   async run(
     agent: Agent,
     session: AgentSessionRecord,
     maxRetries: number,
-    kickoff: AgentMessage | undefined,
+    kickoff: AgentMessage | AgentMessage[] | undefined,
     lifecycle?: SessionRunLifecycle,
   ): Promise<SessionRunResult> {
     let retries = 0;

@@ -55,16 +55,16 @@ export interface SatelliteRuntimeInput {
   routedSatellite?: RoutedSatellite;
 }
 
-/** What routing adds to the satellite block (ARCHITECTURE.md §8h). */
+/**
+ * What routing adds to the satellite block (ARCHITECTURE.md §8h).
+ *
+ * Skill preloads moved to synthetic `load_skill` calls (W5): the satellite
+ * only carries extra tail files now.  `preloadedSkills` is kept as an empty
+ * array so callers that spread or iterate it require no update.
+ */
 export interface RoutedSatellite {
-  preloadedSkills: Array<{
-    name: string;
-    body: string;
-    /** Tool names this preload loaded before the first turn. */
-    tools: string[];
-    /** Definitions of those tools as text, for members that declare deferred tools. */
-    toolDefinitions?: string;
-  }>;
+  /** Always empty after W5; retained so existing spread/iteration needs no change. */
+  preloadedSkills: never[];
   tailFiles: Array<{ source: string; content: string }>;
 }
 
