@@ -1367,12 +1367,18 @@ test("GET /api/sessions/:id/decisions returns camelCase rows in ts order", async
         decision_group: "dg-routing",
         point: "routing",
         source: "model",
-        verdict_json: JSON.stringify({ model: "sol61_aws" }),
-        answers_json: JSON.stringify([{ label: "sol61_aws", probability: 0.9 }]),
-        state_json: JSON.stringify({ request: "help" }),
-        questions_json: JSON.stringify([{ key: "q1", label: "What model?" }]),
-        served_model: "anthropic/claude-haiku-4",
-        served_version: "20250307",
+        // The shapes the engine writes: verdict = routingPoint.describe output,
+        // answers = the answer map keyed by question name.
+        verdict_json: JSON.stringify({ task: "coding", models: ["deep-chat"] }),
+        answers_json: JSON.stringify({
+          task: { type: "choice", choice: "coding", probabilities: { coding: 0.9, other: 0.1 }, confidence: 0.9 },
+        }),
+        state_json: JSON.stringify({ request: { from: "Ada", text: "help" }, recent: [] }),
+        questions_json: JSON.stringify({
+          task: { type: "choice", instructions: "Which task?", criteria: { coding: "Code", other: "Anything else" } },
+        }),
+        served_model: "decider",
+        served_version: "vendor/decider-1-20261001",
         latency_ms: 150,
         input_tokens: 500,
         cost_usd: 0.0005,
@@ -1384,8 +1390,9 @@ test("GET /api/sessions/:id/decisions returns camelCase rows in ts order", async
         decision_group: "dg-records",
         point: "records",
         source: "heuristic",
-        reason: "short session",
+        reason: "timeout",
         candidate_session_id: "s-cand-1",
+        verdict_json: JSON.stringify({ inject: false, relevance: 0, candidateSessionId: "s-cand-1" }),
       }),
     );
     await withServer({ storage }, async (base) => {
@@ -1410,8 +1417,10 @@ test("GET /api/sessions/:id/decisions returns camelCase rows in ts order", async
       assert.equal(typeof first.answersJson, "string");
       assert.equal(typeof first.stateJson, "string");
       assert.equal(typeof first.questionsJson, "string");
-      assert.equal(first.servedModel, "anthropic/claude-haiku-4");
-      assert.equal(first.servedVersion, "20250307");
+      assert.deepEqual(JSON.parse(first.verdictJson), { task: "coding", models: ["deep-chat"] });
+      assert.equal(JSON.parse(first.answersJson).task.confidence, 0.9);
+      assert.equal(first.servedModel, "decider");
+      assert.equal(first.servedVersion, "vendor/decider-1-20261001");
       assert.equal(first.latencyMs, 150);
       assert.equal(first.inputTokens, 500);
       assert.equal(first.costUsd, 0.0005);
@@ -1421,10 +1430,10 @@ test("GET /api/sessions/:id/decisions returns camelCase rows in ts order", async
       assert.equal(second.decisionGroup, "dg-records");
       assert.equal(second.point, "records");
       assert.equal(second.source, "heuristic");
-      assert.equal(second.reason, "short session");
+      assert.equal(second.reason, "timeout");
       assert.equal(second.candidateSessionId, "s-cand-1");
-      // Null JSON columns come through as null.
-      assert.equal(second.verdictJson, null);
+      assert.equal(JSON.parse(second.verdictJson).inject, false);
+      // Null JSON columns (no member answered) come through as null.
       assert.equal(second.answersJson, null);
       assert.equal(second.stateJson, null);
       assert.equal(second.questionsJson, null);

@@ -4,10 +4,12 @@
 	import OctagonXIcon from '@lucide/svelte/icons/octagon-x';
 	import RotateCcwIcon from '@lucide/svelte/icons/rotate-ccw';
 	import { sessionQuery } from '$lib/query/sessions';
+	import { sessionDecisionsQuery, sessionRecordQuery } from '$lib/query/session-record';
 	import { keys } from '$lib/query/keys';
 	import { selection } from '$lib/stores/selection.svelte';
 	import { contextSummary } from '$lib/stores/context-summary.svelte';
 	import { coerceContextMessage, type RolloutMsg } from '$lib/rollout';
+	import { recordTurnPending } from '$lib/query/session-poll';
 	import { formatTokens, formatUsd } from '$lib/format';
 	import { computeCostBudget } from '$lib/cost-budget';
 	import type { ToolInvocation } from '$lib/schemas';
@@ -31,7 +33,18 @@
 	const activeId = $derived(sessionIdProp ?? selection.sessionId);
 
 	const queryClient = useQueryClient();
-	const session = sessionQuery(() => activeId);
+	// The session, its record and its decisions (spec SESSION-RECORDS §8). The
+	// record turn runs after the session completes, so all three keep polling
+	// until it has settled (bounded; see `recordTurnPending`).
+	const session = sessionQuery(() => activeId, {
+		recordPending: () => recordPending()
+	});
+	const record = sessionRecordQuery(() => activeId, () => session.data);
+	const decisions = sessionDecisionsQuery(() => activeId, () => session.data);
+	function recordPending(): boolean {
+		return recordTurnPending(session.data, record.data?.sessionRecord != null);
+	}
+	const decisionEvaluations = $derived(decisions.data ? [...decisions.data.evaluations] : []);
 
 	let stopping = $state(false);
 	let resuming = $state(false);
@@ -313,10 +326,15 @@
 		{/if}
 		{#if isRunning && activeId}
 			{#key activeId}
-				<LiveRollout sessionId={activeId} onEnd={onStreamEnd} onHead={(h) => (liveHead = h)} />
+				<LiveRollout
+					sessionId={activeId}
+					onEnd={onStreamEnd}
+					onHead={(h) => (liveHead = h)}
+					{decisionEvaluations}
+				/>
 			{/key}
 		{:else}
-			<Rollout messages={rolloutMessages} toolUsage={toolUsageByCallId} />
+			<Rollout messages={rolloutMessages} toolUsage={toolUsageByCallId} {decisionEvaluations} />
 		{/if}
 	{/if}
 </div>

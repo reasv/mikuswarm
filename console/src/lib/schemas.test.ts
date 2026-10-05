@@ -804,10 +804,11 @@ describe('session records schemas', () => {
 			candidateSessionId: null,
 			source: 'model',
 			reason: null,
-			verdictJson: '{"model":"sol61_aws"}',
-			answersJson: '[{"label":"sol61_aws","probability":0.9}]',
-			stateJson: '{"request":{"from":"@a:m","text":"hi"}}',
-			questionsJson: '[]',
+			verdictJson: '{"task":"coding","models":["deep-chat"]}',
+			answersJson:
+				'{"task":{"type":"choice","choice":"coding","probabilities":{"coding":0.9,"other":0.1},"confidence":0.9}}',
+			stateJson: '{"request":{"from":"Ada","text":"hi"},"recent":[]}',
+			questionsJson: '{"task":{"type":"choice","instructions":"Which task?","criteria":{"coding":"Code"}}}',
 			servedModel: 'anthropic/claude-haiku-4',
 			servedVersion: '20250307',
 			latencyMs: 213,
@@ -831,8 +832,8 @@ describe('session records schemas', () => {
 			triggerEventId: null,
 			candidateSessionId: 'ses_prev',
 			source: 'heuristic',
-			reason: 'below threshold',
-			verdictJson: '{"inject":false}',
+			reason: 'timeout',
+			verdictJson: '{"inject":false,"relevance":0,"candidateSessionId":"ses_prev"}',
 			answersJson: null,
 			stateJson: null,
 			questionsJson: null,
@@ -844,7 +845,7 @@ describe('session records schemas', () => {
 		});
 		expect(out.candidateSessionId).toBe('ses_prev');
 		expect(out.source).toBe('heuristic');
-		expect(out.reason).toBe('below threshold');
+		expect(out.reason).toBe('timeout');
 		expect(out.costUsd).toBeNull();
 	});
 
@@ -864,8 +865,9 @@ describe('session records schemas', () => {
 					id: 2, ts: 2, decisionGroup: 'dg-B', point: 'records',
 					agent: null, timelineKey: null, agentSessionId: 's1',
 					triggerEventId: null, candidateSessionId: 's-prev',
-					source: 'model', reason: null, verdictJson: '{"inject":true}',
-					answersJson: '[{"label":"relevant","probability":0.85}]',
+					source: 'model', reason: null,
+					verdictJson: '{"inject":true,"relevance":0.85,"candidateSessionId":"s-prev"}',
+					answersJson: '{"relevant":{"type":"noul","noul":0.85}}',
 					stateJson: null, questionsJson: null,
 					servedModel: 'anthropic/claude-haiku-4', servedVersion: '20250307',
 					latencyMs: 180, inputTokens: 900, costUsd: 0.00045
