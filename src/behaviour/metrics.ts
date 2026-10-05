@@ -90,6 +90,10 @@ export const MODEL_BEHAVIOUR_METRICS = {
     source: "distinct judged calls with a decision row whose consequence is overridden",
     model: "as style_hits",
   },
+  no_reply_intent_judged: {
+    source: "judged endings with a no_reply_intent choice (decision rows of point checks, once per judged call)",
+    model: "as style_hits",
+  },
 } as const satisfies Record<string, MetricDefinition>;
 
 export type ModelBehaviourMetric = keyof typeof MODEL_BEHAVIOUR_METRICS;
@@ -103,6 +107,7 @@ export const MODEL_BEHAVIOUR_METRIC_FAMILIES = {
   refusal_reason: { source: "refusal_events.reason (hard and judged)", model: "as refusals_hard" },
   refusal_method: { source: "refusal_events.method", model: "as refusals_hard" },
   refusal_outcome: { source: "refusal_events.outcome (rule outcomes)", model: "as refusals_hard" },
+  judged_refusal_reason: { source: "refusal_events.reason of judged (soft) refusals: live gate and offline audit", model: "as refusals_hard" },
   failure_type: { source: "contract_attempts.primary_type", model: "as contract_failed_attempts" },
   check_hits: { source: "distinct (judged call, check) pairs per fired check code, every kind", model: "as style_hits" },
   check_revisions: { source: "fired codes of decision rows whose consequence is revise, per distinct judged call", model: "as style_hits" },
@@ -126,11 +131,14 @@ export function familyMetric<F extends ModelBehaviourMetricFamily>(family: F, ke
   return `${family}:${key}`;
 }
 
+/** A counter name: a fixed metric or one key of a keyed family (`<family>:<key>`). */
+export type MetricName = ModelBehaviourMetric | `${ModelBehaviourMetricFamily}:${string}`;
+
 /** A headline rate: the sum of the numerator counters over the denominator counter. */
 export interface HeadlineRate {
   id: string;
   label: string;
-  numerator: readonly ModelBehaviourMetric[];
+  numerator: readonly MetricName[];
   denominator: ModelBehaviourMetric;
   /** Multiplier applied to the ratio (1000 for "per 1k tokens"). */
   scale: number;
@@ -138,11 +146,13 @@ export interface HeadlineRate {
   minSample: number;
 }
 
-/** The scorecard columns (spec §12.3 item 1), in display order. */
+/** The scorecard columns (spec §12.3 item 1), in display order; each one can be charted over time. */
 export const HEADLINE_RATES: readonly HeadlineRate[] = [
   { id: "refusals_hard_per_request", label: "Hard refusals per request", numerator: ["refusals_hard"], denominator: "requests", scale: 1, minSample: 50 },
   { id: "refusals_judged_per_request", label: "Judged refusals per request", numerator: ["refusals_judged"], denominator: "requests", scale: 1, minSample: 50 },
+  { id: "refusal_redos_per_session", label: "Refusal redos per session", numerator: ["refusal_redos"], denominator: "sessions", scale: 1, minSample: 20 },
   { id: "nudged_per_session", label: "Sessions nudged", numerator: ["sessions_nudged"], denominator: "sessions", scale: 1, minSample: 20 },
+  { id: "failed_attempts_per_session", label: "Failed send attempts per session", numerator: ["contract_failed_attempts"], denominator: "sessions", scale: 1, minSample: 20 },
   {
     id: "recovered_per_nudged",
     label: "Recovered after nudges",
@@ -151,13 +161,36 @@ export const HEADLINE_RATES: readonly HeadlineRate[] = [
     scale: 1,
     minSample: 5,
   },
-  { id: "contract_redos_per_session", label: "Send-contract redos per session", numerator: ["contract_redos"], denominator: "sessions", scale: 1, minSample: 20 },
+  { id: "gave_up_per_nudged", label: "Gave up (no_reply) after nudges", numerator: ["contract_gave_up"], denominator: "sessions_nudged", scale: 1, minSample: 5 },
   { id: "contract_exhaustions_per_session", label: "Send-contract exhaustions per session", numerator: ["contract_exhausted"], denominator: "sessions", scale: 1, minSample: 20 },
+  { id: "contract_redos_per_session", label: "Send-contract redos per session", numerator: ["contract_redos"], denominator: "sessions", scale: 1, minSample: 20 },
+  {
+    id: "no_reply_abandoned_per_judged",
+    label: "no_reply abandoning a written reply",
+    numerator: ["no_reply_intent:abandoned_written_reply"],
+    denominator: "no_reply_intent_judged",
+    scale: 1,
+    minSample: 5,
+  },
   { id: "style_hits_per_1k_tokens", label: "Style hits per 1k message tokens", numerator: ["style_hits"], denominator: "message_tokens", scale: 1000, minSample: 2000 },
   { id: "messages_with_style_hit", label: "Messages with a style hit", numerator: ["messages_with_style_hit"], denominator: "messages_sent", scale: 1, minSample: 20 },
-  { id: "refusal_redos_per_session", label: "Refusal redos per session", numerator: ["refusal_redos"], denominator: "sessions", scale: 1, minSample: 20 },
 ];
 
 export function headlineRate(id: string): HeadlineRate | undefined {
   return HEADLINE_RATES.find((r) => r.id === id);
 }
+
+/**
+ * Keyed families the page charts over time (one line per key) and tabulates per
+ * group (the "mix" tables): how sends failed, what the audit found after a
+ * correction, why a nudged run ended with `no_reply`, and why judged refusals refused.
+ */
+export const MIX_FAMILIES: ReadonlyArray<{ family: ModelBehaviourMetricFamily; label: string }> = [
+  { family: "failure_type", label: "Send-contract failure types" },
+  { family: "after_correction", label: "After the correction (offline audit)" },
+  { family: "no_reply_intent", label: "no_reply intent after a nudge" },
+  { family: "judged_refusal_reason", label: "Judged refusals by reason" },
+];
+
+/** Chart metric id of a mix family (`mix:<family>`). */
+export const mixMetricId = (family: string): string => `mix:${family}`;

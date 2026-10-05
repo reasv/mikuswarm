@@ -10,7 +10,7 @@
 		"task": null,
 		"selected": "model_b"
 	},
-	"metric": "refusals_hard_per_request",
+	"metric": null,
 	"rates": [
 		{
 			"id": "refusals_hard_per_request",
@@ -33,10 +33,30 @@
 			"minSample": 50
 		},
 		{
+			"id": "refusal_redos_per_session",
+			"label": "Refusal redos per session",
+			"numerator": [
+				"refusal_redos"
+			],
+			"denominator": "sessions",
+			"scale": 1,
+			"minSample": 20
+		},
+		{
 			"id": "nudged_per_session",
 			"label": "Sessions nudged",
 			"numerator": [
 				"sessions_nudged"
+			],
+			"denominator": "sessions",
+			"scale": 1,
+			"minSample": 20
+		},
+		{
+			"id": "failed_attempts_per_session",
+			"label": "Failed send attempts per session",
+			"numerator": [
+				"contract_failed_attempts"
 			],
 			"denominator": "sessions",
 			"scale": 1,
@@ -56,14 +76,14 @@
 			"minSample": 5
 		},
 		{
-			"id": "contract_redos_per_session",
-			"label": "Send-contract redos per session",
+			"id": "gave_up_per_nudged",
+			"label": "Gave up (no_reply) after nudges",
 			"numerator": [
-				"contract_redos"
+				"contract_gave_up"
 			],
-			"denominator": "sessions",
+			"denominator": "sessions_nudged",
 			"scale": 1,
-			"minSample": 20
+			"minSample": 5
 		},
 		{
 			"id": "contract_exhaustions_per_session",
@@ -74,6 +94,26 @@
 			"denominator": "sessions",
 			"scale": 1,
 			"minSample": 20
+		},
+		{
+			"id": "contract_redos_per_session",
+			"label": "Send-contract redos per session",
+			"numerator": [
+				"contract_redos"
+			],
+			"denominator": "sessions",
+			"scale": 1,
+			"minSample": 20
+		},
+		{
+			"id": "no_reply_abandoned_per_judged",
+			"label": "no_reply abandoning a written reply",
+			"numerator": [
+				"no_reply_intent:abandoned_written_reply"
+			],
+			"denominator": "no_reply_intent_judged",
+			"scale": 1,
+			"minSample": 5
 		},
 		{
 			"id": "style_hits_per_1k_tokens",
@@ -94,16 +134,120 @@
 			"denominator": "messages_sent",
 			"scale": 1,
 			"minSample": 20
+		}
+	],
+	"charts": [
+		{
+			"id": "refusals_hard_per_request",
+			"label": "Hard refusals per request",
+			"kind": "rate",
+			"count": 2,
+			"denominator": 4
+		},
+		{
+			"id": "refusals_judged_per_request",
+			"label": "Judged refusals per request",
+			"kind": "rate",
+			"count": 1,
+			"denominator": 4
 		},
 		{
 			"id": "refusal_redos_per_session",
 			"label": "Refusal redos per session",
-			"numerator": [
-				"refusal_redos"
-			],
-			"denominator": "sessions",
-			"scale": 1,
-			"minSample": 20
+			"kind": "rate",
+			"count": 1,
+			"denominator": 3
+		},
+		{
+			"id": "nudged_per_session",
+			"label": "Sessions nudged",
+			"kind": "rate",
+			"count": 2,
+			"denominator": 3
+		},
+		{
+			"id": "failed_attempts_per_session",
+			"label": "Failed send attempts per session",
+			"kind": "rate",
+			"count": 5,
+			"denominator": 3
+		},
+		{
+			"id": "recovered_per_nudged",
+			"label": "Recovered after nudges",
+			"kind": "rate",
+			"count": 1,
+			"denominator": 2
+		},
+		{
+			"id": "gave_up_per_nudged",
+			"label": "Gave up (no_reply) after nudges",
+			"kind": "rate",
+			"count": 0,
+			"denominator": 2
+		},
+		{
+			"id": "contract_exhaustions_per_session",
+			"label": "Send-contract exhaustions per session",
+			"kind": "rate",
+			"count": 1,
+			"denominator": 3
+		},
+		{
+			"id": "contract_redos_per_session",
+			"label": "Send-contract redos per session",
+			"kind": "rate",
+			"count": 1,
+			"denominator": 3
+		},
+		{
+			"id": "no_reply_abandoned_per_judged",
+			"label": "no_reply abandoning a written reply",
+			"kind": "rate",
+			"count": 1,
+			"denominator": 1
+		},
+		{
+			"id": "style_hits_per_1k_tokens",
+			"label": "Style hits per 1k message tokens",
+			"kind": "rate",
+			"count": 1,
+			"denominator": 7
+		},
+		{
+			"id": "messages_with_style_hit",
+			"label": "Messages with a style hit",
+			"kind": "rate",
+			"count": 1,
+			"denominator": 2
+		},
+		{
+			"id": "mix:failure_type",
+			"label": "Send-contract failure types",
+			"kind": "count",
+			"count": 1,
+			"denominator": null
+		},
+		{
+			"id": "mix:after_correction",
+			"label": "After the correction (offline audit)",
+			"kind": "count",
+			"count": 1,
+			"denominator": null
+		},
+		{
+			"id": "mix:no_reply_intent",
+			"label": "no_reply intent after a nudge",
+			"kind": "count",
+			"count": 0,
+			"denominator": null
+		},
+		{
+			"id": "mix:judged_refusal_reason",
+			"label": "Judged refusals by reason",
+			"kind": "count",
+			"count": 1,
+			"denominator": null
 		}
 	],
 	"scorecard": [
@@ -132,9 +276,25 @@
 					"change": null,
 					"lowSample": true
 				},
+				"refusal_redos_per_session": {
+					"rate": 0.5,
+					"count": 1,
+					"denominator": 2,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
 				"nudged_per_session": {
 					"rate": 0.5,
 					"count": 1,
+					"denominator": 2,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"failed_attempts_per_session": {
+					"rate": 2,
+					"count": 4,
 					"denominator": 2,
 					"previousRate": null,
 					"change": null,
@@ -148,10 +308,10 @@
 					"change": null,
 					"lowSample": true
 				},
-				"contract_redos_per_session": {
-					"rate": 0.5,
-					"count": 1,
-					"denominator": 2,
+				"gave_up_per_nudged": {
+					"rate": 0,
+					"count": 0,
+					"denominator": 1,
 					"previousRate": null,
 					"change": null,
 					"lowSample": true
@@ -160,6 +320,22 @@
 					"rate": 0.5,
 					"count": 1,
 					"denominator": 2,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"contract_redos_per_session": {
+					"rate": 0.5,
+					"count": 1,
+					"denominator": 2,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"no_reply_abandoned_per_judged": {
+					"rate": 1,
+					"count": 1,
+					"denominator": 1,
 					"previousRate": null,
 					"change": null,
 					"lowSample": true
@@ -176,14 +352,6 @@
 					"rate": null,
 					"count": 0,
 					"denominator": 0,
-					"previousRate": null,
-					"change": null,
-					"lowSample": true
-				},
-				"refusal_redos_per_session": {
-					"rate": 0.5,
-					"count": 1,
-					"denominator": 2,
 					"previousRate": null,
 					"change": null,
 					"lowSample": true
@@ -208,6 +376,14 @@
 					"lowSample": true
 				},
 				"refusals_judged_per_request": {
+					"rate": 1,
+					"count": 1,
+					"denominator": 1,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"refusal_redos_per_session": {
 					"rate": 0,
 					"count": 0,
 					"denominator": 1,
@@ -223,9 +399,33 @@
 					"change": null,
 					"lowSample": true
 				},
+				"failed_attempts_per_session": {
+					"rate": 1,
+					"count": 1,
+					"denominator": 1,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
 				"recovered_per_nudged": {
 					"rate": 1,
 					"count": 1,
+					"denominator": 1,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"gave_up_per_nudged": {
+					"rate": 0,
+					"count": 0,
+					"denominator": 1,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"contract_exhaustions_per_session": {
+					"rate": 0,
+					"count": 0,
 					"denominator": 1,
 					"previousRate": null,
 					"change": null,
@@ -239,10 +439,10 @@
 					"change": null,
 					"lowSample": true
 				},
-				"contract_exhaustions_per_session": {
-					"rate": 0,
+				"no_reply_abandoned_per_judged": {
+					"rate": null,
 					"count": 0,
-					"denominator": 1,
+					"denominator": 0,
 					"previousRate": null,
 					"change": null,
 					"lowSample": true
@@ -259,14 +459,6 @@
 					"rate": 0.5,
 					"count": 1,
 					"denominator": 2,
-					"previousRate": null,
-					"change": null,
-					"lowSample": true
-				},
-				"refusal_redos_per_session": {
-					"rate": 0,
-					"count": 0,
-					"denominator": 1,
 					"previousRate": null,
 					"change": null,
 					"lowSample": true
@@ -298,7 +490,23 @@
 					"change": null,
 					"lowSample": true
 				},
+				"refusal_redos_per_session": {
+					"rate": null,
+					"count": 0,
+					"denominator": 0,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
 				"nudged_per_session": {
+					"rate": null,
+					"count": 0,
+					"denominator": 0,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"failed_attempts_per_session": {
 					"rate": null,
 					"count": 0,
 					"denominator": 0,
@@ -314,7 +522,7 @@
 					"change": null,
 					"lowSample": true
 				},
-				"contract_redos_per_session": {
+				"gave_up_per_nudged": {
 					"rate": null,
 					"count": 0,
 					"denominator": 0,
@@ -323,6 +531,22 @@
 					"lowSample": true
 				},
 				"contract_exhaustions_per_session": {
+					"rate": null,
+					"count": 0,
+					"denominator": 0,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"contract_redos_per_session": {
+					"rate": null,
+					"count": 0,
+					"denominator": 0,
+					"previousRate": null,
+					"change": null,
+					"lowSample": true
+				},
+				"no_reply_abandoned_per_judged": {
 					"rate": null,
 					"count": 0,
 					"denominator": 0,
@@ -345,54 +569,218 @@
 					"previousRate": null,
 					"change": null,
 					"lowSample": true
-				},
-				"refusal_redos_per_session": {
-					"rate": null,
-					"count": 0,
-					"denominator": 0,
-					"previousRate": null,
-					"change": null,
-					"lowSample": true
 				}
 			}
 		}
 	],
-	"series": {
-		"metric": "refusals_hard_per_request",
+	"overview": {
 		"bucketMs": 3600000,
-		"points": [
+		"metrics": [
 			{
-				"bucket": 3600000000,
-				"group": "cap_model",
-				"count": 1,
-				"denominator": 1,
-				"rate": 1
+				"id": "refusals_hard_per_request",
+				"count": 2,
+				"denominator": 4,
+				"rate": 0.5,
+				"points": [
+					{
+						"bucket": 3600000000,
+						"count": 2,
+						"denominator": 4,
+						"rate": 0.5
+					}
+				]
 			},
 			{
-				"bucket": 3600000000,
-				"group": "model_a",
+				"id": "refusals_judged_per_request",
+				"count": 1,
+				"denominator": 4,
+				"rate": 0.25,
+				"points": [
+					{
+						"bucket": 3600000000,
+						"count": 1,
+						"denominator": 4,
+						"rate": 0.25
+					}
+				]
+			},
+			{
+				"id": "refusal_redos_per_session",
+				"count": 1,
+				"denominator": 3,
+				"rate": 0.3333333333333333,
+				"points": [
+					{
+						"bucket": 3600000000,
+						"count": 1,
+						"denominator": 3,
+						"rate": 0.3333333333333333
+					}
+				]
+			},
+			{
+				"id": "nudged_per_session",
+				"count": 2,
+				"denominator": 3,
+				"rate": 0.6666666666666666,
+				"points": [
+					{
+						"bucket": 3600000000,
+						"count": 2,
+						"denominator": 3,
+						"rate": 0.6666666666666666
+					}
+				]
+			},
+			{
+				"id": "failed_attempts_per_session",
+				"count": 5,
+				"denominator": 3,
+				"rate": 1.6666666666666667,
+				"points": [
+					{
+						"bucket": 3600000000,
+						"count": 5,
+						"denominator": 3,
+						"rate": 1.6666666666666667
+					}
+				]
+			},
+			{
+				"id": "recovered_per_nudged",
 				"count": 1,
 				"denominator": 2,
-				"rate": 0.5
+				"rate": 0.5,
+				"points": [
+					{
+						"bucket": 3600000000,
+						"count": 1,
+						"denominator": 2,
+						"rate": 0.5
+					}
+				]
 			},
 			{
-				"bucket": 3600000000,
-				"group": "model_b",
+				"id": "gave_up_per_nudged",
 				"count": 0,
+				"denominator": 2,
+				"rate": 0,
+				"points": [
+					{
+						"bucket": 3600000000,
+						"count": 0,
+						"denominator": 2,
+						"rate": 0
+					}
+				]
+			},
+			{
+				"id": "contract_exhaustions_per_session",
+				"count": 1,
+				"denominator": 3,
+				"rate": 0.3333333333333333,
+				"points": [
+					{
+						"bucket": 3600000000,
+						"count": 1,
+						"denominator": 3,
+						"rate": 0.3333333333333333
+					}
+				]
+			},
+			{
+				"id": "contract_redos_per_session",
+				"count": 1,
+				"denominator": 3,
+				"rate": 0.3333333333333333,
+				"points": [
+					{
+						"bucket": 3600000000,
+						"count": 1,
+						"denominator": 3,
+						"rate": 0.3333333333333333
+					}
+				]
+			},
+			{
+				"id": "no_reply_abandoned_per_judged",
+				"count": 1,
 				"denominator": 1,
-				"rate": 0
+				"rate": 1,
+				"points": [
+					{
+						"bucket": 3600000000,
+						"count": 1,
+						"denominator": 1,
+						"rate": 1
+					}
+				]
+			},
+			{
+				"id": "style_hits_per_1k_tokens",
+				"count": 1,
+				"denominator": 7,
+				"rate": 142.85714285714286,
+				"points": [
+					{
+						"bucket": 3600000000,
+						"count": 1,
+						"denominator": 7,
+						"rate": 142.85714285714286
+					}
+				]
+			},
+			{
+				"id": "messages_with_style_hit",
+				"count": 1,
+				"denominator": 2,
+				"rate": 0.5,
+				"points": [
+					{
+						"bucket": 3600000000,
+						"count": 1,
+						"denominator": 2,
+						"rate": 0.5
+					}
+				]
 			}
 		]
+	},
+	"series": {
+		"metric": null,
+		"kind": "rate",
+		"bucketMs": 3600000,
+		"points": []
 	},
 	"breakdown": {
 		"refusals": {
 			"hard": 0,
-			"judged": 0,
+			"judged": 1,
 			"redos": 0,
-			"byReason": [],
-			"bySite": [],
-			"byMethod": [],
-			"outcomes": [],
+			"byReason": [
+				{
+					"key": "safety",
+					"count": 1
+				}
+			],
+			"bySite": [
+				{
+					"key": "default",
+					"count": 1
+				}
+			],
+			"byMethod": [
+				{
+					"key": "judged",
+					"count": 1
+				}
+			],
+			"outcomes": [
+				{
+					"key": "observed",
+					"count": 1
+				}
+			],
 			"discardedBranchCostUsd": 0
 		},
 		"contract": {
@@ -432,7 +820,12 @@
 			],
 			"redos": 0,
 			"discardedBranchCostUsd": 0,
-			"afterCorrection": [],
+			"afterCorrection": [
+				{
+					"key": "minor_rewording",
+					"count": 1
+				}
+			],
 			"noReplyIntent": []
 		},
 		"style": {
@@ -451,12 +844,141 @@
 		},
 		"checks": [
 			{
+				"code": "refusal_safety",
+				"hits": 1,
+				"revisions": 0,
+				"overrides": 0
+			},
+			{
 				"code": "style_x",
 				"hits": 1,
 				"revisions": 1,
 				"overrides": 0
 			}
 		]
+	},
+	"mix": [
+		{
+			"id": "failure_type",
+			"label": "Send-contract failure types",
+			"keys": [
+				"empty",
+				"text_only"
+			],
+			"rows": [
+				{
+					"group": "model_a",
+					"total": 4,
+					"counts": {
+						"empty": 4
+					}
+				},
+				{
+					"group": "model_b",
+					"total": 1,
+					"counts": {
+						"text_only": 1
+					}
+				},
+				{
+					"group": "cap_model",
+					"total": 0,
+					"counts": {}
+				}
+			]
+		},
+		{
+			"id": "after_correction",
+			"label": "After the correction (offline audit)",
+			"keys": [
+				"minor_rewording"
+			],
+			"rows": [
+				{
+					"group": "model_a",
+					"total": 0,
+					"counts": {}
+				},
+				{
+					"group": "model_b",
+					"total": 1,
+					"counts": {
+						"minor_rewording": 1
+					}
+				},
+				{
+					"group": "cap_model",
+					"total": 0,
+					"counts": {}
+				}
+			]
+		},
+		{
+			"id": "no_reply_intent",
+			"label": "no_reply intent after a nudge",
+			"keys": [
+				"abandoned_written_reply"
+			],
+			"rows": [
+				{
+					"group": "model_a",
+					"total": 1,
+					"counts": {
+						"abandoned_written_reply": 1
+					}
+				},
+				{
+					"group": "model_b",
+					"total": 0,
+					"counts": {}
+				},
+				{
+					"group": "cap_model",
+					"total": 0,
+					"counts": {}
+				}
+			]
+		},
+		{
+			"id": "judged_refusal_reason",
+			"label": "Judged refusals by reason",
+			"keys": [
+				"safety"
+			],
+			"rows": [
+				{
+					"group": "model_a",
+					"total": 0,
+					"counts": {}
+				},
+				{
+					"group": "model_b",
+					"total": 1,
+					"counts": {
+						"safety": 1
+					}
+				},
+				{
+					"group": "cap_model",
+					"total": 0,
+					"counts": {}
+				}
+			]
+		}
+	],
+	"models": {
+		"cap_model": {
+			"id": "vendor/cap-model",
+			"family": null
+		},
+		"model_a": {
+			"id": "vendor/model-a",
+			"family": null
+		},
+		"model_b": {
+			"id": "vendor/model-b",
+			"family": null
+		}
 	},
 	"markers": [
 		{
@@ -533,14 +1055,14 @@
 					"revision"
 				],
 				"chips": {
-					"refused": 1,
+					"refused": 2,
 					"redone": 1,
 					"nudged": 1,
 					"revised": 1,
 					"overridden": 0,
 					"endings": 0
 				},
-				"outcome": "refused (distillation) by model_a, redone on model_b; nudged 1×, recovered; revised 1×",
+				"outcome": "refused 2× (distillation, safety), last observed; nudged 1×, recovered; revised 1×",
 				"link": {
 					"sessionId": "s1",
 					"branchNo": 0,
@@ -570,5 +1092,326 @@
 			"coding"
 		]
 	},
-	"pendingHours": 0
+	"pendingHours": 0,
+	"audit": {
+		"countedAt": 3607140000,
+		"sessions": 120,
+		"prioritySessions": 30,
+		"stages": [
+			{
+				"id": "contract",
+				"label": "send-contract classification (sessions with nudges or a no_reply ending)",
+				"done": 30,
+				"remaining": 0
+			},
+			{
+				"id": "priority_checks",
+				"label": "refusal checks, sessions with nudges or a no_reply ending",
+				"done": 12,
+				"remaining": 18
+			},
+			{
+				"id": "rest",
+				"label": "refusal checks, every other session",
+				"done": 0,
+				"remaining": 90
+			}
+		],
+		"current": "priority_checks"
+	},
+	"demoSeries": {
+		"refusals_hard_per_request": {
+			"metric": "refusals_hard_per_request",
+			"kind": "rate",
+			"bucketMs": 3600000,
+			"points": [
+				{
+					"bucket": 3600000000,
+					"group": "cap_model",
+					"count": 1,
+					"denominator": 1,
+					"rate": 1
+				},
+				{
+					"bucket": 3600000000,
+					"group": "model_a",
+					"count": 1,
+					"denominator": 2,
+					"rate": 0.5
+				},
+				{
+					"bucket": 3600000000,
+					"group": "model_b",
+					"count": 0,
+					"denominator": 1,
+					"rate": 0
+				}
+			]
+		},
+		"refusals_judged_per_request": {
+			"metric": "refusals_judged_per_request",
+			"kind": "rate",
+			"bucketMs": 3600000,
+			"points": [
+				{
+					"bucket": 3600000000,
+					"group": "cap_model",
+					"count": 0,
+					"denominator": 1,
+					"rate": 0
+				},
+				{
+					"bucket": 3600000000,
+					"group": "model_a",
+					"count": 0,
+					"denominator": 2,
+					"rate": 0
+				},
+				{
+					"bucket": 3600000000,
+					"group": "model_b",
+					"count": 1,
+					"denominator": 1,
+					"rate": 1
+				}
+			]
+		},
+		"refusal_redos_per_session": {
+			"metric": "refusal_redos_per_session",
+			"kind": "rate",
+			"bucketMs": 3600000,
+			"points": [
+				{
+					"bucket": 3600000000,
+					"group": "model_a",
+					"count": 1,
+					"denominator": 2,
+					"rate": 0.5
+				},
+				{
+					"bucket": 3600000000,
+					"group": "model_b",
+					"count": 0,
+					"denominator": 1,
+					"rate": 0
+				}
+			]
+		},
+		"nudged_per_session": {
+			"metric": "nudged_per_session",
+			"kind": "rate",
+			"bucketMs": 3600000,
+			"points": [
+				{
+					"bucket": 3600000000,
+					"group": "model_a",
+					"count": 1,
+					"denominator": 2,
+					"rate": 0.5
+				},
+				{
+					"bucket": 3600000000,
+					"group": "model_b",
+					"count": 1,
+					"denominator": 1,
+					"rate": 1
+				}
+			]
+		},
+		"failed_attempts_per_session": {
+			"metric": "failed_attempts_per_session",
+			"kind": "rate",
+			"bucketMs": 3600000,
+			"points": [
+				{
+					"bucket": 3600000000,
+					"group": "model_a",
+					"count": 4,
+					"denominator": 2,
+					"rate": 2
+				},
+				{
+					"bucket": 3600000000,
+					"group": "model_b",
+					"count": 1,
+					"denominator": 1,
+					"rate": 1
+				}
+			]
+		},
+		"recovered_per_nudged": {
+			"metric": "recovered_per_nudged",
+			"kind": "rate",
+			"bucketMs": 3600000,
+			"points": [
+				{
+					"bucket": 3600000000,
+					"group": "model_a",
+					"count": 0,
+					"denominator": 1,
+					"rate": 0
+				},
+				{
+					"bucket": 3600000000,
+					"group": "model_b",
+					"count": 1,
+					"denominator": 1,
+					"rate": 1
+				}
+			]
+		},
+		"gave_up_per_nudged": {
+			"metric": "gave_up_per_nudged",
+			"kind": "rate",
+			"bucketMs": 3600000,
+			"points": [
+				{
+					"bucket": 3600000000,
+					"group": "model_a",
+					"count": 0,
+					"denominator": 1,
+					"rate": 0
+				},
+				{
+					"bucket": 3600000000,
+					"group": "model_b",
+					"count": 0,
+					"denominator": 1,
+					"rate": 0
+				}
+			]
+		},
+		"contract_exhaustions_per_session": {
+			"metric": "contract_exhaustions_per_session",
+			"kind": "rate",
+			"bucketMs": 3600000,
+			"points": [
+				{
+					"bucket": 3600000000,
+					"group": "model_a",
+					"count": 1,
+					"denominator": 2,
+					"rate": 0.5
+				},
+				{
+					"bucket": 3600000000,
+					"group": "model_b",
+					"count": 0,
+					"denominator": 1,
+					"rate": 0
+				}
+			]
+		},
+		"contract_redos_per_session": {
+			"metric": "contract_redos_per_session",
+			"kind": "rate",
+			"bucketMs": 3600000,
+			"points": [
+				{
+					"bucket": 3600000000,
+					"group": "model_a",
+					"count": 1,
+					"denominator": 2,
+					"rate": 0.5
+				},
+				{
+					"bucket": 3600000000,
+					"group": "model_b",
+					"count": 0,
+					"denominator": 1,
+					"rate": 0
+				}
+			]
+		},
+		"no_reply_abandoned_per_judged": {
+			"metric": "no_reply_abandoned_per_judged",
+			"kind": "rate",
+			"bucketMs": 3600000,
+			"points": [
+				{
+					"bucket": 3600000000,
+					"group": "model_a",
+					"count": 1,
+					"denominator": 1,
+					"rate": 1
+				}
+			]
+		},
+		"style_hits_per_1k_tokens": {
+			"metric": "style_hits_per_1k_tokens",
+			"kind": "rate",
+			"bucketMs": 3600000,
+			"points": [
+				{
+					"bucket": 3600000000,
+					"group": "model_b",
+					"count": 1,
+					"denominator": 7,
+					"rate": 142.85714285714286
+				}
+			]
+		},
+		"messages_with_style_hit": {
+			"metric": "messages_with_style_hit",
+			"kind": "rate",
+			"bucketMs": 3600000,
+			"points": [
+				{
+					"bucket": 3600000000,
+					"group": "model_b",
+					"count": 1,
+					"denominator": 2,
+					"rate": 0.5
+				}
+			]
+		},
+		"mix:failure_type": {
+			"metric": "mix:failure_type",
+			"kind": "count",
+			"bucketMs": 3600000,
+			"points": [
+				{
+					"bucket": 3600000000,
+					"group": "text_only",
+					"count": 1,
+					"denominator": 0,
+					"rate": 1
+				}
+			]
+		},
+		"mix:after_correction": {
+			"metric": "mix:after_correction",
+			"kind": "count",
+			"bucketMs": 3600000,
+			"points": [
+				{
+					"bucket": 3600000000,
+					"group": "minor_rewording",
+					"count": 1,
+					"denominator": 0,
+					"rate": 1
+				}
+			]
+		},
+		"mix:no_reply_intent": {
+			"metric": "mix:no_reply_intent",
+			"kind": "count",
+			"bucketMs": 3600000,
+			"points": []
+		},
+		"mix:judged_refusal_reason": {
+			"metric": "mix:judged_refusal_reason",
+			"kind": "count",
+			"bucketMs": 3600000,
+			"points": [
+				{
+					"bucket": 3600000000,
+					"group": "safety",
+					"count": 1,
+					"denominator": 0,
+					"rate": 1
+				}
+			]
+		}
+	}
 }

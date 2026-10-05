@@ -191,12 +191,13 @@ export function buildBranchPlan(input: BranchPlanInput): BranchPlanItem[] {
 			),
 			audit: []
 		};
+		// The audit's findings for the attempt this nudge closed (by its identity:
+		// attempt numbers run across the session's runs).
 		const attempt = info.attempt;
-		info.audit = audits.filter(
-			(a) =>
-				a.attemptNo === count - 1 &&
-				a.branchNo === (attempt?.branchNo ?? p.node) &&
-				(attempt === undefined || a.redoNo === attempt.redoNo)
+		info.audit = audits.filter((a) =>
+			attempt
+				? a.attemptNo === attempt.attemptNo && a.branchNo === attempt.branchNo && a.redoNo === attempt.redoNo
+				: a.attemptNo === count - 1 && a.branchNo === p.node
 		);
 		nudges.set(i, info);
 		group.push(i);

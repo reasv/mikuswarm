@@ -105,6 +105,63 @@ export interface BehaviourSeriesPoint {
   rate: number | null;
 }
 
+/** One headline rate over the window, all groups combined, with its buckets (the overview chart). */
+export interface BehaviourOverviewMetric {
+  id: string;
+  count: number;
+  denominator: number;
+  rate: number | null;
+  /** Buckets with a denominator or a count, ascending. */
+  points: Array<{ bucket: number; count: number; denominator: number; rate: number | null }>;
+}
+
+/** A metric the chart can plot, with its total in the window (0 = nothing recorded). */
+export interface BehaviourChartOption {
+  /** A headline rate id, or `mix:<family>` (a keyed family, one line per key). */
+  id: string;
+  label: string;
+  kind: "rate" | "count";
+  /** Rates: the numerator over every group; families: the family's total over the selected group. */
+  count: number;
+  /** Rates: the denominator over every group; null for families. */
+  denominator: number | null;
+}
+
+/** A keyed family per scorecard group (e.g. failure types per model). */
+export interface BehaviourMixTable {
+  /** The family (`failure_type`, `after_correction`, `no_reply_intent`, `judged_refusal_reason`). */
+  id: string;
+  label: string;
+  /** Keys present in the window, most frequent first. */
+  keys: string[];
+  /** One per scorecard row, in scorecard order. */
+  rows: Array<{ group: string; total: number; counts: Record<string, number> }>;
+}
+
+/** A config entry's wire model id and configured family (null when unset or no longer configured). */
+export interface BehaviourModelInfo {
+  id: string | null;
+  family: string | null;
+}
+
+/**
+ * The offline audit's backlog, counted in the background by the audit worker (never
+ * on the request path). `stages` in processing order: the send-contract
+ * classification of sessions with nudges or a no_reply ending, then the refusal
+ * checks of those sessions, then every other session.
+ */
+export interface AuditBacklogProgress {
+  /** When the count finished (ms epoch). */
+  countedAt: number;
+  /** Settled, auditable sessions (generation sessions excluded). */
+  sessions: number;
+  /** Of which have nudges or ended with no_reply (the backlog's first stages). */
+  prioritySessions: number;
+  stages: Array<{ id: string; label: string; done: number; remaining: number }>;
+  /** The backlog stage the worker is walking now; null when idle or between passes. */
+  current: string | null;
+}
+
 export interface BehaviourCount {
   key: string;
   count: number;
@@ -194,19 +251,34 @@ export interface ModelBehaviourResponse {
   since: number;
   until: number;
   groupBy: BehaviourGroupBy;
-  /** Group by `[models.*].family` instead of the config entry (model grouping only). */
+  /** Group config entries by family (`[models.*].family`, else the wire model id; model grouping only). */
   family: boolean;
   filters: ModelBehaviourFilters;
-  /** The selected headline rate id the series shows. */
-  metric: string;
+  /** What the chart shows: a headline rate id, `mix:<family>`, or null for the overview. */
+  metric: string | null;
   rates: BehaviourRateDefinition[];
+  /** Every metric the chart can plot, with its total in the window. */
+  charts: BehaviourChartOption[];
   scorecard: BehaviourScorecardRow[];
-  series: { metric: string; bucketMs: number; points: BehaviourSeriesPoint[] };
+  /** Every headline rate over time, all groups combined (the default chart). */
+  overview: { bucketMs: number; metrics: BehaviourOverviewMetric[] };
+  /**
+   * The chosen metric over time: for a rate one point per bucket and group; for a
+   * family (`kind: "count"`) one point per bucket and key (`group` = the key, `rate`
+   * = the count). Empty for the overview.
+   */
+  series: { metric: string | null; kind: "rate" | "count"; bucketMs: number; points: BehaviourSeriesPoint[] };
   breakdown: BehaviourBreakdown;
+  /** Keyed families per scorecard group. */
+  mix: BehaviourMixTable[];
+  /** Wire id and configured family of each config entry shown (group by model). */
+  models: Record<string, BehaviourModelInfo>;
   markers: BehaviourMarker[];
   incidents: BehaviourIncidentPage;
   /** Distinct values present in the window, for the filter menus. */
   facets: { agents: string[]; sites: string[]; models: string[]; tasks: string[] };
   /** Rollup hours still waiting for a recompute (0 = fully current). */
   pendingHours: number;
+  /** The offline audit's backlog progress; null when the audit worker does not run. */
+  audit: AuditBacklogProgress | null;
 }

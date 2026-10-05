@@ -1,8 +1,10 @@
 import type {
 	BehaviourIncidentRow,
 	BehaviourMarker,
+	BehaviourModelInfo,
 	BehaviourRateCell,
 	BehaviourRateDefinition,
+	BehaviourScorecardRow,
 	BehaviourSeriesPoint
 } from '$lib/schemas';
 import { conversationsHref } from '$lib/nav';
@@ -24,6 +26,18 @@ export const BEHAVIOUR_WINDOWS = [
 ] as const;
 export const BEHAVIOUR_GROUP_BYS = ['model', 'agent', 'site', 'task'] as const;
 export const INCIDENT_TYPES = ['refusal', 'nudge', 'redo', 'revision', 'ending'] as const;
+/** Incident type buttons, worded like the row chips they select on. */
+export const INCIDENT_TYPE_LABELS: Record<(typeof INCIDENT_TYPES)[number], string> = {
+	refusal: 'refused',
+	nudge: 'nudged',
+	redo: 'redone',
+	revision: 'revised / overridden',
+	ending: 'judged ending fired'
+};
+/** How a config entry is named on the page: its config key, its wire model id, or both. */
+export const MODEL_LABELS = ['key', 'id', 'both'] as const;
+export type ModelLabelMode = (typeof MODEL_LABELS)[number];
+export type SortDir = 'asc' | 'desc';
 
 export interface BehaviourFilters {
 	window: string;
@@ -35,10 +49,15 @@ export interface BehaviourFilters {
 	task: string | null;
 	/** The clicked scorecard group (scopes the breakdown and the incident log). */
 	selected: string | null;
-	/** Headline rate id for the over-time chart; null = the API's default (first rate). */
+	/** What the over-time chart plots: a headline rate id or `mix:<family>`; null = the overview of every rate. */
 	metric: string | null;
 	/** Incident type filter. */
 	type: string | null;
+	/** Scorecard sort column (`group`, `volume` or a rate id); null = the API's order (by volume). */
+	sort: string | null;
+	dir: SortDir;
+	/** Model naming (group by model): config key (default), wire id, or both. */
+	label: ModelLabelMode;
 }
 
 const WINDOW_IDS: readonly string[] = BEHAVIOUR_WINDOWS.map((w) => w.id);
@@ -49,6 +68,7 @@ export function parseBehaviourFilters(sp: URLSearchParams): BehaviourFilters {
 	const window = sp.get('window');
 	const groupBy = sp.get('group');
 	const type = sp.get('type');
+	const label = sp.get('label');
 	const g = groupBy != null && (BEHAVIOUR_GROUP_BYS as readonly string[]).includes(groupBy) ? groupBy : 'model';
 	return {
 		window: window != null && WINDOW_IDS.includes(window) ? window : '24h',
@@ -59,7 +79,10 @@ export function parseBehaviourFilters(sp: URLSearchParams): BehaviourFilters {
 		task: nonEmpty(sp.get('task')),
 		selected: nonEmpty(sp.get('selected')),
 		metric: nonEmpty(sp.get('metric')),
-		type: type != null && (INCIDENT_TYPES as readonly string[]).includes(type) ? type : null
+		type: type != null && (INCIDENT_TYPES as readonly string[]).includes(type) ? type : null,
+		sort: nonEmpty(sp.get('sort')),
+		dir: sp.get('dir') === 'asc' ? 'asc' : 'desc',
+		label: label != null && (MODEL_LABELS as readonly string[]).includes(label) ? (label as ModelLabelMode) : 'key'
 	};
 }
 
@@ -74,11 +97,14 @@ export function behaviourFiltersToParams(f: BehaviourFilters): Record<string, st
 		task: f.task,
 		selected: f.selected,
 		metric: f.metric,
-		type: f.type
+		type: f.type,
+		sort: f.sort,
+		dir: f.sort && f.dir === 'asc' ? 'asc' : null,
+		label: f.label === 'key' ? null : f.label
 	};
 }
 
-/** The remote query argument (`getModelBehaviour` / `getModelBehaviourIncidents`). */
+/** The remote query argument (`getModelBehaviour` / `getModelBehaviourIncidents`); sort and labels are client-side. */
 export function behaviourQueryArg(f: BehaviourFilters): {
 	window: string;
 	groupBy: string;
@@ -197,7 +223,90 @@ export function incidentHref(row: Pick<BehaviourIncidentRow, 'timelineKey' | 'li
 /** The breakdown family a headline rate belongs to (which breakdown section to emphasize). */
 export function rateFamily(metric: string | null): 'refusals' | 'contract' | 'style' | null {
 	if (!metric) return null;
-	if (metric.startsWith('refusal')) return 'refusals';
+	if (metric.startsWith('refusal') || metric === 'mix:judged_refusal_reason') return 'refusals';
 	if (metric.startsWith('style') || metric.startsWith('messages_with_style')) return 'style';
 	return 'contract';
+}
+
+// ── Scorecard sorting and model labels ───────────────────────────────────────
+
+/**
+ * Click on a column header: a new column sorts descending first (largest rates
+ * and volumes on top) except the group name, which starts ascending; the same
+ * column toggles the direction.
+ */
+export function nextSort(current: { sort: string | null; dir: SortDir }, column: string): { sort: string; dir: SortDir } {
+	if (current.sort === column) return { sort: column, dir: current.dir === 'asc' ? 'desc' : 'asc' };
+	return { sort: column, dir: column === 'group' ? 'asc' : 'desc' };
+}
+
+/**
+ * Scorecard rows in the chosen order: by group label, by volume (requests, then
+ * sessions) or by a rate. Rows without a rate (no denominator) always go last;
+ * ties keep the API's order. Pure; null `sort` keeps the API's order.
+ */
+export function sortScorecard(
+	rows: readonly BehaviourScorecardRow[],
+	sort: string | null,
+	dir: SortDir,
+	labelOf: (group: string) => string = (g) => g
+): BehaviourScorecardRow[] {
+	const out = rows.map((row, i) => ({ row, i }));
+	if (!sort) return out.map((x) => x.row);
+	const sign = dir === 'asc' ? 1 : -1;
+	out.sort((a, b) => {
+		if (sort === 'group') {
+			const la = labelOf(a.row.group);
+			const lb = labelOf(b.row.group);
+			return (la < lb ? -1 : la > lb ? 1 : 0) * sign || a.i - b.i;
+		}
+		if (sort === 'volume') {
+			const d = a.row.volume.requests - b.row.volume.requests || a.row.volume.sessions - b.row.volume.sessions;
+			return d * sign || a.i - b.i;
+		}
+		const ra = a.row.cells[sort]?.rate ?? null;
+		const rb = b.row.cells[sort]?.rate ?? null;
+		if (ra === null || rb === null) return ra === rb ? a.i - b.i : ra === null ? 1 : -1;
+		return (ra - rb) * sign || a.i - b.i;
+	});
+	return out.map((x) => x.row);
+}
+
+/**
+ * The display name of a model group: the config key, its wire model id, or
+ * `key · id`. Only config entries have ids; other groups (agents, sites, tasks,
+ * families) are shown as they are.
+ */
+export function modelLabel(
+	group: string,
+	models: Readonly<Record<string, BehaviourModelInfo>> | undefined,
+	mode: ModelLabelMode
+): string {
+	if (group === '') return '(unknown)';
+	const id = models?.[group]?.id;
+	if (!id || mode === 'key') return group;
+	if (mode === 'id') return id;
+	return id === group ? group : `${group} · ${id}`;
+}
+
+// ── Chart metric choice ──────────────────────────────────────────────────────
+
+/** A chart metric is a keyed family (`mix:<family>`, one line per key) rather than a rate. */
+export const isMixMetric = (metric: string | null): boolean => metric?.startsWith('mix:') ?? false;
+
+/** A count as shown on a family chart axis. */
+export function formatCount(n: number): string {
+	return Number.isInteger(n) ? String(n) : n.toFixed(1);
+}
+
+/**
+ * The chart's empty state, worded by why it is empty: a rate with a numerator of
+ * 0 over a real denominator ("none recorded: 0 of 412 requests"), a rate with no
+ * denominator (no activity), or a family with nothing recorded.
+ */
+export function emptyChartReason(option: { label: string; kind: string; count: number; denominator: number | null } | undefined, denominatorName?: string): string {
+	if (!option) return 'Nothing to plot in this window.';
+	if (option.kind === 'count') return `No ${option.label.toLowerCase()} recorded in this window.`;
+	if ((option.denominator ?? 0) === 0) return `No ${denominatorName ?? 'activity'} in this window, so no ${option.label.toLowerCase()} to show.`;
+	return `None recorded in this window: 0 of ${option.denominator} ${denominatorName ?? ''}`.trimEnd() + '.';
 }

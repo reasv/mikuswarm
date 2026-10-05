@@ -40,6 +40,13 @@
 				>{chip}</span
 			>
 		{/each}
+		{#if afterCorrection && !nudge.recovery}
+			<!-- Nothing was sent after the correction (switched to no_reply, or nothing):
+			     the audit's verdict stands on its own. -->
+			<span class="rounded bg-violet-500/15 px-1 py-0.5 font-mono text-violet-600 normal-case dark:text-violet-300" title="offline audit"
+				>after correction: {afterCorrection}</span
+			>
+		{/if}
 		{#if nudge.attempt?.servedModel}
 			<span class="font-mono text-muted-foreground normal-case">{nudge.attempt.servedModel}</span>
 		{/if}

@@ -3,7 +3,7 @@ import { page } from '@vitest/browser/context';
 import { expect, test, vi } from 'vitest';
 import { Schema } from 'effect';
 import { SessionDetailResponse, SessionDecisionsResponse, SessionRecordResponse } from '$lib/schemas';
-import { DEMO_FEATURED_SESSION, DEMO_REFUSAL_SESSION, resolveFixture } from '$lib/server/api/demo/fixtures';
+import { DEMO_AUDITED_SESSION, DEMO_FEATURED_SESSION, DEMO_REFUSAL_SESSION, resolveFixture } from '$lib/server/api/demo/fixtures';
 import Fixture from './session-view-fixture.svelte';
 
 // The remote queries, answered from the demo fixtures in the shape `fresh()` reads.
@@ -54,6 +54,34 @@ test('SessionView renders a session with branches and check cards without throwi
 		await expect.element(page.getByText('style_vocabulary pattern')).toBeInTheDocument();
 		await page.getByRole('button', { name: 'previous branch' }).click();
 		await expect.element(page.getByTestId('fork-position')).toHaveTextContent('1/2');
+		expect(errors).toEqual([]);
+	} finally {
+		window.removeEventListener('error', onError);
+	}
+});
+
+// An old session only the offline audit judged (spec REFUSAL-HANDLING §7.6,
+// §10.2): historical nudges, no live check rows. The audit's findings render:
+// the nudge cards' diagnosis (self_talk) and after-correction verdicts, the judged
+// refusal on the send and the judged no_reply ending, each marked as the audit's,
+// and the session's audit summary.
+test('SessionView renders an audited old session: the audit findings on its cards', async () => {
+	const errors: unknown[] = [];
+	const onError = (event: ErrorEvent) => errors.push(event.error ?? event.message);
+	window.addEventListener('error', onError);
+	try {
+		render(Fixture, { sessionId: DEMO_AUDITED_SESSION });
+		const nudges = page.getByTestId('nudge-card');
+		await expect.element(nudges.first()).toBeInTheDocument();
+		expect(nudges.elements()).toHaveLength(2);
+		await expect.element(nudges.first()).toHaveTextContent(/self_talk/);
+		await expect.element(nudges.first()).toHaveTextContent(/different_substance/);
+		await expect.element(nudges.nth(1)).toHaveTextContent(/switched_to_no_reply/);
+		await expect.element(page.getByText('offline audit').first()).toBeInTheDocument();
+		await expect.element(page.getByText(/refusal_safety/).first()).toBeInTheDocument();
+		await expect.element(page.getByText(/no_reply_intent: abandoned_written_reply/).first()).toBeInTheDocument();
+		await expect.element(page.getByTestId('audit-summary')).toHaveTextContent(/send_contract done/);
+		await expect.element(page.getByTestId('audit-summary')).toHaveTextContent(/refusal done/);
 		expect(errors).toEqual([]);
 	} finally {
 		window.removeEventListener('error', onError);

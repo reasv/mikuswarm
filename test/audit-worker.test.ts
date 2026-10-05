@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { deriveContractEvents } from "../src/agent/contract.js";
-import { AuditWorkerPool, type AuditStep } from "../src/audit/index.js";
+import { AuditProgressCounter, AuditWorkerPool, type AuditStep } from "../src/audit/index.js";
 import { ModelBehaviourService } from "../src/behaviour/index.js";
 import { buildCheckCatalogue } from "../src/checks/catalogue.js";
 import { BUILTIN_CONTRACT_CHECKS } from "../src/checks/builtin/contract.js";
@@ -356,7 +356,11 @@ test("rollups count the backfill: judged refusals, after_correction, self_talk, 
   ];
   const hour = 3_600_000 * 10; // before T0: settled
   await addSession(storage, "h1", { createdAt: hour + 5_000, transcript });
-  assert.equal((await pool.runOnce()).kind, "audited");
+  // A nudged session in the backlog: the send-contract classification first, the refusal checks in a later stage.
+  const first = await pool.runOnce();
+  assert.deepEqual(first.kind === "audited" && first.statuses, { send_contract: "done" });
+  const second = await pool.runOnce();
+  assert.deepEqual(second.kind === "audited" && second.statuses, { refusal: "done" });
   const service = new ModelBehaviourService({
     storage,
     config,
@@ -455,3 +459,80 @@ test("start/stop: the loop audits in the background and stops cleanly", async ()
   assert.equal(audits(storage, "bg").length, 2);
 });
 
+
+test("backlog order: send-contract classification of nudged and no_reply sessions, their refusal checks, then the rest", async () => {
+  const { storage, pool, server, setNow } = await setup({
+    audit: { backlog_pace_ms: 0 },
+    answer: (id, q, body) =>
+      id.startsWith("no_reply_intent__")
+        ? { choice: "intended_no_reply", confidence: 0.9, probabilities: { intended_no_reply: 0.9 } }
+        : defaultAnswer(id, q, body),
+  });
+  // Oldest first by creation, but the stages reorder them.
+  await addSession(storage, "c1", { createdAt: 1_000_000, transcript: [kick(), ...sent("m1", "Sure, here it is.")] });
+  await addSession(storage, "p1", {
+    createdAt: 2_000_000,
+    transcript: [kick(), asst([text("Here is a reply I never sent")]), nudge(1), ...noReply("n1")],
+  });
+  await addSession(storage, "q1", { createdAt: 3_000_000, transcript: [kick(), ...noReply("n2")] });
+  await storage.write((db) => db.prepare(`update agent_sessions set no_reply = 1 where id in ('p1', 'q1')`).run());
+  await addSession(storage, "c2", { createdAt: 4_000_000, transcript: [kick(), ...sent("m2", "Done.")] });
+
+  const steps: string[] = [];
+  for (let i = 0; i < 8; i++) {
+    const step = await pool.runOnce();
+    if (step.kind !== "audited") break;
+    steps.push(`${step.sessionId}:${Object.entries(step.statuses).map(([a, st]) => `${a}=${st}`).sort().join(",")}`);
+  }
+  assert.deepEqual(steps, [
+    "p1:send_contract=done",
+    "q1:send_contract=skipped",
+    "p1:refusal=done",
+    "q1:refusal=done",
+    "c1:refusal=done,send_contract=skipped",
+    "c2:refusal=done,send_contract=skipped",
+  ]);
+  // The no_reply intent was judged once, with the send-contract classification; the
+  // refusal stage did not ask it again (fired or not: the answer here did not fire).
+  const intentQuestions = server.calls.flatMap((c) => Object.keys(c.questions)).filter((id) => id.startsWith("no_reply_intent__"));
+  assert.equal(intentQuestions.length, 1);
+  assert.ok(server.calls.some((c) => Object.keys(c.questions).some((id) => id.startsWith("op_refusal__"))), "the refusal stage judged");
+  const p1 = JSON.parse(audits(storage, "p1").find((r) => r.audit === "send_contract")!.verdict_json!);
+  assert.equal(p1.runs.length, 1);
+  assert.deepEqual(p1.checks, { items: 1, judged: 1, skippedLive: 0, deferred: 0, fired: {} });
+
+  // A session settling while the backlog runs is audited first (live lane, every audit).
+  await addSession(storage, "c3", { createdAt: 5_000_000, transcript: [kick(), ...sent("m3", "Ok.")] });
+  await addSession(storage, "live", { createdAt: T0 + 1_000, completedAt: T0 + 2_000, transcript: [kick(), ...sent("m4", "Hi.")] });
+  setNow(T0 + 100_000);
+  assert.equal(audited(await pool.runOnce()), "live:live");
+  assert.equal(audited(await pool.runOnce()), "backlog:c3");
+});
+
+test("backlog progress: counted in the background, per stage", async () => {
+  const { storage, pool } = await setup({ audit: { backlog_pace_ms: 0 } });
+  await addSession(storage, "c1", { createdAt: 1_000_000, transcript: [kick(), ...sent("m1", "Sure.")] });
+  await addSession(storage, "p1", { createdAt: 2_000_000, transcript: [kick(), asst([text("draft")]), nudge(1), ...sent("m2", "Sent.")] });
+  await addSession(storage, "sum", { createdAt: 2_500_000, type: "summarize" });
+  assert.equal(pool.backlogProgress(), null, "nothing counted before the first background count");
+  // Small chunks: the walk spans several keyset chunks.
+  const counter = new AuditProgressCounter({
+    storage,
+    audits: () => pool.queueAudits().map((a) => a.name),
+    excludeSessionTypes: ["summarize", "condense", "diary"],
+    knobs: () => ({ settleMs: 60_000, backlogMaxAgeMs: 0 }),
+    now: () => T0,
+    current: () => "contract",
+    chunk: 1,
+  });
+  await counter.countOnce();
+  const before = counter.snapshot()!;
+  assert.equal(before.sessions, 2);
+  assert.equal(before.prioritySessions, 1);
+  assert.deepEqual(before.stages.map((s) => [s.id, s.done, s.remaining]), [["contract", 0, 1], ["priority_checks", 0, 1], ["rest", 0, 1]]);
+  assert.equal(before.current, "contract");
+  await pool.runOnce(); // p1: send_contract
+  await pool.runOnce(); // p1: refusal
+  await counter.countOnce();
+  assert.deepEqual(counter.snapshot()!.stages.map((s) => [s.id, s.done, s.remaining]), [["contract", 1, 0], ["priority_checks", 1, 0], ["rest", 0, 1]]);
+});

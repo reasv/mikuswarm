@@ -12,6 +12,7 @@
 	import { recordTurnPending } from '$lib/query/session-poll';
 	import { formatTokens, formatUsd } from '$lib/format';
 	import { computeCostBudget } from '$lib/cost-budget';
+	import { auditSummary } from '$lib/checks';
 	import type { ToolInvocation } from '$lib/schemas';
 	import { abortSession, resumeSession } from '$lib/api/admin.remote';
 	import { Button } from '$lib/components/ui/button';
@@ -56,6 +57,7 @@
 	const checks = $derived(session.data?.checks ?? []);
 	// The offline audit's rows (send-contract diagnosis); [] until it has run.
 	const audits = $derived(session.data?.audits ?? []);
+	const auditLines = $derived(auditSummary(audits));
 	// A rollout deep link (`branch` / `call` / `attempt` URL params) applies to the
 	// session the URL selects, never to an embedded or explicitly-passed one.
 	const focus = $derived(!embedded && sessionIdProp == null ? selection.focus : null);
@@ -317,6 +319,21 @@
 				<span>· in {formatTokens(toolSpend.inputTokens)}</span>
 				<span>· out {formatTokens(toolSpend.outputTokens)}</span>
 				{#if toolSpend.cost > 0}<span>· {formatUsd(toolSpend.cost)}</span>{/if}
+			</div>
+		{/if}
+		{#if auditLines.length > 0}
+			<!-- The offline audit (spec REFUSAL-HANDLING §7.6, §10.2): what it found for
+			     this session, also for a session from before the live checks existed. -->
+			<div
+				class="flex flex-wrap items-center gap-x-2 gap-y-0.5 border-b bg-background/40 px-3 py-1 font-mono text-[10px] text-muted-foreground"
+				data-testid="audit-summary"
+			>
+				<span class="font-semibold text-violet-600 dark:text-violet-300">audit</span>
+				{#each auditLines as line (line.audit)}
+					<span title={`audited ${new Date(line.createdAt).toLocaleString()}`}
+						>· {line.audit} {line.status}{line.parts.length > 0 ? `: ${line.parts.join('; ')}` : ''}</span
+					>
+				{/each}
 			</div>
 		{/if}
 		{#if costBudget}

@@ -188,7 +188,7 @@
 				<NudgeCard
 					nudge={item.nudge}
 					text={contentText(msg.content)}
-					elementId={`attempt-${item.node}-${item.nudge.index}`}
+					elementId={`attempt-${item.node}-${item.nudge.attempt?.attemptNo ?? item.nudge.index - 1}`}
 				/>
 			{:else if msg.role === 'assistant' && harness?.kind === 'refusal_withheld'}
 				<!-- A withheld refusal (spec REFUSAL-HANDLING §8.2 on_exhausted = "withhold"):

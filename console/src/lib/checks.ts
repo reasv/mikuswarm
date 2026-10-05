@@ -303,10 +303,18 @@ export function attemptBeforeNudge(
 	nudge: number,
 	ts: number | undefined
 ): ContractAttempt | undefined {
-	const candidates = attempts.filter((a) => a.branchNo === branchNo && a.attemptNo === nudge - 1);
+	const inBranch = attempts.filter((a) => a.branchNo === branchNo);
+	// The ending the nudge closed is the branch's latest attempt at or before it.
+	// Attempt numbers run per (branch, redo) across the whole session, so in a
+	// session with several runs the nudge's number alone names another run's attempt.
+	if (ts !== undefined) {
+		const before = inBranch.filter((a) => a.ts != null && a.ts <= ts);
+		if (before.length > 0) return before.reduce((best, a) => ((a.ts ?? 0) >= (best.ts ?? 0) ? a : best));
+	}
+	const candidates = inBranch.filter((a) => a.attemptNo === nudge - 1);
 	if (candidates.length <= 1 || ts === undefined) return candidates[0];
-	const before = candidates.filter((a) => a.ts == null || a.ts <= ts);
-	const pool = before.length > 0 ? before : candidates;
+	const earlier = candidates.filter((a) => a.ts == null || a.ts <= ts);
+	const pool = earlier.length > 0 ? earlier : candidates;
 	return pool.reduce((best, a) => ((a.ts ?? 0) >= (best.ts ?? 0) ? a : best));
 }
 
@@ -386,6 +394,57 @@ function afterCorrectionLabel(v: unknown): string | null {
 	if (!isObject(v) || typeof v.choice !== 'string') return null;
 	if (v.choice === 'uncertain' && typeof v.picked === 'string') return `uncertain (${v.picked}?)`;
 	return v.choice;
+}
+
+/**
+ * One line per offline-audit row of a session (the session view's audit strip):
+ * the audit, its status, and what it found. `send_contract` (done): nudged runs,
+ * self_talk / textual tool calls, what happened after the correction, the judged
+ * `contract` checks (`no_reply` intent) that fired; `refusal` (done): outputs
+ * judged and the checks that fired; `skipped` / `failed`: the reason. Defensive:
+ * a malformed verdict yields the bare status.
+ */
+export interface AuditSummaryLine {
+	audit: string;
+	status: string;
+	parts: string[];
+	createdAt: number;
+}
+
+export function auditSummary(audits: readonly SessionAudit[]): AuditSummaryLine[] {
+	const fired = (v: unknown): string[] =>
+		isObject(v) ? Object.entries(v).filter(([, n]) => typeof n === 'number' && n > 0).map(([code, n]) => `${code} ${n}`) : [];
+	return audits
+		.filter((row) => row.eventId === null)
+		.map((row) => {
+			const v = row.verdict;
+			const parts: string[] = [];
+			if (row.status !== 'done') {
+				if (isObject(v) && typeof v.reason === 'string') parts.push(v.reason.replace(/_/g, ' '));
+			} else if (row.audit === 'send_contract' && isObject(v)) {
+				const runs = Array.isArray(v.runs) ? v.runs.filter(isObject) : [];
+				if (runs.length > 0) parts.push(`${runs.length} nudged ${runs.length === 1 ? 'run' : 'runs'}`);
+				const attempts = runs.flatMap((r) => (Array.isArray(r.attempts) ? r.attempts.filter(isObject) : []));
+				const selfTalk = attempts.filter((a) => a.selfTalk === true).length;
+				const textual = attempts.filter((a) => a.textual === true).length;
+				if (selfTalk > 0) parts.push(`self_talk ${selfTalk}`);
+				if (textual > 0) parts.push(`textual tool call ${textual}`);
+				const after = runs.map((r) => afterCorrectionLabel(r.afterCorrection)).filter((x): x is string => x !== null);
+				if (after.length > 0) parts.push(`after correction: ${after.join(', ')}`);
+				if (isObject(v.checks)) {
+					const f = fired(v.checks.fired);
+					parts.push(f.length > 0 ? `endings judged, fired ${f.join(', ')}` : 'endings judged, nothing fired');
+				}
+			} else if (row.audit === 'refusal' && isObject(v)) {
+				const judged = num(v.judged);
+				const items = num(v.items);
+				const skipped = num(v.skippedLive) ?? 0;
+				if (judged !== null && items !== null) parts.push(`${judged} of ${items} outputs judged${skipped > 0 ? ` (${skipped} judged live)` : ''}`);
+				const f = fired(v.fired);
+				parts.push(f.length > 0 ? `fired ${f.join(', ')}` : 'nothing fired');
+			}
+			return { audit: row.audit, status: row.status, parts, createdAt: row.createdAt };
+		});
 }
 
 /** An evaluation the offline audit recorded (its decision group carries the `audit:` prefix). */

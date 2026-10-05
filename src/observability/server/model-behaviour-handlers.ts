@@ -15,7 +15,8 @@ import type { RequestContext } from "./types.js";
  * Parse the model behaviour page's URL filters (spec REFUSAL-HANDLING §12.3):
  * `window` (today|24h|7d|30d|month|all, default 24h), `groupBy`
  * (model|agent|site|task, default model), `family` (1|true), `agent`, `site`,
- * `task`, `selected`, `metric` (headline rate id), `type` (incident type),
+ * `task`, `selected`, `metric` (headline rate id or `mix:<family>`; absent =
+ * the overview), `type` (incident type),
  * `cursor`, `limit`. Unknown values fall back to the defaults; empty strings are
  * absent.
  */
