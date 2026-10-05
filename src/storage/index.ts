@@ -89,6 +89,8 @@ export {
   type ContractAttemptTypesUpdate,
   type AuditCandidateRow,
   type AuditQueueAudit,
+  type AuditProgressChunk,
+  AUDIT_PRIORITY_SQL,
   type UsageEventClass,
 } from "./database.js";
 // Re-export DmOptout + cross-channel helper return types implicitly — callers

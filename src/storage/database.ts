@@ -1390,10 +1390,26 @@ export interface AuditCandidateRow {
   completed_at: number | null;
   contract_version: number | null;
   contract_nudges: number | null;
+  /** 1 when the session ended without a reply (`no_reply`, the `NO_REPLY` text, or no valid ending). */
+  no_reply: number;
   trigger_body: string | null;
   trigger_sender_id: string | null;
   trigger_sender_display_name: string | null;
   initial_preloads: string | null;
+}
+
+/**
+ * The offline audit's backlog priority: sessions with send-contract nudges or a
+ * no_reply ending (what the send-contract classification and the judged ending
+ * checks read) come before the rest. SQL over `agent_sessions s`.
+ */
+export const AUDIT_PRIORITY_SQL = `(coalesce(s.contract_nudges, 0) > 0 or s.no_reply = 1)`;
+
+/** One chunk of {@link Storage.auditProgressChunk}: per-session flags, aggregated by the caller. */
+export interface AuditProgressChunk {
+  /** The keyset position after this chunk; null when the walk reached the end. */
+  next: { createdAt: number; id: string } | null;
+  rows: Array<{ eligible: number; priority: number; done: Record<string, number> }>;
 }
 
 /** One audit the candidate query considers: pending = no row for it since the session last completed. */
@@ -10171,6 +10187,8 @@ export class Storage {
     after?: { createdAt: number; id: string };
     settledSince?: number;
     minCreatedAt?: number;
+    /** Only sessions with nudges or a no_reply ending ({@link AUDIT_PRIORITY_SQL}). */
+    priority?: boolean;
   }): AuditCandidateRow[] {
     if (opts.audits.length === 0) return [];
     return this.read((db) => {
@@ -10202,6 +10220,7 @@ export class Storage {
         where.push(`s.created_at >= ?`);
         tail.push(opts.minCreatedAt);
       }
+      if (opts.priority) where.push(AUDIT_PRIORITY_SQL);
       if (opts.after) {
         const cmp = opts.order === "asc" ? ">" : "<";
         where.push(`(s.created_at ${cmp} ? or (s.created_at = ? and s.id ${cmp} ?))`);
@@ -10211,13 +10230,70 @@ export class Storage {
       // Parameter order follows the WHERE clause order.
       const ordered = [head[0], ...params, ...head.slice(1), ...tail];
       const sql = `select s.id, s.timeline_key, s.session_type, s.status, s.created_at, s.completed_at,
-                          s.contract_version, s.contract_nudges, s.trigger_body, s.trigger_sender_id,
+                          s.contract_version, s.contract_nudges, s.no_reply, s.trigger_body, s.trigger_sender_id,
                           s.trigger_sender_display_name, s.initial_preloads
                      from agent_sessions s
                     where ${where[0]} and ${where[1]} and ${where[2]}${where.length > 3 ? ` and ${where.slice(3).join(" and ")}` : ""}
                     order by s.created_at ${dir}, s.id ${dir}
                     limit ?`;
       return db.prepare(sql).all(...ordered, opts.limit) as AuditCandidateRow[];
+    });
+  }
+
+  /**
+   * One keyset chunk of the offline audit's backlog count (oldest first): per
+   * session whether it is auditable now (settled, not a generation type, inside
+   * the age bound), whether it has the backlog priority, and per audit whether a
+   * whole-session row exists since it last completed. Bounded by `limit`; the
+   * caller walks the chunks off the request path and aggregates.
+   */
+  auditProgressChunk(opts: {
+    audits: readonly string[];
+    excludeSessionTypes: readonly string[];
+    settledBefore: number;
+    minCreatedAt?: number;
+    after?: { createdAt: number; id: string };
+    limit: number;
+  }): AuditProgressChunk {
+    return this.read((db) => {
+      const done = opts.audits.map(
+        (_a, i) => `exists (select 1 from session_audits a where a.session_id = s.id and a.audit = @a${i} and a.event_id is null
+                     and a.created_at >= coalesce(s.completed_at, 0)) as d${i}`,
+      );
+      const types = opts.excludeSessionTypes.map((_t, i) => `@t${i}`);
+      const params: Record<string, string | number> = {
+        settledBefore: opts.settledBefore,
+        minCreatedAt: opts.minCreatedAt ?? 0,
+        cts: opts.after?.createdAt ?? -1,
+        cid: opts.after?.id ?? "",
+        limit: opts.limit,
+      };
+      opts.audits.forEach((a, i) => (params[`a${i}`] = a));
+      opts.excludeSessionTypes.forEach((t, i) => (params[`t${i}`] = t));
+      const rows = db
+        .prepare(
+          `select s.id, s.created_at,
+                  (s.status not in ('created', 'running', 'resuming')
+                    and coalesce(s.completed_at, s.updated_at) <= @settledBefore
+                    and s.created_at >= @minCreatedAt
+                    ${types.length > 0 ? `and s.session_type not in (${types.join(", ")})` : ""}) as eligible,
+                  ${AUDIT_PRIORITY_SQL} as priority
+                  ${done.length > 0 ? `, ${done.join(", ")}` : ""}
+             from agent_sessions s
+            where s.created_at > @cts or (s.created_at = @cts and s.id > @cid)
+            order by s.created_at, s.id
+            limit @limit`,
+        )
+        .all(params) as Array<Record<string, string | number>>;
+      const last = rows[rows.length - 1];
+      return {
+        next: rows.length < opts.limit || !last ? null : { createdAt: Number(last.created_at), id: String(last.id) },
+        rows: rows.map((r) => ({
+          eligible: Number(r.eligible),
+          priority: Number(r.priority),
+          done: Object.fromEntries(opts.audits.map((a, i) => [a, Number(r[`d${i}`])])),
+        })),
+      };
     });
   }
 

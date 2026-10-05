@@ -202,7 +202,9 @@ Unreleased section; it is not part of any release's notes.
   so the statistics cover history too. Spend is recorded as usage class `audit`
   (`[[limits]].classes` accepts `"audit"`). `scripts/calibrate-checks.ts`
   calibrates check thresholds against model-made labels without anyone reading
-  the messages. Database schema v27 adds `session_audits`.
+  the messages. The history backlog classifies how sessions with nudges or a
+  `no_reply` ending failed before it runs refusal checks, and `/models` shows its
+  progress. Database schema v27 adds `session_audits`.
 
 ### Changed
 

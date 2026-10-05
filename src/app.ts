@@ -2898,6 +2898,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           logger: logger.child("audit"),
         })
       : null;
+  // The /models page shows the audit backlog's last background count.
+  if (auditPool) modelBehaviour.setAuditProgressSource(() => auditPool.backlogProgress());
 
   // Tools made unavailable by EITHER mechanism: the explicit `agent.disabled_tools`
   // allowlist subtraction, or a capability feature gate (`[features]`) being off.

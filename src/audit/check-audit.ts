@@ -10,9 +10,11 @@
  * (kind `soft`, outcome `observed`) per fired refusal check, so the model
  * behaviour rollups and the incident log count them with no special case.
  *
- * An output the gate already judged (a `model` row at the same anchor) is
+ * An output the gate already judged (a live `model` row at the same anchor) is
  * skipped; one with only pattern rows is judged without patterns (its hits are
- * already recorded).
+ * already recorded). The backlog runs the pass in stages (the contract kinds with
+ * the send-contract audit, the rest later): checks an earlier audit stage already
+ * judged at the anchor are not asked again.
  */
 import type { CheckEvaluator, CheckScope } from "../checks/evaluator.js";
 import type { StateMessage } from "../checks/state.js";
@@ -41,10 +43,45 @@ export interface CheckAuditResult {
   modelId?: string;
 }
 
-/** Existing check rows at an output's anchor: judged by a model, or only pattern hits. */
-function existingAt(rows: readonly DecisionEvaluationRow[], item: AuditCheckItem): { judged: boolean; patterns: boolean } {
+/** The decision groups the audit writes start with this (the console tells them from live verdicts by it). */
+export const AUDIT_GROUP_PREFIX = "audit:";
+
+/**
+ * Check codes a judged row asked or fired: `results[].id` is `<code>__<source>`
+ * (split at the last `__`), `fired[]` holds codes (or `{ code }`).
+ */
+export function judgedCodes(verdictJson: string | null): string[] {
+  if (!verdictJson) return [];
+  try {
+    const v = JSON.parse(verdictJson) as { results?: unknown; fired?: unknown };
+    const out: string[] = [];
+    for (const r of Array.isArray(v?.results) ? v.results : []) {
+      const id = (r as { id?: unknown; code?: unknown })?.id;
+      const code = (r as { code?: unknown })?.code;
+      if (typeof code === "string") out.push(code);
+      else if (typeof id === "string" && id.lastIndexOf("__") > 0) out.push(id.slice(0, id.lastIndexOf("__")));
+    }
+    for (const f of Array.isArray(v?.fired) ? v.fired : []) {
+      if (typeof f === "string") out.push(f);
+      else if (typeof (f as { code?: unknown })?.code === "string") out.push((f as { code: string }).code);
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Existing check rows at an output's anchor: judged live by a model, only pattern
+ * hits, and the codes an earlier audit stage already judged there.
+ */
+function existingAt(
+  rows: readonly DecisionEvaluationRow[],
+  item: AuditCheckItem,
+): { judged: boolean; patterns: boolean; auditCodes: Set<string> } {
   let judged = false;
   let patterns = false;
+  const auditCodes = new Set<string>();
   for (const r of rows) {
     if (r.point !== "checks" || r.checkpoint !== item.checkpoint || (r.branch_no ?? 0) !== 0) continue;
     const same = item.toolCallId !== undefined
@@ -52,9 +89,12 @@ function existingAt(rows: readonly DecisionEvaluationRow[], item: AuditCheckItem
       : r.tool_call_id === null && r.attempt_no === (item.attemptNo ?? null);
     if (!same) continue;
     if (r.source === "pattern") patterns = true;
-    else if (r.source === "model") judged = true;
+    else if (r.source === "model") {
+      if (r.decision_group.startsWith(AUDIT_GROUP_PREFIX)) for (const code of judgedCodes(r.verdict_json)) auditCodes.add(code);
+      else judged = true;
+    }
   }
-  return { judged, patterns };
+  return { judged, patterns, auditCodes };
 }
 
 export async function auditSessionChecks(params: {
@@ -99,7 +139,7 @@ export async function auditSessionChecks(params: {
         ...(item.toolCallId !== undefined ? { toolCallId: item.toolCallId } : {}),
         ...(item.attemptNo !== undefined ? { attemptNo: item.attemptNo } : {}),
       },
-      { patterns: !live.patterns, kinds },
+      { patterns: !live.patterns, kinds, ...(live.auditCodes.size > 0 ? { skipCodes: live.auditCodes } : {}) },
     );
     const outcome = await evaluation.done;
     for (const call of evaluation.calls) {

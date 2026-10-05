@@ -146,6 +146,8 @@ export interface CheckStartOptions {
   patterns?: boolean;
   /** Only checks of these kinds take part (default every kind). */
   kinds?: readonly CheckKind[];
+  /** Checks that take no part (already judged at this output, e.g. by an earlier audit stage). */
+  skipCodes?: ReadonlySet<string>;
 }
 
 /** Which source texts the patterns read, per checkpoint. */
@@ -304,6 +306,7 @@ export class CheckEvaluator {
     const raw: Array<Omit<CheckItem, "id">> = [];
     for (const check of this.options.catalogue.enabledFor(checkpoint, scope.agent)) {
       if (opts.kinds && !opts.kinds.includes(check.kind)) continue;
+      if (opts.skipCodes?.has(check.code)) continue;
       const hasQuestions = check.questions.length > 0;
       const shortStyle = check.kind === "style" && messageChars < (check.minChars ?? knobs.styleMinChars);
       // A style check with questions skips a short message entirely; a
