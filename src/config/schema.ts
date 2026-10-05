@@ -1169,6 +1169,8 @@ const CheckSchema = StrictObject({
   patterns: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
   // Word list: word boundaries, case-insensitive.
   words: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  // Question gate: questions are asked only when one of these matches (same syntax as patterns).
+  prefilter: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
   min_chars: Type.Optional(Type.Integer({ minimum: 0 })),
   questions: Type.Optional(Type.Array(CheckQuestionSchema)),
 });

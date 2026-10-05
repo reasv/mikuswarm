@@ -190,6 +190,13 @@ test("validateRefusalRules: operator reasons from the catalogue are known", () =
   validateRefusalRules(cfg, buildCheckCatalogue(cfg));
 });
 
+test("validateRefusalRules: the built-in sexual_content reason is known", () => {
+  const cfg = config({ refusal_fallback: [{ name: "nsfw", reasons: ["sexual_content"], models: ["open_model_x"] }] });
+  validateRefusalRules(cfg, buildCheckCatalogue(cfg));
+  // Known from the built-in reason list, even with no built-in check in the catalogue.
+  validateRefusalRules(cfg, buildCheckCatalogue(cfg, []));
+});
+
 test("validateRefusalRules: startup errors", () => {
   const cases: Array<[unknown[], RegExp, Record<string, unknown>?]> = [
     [[{ name: "a", models: ["nope"] }], /refusal_fallback\[0\] \("a"\)\.models: "nope" does not name a \[models\.\*\] block/],

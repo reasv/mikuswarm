@@ -170,11 +170,14 @@ Unreleased section; it is not part of any release's notes.
   diary entries, captions and session records can be judged; a message is held
   only when a verdict could act (5 s deadline, then sent unjudged). A judged
   refusal with a matching rule discards the turn and redoes it on the rule's
-  model; the discarded part is kept as a branch. Eleven starter style checks ship
-  disabled (em-dashes, "not X but Y", sycophantic openers, sign-offs, stock
-  vocabulary, AI disclaimers, emoji and more): when enabled, a flagged message is
-  returned to the agent to rewrite, within per-message and per-session bounds,
-  and the posting tools gain an `override_checks` argument for false positives.
+  model; the discarded part is kept as a branch. Built-in refusal reasons include
+  `sexual_content` (declining sexual, lewd or NSFW requests). Nine starter style
+  checks ship disabled (em-dashes, "not X but Y", stock vocabulary, AI
+  disclaimers, figurative "load-bearing" and more): when enabled, a flagged
+  message is returned to the agent to rewrite, within per-message and
+  per-session bounds, and the posting tools gain an `override_checks` argument
+  for false positives. A check's `prefilter` patterns make its questions run only
+  on outputs they match, so a check about one word costs nothing elsewhere.
   Per-agent overrides in `[agents.<name>.checks]`.
 
 - **Send-contract records and redo.** Every forced-completion nudge is tagged
@@ -202,9 +205,12 @@ Unreleased section; it is not part of any release's notes.
   so the statistics cover history too. Spend is recorded as usage class `audit`
   (`[[limits]].classes` accepts `"audit"`). `scripts/calibrate-checks.ts`
   calibrates check thresholds against model-made labels without anyone reading
-  the messages. The history backlog classifies how sessions with nudges or a
-  `no_reply` ending failed before it runs refusal checks, and `/models` shows its
-  progress. Database schema v27 adds `session_audits`.
+  the messages; its `--any-refusal` mode measures "is this a refusal of any
+  kind" (the highest score over every refusal check), sampling by the scores
+  already recorded and weighting the estimates back to the whole history. The
+  history backlog classifies how sessions with nudges or a `no_reply` ending
+  failed before it runs refusal checks, and `/models` shows its progress.
+  Database schema v27 adds `session_audits`.
 
 ### Changed
 

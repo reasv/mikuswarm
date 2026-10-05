@@ -11,6 +11,8 @@
  *   payee is over budget (the output proceeds unjudged; the miss is recorded).
  * - **Style checks** skip messages under `min_chars` (a pattern-only style check
  *   ignores it); refusal checks have no floor.
+ * - **Prefilter.** A check with `prefilter` patterns asks a question only when
+ *   one of them matches that question's source text; no match skips it.
  * - **One call by default**, split by the fits ({@link planCheckCalls}); every
  *   call of one evaluation shares a `decisionGroup`.
  * - **Per-check verdict**: a check fires when any of its questions reaches its
@@ -42,7 +44,7 @@ import type {
   RefusalEventInsert,
   RefusalOutcome,
 } from "../storage/database.js";
-import { firstPatternMatch } from "./catalogue.js";
+import { firstPatternMatch, prefilterAllows } from "./catalogue.js";
 import { hasSource, sourceText, type CheckContext, type CheckSources } from "./state.js";
 import type { CheckCatalogue, CheckDefinition, CheckKind, CheckRemedy, CheckSource, Checkpoint } from "./types.js";
 
@@ -329,6 +331,8 @@ export class CheckEvaluator {
       for (const question of check.questions) {
         if (question.actions && !question.actions.includes(action)) continue;
         if (question.afterNudge ? nudges < 1 : !hasSource(sources, question.source)) continue;
+        // A prefilter gates each question on its own source text (no match = not asked).
+        if (!prefilterAllows(check, sourceText(sources, question.source))) continue;
         raw.push({ code: check.code, kind: check.kind, source: question.source, question });
         took = true;
       }

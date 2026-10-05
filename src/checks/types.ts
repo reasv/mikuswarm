@@ -23,6 +23,7 @@ export type InternalSite = (typeof INTERNAL_SITES)[number];
 export const BUILTIN_REFUSAL_REASONS = [
   "distillation",
   "safety",
+  "sexual_content",
   "privacy",
   "copyright",
   "persona",
@@ -86,6 +87,12 @@ export interface CheckDefinition {
   patterns: RegExp[];
   /** Word list (word boundaries, case-insensitive); see `compileWordList`. */
   words: string[];
+  /**
+   * Gates the questions: a question is asked only when one of these matches its
+   * source text (no match = the check is skipped, not fired). Never decides the
+   * check by itself, unlike `patterns`. Empty or undefined = no gate.
+   */
+  prefilter?: RegExp[];
   /** Style checks: skip messages shorter than this (overrides `[decisions.checks].style_min_chars`). */
   minChars?: number;
   questions: CheckQuestion[];

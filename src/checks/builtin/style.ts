@@ -4,15 +4,19 @@
  * (`[checks.<code>] enabled = true`) and may override any field.
  *
  * Two sources: the style rules the workspace template already gives the agent
- * (no assistant filler, no "I'm just an AI" disclaimers, custom emoji or
- * kaomoji over standard emoji, short messages unless length is warranted), and
- * common LLM-isms (owner decision 26).
+ * (no "I'm just an AI" disclaimers, no figurative "load-bearing", short messages
+ * unless length is warranted), and common LLM-isms (owner decision 26). The
+ * sycophantic-opener, sign-off and Unicode-emoji checks of the original starter
+ * set are left commented out below: the first two were never seen in practice,
+ * and standard emoji have legitimate uses.
  *
  * Detection:
  * - Patterns decide their check without a model call and work without a
  *   decision model; they ignore the style length floor (§6.3). They are kept
  *   precise (anchored openers, phrases rather than single words, lookaheads that
  *   skip "an AI researcher"); paraphrases are the questions' job.
+ * - A prefilter gates a question on a cheap pattern (`style_load_bearing` asks
+ *   only when the word is there); unlike a pattern it never decides the check.
  * - Questions read the outgoing `message`. When the fits split the evaluation,
  *   style questions get the message alone, so every question works without
  *   `request` and only uses it when present.
@@ -33,7 +37,10 @@ export const STYLE_THRESHOLD = 0.85;
 const QUOTED =
   "Quoting or reporting what someone else wrote, or showing the construction as an example because the conversation is about it, is not the assistant's own phrasing.";
 
-/** Optional leading mention or addressed name before an opener ("@alice ", "<@123> ", "Bob, "). */
+/**
+ * Optional leading mention or addressed name before an opener ("@alice ",
+ * "<@123> ", "Bob, "); with PRAISE, used by the unshipped `style_sycophantic_opener`.
+ */
 const LEAD = String.raw`^\s*(?:(?:[@<]\S+[,:]?|\p{Lu}\p{L}*[,:])\s+)?(?:(?:oh|wow|ah|ooh|yes)[,!]?\s+){0,2}`;
 
 const PRAISE = String.raw`(?:really\s+|very\s+|such\s+an?\s+)?(?:great|excellent|fantastic|wonderful|fascinating|brilliant|insightful|thoughtful|amazing)\s+`;
@@ -58,9 +65,13 @@ export const LLM_VOCABULARY_WORDS: readonly string[] = [
   "boasts",
 ];
 
+/** "load-bearing", "load bearing", "loadbearing", any case or hyphen: the prefilter of `style_load_bearing`. */
+export const LOAD_BEARING_PATTERN = /(?<![\p{L}\p{N}_])load[\s\u2010\u2011-]*bearing/iu;
+
 /**
- * Standard Unicode emoji: emoji-presentation code points, text-default symbols
- * forced to emoji with VS16, keycaps, with their modifiers and ZWJ sequences.
+ * Standard Unicode emoji (the unshipped `style_unicode_emoji` below):
+ * emoji-presentation code points, text-default symbols forced to emoji with
+ * VS16, keycaps, with their modifiers and ZWJ sequences.
  * Text-default symbols that kaomoji use (♡ ☆ ✿ ♪ ツ) and `:shortcode:` never match.
  */
 export const UNICODE_EMOJI_PATTERN =
@@ -77,7 +88,13 @@ function styleCheck(
   code: string,
   description: string,
   agentExplanation: string,
-  detection: { patterns?: RegExp[]; words?: readonly string[]; question?: CheckQuestion; minChars?: number },
+  detection: {
+    patterns?: RegExp[];
+    words?: readonly string[];
+    prefilter?: RegExp[];
+    question?: CheckQuestion;
+    minChars?: number;
+  },
 ): CheckDefinition {
   return {
     code,
@@ -90,6 +107,7 @@ function styleCheck(
     apiSignals: [],
     patterns: detection.patterns ?? [],
     words: [...(detection.words ?? [])],
+    ...(detection.prefilter ? { prefilter: detection.prefilter } : {}),
     ...(detection.minChars !== undefined ? { minChars: detection.minChars } : {}),
     questions: detection.question ? [detection.question] : [],
     builtin: true,
@@ -140,62 +158,63 @@ export const BUILTIN_STYLE_CHECKS: readonly CheckDefinition[] = [
       ),
     },
   ),
-  styleCheck(
-    "style_sycophantic_opener",
-    "Opens by praising or agreeing with the user",
-    "Opens by praising or agreeing with the user. Start with the substance.",
-    {
-      patterns: [
-        // "Great question!", "That's a great point", "Bob, excellent observation".
-        new RegExp(
-          LEAD + String.raw`(?:that(?:'|’)?s\s+(?:a\s+|an\s+)?)?` + PRAISE + String.raw`(?:question|point|observation|insight)s?\b`,
-          "iu",
-        ),
-        // "What a fascinating idea", "What an excellent question".
-        new RegExp(LEAD + String.raw`what\s+an?\s+` + PRAISE + String.raw`(?:question|point|idea|observation|insight|thought)s?\b`, "iu"),
-        // "You're absolutely right".
-        new RegExp(LEAD + String.raw`you(?:(?:'|’)re|\s+are)\s+(?:absolutely|completely|totally|so|entirely|100%)\s+right\b`, "iu"),
-      ],
-      question: messageQuestion(
-        "`message` opens by praising the user or their question or idea, or by effusively agreeing, before getting to its " +
-          "substance (\"Great question!\", \"You're absolutely right\", \"What a fascinating idea\", or a paraphrase).",
-        {
-          true: "The first sentence or phrase of `message` is flattery or effusive agreement that adds nothing.",
-          false:
-            "A short plain acknowledgment that carries information (confirming a fact, conceding a correction: \"yeah, it " +
-            "was 1998\"), praise that is the substance asked for (someone shared their work and asked for an opinion), or " +
-            `warmth later in the message is not a sycophantic opener. ${QUOTED}`,
-        },
-      ),
-    },
-  ),
-  styleCheck(
-    "style_assistant_sign_off",
-    "Assistant-style offers and sign-offs",
-    "Ends with (or contains) an assistant-style offer or sign-off. Drop it.",
-    {
-      patterns: [
-        /\bhope\s+(?:this|that|it)\s+helps\b/iu,
-        /\blet\s+me\s+know\s+if\s+(?:you\s+)?(?:have|need|want|would\s+like)\s+(?:any(?:thing)?\s+)?(?:else|more|other|further|additional|help|questions?|clarification)\b/iu,
-        /\bfeel\s+free\s+to\s+(?:ask|reach\s+out|let\s+me\s+know)\b/iu,
-        /\bhow\s+(?:can|may)\s+I\s+(?:help|assist)(?:\s+you)?(?:\s+today)?\s*\?/iu,
-        /\bI(?:(?:'|’)d|\s+would)\s+be\s+(?:happy|glad|delighted)\s+to\b/iu,
-        /\bis\s+there\s+anything\s+else\s+(?:I\s+can|you(?:(?:'|’)d|\s+would)\s+like)\b/iu,
-        /\bhappy\s+to\s+help\b/iu,
-      ],
-      question: messageQuestion(
-        "`message` contains a customer-service offer or sign-off: hoping it helped, inviting more questions, offering " +
-          "further help, asking how it can help (\"I hope this helps\", \"Let me know if you need anything else\", \"Feel " +
-          "free to ask\", \"How can I help?\", \"I'd be happy to\"), or a paraphrase.",
-        {
-          true: "`message` contains a service phrase a support bot would add and a person in this chat would not say.",
-          false:
-            "A concrete follow-up that belongs to the conversation (\"ping me when the build finishes and I'll check the " +
-            `logs\") or friendly small talk is not an assistant sign-off. ${QUOTED}`,
-        },
-      ),
-    },
-  ),
+  // Not shipped: never seen in practice.
+  // styleCheck(
+  //   "style_sycophantic_opener",
+  //   "Opens by praising or agreeing with the user",
+  //   "Opens by praising or agreeing with the user. Start with the substance.",
+  //   {
+  //     patterns: [
+  //       // "Great question!", "That's a great point", "Bob, excellent observation".
+  //       new RegExp(
+  //         LEAD + String.raw`(?:that(?:'|’)?s\s+(?:a\s+|an\s+)?)?` + PRAISE + String.raw`(?:question|point|observation|insight)s?\b`,
+  //         "iu",
+  //       ),
+  //       // "What a fascinating idea", "What an excellent question".
+  //       new RegExp(LEAD + String.raw`what\s+an?\s+` + PRAISE + String.raw`(?:question|point|idea|observation|insight|thought)s?\b`, "iu"),
+  //       // "You're absolutely right".
+  //       new RegExp(LEAD + String.raw`you(?:(?:'|’)re|\s+are)\s+(?:absolutely|completely|totally|so|entirely|100%)\s+right\b`, "iu"),
+  //     ],
+  //     question: messageQuestion(
+  //       "`message` opens by praising the user or their question or idea, or by effusively agreeing, before getting to its " +
+  //         "substance (\"Great question!\", \"You're absolutely right\", \"What a fascinating idea\", or a paraphrase).",
+  //       {
+  //         true: "The first sentence or phrase of `message` is flattery or effusive agreement that adds nothing.",
+  //         false:
+  //           "A short plain acknowledgment that carries information (confirming a fact, conceding a correction: \"yeah, it " +
+  //           "was 1998\"), praise that is the substance asked for (someone shared their work and asked for an opinion), or " +
+  //           `warmth later in the message is not a sycophantic opener. ${QUOTED}`,
+  //       },
+  //     ),
+  //   },
+  // ),
+  // styleCheck(
+  //   "style_assistant_sign_off",
+  //   "Assistant-style offers and sign-offs",
+  //   "Ends with (or contains) an assistant-style offer or sign-off. Drop it.",
+  //   {
+  //     patterns: [
+  //       /\bhope\s+(?:this|that|it)\s+helps\b/iu,
+  //       /\blet\s+me\s+know\s+if\s+(?:you\s+)?(?:have|need|want|would\s+like)\s+(?:any(?:thing)?\s+)?(?:else|more|other|further|additional|help|questions?|clarification)\b/iu,
+  //       /\bfeel\s+free\s+to\s+(?:ask|reach\s+out|let\s+me\s+know)\b/iu,
+  //       /\bhow\s+(?:can|may)\s+I\s+(?:help|assist)(?:\s+you)?(?:\s+today)?\s*\?/iu,
+  //       /\bI(?:(?:'|’)d|\s+would)\s+be\s+(?:happy|glad|delighted)\s+to\b/iu,
+  //       /\bis\s+there\s+anything\s+else\s+(?:I\s+can|you(?:(?:'|’)d|\s+would)\s+like)\b/iu,
+  //       /\bhappy\s+to\s+help\b/iu,
+  //     ],
+  //     question: messageQuestion(
+  //       "`message` contains a customer-service offer or sign-off: hoping it helped, inviting more questions, offering " +
+  //         "further help, asking how it can help (\"I hope this helps\", \"Let me know if you need anything else\", \"Feel " +
+  //         "free to ask\", \"How can I help?\", \"I'd be happy to\"), or a paraphrase.",
+  //       {
+  //         true: "`message` contains a service phrase a support bot would add and a person in this chat would not say.",
+  //         false:
+  //           "A concrete follow-up that belongs to the conversation (\"ping me when the build finishes and I'll check the " +
+  //           `logs\") or friendly small talk is not an assistant sign-off. ${QUOTED}`,
+  //       },
+  //     ),
+  //   },
+  // ),
   styleCheck(
     "style_llm_vocabulary",
     "Overused LLM vocabulary (configurable word list)",
@@ -260,11 +279,35 @@ export const BUILTIN_STYLE_CHECKS: readonly CheckDefinition[] = [
       ),
     },
   ),
+  // Not shipped: standard emoji have legitimate uses.
+  // styleCheck(
+  //   "style_unicode_emoji",
+  //   "Standard Unicode emoji in the message body",
+  //   "Contains standard Unicode emoji. Use a custom `:shortcode:` emoji or a kaomoji instead.",
+  //   { patterns: [UNICODE_EMOJI_PATTERN] },
+  // ),
   styleCheck(
-    "style_unicode_emoji",
-    "Standard Unicode emoji in the message body",
-    "Contains standard Unicode emoji. Use a custom `:shortcode:` emoji or a kaomoji instead.",
-    { patterns: [UNICODE_EMOJI_PATTERN] },
+    "style_load_bearing",
+    'Figurative "load-bearing"',
+    'Uses "load-bearing" as a figure of speech. Don\'t; say plainly what you mean (for example "important", "essential" or "doing the real work").',
+    {
+      // Only messages with the word are judged, so the length floor would only hide short ones.
+      prefilter: [LOAD_BEARING_PATTERN],
+      minChars: 0,
+      question: messageQuestion(
+        "`message` uses \"load-bearing\" (or \"load bearing\", \"loadbearing\") as a figure of speech: it calls " +
+          "something that is not a physical structure load-bearing to mean that it is important, essential or doing " +
+          "a lot of work (\"that joke is load-bearing\", \"a load-bearing assumption\", \"the word 'just' is " +
+          "load-bearing here\").",
+        {
+          true: "In its own words, `message` calls an idea, word, joke, person, assumption, detail or anything else that is not a physical structure load-bearing.",
+          false:
+            "The literal structural or engineering meaning is not a figure of speech: a load-bearing wall, beam, column, " +
+            "pillar or foundation, a building, bridge or other architecture, a mechanical, structural or electrical " +
+            `load. ${QUOTED}`,
+        },
+      ),
+    },
   ),
   styleCheck(
     "style_wall_of_text",

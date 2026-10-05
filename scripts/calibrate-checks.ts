@@ -8,6 +8,17 @@
  *
  * Usage:
  *   npx tsx scripts/calibrate-checks.ts --db <path> --labeller <models key> --check <code> [options]
+ *   npx tsx scripts/calibrate-checks.ts --db <path> --labeller <models key> --any-refusal [options]
+ *
+ * `--any-refusal` measures "is this output a refusal of any kind", the decision
+ * that acts in production: the score is the highest probability among every
+ * enabled refusal check's questions over the judged sources (send: message;
+ * ending: analysis, text, thinking), asked in one call. Items are sampled by
+ * score band from the scores already recorded in the database (live gate and
+ * offline audit check rows; outputs without one are excluded and counted),
+ * labelled against a generic refusal definition, and precision, recall and F1
+ * are estimated for the whole population with inverse-sampling weights
+ * (band population / usable items sampled from the band).
  *
  * Options:
  *   --config <dir>          config directory (default ./config); its .env is loaded over the shell's
@@ -26,6 +37,13 @@
  *   --concurrency <n>       parallel items (default 2)
  *   --json                  print the report as JSON
  *
+ * --any-refusal options (instead of --check, --sample, --fired-only):
+ *   --per-band <n>          items sampled per score band (default 25; all of a band if fewer)
+ *   --bands a,b,...         band lower edges, starting at 0 (default 0,0.1,0.3,0.5,0.65,0.8)
+ *   --source <source>       judge only this source (default: message at send; analysis, text, thinking at ending)
+ *   --checkpoint, --agent, --member, --seed, --since, --thresholds, --target-precision,
+ *   --concurrency, --json   as above
+ *
  * Safety:
  * - The database is opened read-only (`query_only`); run it on a copy if you prefer.
  * - The tool refuses to start when the environment sets endpoint or proxy
@@ -37,7 +55,7 @@
  */
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import { buildCheckCatalogue } from "../src/checks/catalogue.js";
-import type { CheckSource } from "../src/checks/types.js";
+import { CHECK_SOURCES, type CheckSource } from "../src/checks/types.js";
 import { loadConfig } from "../src/config/index.js";
 import { createModelFromConfig } from "../src/agent/factory.js";
 import { DecisionClient } from "../src/decisions/client.js";
@@ -53,6 +71,13 @@ import {
   runCalibration,
   type Labeller,
 } from "../src/audit/calibration.js";
+import {
+  ANY_REFUSAL_SOURCES,
+  createAnyRefusalScorer,
+  formatAnyRefusalReport,
+  normalizeBands,
+  runAnyRefusalCalibration,
+} from "../src/audit/any-refusal-calibration.js";
 
 function fail(message: string): never {
   process.stderr.write(`calibrate-checks: ${message}\n`);
@@ -66,7 +91,7 @@ for (let i = 0; i < argv.length; i++) {
   const arg = argv[i]!;
   if (!arg.startsWith("--")) fail(`unexpected argument ${arg}`);
   const name = arg.slice(2);
-  if (name === "json" || name === "fired-only") switches.add(name);
+  if (name === "json" || name === "fired-only" || name === "any-refusal") switches.add(name);
   else {
     const value = argv[i + 1];
     if (value === undefined || value.startsWith("--")) fail(`--${name} needs a value`);
@@ -90,9 +115,13 @@ try {
   fail(error instanceof Error ? error.message : String(error));
 }
 
+const anyRefusal = switches.has("any-refusal");
+if (anyRefusal) {
+  for (const name of ["check", "sample"]) if (flags.has(name)) fail(`--${name} does not apply to --any-refusal`);
+  if (switches.has("fired-only")) fail("--fired-only does not apply to --any-refusal");
+}
 const dbPath = required("db");
 const labellerKey = required("labeller");
-const code = required("check");
 const configDir = flags.get("config") ?? "./config";
 const checkpoint = (flags.get("checkpoint") ?? "send") as "send" | "ending";
 if (checkpoint !== "send" && checkpoint !== "ending") fail("--checkpoint must be send or ending");
@@ -108,9 +137,10 @@ if (!isDecisionModel(memberConfig)) fail(`--member ${memberKey} must be a system
 
 const catalogue = buildCheckCatalogue(config);
 const agent = flags.get("agent") ?? null;
-const check = catalogue.get(code, agent) ?? fail(`unknown check ${code}`);
-const source = (flags.get("source") ?? (checkpoint === "send" ? "message" : "text")) as CheckSource;
-const question = check.questions.find((q) => q.source === source) ?? fail(`check ${code} has no question over ${source}`);
+const sourceFlag = flags.get("source");
+if (sourceFlag !== undefined && !(CHECK_SOURCES as readonly string[]).includes(sourceFlag)) {
+  fail(`--source must be one of ${CHECK_SOURCES.join(", ")}`);
+}
 
 const host = (endpoint: string) => {
   try {
@@ -155,19 +185,81 @@ const labeller: Labeller = requireGuardedTransport(
   fetchGuard,
 );
 
+const since = flags.get("since");
+const sinceMs = since !== undefined ? Date.parse(since) : undefined;
+if (sinceMs !== undefined && !Number.isFinite(sinceMs)) fail("--since must be a date (YYYY-MM-DD)");
+const thresholds = flags.has("thresholds")
+  ? flags.get("thresholds")!.split(",").map((t) => Number(t)).filter((t) => t >= 0 && t <= 1)
+  : undefined;
+const client = new DecisionClient({ models: config.models, fetchImpl: fetchGuard });
+const stateMaxTokens = decisions.checks?.state_max_tokens ?? decisions.state_max_tokens ?? 8000;
+const labellerInfo = { model: labellerKey, host: host(labellerConfig.endpoint) };
+const memberInfo = { model: memberKey, host: host(memberConfig.endpoint) };
+
+if (anyRefusal) {
+  const sources = sourceFlag !== undefined ? [sourceFlag as CheckSource] : [...ANY_REFUSAL_SOURCES[checkpoint]];
+  const checks = catalogue.enabledFor(checkpoint, agent).filter((c) => c.kind === "refusal" && c.questions.length > 0);
+  if (checks.length === 0) fail(`no enabled refusal check has questions at ${checkpoint}`);
+  let bands: number[] | undefined;
+  try {
+    bands = flags.has("bands") ? normalizeBands(flags.get("bands")!.split(",").map((t) => Number(t))) : undefined;
+  } catch (error) {
+    fail(`--bands: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const scorer = createAnyRefusalScorer({
+    client,
+    memberKey,
+    memberConfig,
+    checks,
+    checkpoint,
+    sources,
+    persona: decisions.persona ?? "",
+    stateMaxTokens,
+  });
+  const db = openReadOnly(dbPath);
+  try {
+    const report = await runAnyRefusalCalibration({
+      db,
+      catalogue,
+      agent,
+      agents: Object.keys(config.agents ?? {}),
+      checkpoint,
+      sources,
+      ...(bands ? { bands } : {}),
+      perBand: num("per-band", 25),
+      seed: num("seed", 1),
+      ...(sinceMs !== undefined ? { since: sinceMs } : {}),
+      ...(thresholds ? { thresholds } : {}),
+      targetPrecision: num("target-precision", 0.9),
+      concurrency: num("concurrency", 2),
+      labeller,
+      scorer,
+      labellerInfo,
+      memberInfo,
+    });
+    process.stdout.write(switches.has("json") ? reportJson(report) : formatAnyRefusalReport(report));
+  } catch (error) {
+    // Error texts here are the tool's own (guards, configuration, HTTP status): never content.
+    fail(error instanceof Error ? error.message : String(error));
+  } finally {
+    db.close();
+  }
+  process.exit(0);
+}
+
+const code = required("check");
+const check = catalogue.get(code, agent) ?? fail(`unknown check ${code}`);
+const source = (sourceFlag ?? (checkpoint === "send" ? "message" : "text")) as CheckSource;
+const question = check.questions.find((q) => q.source === source) ?? fail(`check ${code} has no question over ${source}`);
 const scorer = createDecisionScorer({
-  client: new DecisionClient({ models: config.models, fetchImpl: fetchGuard }),
+  client,
   memberKey,
   memberConfig,
   check,
   question,
   persona: decisions.persona ?? "",
-  stateMaxTokens: decisions.checks?.state_max_tokens ?? decisions.state_max_tokens ?? 8000,
+  stateMaxTokens,
 });
-
-const since = flags.get("since");
-const sinceMs = since !== undefined ? Date.parse(since) : undefined;
-if (sinceMs !== undefined && !Number.isFinite(sinceMs)) fail("--since must be a date (YYYY-MM-DD)");
 
 const db = openReadOnly(dbPath);
 try {
@@ -183,15 +275,13 @@ try {
     ...(sinceMs !== undefined ? { since: sinceMs } : {}),
     agent,
     persona: decisions.persona ?? "",
-    ...(flags.has("thresholds")
-      ? { thresholds: flags.get("thresholds")!.split(",").map((t) => Number(t)).filter((t) => t >= 0 && t <= 1) }
-      : {}),
+    ...(thresholds ? { thresholds } : {}),
     targetPrecision: num("target-precision", 0.9),
     concurrency: num("concurrency", 2),
     labeller,
     scorer,
-    labellerInfo: { model: labellerKey, host: host(labellerConfig.endpoint) },
-    memberInfo: { model: memberKey, host: host(memberConfig.endpoint) },
+    labellerInfo,
+    memberInfo,
   });
   process.stdout.write(switches.has("json") ? reportJson(report) : formatReport(report));
 } catch (error) {

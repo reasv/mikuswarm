@@ -58,7 +58,7 @@ describe('gateEvaluations', () => {
 		expect(refused.latencyMs).toBe(640);
 		expect(refused.members).toEqual(['decider · vendor/decider-1-20261001']);
 		expect(refused.clean).toBe(false);
-		expect(refused.questionCount).toBe(7);
+		expect(refused.questionCount).toBe(8);
 	});
 
 	it('a pattern hit decides its check; judged checks that stayed below threshold are listed, not fired', () => {

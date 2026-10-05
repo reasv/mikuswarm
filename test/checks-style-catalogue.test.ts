@@ -2,28 +2,27 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { BUILTIN_STYLE_CHECKS, LLM_VOCABULARY_WORDS } from "../src/checks/builtin/style.js";
-import { buildCheckCatalogue, firstPatternMatch } from "../src/checks/catalogue.js";
+import { buildCheckCatalogue, firstPatternMatch, prefilterAllows } from "../src/checks/catalogue.js";
 import { fillMatched } from "../src/checks/revise.js";
 import type { CheckDefinition } from "../src/checks/types.js";
 
 // ---------------------------------------------------------------------------
-// The starter style catalogue (spec REFUSAL-HANDLING §4.5): eleven built-in
+// The starter style catalogue (spec REFUSAL-HANDLING §4.5): nine built-in
 // style checks, all disabled, remedy revise at the send checkpoint; each
 // check's patterns on positives and near misses; `{matched}`; questions with
-// explicit `false` criteria naming the near misses.
+// explicit `false` criteria naming the near misses. The sycophantic-opener,
+// sign-off and Unicode-emoji checks are not shipped.
 // ---------------------------------------------------------------------------
 
 const CODES = [
   "style_em_dash",
   "style_not_x_but_y",
   "style_parallel_construction",
-  "style_sycophantic_opener",
-  "style_assistant_sign_off",
   "style_llm_vocabulary",
   "style_ai_disclaimer",
   "style_essay_formatting",
   "style_moralizing",
-  "style_unicode_emoji",
+  "style_load_bearing",
   "style_wall_of_text",
 ];
 
@@ -39,7 +38,7 @@ function hits(code: string, positives: string[], negatives: string[]): void {
   for (const text of negatives) assert.equal(firstPatternMatch(c, text), undefined, `${code} should not match: ${text}`);
 }
 
-test("the eleven §4.5 checks: disabled, style, revise, send only, each with an explanation", () => {
+test("the nine starter checks: disabled, style, revise, send only, each with an explanation", () => {
   assert.deepEqual(BUILTIN_STYLE_CHECKS.map((c) => c.code), CODES);
   for (const c of BUILTIN_STYLE_CHECKS) {
     assert.equal(c.kind, "style");
@@ -48,7 +47,10 @@ test("the eleven §4.5 checks: disabled, style, revise, send only, each with an 
     assert.deepEqual(c.checkpoints, ["send"]);
     assert.equal(c.builtin, true);
     assert.ok(c.agentExplanation && c.agentExplanation.length > 10, c.code);
-    assert.ok(c.patterns.length + c.words.length + c.questions.length > 0, `${c.code} detects something`);
+      assert.ok(c.patterns.length + c.words.length + c.questions.length > 0, `${c.code} detects something`);
+  }
+  for (const code of ["style_sycophantic_opener", "style_assistant_sign_off", "style_unicode_emoji"]) {
+    assert.ok(!BUILTIN_STYLE_CHECKS.some((c) => c.code === code), `${code} is not shipped`);
   }
   // Detection per the §4.5 table.
   const detection = (code: string) => {
@@ -58,21 +60,15 @@ test("the eleven §4.5 checks: disabled, style, revise, send only, each with an 
   assert.deepEqual(detection("style_em_dash"), { patterns: true, question: false });
   assert.deepEqual(detection("style_not_x_but_y"), { patterns: false, question: true });
   assert.deepEqual(detection("style_parallel_construction"), { patterns: false, question: true });
-  assert.deepEqual(detection("style_sycophantic_opener"), { patterns: true, question: true });
-  assert.deepEqual(detection("style_assistant_sign_off"), { patterns: true, question: true });
   assert.deepEqual(detection("style_llm_vocabulary"), { patterns: true, question: false });
   assert.deepEqual(detection("style_ai_disclaimer"), { patterns: true, question: true });
   assert.deepEqual(detection("style_essay_formatting"), { patterns: true, question: true });
   assert.deepEqual(detection("style_moralizing"), { patterns: false, question: true });
-  assert.deepEqual(detection("style_unicode_emoji"), { patterns: true, question: false });
+  assert.deepEqual(detection("style_load_bearing"), { patterns: false, question: true });
   assert.deepEqual(detection("style_wall_of_text"), { patterns: false, question: true });
   // The spec's explanations, verbatim.
   assert.equal(check("style_em_dash").agentExplanation, "Contains an em-dash. Use a comma, period, colon or parentheses instead.");
   assert.equal(check("style_llm_vocabulary").agentExplanation, 'Uses stock LLM vocabulary ("{matched}"). Use a plain word.');
-  assert.equal(
-    check("style_unicode_emoji").agentExplanation,
-    "Contains standard Unicode emoji. Use a custom `:shortcode:` emoji or a kaomoji instead.",
-  );
 });
 
 test("questions read the message and name their near misses in the false criteria", () => {
@@ -86,67 +82,13 @@ test("questions read the message and name their near misses in the false criteri
   }
   assert.match(check("style_not_x_but_y").questions[0]!.criteria.false, /factual correction is not a rhetorical contrast/);
   assert.match(check("style_essay_formatting").questions[0]!.criteria.false, /list the user asked for is not essay formatting/);
-  assert.match(check("style_sycophantic_opener").questions[0]!.criteria.false, /Quoting .* is not the assistant's own phrasing/);
+  assert.match(check("style_load_bearing").questions[0]!.criteria.false, /Quoting .* is not the assistant's own phrasing/);
   assert.match(check("style_ai_disclaimer").questions[0]!.criteria.false, /AI as a subject/);
   assert.equal(check("style_wall_of_text").minChars, 300, "a short message is never a wall of text");
 });
 
 test("style_em_dash: the em-dash only", () => {
   hits("style_em_dash", ["it works — mostly", "a—b"], ["it works - mostly", "pages 10–12", "it works -- mostly"]);
-});
-
-test("style_sycophantic_opener: praise or effusive agreement as the opener", () => {
-  hits(
-    "style_sycophantic_opener",
-    [
-      "Great question! The answer is 42.",
-      "great point, but the cache is per room",
-      "Oh wow, what a fascinating idea.",
-      "What an excellent question",
-      "That's a great observation.",
-      "You're absolutely right, the build was broken.",
-      "you are completely right",
-      "@alice great question, it was 1998",
-      "Bob, excellent point.",
-      "  Really great question honestly",
-    ],
-    [
-      "That great idea of yours failed in prod.",
-      "The real question is whether it ships.",
-      "yeah, it was 1998",
-      "You're right that it was 1998.",
-      "I asked a great question yesterday and nobody answered.",
-      "Great, that worked.",
-      "the docs say \"Great question!\" is a cliché",
-    ],
-  );
-});
-
-test("style_assistant_sign_off: service offers anywhere in the message", () => {
-  hits(
-    "style_assistant_sign_off",
-    [
-      "Here it is. I hope this helps!",
-      "hope that helps",
-      "Let me know if you need anything else.",
-      "let me know if you have any questions",
-      "Feel free to ask!",
-      "How can I help you today?",
-      "how may I assist?",
-      "I'd be happy to help with that.",
-      "I would be glad to take a look.",
-      "Is there anything else I can do?",
-      "happy to help :)",
-    ],
-    [
-      "let me know when the build finishes",
-      "ping me if it breaks again",
-      "I'm happy with how it turned out",
-      "how can I fix this error?",
-      "feel free",
-      "does that help with the rendering at all",
-    ],
-  );
 });
 
 test("style_llm_vocabulary: whole words and phrases from the list, {matched} filled", () => {
@@ -208,14 +150,30 @@ test("style_essay_formatting: markdown headings at a line start, not hashtags", 
   );
 });
 
-test("style_unicode_emoji: standard emoji, never kaomoji or shortcodes", () => {
-  const c = check("style_unicode_emoji");
-  hits(
-    "style_unicode_emoji",
-    ["nice 😀", "👍🏽", "flag 🇯🇵", "love it ❤️", "⭐ starred", "☕", "press 1️⃣", "✔️ done"],
-    ["(╯°□°）╯︵ ┻━┻", "ʕ•ᴥ•ʔ", "(｡◕‿◕｡)", "¯\\_(ツ)_/¯", "♡ ☆ ★ ♪ ✿", ":smile: :blobcat:", "© 2026 ™", "✔ done", "→ next"],
-  );
-  assert.equal(firstPatternMatch(c, "ok 👍🏽 then"), "👍🏽", "the whole emoji with its modifier");
+test("style_load_bearing: a prefilter on the word, a question for figurative use, never a pattern hit", () => {
+  const c = check("style_load_bearing");
+  assert.equal(c.patterns.length + c.words.length, 0, "the word alone never decides the check");
+  assert.equal(c.minChars, 0, "short messages are judged too: only messages with the word reach the question");
+  for (const text of [
+    "that joke is load-bearing",
+    "a Load-Bearing assumption",
+    "the word 'just' is load bearing here",
+    "LOADBEARING",
+    "load\u2011bearing detail",
+    "load-bearing.",
+  ]) {
+    assert.equal(prefilterAllows(c, text), true, text);
+  }
+  for (const text of ["bearing the load", "a heavy load", "overload bearings", "unloadbearing"]) {
+    assert.equal(prefilterAllows(c, text), false, text);
+  }
+  const q = c.questions[0]!;
+  assert.equal(q.source, "message");
+  assert.match(q.instructions, /figure of speech/);
+  assert.match(q.criteria.false, /load-bearing wall, beam/);
+  assert.match(q.criteria.false, /bridge/);
+  assert.match(c.agentExplanation!, /figure of speech/);
+  assert.match(c.agentExplanation!, /say plainly what you mean/);
 });
 
 test("fillMatched: the placeholder is filled, clipped, or dropped with its quotes for a judged hit", () => {

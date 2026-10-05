@@ -28,6 +28,7 @@ import {
   reportJson,
   requireGuardedTransport,
   runCalibration,
+  sampleCalibrationItems,
   scoreHistogram,
   thresholdTable,
   type CalibrationRow,
@@ -170,6 +171,23 @@ test("runCalibration: sampling, known positives, labels, scores, aggregates; nev
       assert.match(prompts[0]!.prompt, /Do not reproduce any of the item's content/);
       assert.deepEqual(prompts[0]!.tool.parameters.properties.label.enum, ["true", "false", "unsure"]);
       assert.ok(prompts[0]!.tool.parameters.properties.reason.enum.includes("complies"));
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("sampling: a check's prefilter limits the eligible outputs to those it matches", async () => {
+  await withDb(async (dbPath) => {
+    const db = openReadOnly(dbPath);
+    try {
+      const gatedCatalogue = buildCheckCatalogue({ ...config, checks: { refusal_safety: { prefilter: ["cannot"] } } });
+      const gated = gatedCatalogue.get("refusal_safety")!;
+      const sampled = sampleCalibrationItems(db, {
+        catalogue: gatedCatalogue, check: gated, checkpoint: "send", source: "message", sample: 50, seed: 1,
+      });
+      assert.equal(sampled.eligible, 4, "only the refusing messages (every third of twelve) match");
+      assert.deepEqual(sampled.items.map((i) => i.id).sort(), ["s0:c0", "s3:c3", "s6:c6", "s9:c9"]);
     } finally {
       db.close();
     }
