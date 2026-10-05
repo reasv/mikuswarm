@@ -44,8 +44,8 @@ export function isLlmRunFailure(error: unknown): error is SessionRunnerError & {
 /**
  * True for the run failures resume-in-place can fix by re-issuing the same
  * request: an *environmental* LLM-layer failure (the upstream was unwell; the
- * request itself is fine). A `content` failure is deterministic on replay and
- * is parked without auto-retry; everything else (semantic run problems, aborts,
+ * request itself is fine). A `content` or `refusal` failure is deterministic on
+ * replay and is parked without auto-retry; everything else (semantic run problems, aborts,
  * programming errors) is not improved by re-issuing the same request.
  */
 export function isResumableRunError(error: unknown): boolean {
@@ -249,14 +249,15 @@ function throwIfLlmFailure(agent: Agent, lifecycle?: SessionRunLifecycle): void 
   if (lifecycle?.isInterrupted()) return;
   if (!isLlmRequestError(errorMessage)) return;
   const last = findLastAssistantMessage(agent.state.messages) as
-    | { stopReason?: string }
+    | { stopReason?: string; rawStopReason?: string }
     | undefined;
   const stopReason = typeof last?.stopReason === "string" ? last.stopReason : undefined;
+  const rawStopReason = typeof last?.rawStopReason === "string" ? last.rawStopReason : undefined;
   if (stopReason === "aborted") return;
   const message = stripLlmRequestTag(errorMessage);
   // Prefer the class marker stamped at the surfacing point; fall back to
   // re-classifying the stripped message (e.g. errors tagged by older rows).
-  const cls = extractLlmRequestClass(errorMessage) ?? classifyLlmError(message, stopReason);
+  const cls = extractLlmRequestClass(errorMessage) ?? classifyLlmError(message, stopReason, rawStopReason);
   throw new SessionRunnerError(`agent run failed at the LLM layer (${cls}): ${message}`, "llm", {
     llmClass: cls,
   });

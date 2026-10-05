@@ -273,6 +273,7 @@ const failureCases: Array<{ name: string; toml?: string; recordTurn: () => FakeL
     recordTurn: () => ({ error: { status: 400, body: JSON.stringify({ error: { message: "bad request" } }) } }),
     reason: "llm_error",
   },
+  { name: "refusal (content_filter)", recordTurn: () => ({ finishReason: "content_filter" }), reason: "refusal" },
 ];
 
 for (const c of failureCases) {
@@ -289,6 +290,42 @@ for (const c of failureCases) {
     }
   });
 }
+
+test("app: a refused record turn fails at once as refusal — no retry, no fallover to the chain", async () => {
+  const h = await startHarness({
+    script: chatScript({ recordTurn: (req) => (req.body.model === "fake-model" ? { finishReason: "content_filter" } : finalize("rec")) }),
+    toml: `
+[models.default]
+fallback = ["backup"]
+
+[models.backup]
+id = "backup-model"
+provider = "fake"
+api = "openai-completions"
+endpoint = "LLM_URL"
+api_key = "test-key"
+input_modalities = ["text"]
+max_tokens = 1024
+context_window = 128000
+`,
+  });
+  try {
+    h.say("[work] go", { mention: true });
+    const [row] = await settled(h, 1);
+    assert.equal(records(h).length, 0, "a refused record turn writes no record");
+    assert.ok(hasLog(h, "session_record_failed", { sessionId: row!.id, reason: "refusal" }));
+    const recordRequests = h.llm.requests.filter(isRecordTurnRequest);
+    assert.deepEqual(
+      recordRequests.map((r) => r.body.model),
+      ["fake-model"],
+      "one request: never retried on the refusing member, never sent to the fallback",
+    );
+    assert.ok(hasLog(h, "llm_refusal", { sessionId: row!.id, model: "fake-model", rawStopReason: "content_filter", fallover: false }));
+    assert.equal(row!.status, "completed", "the session itself is unaffected");
+  } finally {
+    await h.stop();
+  }
+});
 
 test("app: finalize on the empty draft is the skip — no row, session_record_skipped", async () => {
   const h = await startHarness({

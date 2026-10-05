@@ -523,7 +523,7 @@ export class LlmScheduler {
    *   per-episode CAPPED EXPONENTIAL BACKOFF (`llm_probe_backoff_base_ms` →
    *   ×2-per-failed-probe → `llm_probe_backoff_max_ms`; spec MODEL-FALLBACK
    *   §4.1, superseding the old fixed `llm_probe_interval_ms`).
-   *   `content`/`aborted` outcomes are neutral — neither count
+   *   `content`/`aborted`/`refusal` outcomes are neutral — neither count
    *   nor reset (one session's oversized context must not pause the model).
    */
   noteOutcome(
@@ -603,8 +603,9 @@ export class LlmScheduler {
       return;
     }
 
-    if (classification === "content" || classification === "aborted") {
-      // Neutral (§3): neither counts nor resets. If this settled the probe,
+    if (classification === "content" || classification === "aborted" || classification === "refusal") {
+      // Neutral (§3): neither counts nor resets. A refusal is an answer, not
+      // evidence the model is unwell (§8a "Refusals"). If this settled the probe,
       // the probe was inconclusive — clear the in-flight flag; `nextProbeAt`
       // is left as-is (already elapsed), so the next pump re-probes promptly.
       if (health?.probeInFlight) {
@@ -1265,7 +1266,9 @@ export function withSchedulerAdmission(
               const message = failure?.errorMessage;
               // A stall cut short by Layer 0's wall-clock budget is an
               // environmental failure of THIS model, not a neutral abort.
-              const cls = isStallAbort(signal) ? "environmental" : classifyLlmError(message, failure?.stopReason);
+              const cls = isStallAbort(signal)
+                ? "environmental"
+                : classifyLlmError(message, failure?.stopReason, failure?.rawStopReason);
               scheduler.noteOutcome(
                 options.group,
                 modelKey,

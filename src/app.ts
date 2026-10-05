@@ -6087,7 +6087,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     timelineKey: string;
     sessionType: string;
     inbound: InboundChatEvent;
-    created: Pick<Awaited<ReturnType<typeof factory.create>>, "agent" | "registry" | "setPriority">;
+    created: Pick<Awaited<ReturnType<typeof factory.create>>, "agent" | "registry" | "setPriority" | "setRefusalFallover">;
     handles: SessionRecordHandles;
     /** The run's capture flush (`captureHandle.flushNow`). */
     flush: () => Promise<void>;
@@ -6105,6 +6105,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       storage,
       registry: args.created.registry,
       setPriority: args.created.setPriority,
+      setRefusalFallover: args.created.setRefusalFallover,
       flush: args.flush,
       logger,
     });

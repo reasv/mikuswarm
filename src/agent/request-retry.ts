@@ -73,6 +73,19 @@ export interface RequestAttemptState {
   attempts: Map<string, number>;
   /** Set at dispatch: should THIS attempt fail, the next goes to another member. */
   failoverOnFailure: boolean;
+  /**
+   * Health keys of the members that refused THIS request (class `refusal`).
+   * Never re-hit within the request, across passes too (ARCHITECTURE.md §8a
+   * "Refusals"). Layer 0 adds {@link servedKey} when an attempt is refused.
+   */
+  refused: Set<string>;
+  /** Set at dispatch by the fallback resolver: the health key of the member serving this attempt. */
+  servedKey?: string;
+  /**
+   * Set at dispatch by the fallback resolver: should THIS attempt be refused,
+   * another member (not refused, healthy, in budget, fits) can take the request.
+   */
+  refusalFalloverAvailable: boolean;
 }
 
 export const REQUEST_ATTEMPT_STATE: unique symbol = Symbol("mikuswarm.requestAttemptState");
@@ -210,6 +223,13 @@ export interface RequestRetryContext {
    * field is then absent.
    */
   getRequestedModel?: () => string | undefined;
+  /**
+   * Whether a refused attempt may fall over to the next chain member, read once
+   * per request (ARCHITECTURE.md §8a "Refusals"). Absent or true = fall over when
+   * another member can serve; false = a refusal fails the request at once. The
+   * session-record turn turns it off (spec SESSION-RECORDS §3.2).
+   */
+  refusalFallover?: () => boolean;
 }
 
 /**
@@ -224,8 +244,12 @@ export interface RequestRetryContext {
  *   escalated to the semantic layer.
  * - `aborted` — intentional (drain, operator Stop, tool/turn caps, scheduler
  *   stop). Never retried; surfaced as an abort.
+ * - `refusal` — the model or its provider's safety layer declined this request
+ *   ({@link isRefusalSignal}). Not a health strike, never retried on the same
+ *   member; Layer 0 falls over to another chain member when one can serve and
+ *   the request allows it, else fails terminally. Content-like downstream.
  */
-export type LlmErrorClass = "environmental" | "content" | "aborted";
+export type LlmErrorClass = "environmental" | "content" | "aborted" | "refusal";
 
 // ─── Layer-1 origin tagging (Decision C / review issue #14) ──────────────────
 //
@@ -265,7 +289,7 @@ export function llmRequestClassMarker(cls: LlmErrorClass): string {
   return `[llm-request:${cls}]`;
 }
 
-const CLASS_MARKER_RE = /\[llm-request:(environmental|content|aborted)\]/;
+const CLASS_MARKER_RE = /\[llm-request:(environmental|content|aborted|refusal)\]/;
 
 /**
  * Append the Layer-1 origin marker, plus the machine-readable class marker when
@@ -325,17 +349,59 @@ const CONTENT_KEYWORDS = [
 // retrying would spin out backed-off attempts per straggler during drain (#11).
 const SCHEDULER_STOPPED_KEYWORD = "scheduler stopped";
 
+// Raw provider stop reasons (pi-ai keeps them on `AssistantMessage.rawStopReason`,
+// lower-cased here) that mean the model or the provider's safety layer declined
+// the request. pi-ai maps each of them to `stopReason: "error"`.
+const REFUSAL_RAW_STOP_REASONS = new Set([
+  "refusal", // Anthropic Messages (`stop_details.explanation` becomes the error text)
+  "sensitive", // Anthropic safety-filter stop
+  "content_filter", // OpenAI chat completions and compatible gateways (`finish_reason`)
+  "incomplete.content_filter", // OpenAI Responses: `${status}.${incomplete_details.reason}`
+  "content_filtered", // Bedrock Converse
+  "guardrail_intervened", // Bedrock Converse
+  "safety", // Google (`finishReason`, upper-case on the wire)
+  "prohibited_content", // Google
+  "blocklist", // Google
+  "spii", // Google
+]);
+
+// The error texts pi-ai writes for those stops, matched against the WHOLE
+// de-tagged message (lower-cased). Only a fallback for when the raw stop reason
+// is gone (a re-classification from the flattened string); kept exact so an
+// ordinary error that merely mentions "refused" (e.g. "connection refused") or a
+// content filter inside a longer body never matches. An Anthropic refusal with a
+// `stop_details.explanation` is free text: only the raw stop reason detects it.
+const REFUSAL_MESSAGE_RES = [
+  /^the model refused to complete the request$/,
+  /^provider stopped with: (sensitive|content_filtered|guardrail_intervened|safety|prohibited_content|blocklist|spii)$/,
+  /^provider finish_reason: content_filter$/,
+  /^response incomplete: content_filter$/,
+];
+
 /**
- * Classify an LLM stream failure (spec LLM-FAILURE-HANDLING §3): three-way
- * `environmental` / `content` / `aborted` replacing the old retryable/fatal
- * binary.
+ * True when a failed request was a provider refusal (ARCHITECTURE.md §8a
+ * "Refusals"): the structured raw stop reason first, else the exact error text
+ * pi-ai writes for a refusal stop. Origin/class markers are ignored.
+ */
+export function isRefusalSignal(rawStopReason: string | undefined, errorMessage: string | undefined): boolean {
+  if (rawStopReason && REFUSAL_RAW_STOP_REASONS.has(rawStopReason.trim().toLowerCase())) return true;
+  const msg = stripLlmRequestTag(errorMessage ?? "").toLowerCase();
+  return msg.length > 0 && REFUSAL_MESSAGE_RES.some((re) => re.test(msg));
+}
+
+/**
+ * Classify an LLM stream failure (spec LLM-FAILURE-HANDLING §3):
+ * `environmental` / `content` / `aborted` / `refusal`, replacing the old
+ * retryable/fatal binary.
  *
  * Inputs are the terminal `error` AssistantMessage's `errorMessage` (a flattened
  * string — pi-ai stores `error.message` here, so an SDK `APIError` arrives status-
- * prefixed, e.g. `"429 {...}"`) and its `stopReason`.
+ * prefixed, e.g. `"429 {...}"`), its `stopReason`, and its `rawStopReason` (the
+ * provider's own stop reason, when the provider stopped on its own).
  *
  * An intentional `aborted` (tool-call/turn cap, shutdown, scheduler stop) is
- * never retried. `content` requires positive evidence — a 400/413/422 status or
+ * never retried. A `refusal` ({@link isRefusalSignal}) is checked next: it
+ * carries no HTTP status. `content` requires positive evidence — a 400/413/422 status or
  * an explicit context-length keyword. EVERYTHING ELSE IS `environmental`:
  * timeouts, resets, empty streams, every other status (5xx, 429, and the
  * 401/403/404/405 endpoint-level failures), auth keywords, and anything
@@ -345,10 +411,12 @@ const SCHEDULER_STOPPED_KEYWORD = "scheduler stopped";
 export function classifyLlmError(
   errorMessage: string | undefined,
   stopReason: string | undefined,
+  rawStopReason?: string,
 ): LlmErrorClass {
   if (stopReason === "aborted") return "aborted";
   const msg = (errorMessage ?? "").toLowerCase();
   if (msg.includes(SCHEDULER_STOPPED_KEYWORD)) return "aborted";
+  if (isRefusalSignal(rawStopReason, errorMessage)) return "refusal";
 
   const status = extractStatus(msg);
   if (status !== undefined && CONTENT_STATUSES.has(status)) return "content";
@@ -590,7 +658,20 @@ export function withRequestRetry(
         let budgetReselects = 0;
         const maxBudgetReselects = 16;
         // One per request: the fallback resolver's per-request pass over the chain.
-        const attemptState: RequestAttemptState = { attempts: new Map(), failoverOnFailure: false };
+        const attemptState: RequestAttemptState = {
+          attempts: new Map(),
+          failoverOnFailure: false,
+          refused: new Set(),
+          refusalFalloverAvailable: false,
+        };
+        // Whether a refusal may move to another chain member, read once per
+        // request (§8a "Refusals"); the record turn turns it off.
+        let refusalFallover = true;
+        try {
+          refusalFallover = ctx.refusalFallover?.() !== false;
+        } catch {
+          /* a throwing getter keeps the default */
+        }
         for (let attempt = 0; ; attempt++) {
           // Reset per-attempt served-model tracking so a stale value from a
           // prior attempt is never read at this attempt's settle (§ served-model
@@ -631,6 +712,8 @@ export function withRequestRetry(
             callerSignal?.removeEventListener("abort", onCallerAbort);
           };
           attemptState.failoverOnFailure = false;
+          attemptState.servedKey = undefined;
+          attemptState.refusalFalloverAvailable = false;
           const attemptOptions = {
             ...((streamOptions as object | undefined) ?? {}),
             signal: attemptCtrl.signal,
@@ -755,7 +838,7 @@ export function withRequestRetry(
           }
 
           const failure = errorEvent.error;
-          let verdict = classifyLlmError(failure?.errorMessage, failure?.stopReason);
+          let verdict = classifyLlmError(failure?.errorMessage, failure?.stopReason, failure?.rawStopReason);
 
           // Budget expiry on a ZERO-token attempt (a stuck/silent stream or a
           // mid-admission wait) arrives as an abort of the per-attempt signal.
@@ -881,6 +964,40 @@ export function withRequestRetry(
             continue;
           }
 
+          if (verdict === "refusal") {
+            // A refusal (§8a "Refusals") is not a health strike (the admission
+            // wrapper notes it neutral) and is never re-sent to the member that
+            // refused. It moves to another chain member that can serve now, with
+            // no backoff, when the request allows it and the budget is not
+            // spent; otherwise it fails at once, terminally — the wall-clock
+            // loop never re-runs it.
+            if (attemptState.servedKey !== undefined) attemptState.refused.add(attemptState.servedKey);
+            const fallover =
+              refusalFallover &&
+              attemptState.refusalFalloverAvailable &&
+              !budgetExpired &&
+              Date.now() < deadline;
+            const explanation = failure?.errorMessage ?? "";
+            ctx.logger?.warn("llm_refusal", {
+              sessionId: ctx.sessionId,
+              timelineKey: ctx.timelineKey,
+              sessionType: ctx.sessionType,
+              group: ctx.group,
+              member: ctx.getServedModel?.(),
+              model: failure?.model ?? (model as { id?: string }).id,
+              rawStopReason: failure?.rawStopReason,
+              explanation: explanation.length > 300 ? `${explanation.slice(0, 300)}…` : explanation,
+              attempt: attempt + 1,
+              fallover,
+            });
+            if (fallover) {
+              tapDiscarded(attempt + 1, `refused: ${errorEvent.error?.errorMessage ?? "refusal"}`);
+              continue;
+            }
+            surface(errorEvent, verdict);
+            return;
+          }
+
           // `content` and `aborted` surface immediately — never retried (§4.3).
           surface(errorEvent, verdict);
           return;
@@ -927,7 +1044,7 @@ function tagErrorEvent(
   cls?: LlmErrorClass,
 ): Extract<AssistantMessageEvent, { type: "error" }> {
   const failure = event.error;
-  const resolved = cls ?? classifyLlmError(failure?.errorMessage, failure?.stopReason);
+  const resolved = cls ?? classifyLlmError(failure?.errorMessage, failure?.stopReason, failure?.rawStopReason);
   return {
     ...event,
     error: { ...event.error, errorMessage: tagLlmRequestError(event.error?.errorMessage, resolved) },

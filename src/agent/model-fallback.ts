@@ -68,6 +68,8 @@ export type FallbackReason =
   | "context-fallback"
   /** Head healthy but it already used its attempts in THIS request (§8a one pass per request). */
   | "failover"
+  /** The head refused THIS request; another member takes it (§8a "Refusals"). */
+  | "refusal-fallback"
   | "all-unhealthy";
 
 export interface BuildModelFallbackOptions {
@@ -347,16 +349,19 @@ export function buildModelFallback(
     options.primaryAttemptsPerRequest ?? DEFAULT_PRIMARY_ATTEMPTS_PER_REQUEST;
 
   const streamFn: StreamFn = (model, context, streamOptions) => {
+    // The request's pass over the chain (§8a), threaded by Layer 0. Absent when
+    // this stream fn is driven outside withRequestRetry (tests) → no pass rule.
+    const pass = getRequestAttemptState(streamOptions);
     const baseDeps = {
       scheduler: options.scheduler,
       isModelAvailable: options.isModelAvailable,
       // Per-attempt observed context size for fits gating (§2.1). Fed from
       // factory.create's §5.3 running counter; fetch consumers omit it → fits skipped.
       observedContextTokens: options.getObservedContextTokens?.(),
+      // Members that refused this request are never chosen again for it, in
+      // any pass (§8a "Refusals").
+      refused: pass?.refused,
     };
-    // The request's pass over the chain (§8a), threaded by Layer 0. Absent when
-    // this stream fn is driven outside withRequestRetry (tests) → no pass rule.
-    const pass = getRequestAttemptState(streamOptions);
     const passDeps = pass
       ? { ...baseDeps, requestAttempts: pass.attempts, primaryAttemptsPerRequest }
       : baseDeps;
@@ -378,6 +383,15 @@ export function buildModelFallback(
       const next = chooseChainMember(candidates, passDeps);
       pass.failoverOnFailure =
         next.reason !== "all-unhealthy" && candidates[next.index]!.healthKey !== candidate.healthKey;
+      // Should this attempt be refused, can another member take the request
+      // right now? Only a member that has not refused it and is viable
+      // (healthy, in budget, fits); else the refusal is terminal (§8a).
+      pass.servedKey = candidate.healthKey;
+      pass.refusalFalloverAvailable =
+        chooseChainMember(candidates, {
+          ...baseDeps,
+          refused: new Set([...pass.refused, candidate.healthKey]),
+        }).reason !== "all-unhealthy";
     }
     options.onResolve?.(candidate.logicalId, reason);
     if (reason !== "primary" && (!options.rateLimitLog || options.rateLimitLog())) {
@@ -534,6 +548,12 @@ export function chooseChainMember(
      */
     requestAttempts?: Map<string, number>;
     primaryAttemptsPerRequest?: number;
+    /**
+     * Health keys of members that refused the current request (§8a "Refusals"):
+     * never viable, never the canary, and never the `all-unhealthy` target while a
+     * member that did not refuse remains.
+     */
+    refused?: Set<string>;
   },
 ): { index: number; reason: FallbackReason } {
   const scheduler = deps.scheduler;
@@ -556,8 +576,10 @@ export function chooseChainMember(
    * A member is viable iff: not already tried, healthy (§8a), fits its own
    * operative window (§2.1; skipped when observed is undefined), and in-budget.
    */
+  const refused = deps.refused;
   const viable = (m: ChooseMember, i: number): boolean => {
     if (tried?.has(m.logicalId)) return false;
+    if (refused?.has(m.healthKey)) return false;
     if (exhausted(m, i)) return false;
     const healthy = !scheduler || scheduler.modelHealth(m.healthKey) === "healthy";
     if (!healthy) return false;
@@ -587,6 +609,7 @@ export function chooseChainMember(
   // a probe fires, so the head is probe-due again when a fitting request arrives.
   if (
     !tried?.has(head.logicalId) &&
+    !refused?.has(head.healthKey) &&
     !exhausted(head, 0) &&
     !scheduler?.hasProber(head.healthKey) &&
     headState === "unhealthy" &&
@@ -601,7 +624,9 @@ export function chooseChainMember(
     if (viable(members[i]!, i)) {
       // Name the reason by WHY the head wasn't used (priority: health > budget > context > pass > tried).
       const reason: FallbackReason =
-        headState === "unhealthy"
+        refused?.has(head.healthKey)
+          ? "refusal-fallback"
+          : headState === "unhealthy"
           ? "health-fallback"
           : !headInBudget
           ? "budget-fallback"
@@ -614,8 +639,10 @@ export function chooseChainMember(
     }
   }
   // Nothing healthy + in-budget + fits — route to the head so it fails and the caller's
-  // own budget/retry decides whole-chain park/wait, and §8a gets a probe waiter.
-  return { index: 0, reason: "all-unhealthy" };
+  // own budget/retry decides whole-chain park/wait, and §8a gets a probe waiter. A
+  // head that refused this request is passed over for the first member that did not.
+  const target = refused ? members.findIndex((m) => !refused.has(m.healthKey)) : 0;
+  return { index: target >= 0 ? target : 0, reason: "all-unhealthy" };
 }
 
 // ─── Fetch-shaped fallback (spec §6 rows 3-5) ────────────────────────────────
