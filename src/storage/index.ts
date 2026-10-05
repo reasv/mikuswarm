@@ -72,6 +72,17 @@ export {
   type SessionRecordRow,
   type DecisionEvaluationInsert,
   type DecisionEvaluationRow,
+  REFUSAL_EXPLANATION_MAX_CHARS,
+  type RefusalOutcome,
+  type RefusalEventInsert,
+  type RefusalEventRow,
+  type ContractAttemptInsert,
+  type ContractAttemptRow,
+  type ContractOutcome,
+  type RefusalPin,
+  type SessionBranchInsert,
+  type SessionBranchRow,
+  type UsageEventClass,
 } from "./database.js";
 // Re-export DmOptout + cross-channel helper return types implicitly — callers
 // destructure from the Storage methods directly.

@@ -1855,6 +1855,8 @@ const LimitRuleSchema = StrictObject({
         Type.Literal("caption"),
         Type.Literal("embedding"),
         Type.Literal("decision"),
+        // Offline audit worker (spec REFUSAL-HANDLING §7.6), never payee-billed.
+        Type.Literal("audit"),
       ]),
     ),
   ),

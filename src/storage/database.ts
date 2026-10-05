@@ -1031,6 +1031,14 @@ export interface AgentSessionRow {
   started_at: number | null;
   updated_at: number;
   completed_at: number | null;
+  /** Send-contract outcome (spec REFUSAL-HANDLING §7.1; v25). Null until recorded. */
+  contract_outcome?: string | null;
+  /** Forced-completion nudges the session used (v25). */
+  contract_nudges?: number | null;
+  /** Version of the contract derivation that wrote the outcome (v25). */
+  contract_version?: number | null;
+  /** Sticky refusal pin, JSON {@link RefusalPin} (spec REFUSAL-HANDLING §8.3; v25). */
+  refusal_pin?: string | null;
 }
 
 const AGENT_SESSION_META_COLUMN_NAMES = [
@@ -1111,7 +1119,8 @@ export interface DecisionEvaluationInsert {
   agent_session_id?: string | null;
   trigger_event_id?: string | null;
   candidate_session_id?: string | null;
-  source: "model" | "heuristic";
+  /** `pattern` = a check's pattern hit, written with no model call (spec REFUSAL-HANDLING §10.1). */
+  source: "model" | "heuristic" | "pattern";
   reason?: string | null;
   verdict_json?: string | null;
   answers_json?: string | null;
@@ -1122,6 +1131,16 @@ export interface DecisionEvaluationInsert {
   latency_ms?: number | null;
   input_tokens?: number | null;
   cost_usd?: number | null;
+  /** Check verdict anchor (spec REFUSAL-HANDLING §9): send | ending | artifact | rollout. */
+  checkpoint?: string | null;
+  /** Branch of the session the judged output belongs to (0 = live transcript). */
+  branch_no?: number | null;
+  /** The judged tool call (outgoing messages, `no_reply`). */
+  tool_call_id?: string | null;
+  /** The judged ending attempt (endings without a send). */
+  attempt_no?: number | null;
+  /** What the verdict did: sent | sent_unjudged | revise | overridden | redo | observed | withheld. */
+  consequence?: string | null;
 }
 
 /** A persisted `decision_evaluations` row (snake_case columns). */
@@ -1146,6 +1165,168 @@ export interface DecisionEvaluationRow {
   latency_ms: number | null;
   input_tokens: number | null;
   cost_usd: number | null;
+  checkpoint: string | null;
+  branch_no: number | null;
+  tool_call_id: string | null;
+  attempt_no: number | null;
+  consequence: string | null;
+}
+
+// ── Refusal handling (spec REFUSAL-HANDLING §9, §10.1) ────────────────────────
+
+/** What happened after a detected refusal (`refusal_events.outcome`). */
+export type RefusalOutcome =
+  | "fallover" // implicit chain fallover, no rule
+  | "redo" // a rule entry takes over (`to_model` set)
+  | "exhausted_send_last"
+  | "exhausted_withheld"
+  | "exhausted_parked"
+  | "exhausted_no_output" // mechanical job
+  | "failed" // no rule and no fallover: terminal as before
+  | "observed"; // recorded only
+
+/** Insert payload for {@link Storage.insertRefusalEvent}. */
+export interface RefusalEventInsert {
+  ts: number;
+  /** Null for sessionless jobs (caption). */
+  agentSessionId?: string | null;
+  branchNo?: number;
+  /** Session type name, or an internal site (record_turn|summarize|condense|diary|caption). */
+  site: string;
+  agent?: string | null;
+  timelineKey?: string | null;
+  /** The session's task keys; null/omitted = taskless. */
+  tasks?: string[] | null;
+  /** Logical id of the member that refused. */
+  servedModel?: string | null;
+  wireModel?: string | null;
+  kind: "hard" | "soft";
+  checkCode: string;
+  reason: string;
+  /** Provider category or raw filter stop reason. */
+  subReason?: string | null;
+  method: "stop_reason" | "provider_category" | "pattern" | "judged";
+  /** api | message | analysis | text | thinking | artifact | rollout. */
+  source?: string | null;
+  probability?: number | null;
+  rawStopReason?: string | null;
+  category?: string | null;
+  /** Provider explanation; stored truncated to {@link REFUSAL_EXPLANATION_MAX_CHARS}. */
+  explanation?: string | null;
+  /** request | send | ending | artifact | rollout. */
+  checkpoint: string;
+  ruleName?: string | null;
+  outcome: RefusalOutcome;
+  toModel?: string | null;
+  decisionEvaluationId?: number | null;
+}
+
+/** Stored length cap of `refusal_events.explanation` (the provider's free text). */
+export const REFUSAL_EXPLANATION_MAX_CHARS = 300;
+
+/** A persisted `refusal_events` row (snake_case columns). */
+export interface RefusalEventRow {
+  id: number;
+  ts: number;
+  agent_session_id: string | null;
+  branch_no: number;
+  site: string;
+  agent: string | null;
+  timeline_key: string | null;
+  tasks_json: string | null;
+  served_model: string | null;
+  wire_model: string | null;
+  kind: string;
+  check_code: string;
+  reason: string;
+  sub_reason: string | null;
+  method: string;
+  source: string | null;
+  probability: number | null;
+  raw_stop_reason: string | null;
+  category: string | null;
+  explanation: string | null;
+  checkpoint: string;
+  rule_name: string | null;
+  outcome: string;
+  to_model: string | null;
+  decision_evaluation_id: number | null;
+}
+
+/** One send-contract attempt (spec REFUSAL-HANDLING §7.1) for {@link Storage.insertContractAttempts}. */
+export interface ContractAttemptInsert {
+  agentSessionId: string;
+  branchNo?: number;
+  /** 0 before any send-contract redo, 1 inside it. */
+  redoNo?: number;
+  /** 0 = the original ending, n = the ending after nudge n. */
+  attemptNo: number;
+  ts?: number | null;
+  servedModel?: string | null;
+  wireModel?: string | null;
+  variant: "original" | "not_sent" | "sent_not_final";
+  /** The attempt's failure types (§7.2); empty = a valid ending. */
+  failureTypes: string[];
+  /** Null = a valid ending. */
+  primaryType?: string | null;
+}
+
+/** A persisted `contract_attempts` row (snake_case columns). */
+export interface ContractAttemptRow {
+  id: number;
+  agent_session_id: string;
+  branch_no: number;
+  redo_no: number;
+  attempt_no: number;
+  ts: number | null;
+  served_model: string | null;
+  wire_model: string | null;
+  variant: string;
+  failure_types_json: string;
+  primary_type: string | null;
+}
+
+/** Per-session send-contract outcome (spec REFUSAL-HANDLING §7.1). */
+export type ContractOutcome = "clean" | "recovered" | "gave_up_no_reply" | "redo_recovered" | "exhausted";
+
+/** Sticky refusal pin (spec REFUSAL-HANDLING §8.3): the rule entry the session stays on. */
+export interface RefusalPin {
+  rule: string;
+  model: string;
+  at: number;
+}
+
+/** Insert payload for {@link Storage.insertSessionBranch}; `branch_no` is allocated by the store. */
+export interface SessionBranchInsert {
+  sessionId: string;
+  parentBranchNo?: number;
+  /** Index in the parent branch's message list where this branch diverges. */
+  forkIndex: number;
+  reason: "refusal_redo" | "contract_redo";
+  checkCode?: string | null;
+  decisionEvaluationId?: number | null;
+  fromModel?: string | null;
+  toModel?: string | null;
+  /** The discarded span (JSON array of messages), sanitized like transcripts by the caller. */
+  messagesJson: string;
+  costUsd?: number | null;
+  createdAt?: number;
+}
+
+/** A persisted `agent_session_branches` row (snake_case columns). */
+export interface SessionBranchRow {
+  session_id: string;
+  branch_no: number;
+  parent_branch_no: number;
+  fork_index: number;
+  reason: string;
+  check_code: string | null;
+  decision_evaluation_id: number | null;
+  from_model: string | null;
+  to_model: string | null;
+  messages_json: string;
+  cost_usd: number | null;
+  created_at: number;
 }
 
 /**
@@ -1224,7 +1405,7 @@ export interface SessionRoutingState {
 }
 
 /** Consumer class of a {@link UsageEventRow} (spec USAGE-COST-LIMITS §3). */
-export type UsageEventClass = "agent_loop" | "tool" | "caption" | "embedding" | "decision";
+export type UsageEventClass = "agent_loop" | "tool" | "caption" | "embedding" | "decision" | "audit";
 
 /**
  * One billable event in the unified usage ledger (spec USAGE-COST-LIMITS §3).
@@ -1276,6 +1457,8 @@ export interface UsageEventRow {
   model_prompt: string | null;
   /** Short hash of the exact preamble + tail bytes sent; identifies the text after a prompt-file edit. */
   model_prompt_hash: string | null;
+  /** Short hash of the frozen system prompt sent (spec REFUSAL-HANDLING §12.4); null = not recorded. */
+  system_prompt_hash: string | null;
   provider: string | null;
   input_tokens: number | null;
   output_tokens: number | null;
@@ -1354,6 +1537,8 @@ export interface UsageEventInput {
   /** Model-prompt profile + text hash the serving member sent (ARCHITECTURE.md §8 "Model prompts"). */
   modelPrompt?: string | null;
   modelPromptHash?: string | null;
+  /** Short hash of the frozen system prompt (spec REFUSAL-HANDLING §12.4). */
+  systemPromptHash?: string | null;
   provider?: string | null;
   inputTokens?: number | null;
   outputTokens?: number | null;
@@ -4405,6 +4590,7 @@ export class Storage {
       space_id: input.spaceId ?? null,
       model_prompt: input.modelPrompt ?? null,
       model_prompt_hash: input.modelPromptHash ?? null,
+      system_prompt_hash: input.systemPromptHash ?? null,
       provider: input.provider ?? null,
       input_tokens: input.inputTokens ?? null,
       output_tokens: input.outputTokens ?? null,
@@ -4420,13 +4606,13 @@ export class Storage {
         `insert into usage_events (
            id, ts, class, agent_session_id, session_type, timeline_key, trigger_sender_id,
            tool_name, model_id, logical_model_id, requested_model_id, budget_partition, room_id, space_id,
-           model_prompt, model_prompt_hash,
+           model_prompt, model_prompt_hash, system_prompt_hash,
            provider, input_tokens, output_tokens, cache_read_tokens,
            cache_write_tokens, images, cost_usd, ref, created_at
          ) values (
            @id, @ts, @class, @agent_session_id, @session_type, @timeline_key, @trigger_sender_id,
            @tool_name, @model_id, @logical_model_id, @requested_model_id, @budget_partition, @room_id, @space_id,
-           @model_prompt, @model_prompt_hash,
+           @model_prompt, @model_prompt_hash, @system_prompt_hash,
            @provider, @input_tokens, @output_tokens, @cache_read_tokens,
            @cache_write_tokens, @images, @cost_usd, @ref, @created_at
          )`,
@@ -9569,21 +9755,24 @@ export class Storage {
 
   /**
    * Record one decision-model evaluation (spec §8). Runs through the
-   * single-writer queue; `id` is generated by SQLite AUTOINCREMENT.
+   * single-writer queue; `id` is generated by SQLite AUTOINCREMENT and returned
+   * (refusal events and session branches link to it).
    */
-  insertDecisionEvaluation(row: DecisionEvaluationInsert): Promise<void> {
+  insertDecisionEvaluation(row: DecisionEvaluationInsert): Promise<number> {
     return this.write((db) => {
-      db.prepare(
+      const result = db.prepare(
         `insert into decision_evaluations
            (ts, decision_group, point, agent, timeline_key, agent_session_id,
             trigger_event_id, candidate_session_id, source, reason,
             verdict_json, answers_json, state_json, questions_json,
-            served_model, served_version, latency_ms, input_tokens, cost_usd)
+            served_model, served_version, latency_ms, input_tokens, cost_usd,
+            checkpoint, branch_no, tool_call_id, attempt_no, consequence)
          values
            (@ts, @decisionGroup, @point, @agent, @timelineKey, @agentSessionId,
             @triggerEventId, @candidateSessionId, @source, @reason,
             @verdictJson, @answersJson, @stateJson, @questionsJson,
-            @servedModel, @servedVersion, @latencyMs, @inputTokens, @costUsd)`,
+            @servedModel, @servedVersion, @latencyMs, @inputTokens, @costUsd,
+            @checkpoint, @branchNo, @toolCallId, @attemptNo, @consequence)`,
       ).run({
         ts: row.ts,
         decisionGroup: row.decision_group,
@@ -9604,7 +9793,13 @@ export class Storage {
         latencyMs: row.latency_ms ?? null,
         inputTokens: row.input_tokens ?? null,
         costUsd: row.cost_usd ?? null,
+        checkpoint: row.checkpoint ?? null,
+        branchNo: row.branch_no ?? null,
+        toolCallId: row.tool_call_id ?? null,
+        attemptNo: row.attempt_no ?? null,
+        consequence: row.consequence ?? null,
       });
+      return Number(result.lastInsertRowid);
     });
   }
 
@@ -9620,6 +9815,207 @@ export class Storage {
         )
         .all(sessionId) as DecisionEvaluationRow[],
     );
+  }
+
+  // ── Refusal handling (spec REFUSAL-HANDLING §9, §10.1) ───────────────────────
+
+  /** Record one detected refusal; returns the row id. */
+  insertRefusalEvent(row: RefusalEventInsert): Promise<number> {
+    const explanation =
+      row.explanation == null ? null : row.explanation.slice(0, REFUSAL_EXPLANATION_MAX_CHARS);
+    return this.write((db) => {
+      const result = db.prepare(
+        `insert into refusal_events
+           (ts, agent_session_id, branch_no, site, agent, timeline_key, tasks_json,
+            served_model, wire_model, kind, check_code, reason, sub_reason, method,
+            source, probability, raw_stop_reason, category, explanation, checkpoint,
+            rule_name, outcome, to_model, decision_evaluation_id)
+         values
+           (@ts, @agentSessionId, @branchNo, @site, @agent, @timelineKey, @tasksJson,
+            @servedModel, @wireModel, @kind, @checkCode, @reason, @subReason, @method,
+            @source, @probability, @rawStopReason, @category, @explanation, @checkpoint,
+            @ruleName, @outcome, @toModel, @decisionEvaluationId)`,
+      ).run({
+        ts: row.ts,
+        agentSessionId: row.agentSessionId ?? null,
+        branchNo: row.branchNo ?? 0,
+        site: row.site,
+        agent: row.agent ?? null,
+        timelineKey: row.timelineKey ?? null,
+        tasksJson: row.tasks == null ? null : JSON.stringify(row.tasks),
+        servedModel: row.servedModel ?? null,
+        wireModel: row.wireModel ?? null,
+        kind: row.kind,
+        checkCode: row.checkCode,
+        reason: row.reason,
+        subReason: row.subReason ?? null,
+        method: row.method,
+        source: row.source ?? null,
+        probability: row.probability ?? null,
+        rawStopReason: row.rawStopReason ?? null,
+        category: row.category ?? null,
+        explanation,
+        checkpoint: row.checkpoint,
+        ruleName: row.ruleName ?? null,
+        outcome: row.outcome,
+        toModel: row.toModel ?? null,
+        decisionEvaluationId: row.decisionEvaluationId ?? null,
+      });
+      return Number(result.lastInsertRowid);
+    });
+  }
+
+  /** A session's refusal events, oldest first. */
+  listRefusalEvents(sessionId: string): RefusalEventRow[] {
+    return this.read((db) =>
+      db
+        .prepare(`select * from refusal_events where agent_session_id = ? order by ts asc, id asc`)
+        .all(sessionId) as RefusalEventRow[],
+    );
+  }
+
+  /**
+   * Record send-contract attempts (spec REFUSAL-HANDLING §7.1), one transaction.
+   * Upserts on `(agent_session_id, branch_no, redo_no, attempt_no)`, so the live
+   * writer and the history backfill can both write a session.
+   */
+  insertContractAttempts(rows: ContractAttemptInsert[]): Promise<void> {
+    if (rows.length === 0) return Promise.resolve();
+    return this.write((db) => {
+      const stmt = db.prepare(
+        `insert into contract_attempts
+           (agent_session_id, branch_no, redo_no, attempt_no, ts, served_model, wire_model,
+            variant, failure_types_json, primary_type)
+         values
+           (@agentSessionId, @branchNo, @redoNo, @attemptNo, @ts, @servedModel, @wireModel,
+            @variant, @failureTypesJson, @primaryType)
+         on conflict(agent_session_id, branch_no, redo_no, attempt_no) do update set
+           ts = excluded.ts,
+           served_model = excluded.served_model,
+           wire_model = excluded.wire_model,
+           variant = excluded.variant,
+           failure_types_json = excluded.failure_types_json,
+           primary_type = excluded.primary_type`,
+      );
+      db.transaction(() => {
+        for (const row of rows) {
+          stmt.run({
+            agentSessionId: row.agentSessionId,
+            branchNo: row.branchNo ?? 0,
+            redoNo: row.redoNo ?? 0,
+            attemptNo: row.attemptNo,
+            ts: row.ts ?? null,
+            servedModel: row.servedModel ?? null,
+            wireModel: row.wireModel ?? null,
+            variant: row.variant,
+            failureTypesJson: JSON.stringify(row.failureTypes),
+            primaryType: row.primaryType ?? null,
+          });
+        }
+      })();
+    });
+  }
+
+  /** A session's send-contract attempts in (branch, redo, attempt) order. */
+  listContractAttempts(sessionId: string): ContractAttemptRow[] {
+    return this.read((db) =>
+      db
+        .prepare(
+          `select * from contract_attempts where agent_session_id = ?
+           order by branch_no asc, redo_no asc, attempt_no asc`,
+        )
+        .all(sessionId) as ContractAttemptRow[],
+    );
+  }
+
+  /** Persist a session's send-contract outcome (spec REFUSAL-HANDLING §7.1). */
+  setAgentSessionContract(
+    sessionId: string,
+    contract: { outcome: ContractOutcome; nudges: number; version: number },
+  ): Promise<void> {
+    return this.write((db) => {
+      const result = db
+        .prepare(
+          `update agent_sessions
+              set contract_outcome = @outcome, contract_nudges = @nudges, contract_version = @version
+            where id = @id`,
+        )
+        .run({ id: sessionId, ...contract });
+      this.warnIfNoSessionRow("setAgentSessionContract", sessionId, result.changes);
+    });
+  }
+
+  /**
+   * Persist a discarded span as a new branch of the session (spec
+   * REFUSAL-HANDLING §9). `branch_no` is allocated as max+1 for the session in
+   * the same write, so concurrent forks never collide; returns it.
+   */
+  insertSessionBranch(row: SessionBranchInsert): Promise<number> {
+    return this.write((db) => {
+      const next = (
+        db
+          .prepare(`select coalesce(max(branch_no), 0) + 1 as n from agent_session_branches where session_id = ?`)
+          .get(row.sessionId) as { n: number }
+      ).n;
+      db.prepare(
+        `insert into agent_session_branches
+           (session_id, branch_no, parent_branch_no, fork_index, reason, check_code,
+            decision_evaluation_id, from_model, to_model, messages_json, cost_usd, created_at)
+         values
+           (@sessionId, @branchNo, @parentBranchNo, @forkIndex, @reason, @checkCode,
+            @decisionEvaluationId, @fromModel, @toModel, @messagesJson, @costUsd, @createdAt)`,
+      ).run({
+        sessionId: row.sessionId,
+        branchNo: next,
+        parentBranchNo: row.parentBranchNo ?? 0,
+        forkIndex: row.forkIndex,
+        reason: row.reason,
+        checkCode: row.checkCode ?? null,
+        decisionEvaluationId: row.decisionEvaluationId ?? null,
+        fromModel: row.fromModel ?? null,
+        toModel: row.toModel ?? null,
+        messagesJson: row.messagesJson,
+        costUsd: row.costUsd ?? null,
+        createdAt: row.createdAt ?? Date.now(),
+      });
+      return next;
+    });
+  }
+
+  /** A session's discarded branches in `branch_no` order. */
+  listSessionBranches(sessionId: string): SessionBranchRow[] {
+    return this.read((db) =>
+      db
+        .prepare(`select * from agent_session_branches where session_id = ? order by branch_no asc`)
+        .all(sessionId) as SessionBranchRow[],
+    );
+  }
+
+  /** Set (or clear, with null) a session's sticky refusal pin (spec REFUSAL-HANDLING §8.3). */
+  setAgentSessionRefusalPin(id: string, pin: RefusalPin | null): Promise<void> {
+    return this.write((db) => {
+      const result = db
+        .prepare(`update agent_sessions set refusal_pin = @json where id = @id`)
+        .run({ id, json: pin === null ? null : JSON.stringify(pin) });
+      this.warnIfNoSessionRow("setAgentSessionRefusalPin", id, result.changes);
+    });
+  }
+
+  /** A session's sticky refusal pin, or undefined (none, or an unreadable value). */
+  getAgentSessionRefusalPin(id: string): RefusalPin | undefined {
+    const row = this.read((db) =>
+      db.prepare(`select refusal_pin from agent_sessions where id = ?`).get(id) as
+        | { refusal_pin: string | null }
+        | undefined,
+    );
+    if (!row?.refusal_pin) return undefined;
+    try {
+      const parsed = JSON.parse(row.refusal_pin) as Record<string, unknown>;
+      if (typeof parsed["rule"] !== "string" || typeof parsed["model"] !== "string") return undefined;
+      return { rule: parsed["rule"], model: parsed["model"], at: typeof parsed["at"] === "number" ? parsed["at"] : 0 };
+    } catch {
+      return undefined;
+    }
   }
 
   close(): void {
@@ -10122,7 +10518,10 @@ create table if not exists usage_events (
   images integer,
   cost_usd real not null default 0,
   ref text,
-  created_at integer not null
+  created_at integer not null,
+  -- Short hash of the frozen system prompt the request carried (spec
+  -- REFUSAL-HANDLING §12.4; added v25). Null for non-agent lanes.
+  system_prompt_hash text
 );
 
 -- NB: there is intentionally NO session_type index. Session-scoped budget rules
@@ -10724,6 +11123,77 @@ function rebuildTimelineCounts(db: Database.Database): void {
   })();
 }
 
+// Refusal handling (spec REFUSAL-HANDLING §9, §10.1; added v25). Shared by SCHEMA
+// (fresh DBs) and the v24→v25 step, so both build the same shape.
+//   refusal_events: one row per detected refusal, hard (API signal) or judged.
+//   contract_attempts: one row per send-contract attempt (§7.1): the original
+//     ending (attempt 0) and the ending after each forced-completion nudge.
+//   agent_session_branches: one row per discarded span of a redo (§9). The live
+//     transcript (agent_session_payloads.transcript_json) is branch 0; a fork at
+//     index k of a parent branch stores the parent's messages[k:].
+const REFUSAL_HANDLING_SCHEMA = `
+create table if not exists refusal_events (
+  id                     integer primary key autoincrement,
+  ts                     integer not null,
+  agent_session_id       text,              -- null for sessionless jobs (caption)
+  branch_no              integer not null default 0,
+  site                   text not null,     -- session type name, or record_turn|summarize|condense|diary|caption
+  agent                  text,
+  timeline_key           text,
+  tasks_json             text,              -- JSON array of the session's task keys; null = taskless
+  served_model           text,              -- logical id of the member that refused
+  wire_model             text,
+  kind                   text not null,     -- 'hard' | 'soft'
+  check_code             text not null,
+  reason                 text not null,     -- built-in or operator-defined refusal reason
+  sub_reason             text,              -- provider category or raw filter stop reason
+  method                 text not null,     -- stop_reason|provider_category|pattern|judged
+  source                 text,              -- api|message|analysis|text|thinking|artifact|rollout
+  probability            real,
+  raw_stop_reason        text,
+  category               text,
+  explanation            text,              -- provider explanation, <= 300 chars
+  checkpoint             text not null,     -- request|send|ending|artifact|rollout
+  rule_name              text,
+  outcome                text not null,     -- fallover|redo|exhausted_*|failed|observed
+  to_model               text,
+  decision_evaluation_id integer
+);
+create index if not exists idx_refusal_events_session on refusal_events(agent_session_id, ts);
+create index if not exists idx_refusal_events_ts on refusal_events(ts);
+
+create table if not exists contract_attempts (
+  id                 integer primary key autoincrement,
+  agent_session_id   text not null,
+  branch_no          integer not null default 0,
+  redo_no            integer not null default 0,  -- 0 before any send-contract redo, 1 inside it
+  attempt_no         integer not null,            -- 0 = the original ending, n = the ending after nudge n
+  ts                 integer,
+  served_model       text,
+  wire_model         text,
+  variant            text not null,               -- 'original' | 'not_sent' | 'sent_not_final'
+  failure_types_json text not null,               -- JSON array of failure types ([] = valid ending)
+  primary_type       text,                        -- null = valid ending
+  unique(agent_session_id, branch_no, redo_no, attempt_no)
+);
+create index if not exists idx_contract_attempts_ts on contract_attempts(ts);
+
+create table if not exists agent_session_branches (
+  session_id             text not null references agent_sessions(id) on delete cascade,
+  branch_no              integer not null,          -- 1.. per session; 0 is the live transcript
+  parent_branch_no       integer not null default 0,
+  fork_index             integer not null,          -- index in the parent's message list where it diverges
+  reason                 text not null,             -- 'refusal_redo' | 'contract_redo'
+  check_code             text,
+  decision_evaluation_id integer,
+  from_model             text,
+  to_model               text,
+  messages_json          text not null,             -- the discarded span, sanitized like transcripts
+  cost_usd               real,
+  created_at             integer not null,
+  primary key (session_id, branch_no)
+);`;
+
 const SCHEMA = `
 create table if not exists timeline_events (
   id text primary key,
@@ -11150,7 +11620,14 @@ create table if not exists agent_sessions (
   created_at integer not null,
   started_at integer,
   updated_at integer not null,
-  completed_at integer
+  completed_at integer,
+  -- Refusal handling (spec REFUSAL-HANDLING §7.1, §8.3; added v25). The send-contract
+  -- outcome (clean|recovered|gave_up_no_reply|redo_recovered|exhausted), nudges used
+  -- and the contract-derivation version; the sticky refusal pin, JSON { rule, model, at }.
+  contract_outcome text,
+  contract_nudges integer,
+  contract_version integer,
+  refusal_pin text
 );
 
 create index if not exists idx_agent_sessions_timeline
@@ -11241,13 +11718,13 @@ create table if not exists decision_evaluations (
   id                   integer primary key autoincrement,
   ts                   integer not null,
   decision_group       text not null,
-  point                text not null,          -- 'routing' | 'records'
+  point                text not null,          -- 'routing' | 'records' | 'checks'
   agent                text,
   timeline_key         text,
   agent_session_id     text,
   trigger_event_id     text,
   candidate_session_id text,                   -- records point only
-  source               text not null,          -- 'model' | 'heuristic'
+  source               text not null,          -- 'model' | 'heuristic' | 'pattern'
   reason               text,                   -- fallback reason
   verdict_json         text,
   answers_json         text,                   -- with probabilities/confidences
@@ -11257,12 +11734,22 @@ create table if not exists decision_evaluations (
   served_version       text,
   latency_ms           integer,
   input_tokens         integer,
-  cost_usd             real
+  cost_usd             real,
+  -- Anchor + consequence of a check verdict (spec REFUSAL-HANDLING §9; added v25):
+  -- checkpoint (send|ending|artifact|rollout), the live-transcript branch, the judged
+  -- tool call or ending attempt, and what the verdict did (sent|sent_unjudged|revise|
+  -- overridden|redo|observed|withheld). Pattern hits are rows with source 'pattern'.
+  checkpoint           text,
+  branch_no            integer,
+  tool_call_id         text,
+  attempt_no           integer,
+  consequence          text
 );
 create index if not exists idx_decision_evaluations_session
   on decision_evaluations(agent_session_id, ts);
 create index if not exists idx_decision_evaluations_ts
-  on decision_evaluations(ts)`;
+  on decision_evaluations(ts);
+${REFUSAL_HANDLING_SCHEMA}`;
 
 // SCHEMA above defines the complete current shape with idempotent
 // `create … if not exists` DDL, so a fresh database is built directly at the
@@ -11270,7 +11757,7 @@ create index if not exists idx_decision_evaluations_ts
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 24;
+export const LATEST_SCHEMA_VERSION = 29;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -12175,6 +12662,48 @@ function addSessionRecordsTables(db: Database.Database): void {
   `);
 }
 
+/**
+ * v24→v25: refusal handling (spec REFUSAL-HANDLING §9, §10.1). Creates
+ * `refusal_events`, `contract_attempts` and `agent_session_branches` (shared DDL
+ * with SCHEMA), and adds the send-contract and refusal-pin columns to
+ * `agent_sessions`, the verdict anchor + consequence columns to
+ * `decision_evaluations`, and `system_prompt_hash` to `usage_events`. Nullable
+ * columns, no back-fill. PRAGMA table_info guards keep it idempotent; a table
+ * that does not exist yet is left to SCHEMA (which runs after the migrations).
+ */
+function addRefusalHandlingTables(db: Database.Database): void {
+  db.exec(REFUSAL_HANDLING_SCHEMA);
+  const addColumns = (table: string, columns: Array<[string, string]>): void => {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (cols.length === 0) return;
+    for (const [name, type] of columns) {
+      if (!cols.some((c) => c.name === name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);
+    }
+  };
+  addColumns("agent_sessions", [
+    ["contract_outcome", "TEXT"],
+    ["contract_nudges", "INTEGER"],
+    ["contract_version", "INTEGER"],
+    ["refusal_pin", "TEXT"],
+  ]);
+  addColumns("decision_evaluations", [
+    ["checkpoint", "TEXT"],
+    ["branch_no", "INTEGER"],
+    ["tool_call_id", "TEXT"],
+    ["attempt_no", "INTEGER"],
+    ["consequence", "TEXT"],
+  ]);
+  addColumns("usage_events", [["system_prompt_hash", "TEXT"]]);
+}
+
+// v25→v29: reserved, no-op steps (one per refusal-handling workstream that may
+// need DDL). A workstream fills only its own step (idempotent, PRAGMA table_info
+// guarded) and adds the same shape to SCHEMA; unused slots stay no-ops.
+function reservedW6a(_db: Database.Database): void {}
+function reservedW1(_db: Database.Database): void {}
+function reservedW2(_db: Database.Database): void {}
+function reservedW3(_db: Database.Database): void {}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -12204,6 +12733,11 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   addAgentSessionInitialPreloads,       // v21→v22
   addUsageEventModelPrompt,             // v22→v23
   addSessionRecordsTables,              // v23→v24
+  addRefusalHandlingTables,             // v24→v25
+  reservedW6a,                          // v25→v26
+  reservedW1,                           // v26→v27
+  reservedW2,                           // v27→v28
+  reservedW3,                           // v28→v29
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write
