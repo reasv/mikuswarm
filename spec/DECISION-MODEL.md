@@ -1,6 +1,6 @@
 # Decision-model integration — session gating, model routing, continuation, dedup, style, retrieval
 
-**Status**: PARTIALLY IMPLEMENTED, revision 3.1 (2026-10-04: owner decisions on every open question folded in, §7; revision 2 earlier the same day; revision 1 was the planning session of 2026-09-18). Implemented and superseded by ARCHITECTURE.md §8h: the foundation (§3.1–§3.4, §3.6, §3.7 per-point chains, §4 `[decisions]` + per-agent overrides). Routing (§5.1, incl. the difficulty axis) is implemented (ARCHITECTURE.md §8h "Routing"); **§5.2 continuation was implemented and then removed** — the continuation point (`src/decisions/points/continuation.ts`) was deleted in the SESSION-RECORDS feature branch; `DecisionPointName` no longer includes `"continuation"`; resume defaults changed to off; the spec's §5.2 is superseded by SESSION-RECORDS (spec/SESSION-RECORDS.md). The records point (§8i wiring, future) replaces continuation as the session-bridging decision point. `image_kind` routing is not implemented, since it needs the vision chain. Not implemented: the vision chain (§3.5), judge-shaped state (§3.8), and points §5.3–§5.9. Retained for review.
+**Status**: PARTIALLY IMPLEMENTED, revision 3.1 (2026-10-04: owner decisions on every open question folded in, §7; revision 2 earlier the same day; revision 1 was the planning session of 2026-09-18). Implemented and superseded by ARCHITECTURE.md §8h: the foundation (§3.1–§3.4, §3.6, §3.7 per-point chains, §4 `[decisions]` + per-agent overrides). Routing (§5.1, incl. the difficulty axis) is implemented (ARCHITECTURE.md §8h "Routing"); **§5.2 continuation was implemented and then removed** — the continuation point (`src/decisions/points/continuation.ts`) was deleted in the SESSION-RECORDS feature branch; `DecisionPointName` no longer includes `"continuation"`; resume defaults changed to off; the spec's §5.2 is superseded by SESSION-RECORDS (spec/SESSION-RECORDS.md). The records point (§8i wiring, future) replaces continuation as the session-bridging decision point. `image_kind` routing is not implemented, since it needs the vision chain. Implemented with spec/REFUSAL-HANDLING.md (2026-10-05) and superseded by ARCHITECTURE.md: judge-shaped state (§3.8, as the output gate's state, ARCHITECTURE.md §8j), multi-label tasks and the built-in `proactive` task (§5.1a, ARCHITECTURE.md §8h "Routing"), and the transcript audit worker (§5.8, as the offline audit worker for the send-contract and refusal audits, ARCHITECTURE.md §9i; its `isms` audit is replaced by the style checks); §5.9 (style gate) is superseded by REFUSAL-HANDLING's output gate and implemented there (ARCHITECTURE.md §8j). Not implemented: the vision chain (§3.5) and points §5.3–§5.7. Retained for review.
 **Companion**: `spec/DECISION-MODEL-SURVEY.md`, measured capabilities, context, latency, billing and rate limits of the decision models on OpenRouter (2026-10-04). Facts below marked *measured* come from it.
 **Target ARCHITECTURE.md home once implemented**: a new §8h "Decision model" (client, decision-point registry, billing lane, fallback rule, vision routing); touched sections §8 (resumable sessions / follow-up folding / duplicate-reply mitigation), §8a (model resolution), §8f (ledger class), §9 (final user turn additions), §9d (auto-retrieval), §9g (proactive scheduler), §10 (`send_message`), §4 (config schema).
 **Related**: PER-USER-LIMITS, MODEL-FALLBACK, PER-MEMBER-CONTEXT-FITS, RESUMABLE-SESSIONS, FOLLOWUP-FOLDING, DUPLICATE-REPLY-MITIGATION, DYNAMIC-TOOL-LOADING, SUMMARY-LAYER-BUDGET.
@@ -293,6 +293,8 @@ Routes to avoid in chains: Solar on any hot path (~14.6 s at 2k tokens); hosted 
 
 ### 3.8 Judge-shaped state
 
+**Status**: IMPLEMENTED with spec/REFUSAL-HANDLING.md as the output gate's state (`src/checks/state.ts`), superseded by ARCHITECTURE.md §8j "The output gate"; retained for review.
+
 Three points ask about something the agent itself wrote: the style gate (§5.9), the duplicate guard (§5.4), and the refusal/ism audits (§5.8). Their state is built as a **conversation plus the reply under judgment**:
 
 ```json
@@ -450,9 +452,9 @@ Each point states: **when** it runs (the trigger condition is always a cheap mec
 
 **Interaction with the deterministic skill→model switch.** A skill loaded *mid-session* via `load_skill` still cannot change the model (context is frozen for it). That remains a possible separate feature and is not designed here; routing at creation is the general answer.
 
-### 5.1a Multi-label tasks (proposal, 2026-10-05, not implemented)
+### 5.1a Multi-label tasks (IMPLEMENTED 2026-10-05)
 
-**Status**: PROPOSAL, owner direction 2026-10-05. Amends the implemented single-task routing (ARCHITECTURE.md §8h "Routing"). Motivation: a request can involve several kinds of work at once, and some task categories exist only to label a request (for statistics and refusal rules, spec/REFUSAL-HANDLING.md §8.1), not to change anything about the session.
+**Status**: IMPLEMENTED with spec/REFUSAL-HANDLING.md, superseded by ARCHITECTURE.md §8h "Routing"; retained for review. Was: PROPOSAL, owner direction 2026-10-05. Amends the implemented single-task routing (ARCHITECTURE.md §8h "Routing"). Motivation: a request can involve several kinds of work at once, and some task categories exist only to label a request (for statistics and refusal rules, spec/REFUSAL-HANDLING.md §8.1), not to change anything about the session.
 
 - **Questions.** The `task` `choice` becomes one `noul` per `[decisions.routing.tasks.<key>]`: "The request involves: <description>." Every task at or above its threshold (`tasks.<key>.threshold`, default the point's `min_confidence`, calibrated per member as today) is selected. `other` is the session's only task when none is selected. On per-request-billed members the extra questions cost almost nothing; per-question-billed members pay per task, which the fits account for (§3.6).
 - **Tag-only tasks.** A task with no `models`/`model`, `skills`, `tail_files` or `thinking_level` is a label: it is recorded and matched by rules and statistics and changes nothing else.
@@ -581,7 +583,7 @@ Asking `pending_media` at trigger time and stretching the 2 s hold to ~10 s only
 
 ### 5.8 Transcript audit — offline classification of model failures (sketch, owner-raised 2026-09-18)
 
-**Partly superseded (2026-10-05)**: the refusal audit and the send-contract audit (questions, storage, console) are specified in spec/REFUSAL-HANDLING.md §7, §10 and §12. This worker remains their offline runner and history backfill.
+**Partly superseded (2026-10-05)**: the refusal audit and the send-contract audit (questions, storage, console) are specified in spec/REFUSAL-HANDLING.md §7, §10 and §12. This worker remains their offline runner and history backfill. **IMPLEMENTED** as the offline audit worker (ARCHITECTURE.md §9i: `send_contract` and `refusal` audits, ledger class `audit`); the `isms` audit was not built (style checks replace it).
 
 Everything above is on the hot path. This point is not: it reads **completed** sessions and classifies what went wrong, for statistics and examples. It is the best-suited use of a decision model in this spec — the questions are about the *shape of text in a transcript*, not about social judgment — and a wrong answer costs nothing but a miscounted statistic.
 
@@ -621,7 +623,7 @@ Everything above is on the hot path. This point is not: it reads **completed** s
 
 ### 5.9 Style gate: catch LLM-isms before they are sent
 
-**Superseded (2026-10-05)** by spec/REFUSAL-HANDLING.md §6 (the outgoing-message gate, shared with refusal checks: one check catalogue, per-check override argument, consecutive and per-session bounds). Retained for review.
+**Superseded (2026-10-05)** by spec/REFUSAL-HANDLING.md §6 (the outgoing-message gate, shared with refusal checks: one check catalogue, per-check override argument, consecutive and per-session bounds), which is implemented (ARCHITECTURE.md §8j). Retained for review.
 
 **Why.** §5.8 measures which models produce which isms; this point acts on it. It is the one hot-path point that touches every reply, which is why revision 1 deferred it, and the reason it is designed now (provider latency and redundancy, §2 and §3.1).
 
