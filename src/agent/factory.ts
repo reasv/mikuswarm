@@ -2261,7 +2261,6 @@ export class AgentSessionFactory {
     agent.subscribe((event) => {
       if (event.type === "tool_execution_end" && !event.isError && isPostingTool(event.toolName)) {
         refusal.noteDelivered();
-        outputGate?.policy.onDelivered?.();
       }
     });
     if (registry) {

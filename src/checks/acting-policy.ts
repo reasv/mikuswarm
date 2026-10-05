@@ -117,18 +117,16 @@ export function createActingPolicy(deps: ActingPolicyDeps): ActingGatePolicy {
     },
 
     consequence(info, verdict, opts) {
-      if (!opts.held) return OBSERVE_POLICY.consequence(info, verdict, opts);
-      const act = decideRefusal(info, verdict, opts.late);
+      // The refusal half decides first; it acts only on a held output.
+      const act = opts.held ? decideRefusal(info, verdict, opts.late) : undefined;
       if (act?.kind === "redo") return "redo";
       if (act?.kind === "exhausted") return exhaustedConsequence(info, act.outcome);
-      // Late: the action already ran on the deadline's verdict; reuse its decision.
-      const decision = reviseDecisions.has(info)
-        ? (reviseDecisions.get(info) ?? undefined)
-        : opts.late
-          ? undefined
-          : decideRevise(info, verdict);
-      if (decision?.kind === "block") return decision.consequence;
-      if (decision?.kind === "pass" && decision.consequence) return decision.consequence;
+      // Revise, held and unheld alike: `sent` after the bounds, `overridden`
+      // for an override (the part decides once per call).
+      if (verdict.revise.length > 0) {
+        const decision = decideRevise(info, verdict);
+        if (decision?.consequence) return decision.consequence;
+      }
       return OBSERVE_POLICY.consequence(info, verdict, opts);
     },
 

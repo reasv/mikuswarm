@@ -77,6 +77,7 @@ import { attachSessionCapture, type SessionCaptureHandle } from "./agent/session
 import { createRedoHandler } from "./agent/redo.js";
 import { createSoftRefusalRedoHandler } from "./refusals/soft-redo.js";
 import { createActingPolicy } from "./checks/acting-policy.js";
+import { createRevisePolicyPart, priorRejections } from "./checks/revise.js";
 import { ContractReconciler, persistSessionContract } from "./agent/contract-store.js";
 import type { CreatedAgent } from "./agent/factory.js";
 import type { SessionRunnerOptions } from "./agent/runner.js";
@@ -2046,7 +2047,19 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       chat: checkChatState,
       // Blocking refusal checks (spec REFUSAL-HANDLING §6.3–§6.4): holds only
       // when a soft rule could act; the revise half (style) plugs in here.
-      actingPolicy: (_session, handles) => createActingPolicy({ ...handles, logger: logger.child("checks") }),
+      actingPolicy: (session, handles) =>
+        createActingPolicy({
+          ...handles,
+          // The revise half (style checks, §6.4): one per session object, so its
+          // counters persist across a refusal redo; a resume re-seeds the
+          // per-session bound from the session's recorded rejections.
+          revise: createRevisePolicyPart({
+            evaluator: checkEvaluator,
+            priorRejections: priorRejections(storage.getDecisionEvaluationsForSession(session.id)),
+            logger: logger.child("checks"),
+          }),
+          logger: logger.child("checks"),
+        }),
       logger: logger.child("checks"),
     },
   });
