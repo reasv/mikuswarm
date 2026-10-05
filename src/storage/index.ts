@@ -82,6 +82,7 @@ export {
   type RefusalPin,
   type SessionBranchInsert,
   type SessionBranchRow,
+  type SessionCheckChips,
   type UsageEventClass,
 } from "./database.js";
 // Re-export DmOptout + cross-channel helper return types implicitly — callers
