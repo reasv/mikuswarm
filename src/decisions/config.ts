@@ -19,8 +19,8 @@ export const DEFAULT_TIMEOUT_MS = 3000;
 export const DEFAULT_MIN_CONFIDENCE = 0.6;
 export const DEFAULT_STATE_MAX_TOKENS = 8000;
 
-export type DecisionPointName = "routing" | "records" | "checks";
-export const DECISION_POINT_NAMES: readonly DecisionPointName[] = ["routing", "records", "checks"];
+export type DecisionPointName = "routing" | "records" | "checks" | "audit";
+export const DECISION_POINT_NAMES: readonly DecisionPointName[] = ["routing", "records", "checks", "audit"];
 
 // `[decisions.checks]` defaults (spec REFUSAL-HANDLING §6.3, §6.4, §16.2).
 export const DEFAULT_CHECKS_SEND_DEADLINE_MS = 5000;

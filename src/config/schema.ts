@@ -1081,6 +1081,40 @@ const DecisionChecksSchema = StrictObject({
   thinking_tail_tokens: Type.Optional(Type.Integer({ minimum: 0 })),
 });
 
+// The offline audit worker's decision point (spec REFUSAL-HANDLING §7.6, §10.2;
+// DECISION-MODEL §5.8): send-contract diagnosis and the judged checks over
+// history and completed sessions. Runs only when `[decisions].enabled` AND this
+// point's `enabled` are true; never payee-billed (ledger class `audit`).
+// Defaults live in src/audit/config.ts.
+const DecisionAuditSchema = StrictObject({
+  ...DecisionPointCommonFields,
+  // Which audits run. Default both.
+  audits: Type.Optional(Type.Array(Type.Union([Type.Literal("send_contract"), Type.Literal("refusal")]))),
+  // Check kinds the history pass judges at sends and endings. Default ["refusal", "contract"].
+  check_kinds: Type.Optional(Type.Array(Type.Union([Type.Literal("refusal"), Type.Literal("style"), Type.Literal("contract")]))),
+  // Share of clean (never nudged) sessions the check pass judges, seeded per
+  // session id so re-runs pick the same sample. Nudged sessions are always judged.
+  // Default 1 (every session: rates over history stay comparable with live ones).
+  sample_clean_sessions: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+  // Sessions older than this are never audited; 0 or unset = the whole history.
+  audit_backlog_max_age_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  // Concurrent audited sessions. Default 1.
+  workers: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })),
+  // Minimum pause between two backlog sessions per worker (live sessions are
+  // never paced). Default 1000.
+  backlog_pace_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  // How long after it settles a session waits before it is audited (its record
+  // turn and contract record land first). Default 60000.
+  settle_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  // Failed decision attempts on one session before it is marked failed. Default 3.
+  max_retries: Type.Optional(Type.Integer({ minimum: 0, maximum: 20 })),
+  // `self_talk`: the attempt's text holds no message for the users with at least
+  // this probability (1 - had_user_message). Default 0.7.
+  self_talk_threshold: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+  // Ambiguous text naming a tool judged a textual tool call at this probability. Default 0.8.
+  textual_tool_call_threshold: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+});
+
 // --- Checks and refusal rules (spec REFUSAL-HANDLING §4, §8.1) ---
 // Cross-field validation (built-in merge, regexes, kind/remedy pairs, rule
 // models/agents/sites/reasons) lives in src/checks/catalogue.ts and
@@ -1183,6 +1217,7 @@ const DecisionsSchema = StrictObject({
   routing: Type.Optional(DecisionRoutingSchema),
   records: Type.Optional(DecisionRecordsSchema),
   checks: Type.Optional(DecisionChecksSchema),
+  audit: Type.Optional(DecisionAuditSchema),
 });
 
 const AgentModelsSchema = StrictObject({
@@ -2495,6 +2530,7 @@ export type ProactiveConfig = Static<typeof ProactiveSchema>;
 export type DecisionsRawConfig = Static<typeof DecisionsSchema>;
 export type DecisionFitsConfig = Static<typeof DecisionFitsSchema>;
 export type DecisionChecksRawConfig = Static<typeof DecisionChecksSchema>;
+export type DecisionAuditRawConfig = Static<typeof DecisionAuditSchema>;
 export type CheckRawConfig = Static<typeof CheckSchema>;
 export type RefusalRuleRawConfig = Static<typeof RefusalRuleSchema>;
 export type ProactiveChannelConfig = Static<typeof ProactiveChannelSchema>;

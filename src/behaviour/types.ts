@@ -136,9 +136,9 @@ export interface BehaviourBreakdown {
     failureTypes: BehaviourCount[];
     redos: number;
     discardedBranchCostUsd: number;
-    /** What happened to the message (`after_correction`, offline audit): not yet derived, always []. */
+    /** What happened to the message after the nudges (`after_correction`, the offline audit's runs). */
     afterCorrection: BehaviourCount[];
-    /** `no_reply_intent` after a nudge: not yet derived, always []. */
+    /** `no_reply_intent` choices of judged endings after a nudge (live gate and audit). */
     noReplyIntent: BehaviourCount[];
   };
   style: {

@@ -177,6 +177,12 @@ export interface EvaluateContext {
   onEvaluation?: (row: DecisionEvaluationRow) => void;
   /** Hard deadline for this call instead of the point's `timeout_ms`. */
   timeoutMs?: number;
+  /**
+   * Ledger and budget class of this call's spend (default `decision`). The
+   * offline audit passes `audit` (DECISION-MODEL §5.8): never payee-billed, and
+   * `[[limits]]` rules with `classes = ["audit"]` cap it.
+   */
+  usageClass?: "decision" | "audit";
 }
 
 /** A member of a point's chain, as the fits planner sees it. */
@@ -312,7 +318,7 @@ export class DecisionEngine {
     for (const member of chain) {
       const allowed = budget
         ? budget.check({
-            class: "decision",
+            class: ctx.usageClass ?? "decision",
             tool: point.name,
             modelId: member.config.id,
             logicalModelId: member.logicalId,
@@ -340,7 +346,7 @@ export class DecisionEngine {
     const onBilled = (attempt: BilledAttempt): void => {
       costUsd += attempt.costUsd;
       inputTokens += attempt.inputTokens;
-      this.recordUsage(point, ctx.attribution, attempt);
+      this.recordUsage(point, ctx.attribution, attempt, ctx.usageClass ?? "decision");
     };
 
     let result;
@@ -424,6 +430,7 @@ export class DecisionEngine {
     point: DecisionPointName,
     agentName: string | null,
     attribution: DecisionAttribution,
+    usageClass: "decision" | "audit" = "decision",
   ): DecisionChainMember[] {
     const settings = this.settings(point, agentName);
     if (!settings) return [];
@@ -440,7 +447,7 @@ export class DecisionEngine {
         if (member.config.api !== "system-one") return false;
         if (budget) {
           const allowed = budget.check({
-            class: "decision",
+            class: usageClass,
             tool: point,
             modelId: member.config.id,
             logicalModelId: member.logicalId,
@@ -456,11 +463,16 @@ export class DecisionEngine {
       .map((member) => ({ logicalId: member.logicalId, config: member.config }));
   }
 
-  private recordUsage(point: { name: string }, attribution: DecisionAttribution, attempt: BilledAttempt): void {
+  private recordUsage(
+    point: { name: string },
+    attribution: DecisionAttribution,
+    attempt: BilledAttempt,
+    usageClass: "decision" | "audit",
+  ): void {
     if (!this.options.record) return;
     try {
       this.options.record({
-        class: "decision",
+        class: usageClass,
         toolName: point.name,
         agentSessionId: attribution.agentSessionId ?? null,
         sessionType: attribution.sessionType ?? null,

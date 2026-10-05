@@ -39,6 +39,14 @@ const markDirty = (hourExpr: string) =>
   `insert into model_behaviour_dirty_hours (hour) select h from (select ${hourExpr} as h) as d
     where h is not null and not exists (select 1 from model_behaviour_dirty_hours where hour = d.h);`;
 
+/**
+ * Trigger-body statement marking the creation hour of the session `sessionIdExpr`
+ * dirty (falling back to `fallbackTsExpr`), for other features' raw tables whose
+ * rows the rollups read (e.g. `session_audits`).
+ */
+export const markSessionHourDirty = (sessionIdExpr: string, fallbackTsExpr: string): string =>
+  markDirty(sessionHour(sessionIdExpr, fallbackTsExpr));
+
 /** Tables and indexes owned by this feature (no dependency on other tables). */
 export const MODEL_BEHAVIOUR_TABLES_SCHEMA = `
 create table if not exists behaviour_snapshots (

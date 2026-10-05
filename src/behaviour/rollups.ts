@@ -63,6 +63,7 @@ interface DecisionRow {
   tool_call_id: string | null; attempt_no: number | null; consequence: string | null; verdict_json: string | null;
 }
 interface MessageRow { id: string; sid: string; received_at: number; body: string }
+interface AuditRow { sid: string; verdict_json: string | null }
 
 /** Parse a JSON string array (task labels); null when absent or malformed. */
 function parseStringArray(json: string | null | undefined): string[] | null {
@@ -105,6 +106,53 @@ export function firedChecks(verdictJson: string | null): Array<{ code: string; k
         const kind = (item as { kind?: unknown }).kind;
         out.push({ code: (item as { code: string }).code, ...(typeof kind === "string" ? { kind } : {}) });
       }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The `no_reply_intent` choice of a decision row (spec REFUSAL-HANDLING §7.4), read
+ * from the checks point's `verdict_json.results[]` (`{ id: "no_reply_intent__<source>",
+ * choice }`); undefined when the row did not ask it.
+ */
+export function noReplyIntentChoice(verdictJson: string | null): string | undefined {
+  if (!verdictJson) return undefined;
+  try {
+    const v = JSON.parse(verdictJson) as { results?: unknown };
+    if (!Array.isArray(v?.results)) return undefined;
+    for (const r of v.results as Array<{ id?: unknown; choice?: unknown }>) {
+      if (typeof r?.id === "string" && r.id.startsWith("no_reply_intent__") && typeof r.choice === "string") return r.choice;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The per-run send-contract diagnoses of an audit row (src/audit/contract-audit.ts
+ * `RunDiagnosis`): `verdict_json.runs[]` with `afterCorrection.choice`, the first
+ * failed attempt's `servedModel` and `ts`. Malformed entries are skipped.
+ */
+export function afterCorrectionRuns(
+  verdictJson: string | null,
+): Array<{ choice: string; servedModel: string | null; ts: number | null }> {
+  if (!verdictJson) return [];
+  try {
+    const v = JSON.parse(verdictJson) as { runs?: unknown };
+    if (!Array.isArray(v?.runs)) return [];
+    const out: Array<{ choice: string; servedModel: string | null; ts: number | null }> = [];
+    for (const run of v.runs as Array<Record<string, unknown>>) {
+      const choice = (run?.["afterCorrection"] as { choice?: unknown } | null | undefined)?.choice;
+      if (typeof choice !== "string") continue;
+      out.push({
+        choice,
+        servedModel: typeof run["servedModel"] === "string" ? (run["servedModel"] as string) : null,
+        ts: typeof run["ts"] === "number" ? (run["ts"] as number) : null,
+      });
     }
     return out;
   } catch {
@@ -230,6 +278,14 @@ export function computeHourRollups(
         )
         .all(p) as MessageRow[],
     );
+    const audits = groupBySession(
+      db
+        .prepare(
+          `select session_id as sid, verdict_json from session_audits
+            where audit = 'send_contract' and status = 'done' and event_id is null and session_id in ${inHour}`,
+        )
+        .all(p) as AuditRow[],
+    );
 
     for (const s of sessions) {
       accumulateSession(acc, s, {
@@ -239,6 +295,7 @@ export function computeHourRollups(
         branches: branches.get(s.id) ?? [],
         decisions: decisions.get(s.id) ?? [],
         messages: messages.get(s.id) ?? [],
+        audits: audits.get(s.id) ?? [],
       }, ctx, countTokens);
     }
   }
@@ -290,6 +347,7 @@ function accumulateSession(
     branches: BranchRow[];
     decisions: DecisionRow[];
     messages: MessageRow[];
+    audits: AuditRow[];
   },
   ctx: RollupContext,
   countTokens: (text: string) => number,
@@ -372,12 +430,18 @@ function accumulateSession(
   const styledAnchors = new Set<string>();
   const revisedAnchors = new Set<string>();
   const overriddenAnchors = new Set<string>();
+  const intentAnchors = new Set<string>();
   for (const d of rows.decisions) {
     const anchor =
       d.tool_call_id !== null || d.attempt_no !== null
         ? `${d.branch_no ?? 0}|${d.checkpoint ?? ""}|${d.tool_call_id ?? ""}|${d.attempt_no ?? ""}`
         : `row:${d.id}`;
     const model = modelAt(d.ts);
+    const intent = noReplyIntentChoice(d.verdict_json);
+    if (intent !== undefined && !intentAnchors.has(anchor)) {
+      intentAnchors.add(anchor);
+      add(model, familyMetric("no_reply_intent", intent));
+    }
     const fired = firedChecks(d.verdict_json);
     for (const f of fired) {
       const key = `${anchor}\u0000${f.code}`;
@@ -407,6 +471,13 @@ function accumulateSession(
         seenCodes.add(key);
         add(model, familyMetric(family, f.code));
       }
+    }
+  }
+
+  // What happened to the message after the nudges (offline audit, §7.3).
+  for (const a of rows.audits) {
+    for (const run of afterCorrectionRuns(a.verdict_json)) {
+      add(run.servedModel ?? modelAt(run.ts), familyMetric("after_correction", run.choice));
     }
   }
 

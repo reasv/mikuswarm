@@ -155,6 +155,7 @@ import { buildCheckCatalogue } from "./checks/catalogue.js";
 import { ModelBehaviourService } from "./behaviour/index.js";
 import { CheckEvaluator } from "./checks/evaluator.js";
 import { createBackgroundChecks, type BackgroundChecks } from "./checks/gate.js";
+import { AuditWorkerPool } from "./audit/index.js";
 import { normalizeRefusalRules, validateRefusalRules } from "./refusals/rules.js";
 import type { SyntheticCallSpec } from "./agent/synthetic-calls.js";
 import { SauceNaoRateLimiter } from "./saucenao/rate-limiter.js";
@@ -2806,6 +2807,43 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         logger: logger.child("diary"),
       })
     : null;
+
+  // Offline audit worker (spec REFUSAL-HANDLING §7.6, §10.2; DECISION-MODEL §5.8):
+  // the send-contract diagnosis and the judged checks over completed sessions and
+  // the whole history, at background priority, billed to the `audit` ledger class
+  // (never a payee). Built only when some agent runs the `audit` point.
+  const auditPool =
+    decisionEngine && [null, ...Object.keys(config.agents ?? {})].some((agent) => decisionEngine.isEnabled("audit", agent))
+      ? new AuditWorkerPool({
+          storage,
+          config,
+          engine: decisionEngine,
+          catalogue: checkCatalogue,
+          agentForTimelineKey: (timelineKey) => agentNameForTimeline(timelineKey),
+          // The chat before the session's trigger, as the check state's `recent` (§5.5).
+          recentChat: (session, limit) => {
+            const events = hydrateEvents(
+              storage,
+              timeline.query({ timelineKey: session.timeline_key, toTimestamp: session.created_at, limit: limit + 1 }),
+            );
+            const last = events[events.length - 1];
+            const before = last && last.body === session.trigger_body ? events.slice(0, -1) : events;
+            return before.slice(-limit).map((event) => toTranscriptMessage(event, 400));
+          },
+          // Stop claiming while every member of the audit chain is over an `audit` budget.
+          shouldPause: () => {
+            const engine = budgetHooks.engine;
+            const settings = decisionEngine.settings("audit", null);
+            if (!engine || !settings) return false;
+            const members = [settings.model, ...(config.models[settings.model]?.fallback ?? [])];
+            return !members.some((key) => {
+              const model = config.models[key];
+              return model !== undefined && engine.check({ class: "audit", tool: "audit", modelId: model.id, logicalModelId: key }).allowed;
+            });
+          },
+          logger: logger.child("audit"),
+        })
+      : null;
 
   // Tools made unavailable by EITHER mechanism: the explicit `agent.disabled_tools`
   // allowlist subtraction, or a capability feature gate (`[features]`) being off.
@@ -7931,6 +7969,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // catches any donor summaries that landed during downtime.
   if (mirrorWorker) mirrorWorker.start();
   if (diaryPool) await diaryPool.start();
+  auditPool?.start();
   if (retrieval) await retrieval.start();
   redecryptionSweeper.start();
   proactiveScheduler.start();
@@ -8047,6 +8086,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         for (const client of allCaptionClients) client.stop();
         await captionPool.stop();
         if (retrieval) await retrieval.stop();
+        if (auditPool) await auditPool.stop();
         if (diaryPool) await diaryPool.stop();
         // Stop the mirror worker before the summarization pool so the in-flight
         // sweep doesn't try to insert mirrored summaries after the pool stops.
