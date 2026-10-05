@@ -28,6 +28,8 @@ import {
 } from "./config.js";
 import { summarizeAnswers, type DecisionAnswers, type DecisionQuestion } from "./types.js";
 
+type DecisionClientModelConfig = AppConfig["models"]["default"];
+
 /**
  * One row emitted per `evaluate()` outcome — maps 1:1 to the
  * `decision_evaluations` table (CONTRACT §storage). The sink receives it
@@ -100,6 +102,11 @@ export interface DecisionPoint<I, V> {
   fallback(input: I): V;
   /** A cheap, loggable summary of a verdict. */
   describe(verdict: V): unknown;
+  /**
+   * Shape of the state `state()` builds for this input (default `"object"`);
+   * `"conversation"` is the judge-shaped `{ input, output }` (DECISION-MODEL §3.8).
+   */
+  stateShape?(input: I): "object" | "conversation";
 }
 
 export type DecisionSource = "model" | "heuristic";
@@ -162,6 +169,18 @@ export interface EvaluateContext {
   candidateSessionId?: string | null;
   /** The event that triggered this decision (logged as-is). */
   triggerEventId?: string | null;
+  /**
+   * Evaluation sink for this call only: when set it receives the row instead
+   * of the engine's `onEvaluation`, so a caller that anchors rows (the output
+   * gate, spec REFUSAL-HANDLING §9) can complete and persist them itself.
+   */
+  onEvaluation?: (row: DecisionEvaluationRow) => void;
+}
+
+/** A member of a point's chain, as the fits planner sees it. */
+export interface DecisionChainMember {
+  logicalId: string;
+  config: DecisionClientModelConfig;
 }
 
 const UNAVAILABLE_LOG_INTERVAL_MS = 60_000;
@@ -208,6 +227,7 @@ export class DecisionEngine {
     let lastSent: SentAttempt | null = null;
 
     // Emit one evaluation row to the optional sink (no storage import here).
+    const sink = ctx.onEvaluation ?? this.options.onEvaluation;
     const emitRow = (
       source: "model" | "heuristic",
       reason: string | null,
@@ -216,12 +236,12 @@ export class DecisionEngine {
       servedModel: string | null,
       servedVersion: string | null,
     ): void => {
-      if (!this.options.onEvaluation) return;
+      if (!sink) return;
       // Use the real sent payload when a request was made; null otherwise.
       const stateJson = lastSent !== null ? capJsonBytes(lastSent.state, 64 * 1024) : null;
       const qJson = lastSent !== null ? questionsJson : null;
       try {
-        this.options.onEvaluation({
+        sink({
           ts: now(),
           decisionGroup,
           point: point.name,
@@ -330,6 +350,7 @@ export class DecisionEngine {
           state: (budgetTokens) => point.state(input, budgetTokens),
           stateMaxTokens: settings.stateMaxTokens,
           minStateTokens: settings.minStateTokens,
+          stateShape: point.stateShape?.(input) ?? "object",
         },
         {
           consumer: `decision:${point.name}`,
@@ -389,6 +410,48 @@ export class DecisionEngine {
       costUsd,
       decisionGroup,
     };
+  }
+
+  /**
+   * The members of a point's chain that an evaluation could reach now (head
+   * first): in budget (the same `[[limits]]` check `evaluate` makes) and healthy
+   * or probe-due. Empty when the point is off. The output gate plans its calls
+   * for the first of them (spec REFUSAL-HANDLING §6.2).
+   */
+  usableMembers(
+    point: DecisionPointName,
+    agentName: string | null,
+    attribution: DecisionAttribution,
+  ): DecisionChainMember[] {
+    const settings = this.settings(point, agentName);
+    if (!settings) return [];
+    let chain;
+    try {
+      chain = this.options.client.chain(settings.model);
+    } catch {
+      return [];
+    }
+    const budget = this.options.budget?.();
+    const scheduler = this.options.scheduler;
+    return chain
+      .filter((member) => {
+        if (member.config.api !== "system-one") return false;
+        if (budget) {
+          const allowed = budget.check({
+            class: "decision",
+            tool: point,
+            modelId: member.config.id,
+            logicalModelId: member.logicalId,
+            sessionType: attribution.sessionType ?? undefined,
+            timelineKey: attribution.timelineKey ?? undefined,
+          }).allowed;
+          if (!allowed) return false;
+        }
+        if (!scheduler) return true;
+        const key = `${member.config.endpoint ?? "unknown"}::${member.config.id}`;
+        return scheduler.modelHealth(key) === "healthy" || scheduler.isProbeDue(key);
+      })
+      .map((member) => ({ logicalId: member.logicalId, config: member.config }));
   }
 
   private recordUsage(point: { name: string }, attribution: DecisionAttribution, attempt: BilledAttempt): void {

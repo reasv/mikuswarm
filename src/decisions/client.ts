@@ -64,6 +64,13 @@ export interface DecisionRequest {
   stateMaxTokens: number;
   /** Members whose effective state budget is below this are skipped. */
   minStateTokens: number;
+  /**
+   * The shape of the state the builder returns: `"object"` (default, every
+   * point's named-field object) or `"conversation"`, the judge-shaped
+   * `{ input, output }` of DECISION-MODEL §3.8 that a judge-only member
+   * (`state_shapes = "text_or_conversation"`) also accepts.
+   */
+  stateShape?: "object" | "conversation";
 }
 
 export interface SentAttempt {
@@ -134,6 +141,7 @@ export function memberMisfit(
   shape: DecisionRequestShape,
   effectiveStateBudget: number,
   minStateTokens: number,
+  stateShape: "object" | "conversation" = "object",
 ): string | undefined {
   const fits = config.decision;
   if (fits?.question_types) {
@@ -148,9 +156,13 @@ export function memberMisfit(
   if (fits?.max_score_levels !== undefined && shape.maxScoreLevels > fits.max_score_levels) {
     return "max_score_levels";
   }
-  // Every state the points build is an object; a judge-only member takes only a
-  // string or an {input, output} conversation.
-  if (fits?.state_shapes === "text_or_conversation") return "state_shape";
+  // A judge-only member takes only a string or an {input, output} conversation,
+  // with `noul` questions (DECISION-MODEL §3.8); every other state the points
+  // build is a named-field object.
+  if (fits?.state_shapes === "text_or_conversation") {
+    if (stateShape !== "conversation") return "state_shape";
+    for (const type of shape.questionTypes) if (type !== "noul") return `question_type:${type}`;
+  }
   if (effectiveStateBudget < minStateTokens) return "state_budget";
   return undefined;
 }
@@ -236,7 +248,13 @@ export class DecisionClient {
           logger: this.options.logger,
           memberFilter: (member) =>
             member.config.api === "system-one" &&
-            memberMisfit(member.config, shape, effectiveBudget(member.config), request.minStateTokens) === undefined,
+            memberMisfit(
+              member.config,
+              shape,
+              effectiveBudget(member.config),
+              request.minStateTokens,
+              request.stateShape,
+            ) === undefined,
         },
         async (member) => {
           const remaining = deadline - Date.now();
