@@ -35,7 +35,11 @@ export interface RecordsCandidate {
    * `isReplyTarget`, but conventionally callers set it only on the reply target).
    */
   replyTo?: RecordsInput["replyTo"];
-  /** Recent chat messages before the request, oldest first. */
+  /**
+   * Recent chat messages before the request, oldest first (non-reply framing).
+   * Mark this candidate's own bot message with `ofRecord: true`: packing always
+   * keeps it in place and budgets the record around it (spec §6.2).
+   */
   recentChat?: RecordsInput["recentChat"];
 }
 
@@ -61,7 +65,7 @@ export interface RecordsCandidate {
  *         record: "...",
  *         isReplyTarget: false,
  *         request: { from: "Alice", text: "post the second one" },
- *         recentChat: [{ from: "Alice", text: "..." }, { from: "Miku", text: "...", self: true }],
+ *         recentChat: [{ from: "Alice", text: "..." }, { from: "Miku", text: "...", self: true, ofRecord: true }],
  *       },
  *     ],
  *     rawDecisions: decisionsFor(config, agentName),
