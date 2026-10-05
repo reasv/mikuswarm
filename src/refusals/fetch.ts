@@ -22,7 +22,7 @@ import {
   type ModelChainEntry,
   type RunFetchFallbackOptions,
 } from "../agent/model-fallback.js";
-import { matchRefusalRule } from "./rules.js";
+import { RefusalRuleWalk, matchRefusalRule, ruleAdmitsIgnoringFromModels } from "./rules.js";
 import { classifyHardRefusal } from "./session.js";
 
 type ModelConfig = AppConfig["models"]["default"];
@@ -85,20 +85,14 @@ export async function runFetchWithRefusalRules<T>(
 ): Promise<T> {
   if (!routing) return runFetchWithFallback(chain, options, attempt);
   let current = chain;
-  // The rule in play and the entry serving for it (after a redo).
-  let ruleInPlay: RefusalRule | undefined;
-  let entry: string | undefined;
-  // Members that refused this call: never attempted again in it.
-  const refused = new Set<string>();
+  // The call is one refusal point: the rule walk in play (spec §8.1 tries).
+  let walk: RefusalRuleWalk | undefined;
   for (;;) {
     let last: FetchChainMember | undefined;
     try {
       return await runFetchWithFallback(
         current,
-        {
-          ...options,
-          memberFilter: (m) => !refused.has(m.logicalId) && (options.memberFilter?.(m) ?? true),
-        },
+        options,
         (member) => {
           last = member;
           return attempt(member);
@@ -108,7 +102,6 @@ export async function runFetchWithRefusalRules<T>(
       const signal = fetchRefusalOf(error);
       if (!signal || !last) throw error;
       const member: FetchChainMember = last;
-      refused.add(member.logicalId);
       try {
         onRefused?.(member, error);
       } catch {
@@ -120,36 +113,23 @@ export async function runFetchWithRefusalRules<T>(
         { api: member.config.api, rawStopReason: signal.rawStopReason, category },
         routing.agent,
       );
-      // The entry the refusing member served for (a member of its fallback chain counts as it).
-      const servedFor =
-        entry !== undefined && chainIds(entry, routing.models).includes(member.logicalId) ? entry : member.logicalId;
-      let rule: RefusalRule | undefined;
-      if (ruleInPlay && ruleInPlay.models.includes(servedFor)) {
-        const { fromModels: _fromModels, ...rest } = ruleInPlay;
-        if (matchRefusalRule([rest], { site: routing.site, agent: routing.agent, tasks: null, reason: cls.reason, kind: "hard" })) {
-          rule = ruleInPlay;
-        }
-      }
-      rule ??= matchRefusalRule(routing.rules, {
-        site: routing.site,
-        agent: routing.agent,
-        tasks: null,
-        fromModel: member.logicalId,
-        reason: cls.reason,
-        kind: "hard",
-      });
+      const scope = { site: routing.site, agent: routing.agent, tasks: null, reason: cls.reason, kind: "hard" as const };
+      // The walk's last try (or a member of its chain serving for it) refused:
+      // the same rule continues, `from_models` aside (they named the first refuser).
+      const continuing =
+        walk?.last !== undefined &&
+        chainIds(walk.last, routing.models).includes(member.logicalId) &&
+        ruleAdmitsIgnoringFromModels(walk.rule, scope);
+      const rule: RefusalRule | undefined = continuing
+        ? walk!.rule
+        : matchRefusalRule(routing.rules, { ...scope, fromModel: member.logicalId });
       let toModel: string | undefined;
       if (rule) {
-        const from = rule.models.indexOf(servedFor);
-        for (let i = from + 1; i < rule.models.length; i++) {
-          const candidate = rule.models[i]!;
-          if (refused.has(candidate)) continue;
-          if (entryUsable(candidate, routing.models, options, refused)) {
-            toModel = candidate;
-            break;
-          }
-          routing.logger?.info("refusal_rule_entry_skipped", { site: routing.site, rule: rule.name, model: candidate });
-        }
+        if (!continuing) walk = new RefusalRuleWalk(rule, member.logicalId);
+        toModel = walk!.next(
+          (candidate) => entryUsable(candidate, routing.models, options),
+          (candidate) => routing.logger?.info("refusal_rule_entry_skipped", { site: routing.site, rule: rule.name, model: candidate }),
+        );
       }
       const outcome: RefusalOutcome = !rule ? "failed" : toModel !== undefined ? "redo" : "exhausted_no_output";
       routing.logger?.warn("llm_refusal", {
@@ -202,8 +182,6 @@ export async function runFetchWithRefusalRules<T>(
         (error as { [EXHAUSTED]?: boolean })[EXHAUSTED] = true;
       }
       if (toModel === undefined) throw error;
-      ruleInPlay = rule;
-      entry = toModel;
       current = resolveModelChain(toModel, routing.models);
     }
   }
@@ -219,15 +197,10 @@ function chainIds(head: string, models: Record<string, ModelConfig>): string[] {
 
 /**
  * A rule entry can serve the call now: it exists, its head passes the consumer's
- * capability filter, and some member of its chain that did not refuse is
- * healthy and in budget.
+ * capability filter, and some member of its chain is healthy and in budget. A
+ * model that refused is not excluded: explicit entries may retry it (§8.1 tries).
  */
-function entryUsable(
-  candidate: string,
-  models: Record<string, ModelConfig>,
-  options: RunFetchFallbackOptions,
-  refused: ReadonlySet<string>,
-): boolean {
+function entryUsable(candidate: string, models: Record<string, ModelConfig>, options: RunFetchFallbackOptions): boolean {
   const config = models[candidate];
   if (!config) return false;
   if (options.capability && !options.capability(config)) return false;
@@ -242,7 +215,6 @@ function entryUsable(
   const pick = chooseChainMember(members, {
     scheduler: options.scheduler,
     isModelAvailable: options.isModelAvailable,
-    tried: new Set(refused),
   });
   return pick.reason !== "all-unhealthy";
 }

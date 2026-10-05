@@ -196,6 +196,40 @@ test("handle: a resumed pin naming an unknown model is dropped; refusalRuleModel
   assert.deepEqual(refusalRuleModels(all, { sites: ["default", "record_turn"], agent: "agent_a" }).sort(), ["open_x", "open_y"]);
 });
 
+test("handle (soft path, W4 API): tries, @same, no pin move on a same-model retry, restart after a delivery", () => {
+  const { c, pins } = controller({
+    rules: rules([{ name: "r", models: [{ model: "@same", tries: 2 }, "open_x"] }]),
+  });
+  const rule = c.matchRule({ reason: "distillation", kind: "soft", fromModel: "model_a" })!;
+  assert.equal(rule.name, "r");
+  assert.equal(c.advance(rule, "model_a"), "model_a", "@same try 1");
+  assert.equal(c.pinnedModel(), undefined);
+  assert.equal(c.dispatchModel(), "model_a", "the retry target holds for the current request");
+  c.noteCommitted();
+  assert.equal(c.dispatchModel(), undefined);
+  // Still the same refusal point: the walk continues.
+  assert.equal(c.matchRule({ reason: "distillation", kind: "soft", fromModel: "model_a" })?.name, "r");
+  assert.equal(c.advance(rule, "model_a"), "model_a", "@same try 2");
+  assert.equal(c.advance(rule, "model_a"), "open_x", "then the next entry");
+  assert.equal(c.pinnedModel(), "open_x");
+  assert.equal(c.advance(rule, "open_x"), undefined, "every try spent");
+  // A delivered message ends the point: the pinned model's next refusal restarts at entry 1,
+  // where @same now means the pinned model.
+  c.noteDelivered();
+  assert.equal(c.matchRule({ reason: "distillation", kind: "soft", fromModel: "open_x" })?.name, "r");
+  assert.equal(c.advance(rule, "open_x"), "open_x");
+  assert.equal(c.pinnedModel(), "open_x", "a same-model retry leaves the pin");
+  assert.deepEqual(pins.map((p) => p.model), ["open_x"]);
+});
+
+test("handle: a site switch ends the walk", () => {
+  const { c } = controller({ rules: rules([{ name: "r", models: [{ model: "open_x", tries: 2 }, "open_y"] }]) });
+  const rule = c.matchRule({ reason: "safety", kind: "hard", fromModel: "model_a" })!;
+  assert.equal(c.advance(rule, "model_a"), "open_x");
+  c.setSite("record_turn");
+  assert.equal(c.advance(rule, "open_x"), "open_x", "a new walk starts at entry 1 (a same-model retry here)");
+});
+
 // ── Layer 0 ──────────────────────────────────────────────────────────────────
 
 function scripted(answers: Array<"refuse" | "ok">, calls: string[]): StreamFn {
@@ -343,14 +377,15 @@ for (const [outcome, expectedRuns] of [["exhausted_no_output", 1], [undefined, 3
 
 type CaptionAnswer = "ok" | "filter" | "refusal-field";
 
-async function captionServer(answers: Record<string, CaptionAnswer>) {
+async function captionServer(answers: Record<string, CaptionAnswer | CaptionAnswer[]>) {
   const hits: string[] = [];
   const server = http.createServer((req, res) => {
     req.on("data", () => {});
     req.on("end", () => {
       const prefix = (req.url ?? "").split("/")[1]!;
       hits.push(prefix);
-      const answer = answers[prefix] ?? "ok";
+      const configured = answers[prefix] ?? "ok";
+      const answer: CaptionAnswer = Array.isArray(configured) ? (configured.shift() ?? "ok") : configured;
       res.statusCode = 200;
       res.setHeader("content-type", "application/json");
       const usage = { prompt_tokens: 30, completion_tokens: 2, total_tokens: 32 };
@@ -523,3 +558,24 @@ for (const [outcome, expectedRuns] of [["exhausted_no_output", 1], [undefined, 3
     }
   });
 }
+
+test("caption: @same retries the refusing caption model (tries), then the next entry", async () => {
+  await withImage(async (filePath) => {
+    const server = await captionServer({ cap: ["filter", "filter", "ok"] });
+    try {
+      const events: RefusalEventInsert[] = [];
+      const billed: RefusedCaptionAttempt[] = [];
+      const client = captionClient(server.port, [{ name: "again", models: [{ model: "@same", tries: 2 }, "alt1"] }], events, billed);
+      const result = await client.caption({ filePath, mimeType: "image/png", filename: "x.png" });
+      assert.equal(result.logicalModelId, "cap");
+      assert.deepEqual(server.hits, ["cap", "cap", "cap"]);
+      await new Promise((r) => setImmediate(r));
+      assert.deepEqual(events.map((e) => [e.servedModel, e.outcome, e.toModel]), [
+        ["cap", "redo", "cap"],
+        ["cap", "redo", "cap"],
+      ]);
+    } finally {
+      await server.close();
+    }
+  });
+});

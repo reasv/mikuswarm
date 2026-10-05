@@ -60,6 +60,7 @@ import {
 import { createLoadSkillTool, loadSkillToolDefinition } from "../tools/load-skill.js";
 import { createToolSearchTool, toolSearchToolDefinition } from "../tools/tool-search.js";
 import type { CheckCatalogue, RefusalRule } from "../checks/types.js";
+import { isPostingTool } from "../tools/side-effects.js";
 import {
   createSessionRefusalController,
   isInternalSite,
@@ -1200,8 +1201,9 @@ export class AgentSessionFactory {
     };
     // The session's refusal handle (spec REFUSAL-HANDLING §8). A rule entry is
     // usable when the session's gates pass for it: capability (the reply's image
-    // needs), health + budget + context fits over its own chain (never a member
-    // that refused this request), and the user's per-user limits.
+    // needs), health + budget + context fits over its own chain, and the user's
+    // per-user limits. A model that refused is not excluded: explicit entries may
+    // retry it (§8.1 tries).
     const refusal = createSessionRefusalController({
       sessionType: session.sessionType,
       agent: refusalAgent,
@@ -1218,7 +1220,7 @@ export class AgentSessionFactory {
           return [id];
         }
       },
-      isUsable: (logicalId, refusedKeys) => {
+      isUsable: (logicalId) => {
         const cfg = this.options.config.models[logicalId];
         if (!cfg) return false;
         if (requiresMultimodal && !cfg.input_modalities.includes("image")) return false;
@@ -1228,7 +1230,6 @@ export class AgentSessionFactory {
           scheduler,
           isModelAvailable: isModelAvailableFn,
           observedContextTokens: ctxCounter.seenMsgs < 0 ? undefined : ctxCounter.running,
-          refused: refusedKeys ? new Set(refusedKeys) : undefined,
         });
         if (pick.reason === "all-unhealthy") return false;
         return !userSelectionActive || affordableNow(logicalId).ok;
@@ -1249,7 +1250,8 @@ export class AgentSessionFactory {
     // model: billed to the session's payee, counted on its caps, output capped at
     // its affordable headroom.
     const sessionStreamFn: StreamFn = (m, context, streamOptions) => {
-      const pinned = refusal.pinnedModel();
+      // The pin, or a same-model retry's target for the rest of this request.
+      const pinned = refusal.dispatchModel();
       if (pinned === undefined) return admittedStreamFn(m, context, streamOptions);
       requestedMember.logicalId = pinned;
       let opts2 = streamOptions;
@@ -2125,6 +2127,13 @@ export class AgentSessionFactory {
         : {}),
     });
     agentRef.agent = agent;
+    // A delivered message ends the refusal point: a later refusal starts its rule
+    // from the first entry (spec REFUSAL-HANDLING §8.1 "Tries and same-model retries").
+    agent.subscribe((event) => {
+      if (event.type === "tool_execution_end" && !event.isError && isPostingTool(event.toolName)) {
+        refusal.noteDelivered();
+      }
+    });
     if (registry) {
       // Between-run pickup + accounting (spec §7/§9): reassert `agent.state.tools`
       // so the NEXT run's snapshot sees the loaded set (steering/follow-up/forced-

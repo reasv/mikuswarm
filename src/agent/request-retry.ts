@@ -238,8 +238,9 @@ export interface RequestRetryContext {
    * Refusal rules (spec REFUSAL-HANDLING §8.1): asked on every refused attempt,
    * after the refusing member was added to the request's `refused` set. Its
    * decision replaces the implicit chain fallover: `redo` re-issues the request
-   * at once (the hook has pinned the session to a rule entry, which the session's
-   * stream fn dispatches from now on), `fallover` is the implicit fallover,
+   * at once on the try the hook chose (a pinned rule entry, or the refusing model
+   * again for a same-model retry), with the request's `refused` set and pass
+   * cleared; `fallover` is the implicit fallover,
    * `fail` surfaces the refusal terminally, `withhold` settles the request as a
    * clean `NO_REPLY` turn with no failure. Absent or throwing = today's implicit
    * fallover. `log` fields join the `llm_refusal` line.
@@ -1064,6 +1065,13 @@ export function withRequestRetry(
               fallover: decision.action === "fallover",
               ...(decision.log ?? {}),
             });
+            if (decision.action === "redo" && canReissue) {
+              // A rule's try is a fresh request on its entry: it may re-send to
+              // the member that refused (spec REFUSAL-HANDLING §8.1 tries), and
+              // the new target starts a fresh pass over its own chain.
+              attemptState.refused.clear();
+              attemptState.attempts.clear();
+            }
             if ((decision.action === "fallover" || decision.action === "redo") && canReissue) {
               tapDiscarded(attempt + 1, `refused: ${errorEvent.error?.errorMessage ?? "refusal"}`);
               continue;

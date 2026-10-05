@@ -4,7 +4,15 @@
  */
 import type { AppConfig } from "../config/index.js";
 import { catalogueReasons } from "../checks/catalogue.js";
-import { BUILTIN_REFUSAL_REASONS, INTERNAL_SITES, type CheckCatalogue, type RefusalRule } from "../checks/types.js";
+import {
+  BUILTIN_REFUSAL_REASONS,
+  INTERNAL_SITES,
+  MAX_RULE_ENTRY_TRIES,
+  SAME_MODEL_KEY,
+  type CheckCatalogue,
+  type RefusalRule,
+  type RefusalRuleEntry,
+} from "../checks/types.js";
 import { isDecisionModel } from "../decisions/config.js";
 
 /** The rules in authored order (precedence: first match wins). */
@@ -12,7 +20,7 @@ export function normalizeRefusalRules(config: Pick<AppConfig, "refusal_fallback"
   return (config.refusal_fallback ?? []).map((raw, index) => {
     const rule: RefusalRule = {
       name: raw.name,
-      models: [...raw.models],
+      models: raw.models.map(normalizeRuleEntry),
       soft: raw.soft ?? "redo",
       onExhausted: raw.on_exhausted ?? "send_last",
       index,
@@ -25,6 +33,16 @@ export function normalizeRefusalRules(config: Pick<AppConfig, "refusal_fallback"
     if (raw.tasks && raw.tasks.length > 0) rule.tasks = [...raw.tasks];
     return rule;
   });
+}
+
+/** A raw `models` entry (key or `{ model, tries }`) as a {@link RefusalRuleEntry}; tries default 1. */
+export function normalizeRuleEntry(raw: string | { model: string; tries?: number }): RefusalRuleEntry {
+  return typeof raw === "string" ? { model: raw, tries: 1 } : { model: raw.model, tries: raw.tries ?? 1 };
+}
+
+/** The `[models.*]` keys a rule names (`@same` excluded, each once). */
+export function ruleModelKeys(rule: Pick<RefusalRule, "models">): string[] {
+  return [...new Set(rule.models.map((entry) => entry.model).filter((model) => model !== SAME_MODEL_KEY))];
 }
 
 /** The session a refusal happened in: what a rule's scope conditions test. */
@@ -81,6 +99,9 @@ export function refusalRulesForSession(rules: readonly RefusalRule[], scope: Ref
  * wiring, beside the other cross-field checks). Throws on the first problem.
  */
 export function validateRefusalRules(config: AppConfig, catalogue: CheckCatalogue): void {
+  if (config.models[SAME_MODEL_KEY]) {
+    throw new Error(`models.${SAME_MODEL_KEY}: "${SAME_MODEL_KEY}" is reserved (a refusal rule's "the model that refused"); rename the model`);
+  }
   const rules = config.refusal_fallback ?? [];
   if (rules.length === 0) return;
   const agentNames = Object.keys(config.agents ?? {});
@@ -99,7 +120,12 @@ export function validateRefusalRules(config: AppConfig, catalogue: CheckCatalogu
     if (names.has(rule.name)) throw new Error(`${where}: duplicate rule name "${rule.name}"`);
     names.add(rule.name);
     if (!rule.models || rule.models.length === 0) throw new Error(`${where}: models must list at least one model`);
-    for (const key of rule.models) {
+    for (const [j, raw] of rule.models.entries()) {
+      const { model: key, tries } = normalizeRuleEntry(raw);
+      if (!Number.isInteger(tries) || tries < 1 || tries > MAX_RULE_ENTRY_TRIES) {
+        throw new Error(`${where}.models[${j}]: tries must be an integer from 1 to ${MAX_RULE_ENTRY_TRIES} (got ${tries})`);
+      }
+      if (key === SAME_MODEL_KEY) continue;
       const model = config.models[key];
       if (!model) throw new Error(`${where}.models: "${key}" does not name a [models.*] block`);
       if (isDecisionModel(model)) {
@@ -141,4 +167,57 @@ export function validateRefusalRules(config: AppConfig, catalogue: CheckCatalogu
       }
     }
   });
+}
+
+/**
+ * One refusal point's walk through a rule's entries (spec §8.1 "Tries and
+ * same-model retries"): each entry is tried `tries` times before the next one
+ * applies; `@same` resolves to the model that refused when the walk started; an
+ * entry that fails the caller's gates is skipped whole. A walk lasts for one
+ * refusal point (the span since the last delivered message); the next point
+ * starts a new walk from the first entry.
+ */
+export class RefusalRuleWalk {
+  private index = 0;
+  private used = 0;
+  /** The model of the last try handed out. */
+  last: string | undefined;
+
+  constructor(
+    readonly rule: RefusalRule,
+    /** What `@same` means for this walk: the model that refused first. */
+    readonly same: string,
+  ) {}
+
+  /** The next try's model, or undefined when every entry (every try) is spent. */
+  next(usable: (model: string) => boolean, onSkip?: (model: string) => void): string | undefined {
+    while (this.index < this.rule.models.length) {
+      const entry = this.rule.models[this.index]!;
+      if (this.used >= entry.tries) {
+        this.index += 1;
+        this.used = 0;
+        continue;
+      }
+      const model = entry.model === SAME_MODEL_KEY ? this.same : entry.model;
+      if (!usable(model)) {
+        onSkip?.(model);
+        this.index += 1;
+        this.used = 0;
+        continue;
+      }
+      this.used += 1;
+      this.last = model;
+      return model;
+    }
+    return undefined;
+  }
+}
+
+/** The rule with its `from_models` dropped: does it still admit this refusal? (Walk continuation.) */
+export function ruleAdmitsIgnoringFromModels(
+  rule: RefusalRule,
+  input: Omit<RefusalRuleMatchInput, "fromModel">,
+): boolean {
+  const { fromModels: _fromModels, ...rest } = rule;
+  return matchRefusalRule([rest], input) !== undefined;
 }

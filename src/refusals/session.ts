@@ -13,7 +13,13 @@ import { INTERNAL_SITES, type CheckCatalogue, type RefusalRule } from "../checks
 import type { Logger } from "../observability/logger.js";
 import type { RefusalEventInsert, RefusalOutcome, RefusalPin } from "../storage/database.js";
 import { stripLlmRequestTag, type RefusalAttemptInfo, type RefusalDecision } from "../agent/request-retry.js";
-import { matchRefusalRule, refusalRulesForSession } from "./rules.js";
+import {
+  RefusalRuleWalk,
+  matchRefusalRule,
+  refusalRulesForSession,
+  ruleAdmitsIgnoringFromModels,
+  ruleModelKeys,
+} from "./rules.js";
 import { classifyApiRefusal, UNCATEGORIZED_REFUSAL_CODE } from "./signals.js";
 
 /** A refusal event as a handle records it: the session fields are filled in. */
@@ -40,11 +46,15 @@ export interface SessionRefusalHandle {
   /** Some soft = "redo" rule could match this session now, for any reason. Cheap. */
   softRuleCouldMatch(): boolean;
   /**
-   * Pick the rule's next usable entry after `refusedModel` (entries before it are
-   * never revisited, so a rule walks forward and ends), pin the session to it and
-   * persist the pin. Usable = the session's gates pass (health, budget, per-user
-   * limits, context fits, capability) and the model has not refused in the
-   * current request or redo. Undefined = the rule is exhausted.
+   * The rule's next try at this refusal point (spec §8.1 "Tries and same-model
+   * retries"): the current entry while it has tries left, else the next entry;
+   * `@same` is the model that refused when the walk started; entries failing the
+   * session's gates (health, budget, per-user limits, context fits, capability)
+   * are skipped whole. A try on another model pins the session to it (persisted);
+   * a try on `refusedModel` itself is a same-model retry and leaves the pin as it
+   * is. The walk lasts until a message is delivered (or the site changes); a
+   * different rule starts a new walk. Undefined = every entry, every try, spent.
+   * The returned model may equal `refusedModel`.
    */
   advance(rule: RefusalRule, refusedModel: string): string | undefined;
   /** Write one `refusal_events` row with the session fields filled in; resolves to its id (0 without storage). */
@@ -63,8 +73,12 @@ export interface SessionRefusalController extends SessionRefusalHandle {
   setSite(site: string | undefined): void;
   /** The member the composite resolved for the current attempt. */
   noteServing(logicalId: string): void;
-  /** A request committed cleanly: the per-request refused set starts over. */
+  /** A request committed cleanly: a same-model retry target ends with it. */
   noteCommitted(): void;
+  /** A message was delivered: the refusal point ends; the next refusal starts a rule from its first entry. */
+  noteDelivered(): void;
+  /** The model the session's requests go to: a same-model retry's target, else the pin. */
+  dispatchModel(): string | undefined;
 }
 
 export interface SessionRefusalDeps {
@@ -82,8 +96,12 @@ export interface SessionRefusalDeps {
   knownModel: (logicalId: string) => boolean;
   /** Logical ids of a model's fallback chain, head first (rule-entry continuation). */
   chainOf: (logicalId: string) => string[];
-  /** The session's gates for a rule entry, given the health keys that refused the request. */
-  isUsable: (logicalId: string, refusedKeys?: ReadonlySet<string>) => boolean;
+  /**
+   * The session's gates for a rule entry (health, budget, per-user limits, fits,
+   * capability). A model that refused is NOT excluded: explicit entries may
+   * re-send to it (spec §8.1 tries); only the implicit fallover never does.
+   */
+  isUsable: (logicalId: string) => boolean;
   /** The pin persisted for a resumed session. */
   initialPin?: RefusalPin;
   /** Persist the pin (`setAgentSessionRefusalPin`). */
@@ -147,7 +165,12 @@ export function createSessionRefusalController(deps: SessionRefusalDeps): Sessio
   let serving: string | undefined;
   let lastOutcome: RefusalOutcome | undefined;
   // Models that refused in the current request (or redo): never chosen again for it.
-  const refusedNow = new Set<string>();
+  // The current refusal point's walk through a rule (spec §8.1 tries): lives
+  // until a message is delivered or the site changes.
+  let walk: RefusalRuleWalk | undefined;
+  // A same-model retry's target for the rest of the current request (the pin
+  // does not move when a try re-sends to the model that refused).
+  let retryTarget: string | undefined;
   // The rules whose scope admits the current site (cached per site).
   const scopedBySite = new Map<string, RefusalRule[]>();
   const scoped = (): RefusalRule[] => {
@@ -175,39 +198,20 @@ export function createSessionRefusalController(deps: SessionRefusalDeps): Sessio
   const pinRule = (): RefusalRule | undefined =>
     pin ? deps.rules.find((rule) => rule.name === pin!.rule) : undefined;
 
-  /**
-   * Index of `model` among the rule's entries; a member of the pinned entry's
-   * fallback chain counts as that entry (it served on the entry's behalf).
-   */
-  const entryIndex = (rule: RefusalRule, model: string | undefined): number => {
-    if (model === undefined) return -1;
-    const direct = rule.models.indexOf(model);
-    if (direct >= 0) return direct;
-    if (pin && pin.rule === rule.name) {
-      const pinned = rule.models.indexOf(pin.model);
-      if (pinned >= 0 && deps.chainOf(pin.model).includes(model)) return pinned;
-    }
-    return -1;
-  };
+  /** `refused` is `model`, or a member of its fallback chain that served on its behalf. */
+  const servedFor = (model: string | undefined, refused: string | undefined): boolean =>
+    model !== undefined && refused !== undefined && (model === refused || deps.chainOf(model).includes(refused));
 
   const matchRule: SessionRefusalHandle["matchRule"] = (input) => {
-    const current = pinRule();
-    if (current && entryIndex(current, input.fromModel) >= 0) {
-      // The pinned entry refused: the same rule continues when it admits this
-      // refusal apart from `from_models` (which named the model that refused first).
-      const { fromModels: _fromModels, ...rest } = current;
-      if (matchRefusalRule([rest], { site, agent: deps.agent, tasks: null, reason: input.reason, kind: input.kind })) {
-        return current;
-      }
-    }
-    return matchRefusalRule(deps.rules, {
-      site,
-      agent: deps.agent,
-      tasks: null,
-      fromModel: input.fromModel,
-      reason: input.reason,
-      kind: input.kind,
-    });
+    const scope = { site, agent: deps.agent, tasks: null, reason: input.reason, kind: input.kind };
+    // The model a running walk handed out refused: the same rule continues, when
+    // it admits this refusal apart from `from_models` (they named the model that
+    // refused first). Likewise for the rule the session is pinned by, when its
+    // pinned model refuses at a later refusal point (spec §8.1 tries).
+    if (walk && servedFor(walk.last, input.fromModel) && ruleAdmitsIgnoringFromModels(walk.rule, scope)) return walk.rule;
+    const pinned = pinRule();
+    if (pinned && servedFor(pin?.model, input.fromModel) && ruleAdmitsIgnoringFromModels(pinned, scope)) return pinned;
+    return matchRefusalRule(deps.rules, { ...scope, fromModel: input.fromModel });
   };
 
   const setPin = (rule: RefusalRule, model: string): void => {
@@ -223,30 +227,32 @@ export function createSessionRefusalController(deps: SessionRefusalDeps): Sessio
     }
   };
 
-  const advanceWith = (
-    rule: RefusalRule,
-    refusedModel: string | undefined,
-    refusedKeys?: ReadonlySet<string>,
-  ): string | undefined => {
-    if (refusedModel !== undefined) refusedNow.add(refusedModel);
-    const from = entryIndex(rule, refusedModel);
-    for (let i = from + 1; i < rule.models.length; i++) {
-      const candidate = rule.models[i]!;
-      if (refusedNow.has(candidate)) continue;
-      let usable = false;
-      try {
-        usable = deps.isUsable(candidate, refusedKeys);
-      } catch {
-        usable = false;
-      }
-      if (!usable) {
-        deps.logger?.info("refusal_rule_entry_skipped", { sessionId: deps.sessionId, site, rule: rule.name, model: candidate });
-        continue;
-      }
-      setPin(rule, candidate);
-      return candidate;
+  const advanceWith = (rule: RefusalRule, refusedModel: string | undefined): string | undefined => {
+    // A new walk unless this refusal point is already walking this rule.
+    if (!walk || walk.rule.name !== rule.name) {
+      walk = new RefusalRuleWalk(rule, refusedModel ?? pin?.model ?? deps.headModel ?? "");
     }
-    return undefined;
+    const model = walk.next(
+      (candidate) => {
+        try {
+          return candidate.length > 0 && deps.isUsable(candidate);
+        } catch {
+          return false;
+        }
+      },
+      (candidate) =>
+        deps.logger?.info("refusal_rule_entry_skipped", { sessionId: deps.sessionId, site, rule: rule.name, model: candidate }),
+    );
+    if (model === undefined) return undefined;
+    if (model === refusedModel) {
+      // A same-model retry (@same, or the refusing model listed again): a fresh
+      // sample of the same model; the pin does not move (spec §8.1).
+      retryTarget = model;
+    } else {
+      retryTarget = undefined;
+      setPin(rule, model);
+    }
+    return model;
   };
 
   const record = (event: SessionRefusalEvent): Promise<number> => {
@@ -282,16 +288,14 @@ export function createSessionRefusalController(deps: SessionRefusalDeps): Sessio
     let outcome: RefusalOutcome;
     let toModel: string | undefined;
     if (!rule) {
-      if (refusedModel !== undefined) refusedNow.add(refusedModel);
       action = info.implicitFallover ? "fallover" : "fail";
       outcome = info.implicitFallover ? "fallover" : "failed";
     } else if (!info.canReissue) {
       // The wall-clock budget is spent: no attempt can be issued any more.
-      if (refusedModel !== undefined) refusedNow.add(refusedModel);
       action = "fail";
       outcome = "failed";
     } else {
-      toModel = advanceWith(rule, refusedModel, info.refusedKeys);
+      toModel = advanceWith(rule, refusedModel);
       if (toModel !== undefined) {
         action = "redo";
         outcome = "redo";
@@ -355,26 +359,35 @@ export function createSessionRefusalController(deps: SessionRefusalDeps): Sessio
       const rules = scoped();
       if (rules.length === 0) return false;
       const current = serving ?? pin?.model ?? deps.headModel;
-      const continuing = pinRule();
       return rules.some(
         (rule) =>
           rule.soft === "redo" &&
           (!rule.fromModels ||
             (current !== undefined && rule.fromModels.includes(current)) ||
-            (rule === continuing && entryIndex(rule, current) >= 0)),
+            rule.name === pin?.rule ||
+            rule.name === walk?.rule.name),
       );
     },
     advance: (rule, refusedModel) => advanceWith(rule, refusedModel),
     record,
     onHardRefusal,
     setSite: (next) => {
-      site = next ?? deps.sessionType;
+      const nextSite = next ?? deps.sessionType;
+      if (nextSite !== site) {
+        walk = undefined;
+        retryTarget = undefined;
+      }
+      site = nextSite;
+    },
+    dispatchModel: () => retryTarget ?? pin?.model,
+    noteDelivered: () => {
+      walk = undefined;
     },
     noteServing: (logicalId) => {
       serving = logicalId;
     },
     noteCommitted: () => {
-      refusedNow.clear();
+      retryTarget = undefined;
     },
   };
 }
@@ -391,7 +404,7 @@ export function refusalRuleModels(
   const models = new Set<string>();
   for (const site of scope.sites) {
     for (const rule of refusalRulesForSession(rules, { site, agent: scope.agent, tasks: null })) {
-      for (const model of rule.models) models.add(model);
+      for (const model of ruleModelKeys(rule)) models.add(model);
     }
   }
   return [...models];

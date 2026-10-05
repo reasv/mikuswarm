@@ -23,17 +23,18 @@ import { Storage } from "../src/storage/index.js";
 // pinned for the session. Upstreams are a local HTTP stub per path prefix.
 // ---------------------------------------------------------------------------
 
-type Behaviour = "ok" | "filter" | "anthropic-refusal" | "anthropic-refusal-unknown";
+type Behaviour = "ok" | "filter" | "toolcall" | "anthropic-refusal" | "anthropic-refusal-unknown";
 
 interface Stub {
   port: number;
   bodies: Array<{ path: string; body: any }>;
-  behaviour: Record<string, Behaviour>;
+  /** A behaviour, or a queue consumed one request at a time (then "ok"). */
+  behaviour: Record<string, Behaviour | Behaviour[]>;
   close: () => Promise<void>;
 }
 
 /** Path prefix ("/a/") → behaviour; unknown prefixes answer ok. */
-async function stubServer(behaviour: Record<string, Behaviour>): Promise<Stub> {
+async function stubServer(behaviour: Record<string, Behaviour | Behaviour[]>): Promise<Stub> {
   const bodies: Array<{ path: string; body: any }> = [];
   const server = http.createServer((req, res) => {
     let raw = "";
@@ -42,7 +43,8 @@ async function stubServer(behaviour: Record<string, Behaviour>): Promise<Stub> {
       const url = req.url ?? "";
       bodies.push({ path: url, body: JSON.parse(raw) });
       const prefix = Object.keys(behaviour).find((p) => url.startsWith(p));
-      const kind = prefix ? behaviour[prefix]! : "ok";
+      const configured = prefix ? behaviour[prefix]! : "ok";
+      const kind: Behaviour = Array.isArray(configured) ? (configured.shift() ?? "ok") : configured;
       res.writeHead(200, { "Content-Type": "text/event-stream" });
       if (kind === "anthropic-refusal" || kind === "anthropic-refusal-unknown") {
         const send = (event: string, data: unknown) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -71,7 +73,12 @@ async function stubServer(behaviour: Record<string, Behaviour>): Promise<Stub> {
         return;
       }
       const chunk = (obj: unknown) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
-      if (kind === "filter") {
+      if (kind === "toolcall") {
+        const name = (JSON.parse(raw).tools ?? [])[0]?.function?.name ?? "tool";
+        chunk({ id: "c", object: "chat.completion.chunk", created: 1, model: "m", choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, id: `call_${bodies.length}`, type: "function", function: { name, arguments: "{}" } }] }, finish_reason: null }] });
+        chunk({ id: "c", object: "chat.completion.chunk", created: 1, model: "m", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
+        chunk({ id: "c", object: "chat.completion.chunk", created: 1, model: "m", choices: [], usage: { prompt_tokens: 10, completion_tokens: 1, total_tokens: 11 } });
+      } else if (kind === "filter") {
         chunk({ id: "c", object: "chat.completion.chunk", created: 1, model: "m", choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] });
         chunk({ id: "c", object: "chat.completion.chunk", created: 1, model: "m", choices: [{ index: 0, delta: {}, finish_reason: "content_filter" }] });
         chunk({ id: "c", object: "chat.completion.chunk", created: 1, model: "m", choices: [], usage: { prompt_tokens: 20, completion_tokens: 2, total_tokens: 22 } });
@@ -204,7 +211,7 @@ function session(id: string, sessionType = "default", attachments?: unknown[]): 
 }
 
 async function withEnv(
-  behaviour: Record<string, Behaviour>,
+  behaviour: Record<string, Behaviour | Behaviour[]>,
   fn: (env: { stub: Stub; storage: Storage; root: string }) => Promise<void>,
 ): Promise<void> {
   const stub = await stubServer(behaviour);
@@ -678,3 +685,98 @@ test("classifier end to end: an unknown category is refusal_uncategorized with t
     assert.equal(last.stopCategory, "novel_category");
   });
 });
+
+// ── Tries and same-model retries (spec §8.1, owner decision 28) ─────────────
+
+test("tries: @same retries the model that refused without moving the pin; a success stays on it", async () => {
+  await withEnv({ "/a/": ["filter", "ok"] }, async ({ stub, storage, root }) => {
+    await addSessionRow(storage, "t1");
+    const recorded: any[] = [];
+    const factory = makeFactory({
+      root,
+      storage,
+      recorded,
+      models: { default: oai(stub.port, "a-wire", "a", { fallback: ["second"] }), second: oai(stub.port, "b-wire", "b"), redo1: oai(stub.port, "r1-wire", "r1") },
+      rules: [{ name: "r", models: [{ model: "@same", tries: 2 }, "redo1"] }],
+    });
+    const created = await factory.create(session("t1"), []);
+    await runFirst(created);
+    assert.deepEqual(prefixes(stub), ["a", "a"], "re-sent to the refusing model (the implicit rule does not apply to explicit entries)");
+    assert.equal(created.refusal.pinnedModel(), undefined, "a same-model retry pins nothing");
+    assert.equal(storage.getAgentSessionRefusalPin("t1"), undefined);
+    const rows = await events(storage, "t1");
+    assert.deepEqual(rows.map((r) => [r.served_model, r.outcome, r.to_model]), [["default", "redo", "default"]]);
+    assert.deepEqual(recorded.filter((r) => r.class === "agent_loop").map((r) => r.logicalModelId), ["default", "default"]);
+    await created.agent.prompt({ role: "user", content: "next", timestamp: 2 } as any);
+    assert.deepEqual(prefixes(stub), ["a", "a", "a"]);
+  });
+});
+
+test("tries: every try of an entry is spent before the next entry; repeated keys are separate entries", async () => {
+  await withEnv({ "/a/": "filter", "/r1/": ["filter", "filter", "ok"] }, async ({ stub, storage, root }) => {
+    await addSessionRow(storage, "t2");
+    const factory = makeFactory({
+      root,
+      storage,
+      models: { default: oai(stub.port, "a-wire", "a"), redo1: oai(stub.port, "r1-wire", "r1"), redo2: oai(stub.port, "r2-wire", "r2") },
+      rules: [{ name: "r", models: [{ model: "@same", tries: 2 }, "redo1", "redo2", "redo1"] }],
+    });
+    const created = await factory.create(session("t2"), []);
+    await runFirst(created);
+    // a refuses; @same twice (a, a); redo1 refuses; redo2 serves.
+    assert.deepEqual(prefixes(stub), ["a", "a", "a", "r1", "r2"]);
+    assert.equal(created.refusal.pinnedModel(), "redo2");
+    const rows = await events(storage, "t2");
+    assert.deepEqual(rows.map((r) => [r.served_model, r.to_model]), [
+      ["default", "default"],
+      ["default", "default"],
+      ["default", "redo1"],
+      ["redo1", "redo2"],
+    ]);
+  });
+});
+
+test("tries: exhaustion counts every try", async () => {
+  await withEnv({ "/a/": "filter", "/r1/": "filter" }, async ({ stub, storage, root }) => {
+    await addSessionRow(storage, "t3");
+    const factory = makeFactory({
+      root,
+      storage,
+      models: { default: oai(stub.port, "a-wire", "a"), redo1: oai(stub.port, "r1-wire", "r1") },
+      rules: [{ name: "r", models: [{ model: "redo1", tries: 3 }] }],
+    });
+    const created = await factory.create(session("t3"), []);
+    await runFirst(created);
+    assert.deepEqual(prefixes(stub), ["a", "r1", "r1", "r1"]);
+    assert.deepEqual((await events(storage, "t3")).map((r) => r.outcome), ["redo", "redo", "redo", "exhausted_send_last"]);
+  });
+});
+
+for (const [tool, delivered] of [["send_message", true], ["read_messages", false]] as const) {
+  test(`tries: a refusal point ${delivered ? "ends at a delivered message (the rule restarts at entry 1 on the pinned model)" : "spans non-posting tool work (the walk continues)"}`, async () => {
+    await withEnv({ "/a/": "filter", "/r1/": ["toolcall", "filter", "ok"] }, async ({ stub, storage, root }) => {
+      await addSessionRow(storage, `t4-${tool}`);
+      const factory = makeFactory({
+        root,
+        storage,
+        models: { default: oai(stub.port, "a-wire", "a"), redo1: oai(stub.port, "r1-wire", "r1"), redo2: oai(stub.port, "r2-wire", "r2") },
+        rules: [{ name: "r", from_models: ["default"], models: ["redo1", "redo2"] }],
+      });
+      const toolDef = {
+        name: tool,
+        label: tool,
+        description: "test tool",
+        parameters: { type: "object", properties: {} },
+        execute: async () => ({ content: [{ type: "text", text: "done" }], details: {} }),
+      } as any;
+      const created = await factory.create(session(`t4-${tool}`), [toolDef]);
+      await runFirst(created);
+      assert.deepEqual(
+        prefixes(stub),
+        delivered ? ["a", "r1", "r1", "r1"] : ["a", "r1", "r1", "r2"],
+        "after a delivery the pinned model's refusal starts the rule over (entry 1 = redo1, a same-model retry)",
+      );
+      assert.equal(created.refusal.pinnedModel(), delivered ? "redo1" : "redo2");
+    });
+  });
+}

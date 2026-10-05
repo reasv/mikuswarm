@@ -114,7 +114,7 @@ min_chars = 20
 [[refusal_fallback]]
 name = "distillation"
 reasons = ["distillation"]
-models = ["open_model_x"]
+models = [{ model = "@same", tries = 2 }, "open_model_x", { model = "open_model_x" }]
 on_exhausted = "withhold"
 
 [decisions.checks]
@@ -133,7 +133,18 @@ style_min_chars = 30
   assert.equal(vocab.minChars, 20);
   validateRefusalRules(config, catalogue);
   assert.deepEqual(normalizeRefusalRules(config), [
-    { name: "distillation", reasons: ["distillation"], models: ["open_model_x"], soft: "redo", onExhausted: "withhold", index: 0 },
+    {
+      name: "distillation",
+      reasons: ["distillation"],
+      models: [
+        { model: "@same", tries: 2 },
+        { model: "open_model_x", tries: 1 },
+        { model: "open_model_x", tries: 1 },
+      ],
+      soft: "redo",
+      onExhausted: "withhold",
+      index: 0,
+    },
   ]);
   const knobs = checksPointKnobs(decisionsFor(config, null));
   assert.equal(knobs.sendDeadlineMs, 4000);
@@ -151,6 +162,10 @@ test("TOML: unknown kind / remedy / source / checkpoint and bad thresholds fail 
     [`[[refusal_fallback]]\nname = "a"\nmodels = []\n`, /\/refusal_fallback\/0\/models/],
     [`[[refusal_fallback]]\nname = "a"\nmodels = ["default"]\nsoft = "maybe"\n`, /\/refusal_fallback\/0\/soft/],
     [`[[refusal_fallback]]\nname = "a"\nmodels = ["default"]\non_exhausted = "explode"\n`, /\/refusal_fallback\/0\/on_exhausted/],
+    [`[[refusal_fallback]]\nname = "a"\nmodels = [{ model = "default", tries = 0 }]\n`, /\/refusal_fallback\/0\/models\/0/],
+    [`[[refusal_fallback]]\nname = "a"\nmodels = [{ model = "default", tries = 11 }]\n`, /\/refusal_fallback\/0\/models\/0/],
+    [`[[refusal_fallback]]\nname = "a"\nmodels = [{ model = "default", tries = 1.5 }]\n`, /\/refusal_fallback\/0\/models\/0/],
+    [`[[refusal_fallback]]\nname = "a"\nmodels = [{ model = "default", weight = 2 }]\n`, /refusal_fallback/],
     [`[decisions.checks]\nsend_deadline_ms = -1\n`, /\/decisions\/checks\/send_deadline_ms/],
   ];
   for (const [extra, re] of bad) {
