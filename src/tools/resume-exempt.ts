@@ -36,9 +36,9 @@ import { createSessionRecordTool, SummaryDraft } from "./session-record-tool.js"
 // the memoized cache, silently making pure-chat sessions resumable. Deriving the
 // set here, independent of any context, removes that foot-gun entirely.
 //
-// These eleven factories build a plain tool object and never touch their context
-// at construction time (they only dereference it inside `execute`), so a stub
-// context is safe — `test/work-gate.test.ts` and `test/resume-exempt.test.ts`
+// These factories build a plain tool object and never touch their context at
+// construction time (they only dereference it inside `execute`), so a stub
+// context is safe (session_record_tool gets a throwaway draft instead) — `test/work-gate.test.ts` and `test/resume-exempt.test.ts`
 // both rely on exactly this and assert the resulting set equals the spec's list.
 // =============================================================================
 
@@ -52,9 +52,6 @@ import { createSessionRecordTool, SummaryDraft } from "./session-record-tool.js"
  * the omission direction is safe (an un-listed exempt tool degrades to "counts as
  * work" → FRESH, the spec's safe failure direction).
  */
-// CRITICAL: this enumeration is CONTEXT-FREE and must include every factory
-// that carries (or may carry) `resumeWorkExempt: true`. The 4 new entries
-// (SESSION-RECORDS CONTRACT §4) use stub contexts derived below.
 const RESUME_EXEMPT_TOOL_FACTORIES: ReadonlyArray<(context: never) => AgentTool> = [
   createSendMessageTool,
   createReactTool,

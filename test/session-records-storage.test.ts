@@ -272,3 +272,72 @@ test("insertDecisionEvaluation: full row stored correctly", async () => {
     assert.ok(r.id > 0);
   });
 });
+
+// ── real v23 → v24 migration ──────────────────────────────────────────────────
+
+test("migration: a v23 database migrates to v24 with the fresh-DB shape, rows kept", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = await mkdtemp(path.join(os.tmpdir(), "mikuswarm-sr-mig-"));
+  const dbPath = path.join(dir, "v23.db");
+  // Structural shape (columns with type/nullability/default/pk, and indexes with
+  // their columns): the DDL text itself differs only in whitespace and comments.
+  const shape = (s: Storage) =>
+    s.read((db) =>
+      ["session_records", "decision_evaluations"].map((table) => ({
+        table,
+        columns: db.prepare(`pragma table_info(${table})`).all(),
+        indexes: (db.prepare(`pragma index_list(${table})`).all() as { name: string; unique: number }[])
+          .sort((a, b) => a.name.localeCompare(b.name))
+          .map((index) => ({
+            name: index.name,
+            unique: index.unique,
+            columns: db.prepare(`pragma index_info(${index.name})`).all(),
+          })),
+      })),
+    );
+  try {
+    // The fresh-DB shape, for comparison.
+    const fresh = await Storage.open({ databasePath: ":memory:" });
+    const freshShape = shape(fresh);
+    fresh.close();
+    assert.equal(freshShape[1].indexes.length, 2, "decision_evaluations has its two indexes");
+
+    // Build a v23-shaped database: the v24 tables absent, a pre-existing session row.
+    {
+      const s = await Storage.open({ databasePath: dbPath });
+      await s.insertAgentSession({
+        id: "s-old", timelineKey: "matrix:a:room:!r:x", sessionType: "default",
+        status: "completed", createdAt: 1, updatedAt: 1,
+      });
+      await s.write((db) => {
+        db.exec("drop table session_records");
+        db.exec("drop table decision_evaluations");
+        db.pragma("user_version = 23");
+      });
+      await s.waitForIdle();
+      s.close();
+    }
+
+    const migrated = await Storage.open({ databasePath: dbPath });
+    try {
+      assert.equal(
+        migrated.read((db) => Number(db.pragma("user_version", { simple: true }))),
+        LATEST_SCHEMA_VERSION,
+      );
+      assert.deepEqual(shape(migrated), freshShape, "migrated shape equals the fresh-DB shape");
+      assert.equal(migrated.getAgentSessionMeta("s-old")?.status, "completed", "existing rows survive");
+      await migrated.upsertSessionRecord({
+        session_id: "s-old", timeline_key: "matrix:a:room:!r:x", text: "t", token_count: 1, created_at: 2,
+      });
+      await migrated.waitForIdle();
+      assert.equal(migrated.getSessionRecord("s-old")?.text, "t");
+    } finally {
+      await migrated.waitForIdle();
+      migrated.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
