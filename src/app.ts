@@ -148,7 +148,7 @@ import {
   type RecordsCandidate,
 } from "./decisions/index.js";
 import { buildCheckCatalogue } from "./checks/catalogue.js";
-import { validateRefusalRules } from "./refusals/rules.js";
+import { normalizeRefusalRules, validateRefusalRules } from "./refusals/rules.js";
 import type { SyntheticCallSpec } from "./agent/synthetic-calls.js";
 import { SauceNaoRateLimiter } from "./saucenao/rate-limiter.js";
 import { setEgressGuardEnabled } from "./tools/ssrf.js";
@@ -162,6 +162,7 @@ import { resolveYotsubaConfig, parseYotsubaPreviewPayload, type ResolvedYotsubaC
 import { YotsubaClient } from "./yotsuba/client.js";
 import { planYotsubaUpgrade } from "./yotsuba/upgrade.js";
 import { CaptionWorkerPool, InferenceClient, type MediaModality } from "./captioning/index.js";
+import type { RefusedCaptionAttempt } from "./captioning/inference-client.js";
 import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools, type McpServerEntry } from "./mcp/index.js";
 import { SummarizationIndexer, SummarizationWorkerPool, createEscalateSummary, MirrorWorker, buildMirrorTopology } from "./summarization/index.js";
@@ -1285,7 +1286,38 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // Build an InferenceClient for the given modality and chain. All behavioral
   // options (prompt, maxChars, maxTokens, scheduler, media processing) come from
   // the global captioning config; only `chain` varies per-agent (§3).
-  function buildCaptionClient(modality: MediaModality, chain: ReturnType<typeof resolveModalityChain>): InferenceClient {
+  function buildCaptionClient(
+    modality: MediaModality,
+    chain: ReturnType<typeof resolveModalityChain>,
+    agentName: string | null = null,
+  ): InferenceClient {
+    // Refusal rules for site `caption` (spec REFUSAL-HANDLING §8.1) and the
+    // refused attempts' ledger rows (§10.3). A per-agent client knows its agent;
+    // the baseline clients are agent-less.
+    const refusalOptions = {
+      refusals: {
+        site: "caption",
+        agent: agentName,
+        rules: normalizeRefusalRules(config),
+        catalogue: checkCatalogue,
+        models: config.models,
+        insertEvent: (row: Parameters<typeof storage.insertRefusalEvent>[0]) => storage.insertRefusalEvent(row),
+        logger,
+      },
+      onRefusedAttempt: (attempt: RefusedCaptionAttempt) => {
+        budgetHooks.record?.({
+          class: "caption",
+          modelId: attempt.model,
+          logicalModelId: attempt.logicalModelId,
+          provider: attempt.provider,
+          inputTokens: attempt.usage?.input ?? null,
+          outputTokens: attempt.usage?.output ?? null,
+          cacheReadTokens: attempt.usage?.cacheRead ?? null,
+          images: attempt.usage?.images ?? null,
+          costUsd: attempt.cost ?? 0,
+        });
+      },
+    };
     if (modality === "image") {
       return new InferenceClient({
         modality: "image",
@@ -1296,6 +1328,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         scheduler: llmScheduler,
         isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
         imageProcessing: inferenceImageOptions,
+        ...refusalOptions,
       });
     }
     if (modality === "video") {
@@ -1309,6 +1342,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
         timeoutMs: videoConfig.timeout_ms,
         videoProcessing: captionVideoProcessing,
+        ...refusalOptions,
       });
     }
     // audio
@@ -1322,6 +1356,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
       timeoutMs: audioConfig.timeout_ms,
       audioProcessing: captionAudioProcessing,
+      ...refusalOptions,
     });
   }
 
@@ -1354,7 +1389,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         const baselineRef = agentModelOverrides.resolveCaptionModelRef(null, modality);
         if (agentRef === baselineRef) continue; // same chain → reuse baseline
         const agentChain = resolveModelChain(agentRef, config.models);
-        const agentClient = buildCaptionClient(modality, agentChain);
+        const agentClient = buildCaptionClient(modality, agentChain, agentName);
         agentMap.set(modality, agentClient);
         allCaptionClients.add(agentClient);
       }
@@ -1905,6 +1940,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // Per-session workspace root resolver (spec MULTI-AGENT-SUPPORT §4.1/§4.3).
     // Returns the owning agent's resolved workspace root for a timeline key.
     resolveWorkspaceRoot: (timelineKey) => resolveWorkspaceForTimeline(timelineKey)?.workspaceRoot,
+    // Refusal handling (spec REFUSAL-HANDLING §8): the one check catalogue built
+    // above classifies hard refusals; the rules may redo them on another model.
+    refusals: { catalogue: checkCatalogue, rules: normalizeRefusalRules(config) },
     // Per-agent model override ladder (spec PER-AGENT-MODEL-OVERRIDES §4/§8).
     // Only active in agents mode (agentWorkspaces.length > 0); in legacy mode the
     // resolver is absent → factory falls back to the global-only path (§2).
@@ -6094,7 +6132,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     timelineKey: string;
     sessionType: string;
     inbound: InboundChatEvent;
-    created: Pick<Awaited<ReturnType<typeof factory.create>>, "agent" | "registry" | "setPriority" | "setRefusalFallover">;
+    created: Pick<
+      Awaited<ReturnType<typeof factory.create>>,
+      "agent" | "registry" | "setPriority" | "setRefusalFallover" | "setRefusalSite"
+    >;
     handles: SessionRecordHandles;
     /** The run's capture flush (`captureHandle.flushNow`). */
     flush: () => Promise<void>;
@@ -6113,6 +6154,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       registry: args.created.registry,
       setPriority: args.created.setPriority,
       setRefusalFallover: args.created.setRefusalFallover,
+      setRefusalSite: args.created.setRefusalSite,
       flush: args.flush,
       logger,
     });

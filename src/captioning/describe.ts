@@ -1,4 +1,6 @@
 import type { RawTokenUsage } from "../agent/usage.js";
+import { isRefusalSignal } from "../agent/request-retry.js";
+import type { FetchRefusalSignal } from "../refusals/fetch.js";
 
 export type MediaModality = "image" | "video" | "audio";
 
@@ -79,6 +81,25 @@ interface ResponsesUsageBlock {
 /** A caption cannot be used; retrying another model is not an outage recovery. */
 export class CaptionContentError extends Error {}
 
+/**
+ * The provider refused the caption (a refusal stop reason or a structured
+ * refusal, spec REFUSAL-HANDLING §5.1). Still a content failure (no outage
+ * fallover); refusal rules for site `caption` may re-run it on another model.
+ * Carries the attempt's usage so the refused call is billed.
+ */
+export class CaptionRefusalError extends CaptionContentError {
+  readonly refusal: FetchRefusalSignal;
+  constructor(
+    message: string,
+    refusal: FetchRefusalSignal,
+    readonly usage: RawTokenUsage | null,
+  ) {
+    super(message);
+    this.name = "CaptionRefusalError";
+    this.refusal = refusal;
+  }
+}
+
 interface ResponsesCaptionResult {
   status?: string;
   model?: string;
@@ -105,6 +126,15 @@ function responsesCaption(result: ResponsesCaptionResult, modelId: string): Desc
   if (result.status === "failed") {
     throw new Error(`Caption API failed: ${result.error?.message ?? "Responses request failed"}`);
   }
+  const wireModel = result.model ?? modelId;
+  if (result.status === "incomplete" && result.incomplete_details?.reason && isRefusalSignal(`incomplete.${result.incomplete_details.reason}`, undefined)) {
+    const rawStopReason = `incomplete.${result.incomplete_details.reason}`;
+    throw new CaptionRefusalError(
+      `Caption inference was refused: ${rawStopReason}`,
+      { rawStopReason, wireModel },
+      parseResponsesUsage(result.usage),
+    );
+  }
   if (result.status && result.status !== "completed") {
     throw new CaptionContentError(
       `Caption inference returned ${result.status} response: ${result.incomplete_details?.reason ?? "no complete caption"}`,
@@ -115,7 +145,12 @@ function responsesCaption(result: ResponsesCaptionResult, modelId: string): Desc
     if (item.type !== "message" || item.role !== "assistant") continue;
     for (const block of item.content ?? []) {
       if (block.type === "refusal") {
-        throw new CaptionContentError(`Caption inference was refused: ${(block.refusal ?? "").slice(0, 500)}`);
+        const text = (block.refusal ?? "").slice(0, 500);
+        throw new CaptionRefusalError(
+          `Caption inference was refused: ${text}`,
+          { rawStopReason: "refusal", explanation: text, wireModel },
+          parseResponsesUsage(result.usage),
+        );
       }
       if (block.type === "output_text" && typeof block.text === "string") parts.push(block.text);
     }
@@ -216,10 +251,28 @@ export async function describeMedia(options: DescribeMediaOptions): Promise<Desc
     }
 
     const result = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string | Array<{ type: string; text?: string }> } }>;
+      choices?: Array<{
+        finish_reason?: string | null;
+        message?: { content?: string | Array<{ type: string; text?: string }>; refusal?: string | null };
+      }>;
       model?: string;
       usage?: OpenAiUsageBlock;
     };
+
+    // A refusal stop (`content_filter`, a Google safety stop through a compatible
+    // gateway) or a structured `message.refusal`: never a caption, whatever text
+    // came with it (spec REFUSAL-HANDLING §5.1, §8.2).
+    const finishReason = result.choices?.[0]?.finish_reason ?? undefined;
+    const structuredRefusal = result.choices?.[0]?.message?.refusal;
+    if ((finishReason && isRefusalSignal(finishReason, undefined)) || (typeof structuredRefusal === "string" && structuredRefusal.length > 0)) {
+      const rawStopReason = finishReason && isRefusalSignal(finishReason, undefined) ? finishReason : "refusal";
+      const explanation = typeof structuredRefusal === "string" ? structuredRefusal.slice(0, 500) : undefined;
+      throw new CaptionRefusalError(
+        `Caption inference was refused: ${explanation ?? rawStopReason}`,
+        { rawStopReason, explanation, wireModel: result.model ?? options.model.id },
+        parseOpenAiUsage(result.usage),
+      );
+    }
 
     const choice = result.choices?.[0]?.message?.content;
     let text: string;

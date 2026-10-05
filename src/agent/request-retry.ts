@@ -162,6 +162,10 @@ export interface RequestRetryContext {
    * terminal errors (their usage is stub zeros) nor for discarded attempts —
    * this is the single authoritative usage capture point, distinct from the
    * observe-only `onAttemptEvent` tap (which also fires for discarded attempts).
+   * The one exception is a REFUSED attempt that carries provider usage (spec
+   * REFUSAL-HANDLING §10.3): the provider billed it, so it is fired with the
+   * refusal's error message (`stopReason: "error"`) whether the request then
+   * falls over, is redone, or fails.
    */
   onRequestCommitted?: (message: AssistantMessage) => void;
   /**
@@ -230,6 +234,41 @@ export interface RequestRetryContext {
    * session-record turn turns it off (spec SESSION-RECORDS §3.2).
    */
   refusalFallover?: () => boolean;
+  /**
+   * Refusal rules (spec REFUSAL-HANDLING §8.1): asked on every refused attempt,
+   * after the refusing member was added to the request's `refused` set. Its
+   * decision replaces the implicit chain fallover: `redo` re-issues the request
+   * at once (the hook has pinned the session to a rule entry, which the session's
+   * stream fn dispatches from now on), `fallover` is the implicit fallover,
+   * `fail` surfaces the refusal terminally, `withhold` settles the request as a
+   * clean `NO_REPLY` turn with no failure. Absent or throwing = today's implicit
+   * fallover. `log` fields join the `llm_refusal` line.
+   */
+  onRefusal?: (info: RefusalAttemptInfo) => RefusalDecision;
+}
+
+/** What Layer 0 knows about a refused attempt (see {@link RequestRetryContext.onRefusal}). */
+export interface RefusalAttemptInfo {
+  /** The refused attempt's terminal message: raw stop reason, category, usage, wire model. */
+  message: AssistantMessage | undefined;
+  /** Logical id of the member that refused (from `getServedModel`). */
+  servedModel: string | undefined;
+  /** 1-based attempt number within the request. */
+  attempt: number;
+  /** Health keys of every member that refused this request so far (the refusing one included). */
+  refusedKeys: ReadonlySet<string>;
+  /** Whether the implicit chain fallover would move this request to another member. */
+  implicitFallover: boolean;
+  /** Whether the wall-clock budget still allows re-issuing the request. */
+  canReissue: boolean;
+}
+
+export type RefusalAction = "fallover" | "redo" | "fail" | "withhold";
+
+export interface RefusalDecision {
+  action: RefusalAction;
+  /** Extra fields for the `llm_refusal` log line (check code, rule, outcome, target). */
+  log?: Record<string, unknown>;
 }
 
 /**
@@ -972,27 +1011,70 @@ export function withRequestRetry(
             // spent; otherwise it fails at once, terminally — the wall-clock
             // loop never re-runs it.
             if (attemptState.servedKey !== undefined) attemptState.refused.add(attemptState.servedKey);
-            const fallover =
-              refusalFallover &&
-              attemptState.refusalFalloverAvailable &&
-              !budgetExpired &&
-              Date.now() < deadline;
+            const canReissue = !budgetExpired && Date.now() < deadline;
+            const fallover = refusalFallover && attemptState.refusalFalloverAvailable && canReissue;
+            const servedModel = ctx.getServedModel?.();
+            // The provider billed the refused attempt: its usage reaches the
+            // ledger like a committed request's (spec REFUSAL-HANDLING §10.3).
+            if (failure?.usage && (failure.usage.totalTokens > 0 || (failure.usage.cost?.total ?? 0) > 0)) {
+              if (attemptRecord) {
+                attemptRecord.usage = {
+                  input: failure.usage.input,
+                  output: failure.usage.output,
+                  cacheRead: failure.usage.cacheRead,
+                  cacheWrite: failure.usage.cacheWrite,
+                  totalTokens: failure.usage.totalTokens,
+                  cost: failure.usage.cost?.total ?? 0,
+                };
+              }
+              try {
+                ctx.onRequestCommitted?.(failure);
+              } catch {
+                /* best-effort: the capture hook can never affect the run */
+              }
+            }
+            // Refusal rules (spec REFUSAL-HANDLING §8.1): a matching rule
+            // replaces the implicit fallover; no rule keeps it.
+            let decision: RefusalDecision = { action: fallover ? "fallover" : "fail" };
+            if (ctx.onRefusal) {
+              try {
+                decision = ctx.onRefusal({
+                  message: failure,
+                  servedModel,
+                  attempt: attempt + 1,
+                  refusedKeys: attemptState.refused,
+                  implicitFallover: fallover,
+                  canReissue,
+                });
+              } catch {
+                /* a throwing hook keeps the implicit behaviour */
+              }
+            }
             const explanation = failure?.errorMessage ?? "";
             ctx.logger?.warn("llm_refusal", {
               sessionId: ctx.sessionId,
               timelineKey: ctx.timelineKey,
               sessionType: ctx.sessionType,
               group: ctx.group,
-              member: ctx.getServedModel?.(),
+              member: servedModel,
               model: failure?.model ?? (model as { id?: string }).id,
               rawStopReason: failure?.rawStopReason,
               explanation: explanation.length > 300 ? `${explanation.slice(0, 300)}…` : explanation,
               attempt: attempt + 1,
-              fallover,
+              fallover: decision.action === "fallover",
+              ...(decision.log ?? {}),
             });
-            if (fallover) {
+            if ((decision.action === "fallover" || decision.action === "redo") && canReissue) {
               tapDiscarded(attempt + 1, `refused: ${errorEvent.error?.errorMessage ?? "refusal"}`);
               continue;
+            }
+            if (decision.action === "withhold") {
+              // The rule's entries are exhausted and the operator chose to send
+              // nothing: the request settles as a clean NO_REPLY turn (no failure,
+              // no notice), so the run ends the way an explicit NO_REPLY does.
+              tapDiscarded(attempt + 1, `refused: ${errorEvent.error?.errorMessage ?? "refusal"}`);
+              flush(outer, withheldTurnEvents(model, failure));
+              return;
             }
             surface(errorEvent, verdict);
             return;
@@ -1049,6 +1131,34 @@ function tagErrorEvent(
     ...event,
     error: { ...event.error, errorMessage: tagLlmRequestError(event.error?.errorMessage, resolved) },
   };
+}
+
+/**
+ * The events of a harness-written `NO_REPLY` turn that stands in for a refused
+ * request whose refusal rule withholds the reply (spec REFUSAL-HANDLING §8.2
+ * `on_exhausted = "withhold"`). Zero usage: the refused attempts were already
+ * billed through `onRequestCommitted`. Marked `harness: { kind:
+ * "refusal_withheld" }` so it is never mistaken for the model's own output.
+ */
+function withheldTurnEvents(
+  model: Parameters<StreamFn>[0],
+  refused: AssistantMessage | undefined,
+): AssistantMessageEvent[] {
+  const message = {
+    role: "assistant",
+    content: [{ type: "text", text: "NO_REPLY" }],
+    api: refused?.api ?? model.api,
+    provider: refused?.provider ?? model.provider ?? "unknown",
+    model: refused?.model ?? model.id,
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: "stop",
+    timestamp: Date.now(),
+    harness: { kind: "refusal_withheld" },
+  } as AssistantMessage;
+  return [
+    { type: "start", partial: message },
+    { type: "done", reason: "stop", message },
+  ];
 }
 
 /** Build a terminal `error` event mirroring the shape pi-ai providers emit. */

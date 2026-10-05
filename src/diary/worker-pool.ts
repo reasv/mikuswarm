@@ -438,6 +438,9 @@ export class DiaryWorkerPool {
       instruction;
 
     let agentError: unknown;
+    // Set when a refusal rule's entries were all exhausted (spec REFUSAL-HANDLING
+    // §8.2): the entry is not written and the job is not re-run.
+    let refusalExhausted = false;
     try {
       // Diary-range build (spec DIARY-CONTEXT-PARITY §3): the summarize-style
       // prefix — system prompt, prior chunks' summaries bounded at the range
@@ -446,7 +449,7 @@ export class DiaryWorkerPool {
       // turn, exactly like the summarize worker's cutoff build. The build also
       // yields a real snapshot, so diary sessions gain context_snapshot_json
       // observability parity with summarize sessions.
-      const { agent, finalTurn, snapshot, tokenEstimate, usage } = await factory.create(syntheticSession, [diaryTool], {
+      const { agent, finalTurn, snapshot, tokenEstimate, usage, refusal } = await factory.create(syntheticSession, [diaryTool], {
         diaryRange: {
           earliestTimestamp: job.earliestTimestamp,
           latestTimestamp: job.latestTimestamp,
@@ -502,6 +505,7 @@ export class DiaryWorkerPool {
         // can no longer reach this point — absorbed (unbounded) at Layer-0.
         assertRunSettledCleanly(agent);
       } catch (err) {
+        refusalExhausted = refusal?.lastHardOutcome() === "exhausted_no_output";
         try {
           await capture.flushNow();
         } catch (flushErr) {
@@ -579,7 +583,7 @@ export class DiaryWorkerPool {
     });
 
     try {
-      if (job.attempts <= maxRetries) {
+      if (job.attempts <= maxRetries && !refusalExhausted) {
         await storage.setDiaryStatus(job.summaryId, "pending");
         this.emit(job, "retried", "pending");
       } else {
