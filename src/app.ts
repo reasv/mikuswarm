@@ -148,6 +148,8 @@ import {
   type RecordsCandidate,
 } from "./decisions/index.js";
 import { buildCheckCatalogue } from "./checks/catalogue.js";
+import { CheckEvaluator } from "./checks/evaluator.js";
+import { createBackgroundChecks, type BackgroundChecks } from "./checks/gate.js";
 import { validateRefusalRules } from "./refusals/rules.js";
 import type { SyntheticCallSpec } from "./agent/synthetic-calls.js";
 import { SauceNaoRateLimiter } from "./saucenao/rate-limiter.js";
@@ -1505,6 +1507,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     logger,
   });
 
+  // Output checks of internal jobs (spec REFUSAL-HANDLING §5.2.3–4), bound once
+  // the decision engine exists (below); the caption pool reads it per caption.
+  const backgroundChecksRef: { current?: BackgroundChecks } = {};
   const captionPool = new CaptionWorkerPool({
     storage,
     clients: captionClients,
@@ -1555,6 +1560,15 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         "default",
       config.models,
     ).map((m) => m.logicalId),
+    onCaptioned: (asset, result) =>
+      void backgroundChecksRef.current?.artifact({
+        site: "caption",
+        kind: "caption",
+        text: result.caption,
+        timelineKey: asset.timeline_key ?? null,
+        servedModel: result.logicalModelId,
+        wireModel: result.model,
+      }),
     logger,
   });
 
@@ -1888,6 +1902,40 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     });
   }
 
+  // Output checks (spec REFUSAL-HANDLING §5–§6): the one catalogue (R2), pattern
+  // checks always, judged checks through the decision engine when the checks
+  // point is on for the agent. A payee with no budget left is never judged.
+  const checkEvaluator = new CheckEvaluator({
+    catalogue: checkCatalogue,
+    engine: decisionEngine,
+    config,
+    storage,
+    isPayeeOverBudget: (sessionId) => {
+      const entry = userLimitResolutions.get(sessionId);
+      if (!entry || !userLimitEngine) return false;
+      const headroom = userLimitEngine.totalHeadroom(entry.resolution);
+      return headroom !== undefined && headroom <= 0;
+    },
+    logger: logger.child("checks"),
+  });
+  backgroundChecksRef.current = createBackgroundChecks(checkEvaluator, {
+    agentFor: agentNameForTimeline,
+    logger: logger.child("checks"),
+  });
+  // The check state's request and recent chat (spec §5.5), read through the same
+  // timeline query and hydration the routing point uses.
+  const checkChatState = (session: AgentSessionRecord, recentMessages: number) => {
+    const stored = timeline.getById(session.trigger.event.id) ?? session.trigger.event;
+    const latest = recentMessages > 0
+      ? timeline.query({ timelineKey: session.timelineKey, limit: recentMessages + 1 })
+      : [];
+    const [trigger, ...recent] = hydrateEvents(storage, [stored, ...latest.filter((e) => e.id !== stored.id)]);
+    return {
+      request: trigger ? [toTranscriptMessage(trigger, 1200)] : [],
+      recent: recent.slice(-recentMessages).map((event) => toTranscriptMessage(event, 400)),
+    };
+  };
+
   // Shared in-flight registry + record-turn driver (spec SESSION-RECORDS §3).
   const sessionRecordService = new SessionRecordService();
 
@@ -1926,6 +1974,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // mcpPool.start() below (same Map object reference — by the time create()
     // runs at runtime it is fully populated).
     mcpToolServerMap,
+    // The output gate of every chat-lane session (spec REFUSAL-HANDLING §6).
+    outputChecks: { evaluator: checkEvaluator, chat: checkChatState, logger: logger.child("checks") },
   });
 
   // ---------------------------------------------------------------------------
@@ -2410,6 +2460,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // §10b mirror check: evaluated lazily via the mutable ref so the pool
         // can be constructed before mirrorWorker exists.
         isMirroredTimeline: (tk) => mirrorWorkerRef?.isMirroredTimeline(tk) ?? false,
+        outputChecks: backgroundChecksRef.current,
         onComplete: (jobId, summaryId) => {
           logger.info("summarization_job_complete", { jobId, summaryId });
           // The job is terminal — drop any sticky escalation pinned to it (§5.5).
@@ -2685,6 +2736,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // Channel visibility resolver (ARCHITECTURE.md §9h): terminalize jobs
         // for channels whose mode is not "shared" as `excluded`.
         visibilityResolver,
+        outputChecks: backgroundChecksRef.current,
         logger: logger.child("diary"),
       })
     : null;
@@ -5882,6 +5934,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       provider: providers.get(target.provider),
       target,
       suppressTyping: record.sessionType === (config.proactive?.session_type ?? "proactive"),
+      endings: created?.gate,
     });
     try {
       const result = await runner.run(
@@ -6094,7 +6147,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     timelineKey: string;
     sessionType: string;
     inbound: InboundChatEvent;
-    created: Pick<Awaited<ReturnType<typeof factory.create>>, "agent" | "registry" | "setPriority" | "setRefusalFallover">;
+    created: Pick<Awaited<ReturnType<typeof factory.create>>, "agent" | "registry" | "setPriority" | "setRefusalFallover" | "gate">;
     handles: SessionRecordHandles;
     /** The run's capture flush (`captureHandle.flushNow`). */
     flush: () => Promise<void>;
@@ -6114,6 +6167,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       setPriority: args.created.setPriority,
       setRefusalFallover: args.created.setRefusalFallover,
       flush: args.flush,
+      // The written record is judged as an artifact (spec REFUSAL-HANDLING §5.2.3).
+      onRecordWritten: (text) => void args.created.gate?.judgeArtifact("session_record", text, { site: "record_turn" }),
       logger,
     });
   }
@@ -6660,7 +6715,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       logger,
     });
     const costWarnUnsub = wireCostBudgetWarner(record.id, record.sessionType, usage, costCeiling);
-    const runner = new SessionRunner({ provider: providers.get(target.provider), target, suppressTyping: false });
+    const runner = new SessionRunner({ provider: providers.get(target.provider), target, suppressTyping: false, endings: created?.gate });
     // The success path releases the slot itself, before the record turn (as in
     // launchSession); the .finally drains only on the error path.
     let resumeDrainCalled = false;
@@ -7133,7 +7188,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // Soft cost-budget interjection (spec SESSION-COST-LIMITS §2.1); torn down in
     // the run's .finally alongside the capture handle.
     const costWarnUnsub = wireCostBudgetWarner(session.id, session.sessionType, usage, costCeiling);
-    const runner = new SessionRunner({ provider: providers.get(target.provider), target, suppressTyping: proactive });
+    const runner = new SessionRunner({ provider: providers.get(target.provider), target, suppressTyping: proactive, endings: created?.gate });
 
     // drainCalled: the success path releases the timeline slot itself (before the
     // record turn), so the .finally drains only on the error path.

@@ -169,6 +169,11 @@ export interface StartRecordTurnParams {
    * transcript, a reply injecting the record) sees the finished turn. Never throws.
    */
   flush?: () => Promise<void>;
+  /**
+   * Told of every written record (its text): the output gate judges it as an
+   * artifact off the turn's path (spec REFUSAL-HANDLING §5.2.3). Never awaited.
+   */
+  onRecordWritten?: (text: string) => void;
   logger: Logger;
 }
 
@@ -422,5 +427,10 @@ export class SessionRecordService {
       modelId: served?.model,
       ...(buildsOn.length > 0 ? { buildsOn } : {}),
     });
+    try {
+      params.onRecordWritten?.(text);
+    } catch {
+      /* observe-only */
+    }
   }
 }

@@ -63,6 +63,25 @@ export interface SessionRunnerOptions {
    * meaningless — typing is simply never started.
    */
   suppressTyping?: boolean;
+  /**
+   * Endings without a send tool (spec REFUSAL-HANDLING §5.4): told when the run
+   * ends with the literal `NO_REPLY` text or with its forced-completion nudges
+   * exhausted (the `no_reply` call is judged by the tool itself). The output
+   * gate implements it; observe-only, it returns without waiting.
+   */
+  endings?: SessionEndingHook;
+}
+
+/** A run that ended without a send tool, as the runner reports it. */
+export interface SessionEnding {
+  /** `NO_REPLY` = the literal text marker; `exhausted` = the nudges ran out without a valid ending. */
+  kind: "NO_REPLY" | "exhausted";
+  /** Forced-completion nudges of this run. */
+  nudges: number;
+}
+
+export interface SessionEndingHook {
+  onEnding(ending: SessionEnding): void | Promise<void>;
 }
 
 // matrix-sdk sends typing notices to the homeserver with a fixed 4s server-side
@@ -151,6 +170,8 @@ export class SessionRunner {
         throwIfLlmFailure(agent, lifecycle);
       }
 
+      await reportEnding(this.options.endings, agent, retries, lifecycle);
+
       const noReply = !isTerminallyValid(agent.state.messages) ||
         (isExplicitNoReply(agent.state.messages) && !hasSendMessageCall(agent.state.messages));
       return {
@@ -167,6 +188,36 @@ export class SessionRunner {
         await this.options.provider.setTyping(this.options.target, false).catch(() => undefined);
       }
     }
+  }
+}
+
+/**
+ * Tell the ending hook about a run that ended without a send tool: the literal
+ * `NO_REPLY` text, or nudges exhausted. An interrupted or aborted run, a
+ * `no_reply` call and a send are not reported. Never throws.
+ */
+async function reportEnding(
+  hook: SessionEndingHook | undefined,
+  agent: Agent,
+  nudges: number,
+  lifecycle: SessionRunLifecycle | undefined,
+): Promise<void> {
+  if (!hook || lifecycle?.isInterrupted() || wasAborted(agent.state.messages)) return;
+  const messages = agent.state.messages;
+  let kind: SessionEnding["kind"];
+  if (!isTerminallyValid(messages)) {
+    kind = "exhausted";
+  } else {
+    const last = findLastAssistantMessage(messages);
+    const blocks = (last?.content ?? []) as Array<{ type: string; name?: string }>;
+    const toolEnded = blocks.some((b) => b.type === "toolCall" && (b.name === "send_message" || b.name === "no_reply"));
+    if (toolEnded || extractLastAssistantText(messages).trim() !== "NO_REPLY") return;
+    kind = "NO_REPLY";
+  }
+  try {
+    await hook.onEnding({ kind, nudges });
+  } catch {
+    /* observe-only: the hook can never affect the run */
   }
 }
 

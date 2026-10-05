@@ -15,6 +15,7 @@ import { SummaryDraft, createSummaryTool } from "../tools/index.js";
 import { estimateTokens, truncateToTokens } from "../context/index.js";
 import { attachSessionCapture } from "../agent/session-capture.js";
 import { evaluateCondensation } from "./evaluator.js";
+import type { BackgroundChecks } from "../checks/gate.js";
 
 export interface SummarizationWorkerPoolOptions {
   storage: Storage;
@@ -37,6 +38,12 @@ export interface SummarizationWorkerPoolOptions {
    * Threaded into evaluateCondensation so it can skip mirrored timelines.
    */
   isMirroredTimeline?: (timelineKey: string) => boolean;
+  /**
+   * Output checks (spec REFUSAL-HANDLING §5.2): the summary draft at finalize
+   * (artifact) and a failed rollout before its re-run, judged off the job's
+   * path. Observe-only; absent = no checks.
+   */
+  outputChecks?: BackgroundChecks;
   logger: Logger;
 }
 
@@ -364,6 +371,8 @@ export class SummarizationWorkerPool {
     });
 
     let agentError: unknown;
+    // The run's messages, kept for the rollout check of a failed run.
+    let runMessages: readonly unknown[] | undefined;
     try {
       // Input-addressed generation (spec SUMMARIZATION-JOB-INPUT-INTEGRITY
       // §3.1): a condense job renders its DECLARED child summaries directly —
@@ -491,6 +500,7 @@ export class SummarizationWorkerPool {
       } finally {
         this.activeAgents.delete(agent);
         capture.detach();
+        runMessages = agent.state.messages;
       }
     } catch (err) {
       agentError = err;
@@ -565,6 +575,11 @@ export class SummarizationWorkerPool {
         tokenCount,
         elapsed: Date.now() - started,
       });
+      void this.options.outputChecks?.artifact({
+        ...this.checkScope(job, syntheticSession, runMessages),
+        kind: job.level === 1 ? "summary" : "condense",
+        text: content,
+      });
       this.options.onComplete(job.id, summaryId);
       this.emit(job, "completed", "complete");
       await this.runCondensation(job.timelineKey, job.level);
@@ -591,6 +606,15 @@ export class SummarizationWorkerPool {
       attempt: job.attempts,
       error: errMsg,
     });
+    // A run that produced no summary is judged for a refusal before its re-run
+    // (spec REFUSAL-HANDLING §5.2.4); observe-only, the re-run is unchanged.
+    if (runMessages && runMessages.length > 0) {
+      void this.options.outputChecks?.rollout({
+        ...this.checkScope(job, syntheticSession, runMessages),
+        kind: job.level === 1 ? "summary" : "condense",
+        messages: runMessages,
+      });
+    }
 
     try {
       if (job.attempts <= job.maxRetries) {
@@ -624,6 +648,20 @@ export class SummarizationWorkerPool {
       this.options.onError(job.id, new Error(errMsg));
       this.emit(job, "failed", "failed");
     }
+  }
+
+  /** Where an output check of this job's run is attributed (spec REFUSAL-HANDLING §10.1). */
+  private checkScope(job: SummarizationJob, session: AgentSessionRecord, messages: readonly unknown[] | undefined) {
+    const lastAssistant = [...(messages ?? [])]
+      .reverse()
+      .find((m) => (m as { role?: string }).role === "assistant") as { model?: unknown } | undefined;
+    return {
+      site: job.level === 1 ? "summarize" : "condense",
+      timelineKey: job.timelineKey,
+      sessionId: session.id,
+      sessionType: session.sessionType,
+      ...(typeof lastAssistant?.model === "string" ? { wireModel: lastAssistant.model } : {}),
+    };
   }
 
   /** §10 truncation fallback: salvage the best-effort draft or give up. */

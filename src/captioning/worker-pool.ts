@@ -2,7 +2,7 @@ import type { MediaAssetRow, Storage } from "../storage/index.js";
 import type { InferenceClient } from "./inference-client.js";
 import type { MediaModality } from "./describe.js";
 import type { PipelineActivityBus, PipelineActivityKind, PipelineStats } from "../observability/pipelines.js";
-import { CaptionWorker } from "./worker.js";
+import { CaptionWorker, type CaptionWorkerOptions } from "./worker.js";
 import type { BudgetHooks } from "../budget/index.js";
 
 export interface CaptionConfig {
@@ -70,6 +70,8 @@ export interface CaptionWorkerPoolOptions {
    * list = no gate (no budgeting).
    */
   captionModelIds?: string[];
+  /** Output checks on each persisted caption (spec REFUSAL-HANDLING §5.2.3); see CaptionWorkerOptions. */
+  onCaptioned?: CaptionWorkerOptions["onCaptioned"];
   logger: { info(msg: string, data?: Record<string, unknown>): void; warn(msg: string, data?: Record<string, unknown>): void; error(msg: string, data?: Record<string, unknown>): void };
 }
 
@@ -224,6 +226,7 @@ export class CaptionWorkerPool {
               costUsd: result.cost ?? 0,
             })
         : undefined,
+      ...(this.options.onCaptioned ? { onCaptioned: this.options.onCaptioned } : {}),
     });
 
     for (const asset of claimed) {
