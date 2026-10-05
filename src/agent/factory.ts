@@ -462,6 +462,13 @@ export interface CreatedAgent {
    * agent. Undefined for resume / live / proactive / diary builds.
    */
   renderedInputIds?: string[];
+  /**
+   * The per-session dynamic-tool registry, when dynamic tools are enabled
+   * (spec DYNAMIC-TOOL-LOADING §7). Callers can use this to load harnessOnly
+   * tools (e.g. session_record_tool) before the record-turn prompt without
+   * re-building tools. Undefined when dynamic tools are off.
+   */
+  registry?: DynamicToolRegistry;
 }
 
 export class AgentSessionFactory {
@@ -2017,6 +2024,9 @@ export class AgentSessionFactory {
       richTokens: snapshotRichTokens,
       usage,
       renderedInputIds,
+      // Exposed so callers can load harnessOnly tools (e.g. session_record_tool)
+      // via registry.load() before the record turn prompt without re-building tools.
+      registry,
     };
   }
 
@@ -2325,6 +2335,13 @@ export class AgentSessionFactory {
         if (!skill.tools) continue;
         for (const name of matchToolPatterns(names, skill.tools)) immediate.add(name);
       }
+    }
+    // harnessOnly tools must never appear in the initial wire set: they are not
+    // for the agent (session_record_tool is gate-blocked during a normal run)
+    // and placing them in `immediate` would make them visible before the record
+    // turn's explicit registry.load() step.
+    for (const d of defs) {
+      if ((d as { harnessOnly?: boolean }).harnessOnly) immediate.delete(d.name);
     }
     const loaders: ToolDefinitionLike[] = [];
     if (!workspace || workspace.skills.listed.length > 0) loaders.push(loadSkillToolDefinition());
