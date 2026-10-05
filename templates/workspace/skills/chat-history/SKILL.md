@@ -1,6 +1,6 @@
 ---
 name: chat-history
-description: "Catch up on a period you (or someone) were away (`recap`) or profile a user's activity over time (`user_activity`). Also loads channel roster and overlap tools (`list_members`, `list_channels`). Load whenever someone asks \"what did I miss?\", about a user's presence/habits, who's in a channel, or for membership comparisons. Keyword search (`search_messages`, `search_summaries`) and summary expansion (`expand_summary`) are always loaded and need no skill."
+description: "Catch up on a period you (or someone) were away (`recap`) or profile a user's activity over time (`user_activity`). Also loads channel roster and overlap tools (`list_members`, `list_channels`). Load whenever someone asks 'what did I miss?', about a user's presence/habits, who's in a channel, or for membership comparisons. Keyword search (`search_messages`, `search_summaries`) and summary expansion (`expand_summary`) are always loaded and need no skill."
 tools:
   - recap
   - user_activity

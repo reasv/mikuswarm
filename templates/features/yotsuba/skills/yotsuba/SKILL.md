@@ -1,6 +1,6 @@
 ---
 name: yotsuba
-description: "4chan: someone drops a boards.4chan.org link or asks what a board or general is saying (\"what's /v/ saying about the new game\", \"is there an /a/ thread for this show\", \"check the /lmg/ thread\", \"summarize this thread\", \"what did anons reply to this\", \"post the image from >>123\"). Read threads, search a board's catalog, follow reply chains, and view or download images, videos and PDFs with `yotsuba`."
+description: "4chan: someone drops a boards.4chan.org link or asks what a board or general is saying ('what's /v/ saying about the new game', 'is there an /a/ thread for this show', 'check the /lmg/ thread', 'summarize this thread', 'what did anons reply to this', 'post the image from >>123'). Read threads, search a board's catalog, follow reply chains, and view or download images, videos and PDFs with `yotsuba`."
 tools:
   - yotsuba
 ---
