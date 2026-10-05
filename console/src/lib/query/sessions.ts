@@ -15,7 +15,7 @@ export function sessionQuery(
 	id: () => string | null,
 	opts: {
 		/** True while the record turn may still append to the transcript (SESSION-RECORDS §3.2). */
-		recordPending?: () => boolean;
+		recordPending?: (data: Awaited<ReturnType<typeof getSession>> | undefined) => boolean;
 	} = {}
 ) {
 	return createQuery(() => {
@@ -27,7 +27,7 @@ export function sessionQuery(
 			refetchInterval: (query) => {
 				const base = sessionPollInterval(query.state.data);
 				if (base !== false) return base;
-				return opts.recordPending?.() ? RECORD_PENDING_POLL_MS : false;
+				return opts.recordPending?.(query.state.data) ? RECORD_PENDING_POLL_MS : false;
 			}
 		};
 	});

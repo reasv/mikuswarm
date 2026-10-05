@@ -36,14 +36,16 @@
 	// The session, its record and its decisions (spec SESSION-RECORDS §8). The
 	// record turn runs after the session completes, so all three keep polling
 	// until it has settled (bounded; see `recordTurnPending`).
+	// The session query's refetchInterval can run while `session` itself is still
+	// being created, so it gets the session data from the query and reaches the
+	// record query through a late-bound holder (never through the consts below).
+	let recordRef: { data?: { sessionRecord: unknown } } | undefined;
 	const session = sessionQuery(() => activeId, {
-		recordPending: () => recordPending()
+		recordPending: (data) => recordTurnPending(data, recordRef?.data?.sessionRecord != null)
 	});
 	const record = sessionRecordQuery(() => activeId, () => session.data);
+	recordRef = record;
 	const decisions = sessionDecisionsQuery(() => activeId, () => session.data);
-	function recordPending(): boolean {
-		return recordTurnPending(session.data, record.data?.sessionRecord != null);
-	}
 	const decisionEvaluations = $derived(decisions.data ? [...decisions.data.evaluations] : []);
 
 	let stopping = $state(false);
