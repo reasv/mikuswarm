@@ -42,6 +42,7 @@ function toCaptionModelConfig(config: ModelChainEntry["config"]): CaptionModelCo
     provider: config.provider ?? null, api: config.api,
     reasoning_effort: level === undefined ? undefined :
       config.thinking_level_map?.[level] ?? (level === "off" ? "none" : level),
+    openrouter_routing: config.compat?.openrouter_routing,
   };
 }
 

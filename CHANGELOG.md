@@ -180,6 +180,12 @@ Unreleased section; it is not part of any release's notes.
 
 ### Fixed
 
+- **Caption calls ignored `compat.openrouter_routing`.** Media captioning built
+  its own request and never sent the model's OpenRouter `provider` object, so a
+  caption model set to `{ zdr = true }` (or pinned with `order`/`only`) was still
+  routed to any provider. Chat Completions caption calls now send it, the same
+  way agent sessions do.
+
 - **Summary and diary editor errors were recorded as successful tool calls.**
   `summary_tool` and `diary_tool` returned their failures (token budget overage,
   missing diary header, `old_str` misses) instead of throwing, so the transcript

@@ -203,3 +203,23 @@ test("Incomplete Responses captions preserve model health and do not fall over",
     });
   });
 });
+
+test("Chat Completions caption sends the member's openrouter_routing as the provider object", async () => {
+  await withImage(async (file) => {
+    const bodies: Record<string, any>[] = [];
+    await withServer((request, res) => {
+      assert.equal(request.url, "/chat/completions");
+      bodies.push(request.body);
+      res.end(JSON.stringify({ choices: [{ message: { content: "A square." } }] }));
+    }, async (url) => {
+      const routed = member(url, "routed", "openai-completions");
+      routed.config.compat = { openrouter_routing: { zdr: true, only: ["google-vertex"] } };
+      for (const chain of [[routed], [member(url, "plain", "openai-completions")]]) {
+        const client = new InferenceClient({ modality: "image", prompt: "describe", maxChars: 100, maxTokens: 1024, chain });
+        assert.equal((await client.caption({ filePath: file, mimeType: "image/png", filename: "image.png" })).caption, "A square.");
+      }
+    });
+    assert.deepEqual(bodies[0]?.provider, { zdr: true, only: ["google-vertex"] });
+    assert.equal("provider" in (bodies[1] ?? {}), false, "no routing configured sends no provider object");
+  });
+});

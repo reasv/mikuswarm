@@ -12,6 +12,12 @@ export interface CaptionModelConfig {
   api?: string;
   /** Configured thinking level after the model's wire-level remapping. */
   reasoning_effort?: string;
+  /**
+   * OpenRouter provider-routing table (the model's `compat.openrouter_routing`),
+   * sent verbatim as the Chat Completions `provider` object, e.g. `{ zdr = true }`.
+   * Absent or empty sends no `provider` object.
+   */
+  openrouter_routing?: Record<string, unknown>;
 }
 
 export interface DescribeMediaOptions {
@@ -151,6 +157,7 @@ export async function describeMedia(options: DescribeMediaOptions): Promise<Desc
     });
   }
 
+  const routing = options.model.openrouter_routing;
   const body = responses
     ? {
         model: options.model.id,
@@ -169,6 +176,7 @@ export async function describeMedia(options: DescribeMediaOptions): Promise<Desc
         model: options.model.id,
         messages: [{ role: "user", content: contentBlocks }],
         max_tokens: options.maxTokens,
+        ...(routing && Object.keys(routing).length > 0 ? { provider: routing } : {}),
       };
 
   const controller = new AbortController();
