@@ -19,8 +19,18 @@ export const DEFAULT_TIMEOUT_MS = 3000;
 export const DEFAULT_MIN_CONFIDENCE = 0.6;
 export const DEFAULT_STATE_MAX_TOKENS = 8000;
 
-export type DecisionPointName = "routing" | "records";
-export const DECISION_POINT_NAMES: readonly DecisionPointName[] = ["routing", "records"];
+export type DecisionPointName = "routing" | "records" | "checks";
+export const DECISION_POINT_NAMES: readonly DecisionPointName[] = ["routing", "records", "checks"];
+
+// `[decisions.checks]` defaults (spec REFUSAL-HANDLING §6.3, §6.4, §16.2).
+export const DEFAULT_CHECKS_SEND_DEADLINE_MS = 5000;
+export const DEFAULT_CHECKS_ENDING_DEADLINE_MS = 15_000;
+export const DEFAULT_CHECKS_BACKGROUND_DEADLINE_MS = 30_000;
+export const DEFAULT_CHECKS_STYLE_MIN_CHARS = 40;
+export const DEFAULT_CHECKS_REVISE_MAX_CONSECUTIVE = 2;
+export const DEFAULT_CHECKS_REVISE_MAX_PER_SESSION = 6;
+export const DEFAULT_CHECKS_RECENT_MESSAGES = 6;
+export const DEFAULT_CHECKS_THINKING_TAIL_TOKENS = 800;
 
 export function isDecisionModel(model: ModelConfig | undefined): boolean {
   return model?.api === DECISION_API;
@@ -107,6 +117,37 @@ export function pointSettings(decisions: DecisionsRawConfig, point: DecisionPoin
     }
   }
   return base;
+}
+
+/** The `[decisions.checks]` point-specific knobs, defaults applied. */
+export interface ChecksPointKnobs {
+  sendDeadlineMs: number;
+  endingDeadlineMs: number;
+  backgroundDeadlineMs: number;
+  styleMinChars: number;
+  reviseMaxConsecutive: number;
+  reviseMaxPerSession: number;
+  recentMessages: number;
+  thinkingTailTokens: number;
+}
+
+/**
+ * The gate's knobs for an effective decisions table (spec REFUSAL-HANDLING §6).
+ * Independent of whether the point is enabled: the revise bounds and the style
+ * length floor also apply to pattern-only checks, which need no decision model.
+ */
+export function checksPointKnobs(decisions: DecisionsRawConfig): ChecksPointKnobs {
+  const raw = decisions.checks ?? {};
+  return {
+    sendDeadlineMs: raw.send_deadline_ms ?? DEFAULT_CHECKS_SEND_DEADLINE_MS,
+    endingDeadlineMs: raw.ending_deadline_ms ?? DEFAULT_CHECKS_ENDING_DEADLINE_MS,
+    backgroundDeadlineMs: raw.background_deadline_ms ?? DEFAULT_CHECKS_BACKGROUND_DEADLINE_MS,
+    styleMinChars: raw.style_min_chars ?? DEFAULT_CHECKS_STYLE_MIN_CHARS,
+    reviseMaxConsecutive: raw.revise_max_consecutive ?? DEFAULT_CHECKS_REVISE_MAX_CONSECUTIVE,
+    reviseMaxPerSession: raw.revise_max_per_session ?? DEFAULT_CHECKS_REVISE_MAX_PER_SESSION,
+    recentMessages: raw.recent_messages ?? DEFAULT_CHECKS_RECENT_MESSAGES,
+    thinkingTailTokens: raw.thinking_tail_tokens ?? DEFAULT_CHECKS_THINKING_TAIL_TOKENS,
+  };
 }
 
 /**
@@ -326,6 +367,13 @@ function validateEffective(
     // confidence floor would be a second knob for the same number.
     throw new Error(
       `${where}.records.min_confidence is not used by the records point; set ${where}.records.inject_threshold instead`,
+    );
+  }
+  if (decisions.checks?.min_confidence !== undefined) {
+    // Check questions are `noul` questions with a per-question threshold
+    // ([checks.<code>.questions].threshold); there is no confidence floor.
+    throw new Error(
+      `${where}.checks.min_confidence is not used by the checks point; set each question's threshold under [checks.<code>] instead`,
     );
   }
   if (records?.enabled === true) {

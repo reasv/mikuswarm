@@ -147,6 +147,8 @@ import {
   DEFAULT_RECORDS_CANDIDATES,
   type RecordsCandidate,
 } from "./decisions/index.js";
+import { buildCheckCatalogue } from "./checks/catalogue.js";
+import { validateRefusalRules } from "./refusals/rules.js";
 import type { SyntheticCallSpec } from "./agent/synthetic-calls.js";
 import { SauceNaoRateLimiter } from "./saucenao/rate-limiter.js";
 import { setEgressGuardEnabled } from "./tools/ssrf.js";
@@ -309,6 +311,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       agentName ? config.agents?.[agentName]?.workspace_root : config.workspace?.root_dir ?? "./workspaces/miku",
     warn: (event, fields) => logger.warn(event, fields),
   });
+  // Check catalogue and refusal rules (spec REFUSAL-HANDLING §4, §8.1): built-in
+  // overrides, kind/remedy pairs, regexes, per-agent codes; rule models, agents,
+  // sites and reasons. Built once here; consumers read this catalogue.
+  const checkCatalogue = buildCheckCatalogue(config);
+  validateRefusalRules(config, checkCatalogue);
   // [fxtwitter.tool] cross-field sanity (same fail-fast convention): the
   // per-window default must fit under the per-window hard cap, which must fit
   // under the assembled-document cap — anything else is a config typo that

@@ -14,10 +14,12 @@ export {
   applyDecisionRateLimitGroups,
   DECISION_POINT_NAMES,
   calibratedThreshold,
+  checksPointKnobs,
   decisionsFor,
   isDecisionModel,
   pointSettings,
   validateDecisionsConfig,
+  type ChecksPointKnobs,
   type DecisionPointName,
   type PointSettings,
 } from "./config.js";

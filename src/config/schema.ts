@@ -581,6 +581,10 @@ const ModelSchema = StrictObject({
   // or per-session-type fallback config. The model itself is the implicit head, so
   // a chain of `["Y","Z"]` resolves as `[self, Y, Z]`.
   fallback: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  // Groups config entries by underlying model on the model behaviour page (spec
+  // REFUSAL-HANDLING §12.3): entries with the same family can be shown as one
+  // model. Entries without one stay separate.
+  family: Type.Optional(Type.String({ minLength: 1 })),
   id: Type.String({ minLength: 1 }),
   // pi-ai provider string. Besides naming the upstream, it drives the OAI
   // provider's compat AUTO-DETECTION (request dialect): e.g. "together" turns
@@ -1056,6 +1060,98 @@ const DecisionRecordsSchema = StrictObject({
   max_injected: Type.Optional(Type.Integer({ minimum: 0, maximum: 10 })),
 });
 
+// The output gate's decision point (spec REFUSAL-HANDLING §6): judged checks at
+// every checkpoint. Runs only when `[decisions].enabled` AND this point's
+// `enabled` are true. Defaults live in src/decisions/config.ts.
+const DecisionChecksSchema = StrictObject({
+  ...DecisionPointCommonFields,
+  // Fail-open deadlines (timeouts, not targets): past them the output proceeds
+  // unjudged and the miss is counted. Defaults 5000 / 15000 / 30000.
+  send_deadline_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  ending_deadline_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  background_deadline_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  // Style checks skip messages shorter than this (pattern-only checks ignore it). Default 40.
+  style_min_chars: Type.Optional(Type.Integer({ minimum: 0 })),
+  // Revise bounds: rejections of one message, and per session. Defaults 2 / 6.
+  revise_max_consecutive: Type.Optional(Type.Integer({ minimum: 0 })),
+  revise_max_per_session: Type.Optional(Type.Integer({ minimum: 0 })),
+  // Recent chat messages in the judged state. Default 6.
+  recent_messages: Type.Optional(Type.Integer({ minimum: 0, maximum: 50 })),
+  // Tokens of the thinking block's tail sent as the `thinking` source. Default 800.
+  thinking_tail_tokens: Type.Optional(Type.Integer({ minimum: 0 })),
+});
+
+// --- Checks and refusal rules (spec REFUSAL-HANDLING §4, §8.1) ---
+// Cross-field validation (built-in merge, regexes, kind/remedy pairs, rule
+// models/agents/sites/reasons) lives in src/checks/catalogue.ts and
+// src/refusals/rules.ts.
+const CheckQuestionSchema = StrictObject({
+  source: Type.Union([
+    Type.Literal("message"),
+    Type.Literal("analysis"),
+    Type.Literal("text"),
+    Type.Literal("thinking"),
+    Type.Literal("artifact"),
+    Type.Literal("rollout"),
+  ]),
+  instructions: Type.String({ minLength: 1 }),
+  criteria: StrictObject({
+    true: Type.String({ minLength: 1 }),
+    false: Type.String({ minLength: 1 }),
+  }),
+  threshold: Type.Number({ minimum: 0, maximum: 1 }),
+});
+
+const CheckApiSignalSchema = StrictObject({
+  // pi-ai api name (e.g. "anthropic-messages"); omitted = any api.
+  api: Type.Optional(Type.String({ minLength: 1 })),
+  // Raw provider stop reason, compared case-insensitively.
+  stop_reason: Type.String({ minLength: 1 }),
+  // Provider refusal category; omitted = any category, "" = no category.
+  category: Type.Optional(Type.String()),
+});
+
+// One check-catalogue entry. A built-in code is overridden field by field, so
+// every field is optional here; a new code needs `kind` (and `reason` for a
+// refusal check).
+const CheckSchema = StrictObject({
+  kind: Type.Optional(Type.Union([Type.Literal("refusal"), Type.Literal("style"), Type.Literal("contract")])),
+  enabled: Type.Optional(Type.Boolean()),
+  remedy: Type.Optional(Type.Union([Type.Literal("redo"), Type.Literal("revise"), Type.Literal("observe")])),
+  reason: Type.Optional(Type.String({ minLength: 1 })),
+  description: Type.Optional(Type.String()),
+  agent_explanation: Type.Optional(Type.String()),
+  checkpoints: Type.Optional(Type.Array(Type.Union([
+    Type.Literal("send"),
+    Type.Literal("ending"),
+    Type.Literal("artifact"),
+    Type.Literal("rollout"),
+  ]))),
+  api_signals: Type.Optional(Type.Array(CheckApiSignalSchema)),
+  // JS regex sources; a leading (?i) makes one case-insensitive.
+  patterns: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  // Word list: word boundaries, case-insensitive.
+  words: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  min_chars: Type.Optional(Type.Integer({ minimum: 0 })),
+  questions: Type.Optional(Type.Array(CheckQuestionSchema)),
+});
+
+const RefusalRuleSchema = StrictObject({
+  name: Type.String({ minLength: 1 }),
+  // Conditions; omitted = any. `tasks` needs multi-label tasks (not available yet).
+  sites: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
+  reasons: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
+  from_models: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
+  agents: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
+  tasks: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  // Chat models tried in order.
+  models: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
+  // Whether a judged (soft) refusal triggers a redo. Default "redo".
+  soft: Type.Optional(Type.Union([Type.Literal("redo"), Type.Literal("observe")])),
+  // Chat sites, when every entry refused. Default "send_last".
+  on_exhausted: Type.Optional(Type.Union([Type.Literal("send_last"), Type.Literal("withhold"), Type.Literal("park")])),
+});
+
 const DecisionsSchema = StrictObject({
   // Master switch. Off (default) = no decision model is ever called and every
   // point behaves exactly as without this feature.
@@ -1076,6 +1172,7 @@ const DecisionsSchema = StrictObject({
   calibration: Type.Optional(Type.Record(Type.String(), Type.Record(Type.String(), Type.Number({ minimum: 0, maximum: 1 })))),
   routing: Type.Optional(DecisionRoutingSchema),
   records: Type.Optional(DecisionRecordsSchema),
+  checks: Type.Optional(DecisionChecksSchema),
 });
 
 const AgentModelsSchema = StrictObject({
@@ -1183,6 +1280,12 @@ const AgentBlockSchema = StrictObject({
    * `routing.tasks`, which replaces the global task map wholesale.
    */
   decisions: Type.Optional(DecisionsSchema),
+  /**
+   * Per-agent check overrides (spec REFUSAL-HANDLING §4.3): each entry deep-merges
+   * over the global `[checks.<code>]` (or built-in) entry of the same code. Only
+   * existing codes may be overridden.
+   */
+  checks: Type.Optional(Type.Record(Type.String({ minLength: 1 }), CheckSchema)),
 });
 
 /**
@@ -2163,6 +2266,10 @@ export const AppConfigSchema = StrictObject({
     // Tool-result context budget (spec TOOL-RESULT-BUDGET §7). All three knobs
     // ship in 00-defaults.toml; see AgentToolsSchema above for per-key docs.
     tools: Type.Optional(AgentToolsSchema),
+    // After the forced-completion nudges run out, discard back to the fork point
+    // and redo once on the same model with its own nudge budget (spec
+    // REFUSAL-HANDLING §7.5). Default false (00-defaults.toml).
+    forced_completion_redo: Type.Optional(Type.Boolean()),
   }),
   // NOT StrictObject: `models` is a dictionary (arbitrary model names) with a
   // required `default` entry. A strict `{ default }` arm would reject every
@@ -2259,6 +2366,12 @@ export const AppConfigSchema = StrictObject({
   proactive: Type.Optional(ProactiveSchema),
   /** Decision-model integration (ARCHITECTURE.md §8h). Off by default. */
   decisions: Type.Optional(DecisionsSchema),
+  // Check catalogue (spec REFUSAL-HANDLING §4): operator checks and overrides of
+  // the built-in ones, keyed by check code.
+  checks: Type.Optional(Type.Record(Type.String({ minLength: 1 }), CheckSchema)),
+  // Refusal fallback rules (spec REFUSAL-HANDLING §8.1). First match in authored
+  // order wins; unset/empty = no rule (implicit chain fallover only).
+  refusal_fallback: Type.Optional(Type.Array(RefusalRuleSchema)),
   // Channel visibility (ARCHITECTURE.md §9h). Default-absent = all-shared; zero
   // behavior change for deployments that never touch this block.
   visibility: Type.Optional(VisibilitySchema),
@@ -2371,6 +2484,9 @@ export type YotsubaRawConfig = Static<typeof YotsubaSchema>;
 export type ProactiveConfig = Static<typeof ProactiveSchema>;
 export type DecisionsRawConfig = Static<typeof DecisionsSchema>;
 export type DecisionFitsConfig = Static<typeof DecisionFitsSchema>;
+export type DecisionChecksRawConfig = Static<typeof DecisionChecksSchema>;
+export type CheckRawConfig = Static<typeof CheckSchema>;
+export type RefusalRuleRawConfig = Static<typeof RefusalRuleSchema>;
 export type ProactiveChannelConfig = Static<typeof ProactiveChannelSchema>;
 export type SessionRecordsConfig = Static<typeof SessionRecordsSchema>;
 /** Per-agent workspace config (spec MULTI-AGENT-SUPPORT §4.1, §10, §10a). */
