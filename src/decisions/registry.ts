@@ -18,7 +18,7 @@ import type { AppConfig } from "../config/index.js";
 import type { LlmScheduler, PriorityClass } from "../agent/scheduler.js";
 import type { Logger } from "../observability/logger.js";
 import type { UsageEventInput } from "../storage/database.js";
-import { DecisionClient, NoFittingMemberError, type BilledAttempt } from "./client.js";
+import { DecisionClient, NoFittingMemberError, type BilledAttempt, type SentAttempt } from "./client.js";
 import {
   calibratedThreshold,
   decisionsFor,
@@ -200,17 +200,26 @@ export class DecisionEngine {
     const questions = point.questions(input, settings);
     const questionsJson = capJsonBytes(questions, 16 * 1024);
 
+    // Track the last attempt actually sent to a member (via client.onSent).
+    // Used for the evaluation row: spec §8 requires state_json/questions_json to
+    // reflect what the member actually received, not a post-facto rebuild.
+    // Fallbacks that made no request (disabled, budget, unavailable, …) leave
+    // this null, and the row's state/questions fields are null accordingly.
+    let lastSent: SentAttempt | null = null;
+
     // Emit one evaluation row to the optional sink (no storage import here).
     const emitRow = (
       source: "model" | "heuristic",
       reason: string | null,
       verdictJson: string | null,
       answersJson: string | null,
-      stateJson: string | null,
       servedModel: string | null,
       servedVersion: string | null,
     ): void => {
       if (!this.options.onEvaluation) return;
+      // Use the real sent payload when a request was made; null otherwise.
+      const stateJson = lastSent !== null ? capJsonBytes(lastSent.state, 64 * 1024) : null;
+      const qJson = lastSent !== null ? questionsJson : null;
       try {
         this.options.onEvaluation({
           ts: now(),
@@ -226,7 +235,7 @@ export class DecisionEngine {
           verdictJson,
           answersJson,
           stateJson,
-          questionsJson,
+          questionsJson: qJson,
           servedModel,
           servedVersion: servedVersion ?? null,
           latencyMs: now() - started,
@@ -235,16 +244,6 @@ export class DecisionEngine {
         });
       } catch (error) {
         this.options.logger?.warn("decision_emit_row_failed", { point: point.name, error: errorMessage(error) });
-      }
-    };
-
-    // Best-effort state JSON for fallback rows where no request was made.
-    const fallbackStateJson = (): string | null => {
-      try {
-        const state = point.state(input, settings.stateMaxTokens);
-        return capJsonBytes(state, 64 * 1024);
-      } catch {
-        return null;
       }
     };
 
@@ -258,25 +257,12 @@ export class DecisionEngine {
         inputTokens,
         ...extra,
       });
-      // Use actual state when we ran a request (low_confidence has stateTokens).
-      let stateJson: string | null;
-      const stateTokens = typeof extra["stateTokens"] === "number" ? extra["stateTokens"] : null;
-      if (stateTokens !== null) {
-        try {
-          stateJson = capJsonBytes(point.state(input, stateTokens), 64 * 1024);
-        } catch {
-          stateJson = fallbackStateJson();
-        }
-      } else {
-        stateJson = fallbackStateJson();
-      }
       const answersJson = "answers" in extra ? safeJson(extra["answers"]) : null;
       emitRow(
         "heuristic",
         reason,
         safeJson(point.describe(verdict)),
         answersJson,
-        stateJson,
         typeof extra["servedModel"] === "string" ? extra["servedModel"] : null,
         typeof extra["servedVersion"] === "string" ? extra["servedVersion"] : null,
       );
@@ -352,6 +338,7 @@ export class DecisionEngine {
           signal: ctx.signal,
           isModelAvailable: (id) => available.get(id) ?? true,
           onBilled,
+          onSent: (sent) => { lastSent = sent; },
         },
       );
     } catch (error) {
@@ -386,19 +373,11 @@ export class DecisionEngine {
       inputTokens,
       ...served,
     });
-    // Reconstruct actual state sent using the stateTokens reported by the result.
-    let stateJson: string | null;
-    try {
-      stateJson = capJsonBytes(point.state(input, result.stateTokens), 64 * 1024);
-    } catch {
-      stateJson = null;
-    }
     emitRow(
       "model",
       null,
       safeJson(point.describe(verdict)),
       safeJson(result.answers),
-      stateJson,
       result.logicalId,
       result.servedVersion ?? null,
     );

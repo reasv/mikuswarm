@@ -351,13 +351,14 @@ test("engine + records point: verdict below threshold is inject=false (no fallba
 
 test("engine + records point: error fallback row when server returns malformed answer", async () => {
   // A missing noul field causes parseAnswers to fail → content error → "error" fallback.
-  // The evaluation row still captures state (best-effort) and the fallback verdict.
+  // The evaluation row captures the real sent state (a request was attempted).
   const body = {
     model: "vendor/decider-1-20261001",
     answers: { relevant: { choice: "yes", probabilities: {}, confidence: 0.9 } }, // wrong type for noul
     usage: { input_tokens: 200, output_tokens: 5, cost: 0.000009 },
   };
-  const { fn } = fakeFetch([() => j(200, body)]);
+  let capturedState: unknown;
+  const { fn } = fakeFetch([(call) => { capturedState = call.body.state; return j(200, body); }]);
   const { engine, evaluations } = makeEngine(recordsConfig(), fn);
   const out = await engine.evaluate(recordsPoint, input({ isReplyTarget: false }), ctx);
   assert.equal(out.source, "heuristic");
@@ -366,8 +367,9 @@ test("engine + records point: error fallback row when server returns malformed a
   const row = evaluations[0]!;
   assert.equal(row.source, "heuristic");
   assert.equal(row.reason, "error");
-  // Best-effort state is still captured for error rows
-  assert.ok(row.stateJson !== null, "state present even for error fallback");
+  // A request was attempted, so state/questions are the actual sent payload.
+  assert.ok(row.stateJson !== null, "state present for error fallback (request was attempted)");
+  assert.equal(row.stateJson, JSON.stringify(capturedState!), "stateJson must equal what was actually sent");
 });
 
 test("engine + records point: decisionGroup shared when passed in ctx", async () => {
@@ -407,6 +409,72 @@ test("engine + records point: questionsJson capped at 16 KiB", async () => {
   assert.ok(Buffer.byteLength(row.questionsJson!, "utf8") <= 16 * 1024);
   const parsed = JSON.parse(row.questionsJson!);
   assert.ok("relevant" in parsed);
+});
+
+test("engine + records: row.stateJson equals the state actually received by the member", async () => {
+  // Spec §8: state_json must reflect what the member actually received, not a
+  // post-facto rebuild. Capture the fetch body and compare directly.
+  let capturedState: unknown;
+  const { fn } = fakeFetch([(call) => {
+    capturedState = call.body.state;
+    return j(200, relevantBody(0.8));
+  }]);
+  const { engine, evaluations } = makeEngine(recordsConfig(), fn);
+  await engine.evaluate(recordsPoint, input({ record: "Found X. Saved to /tmp/out.md." }), ctx);
+  assert.equal(evaluations.length, 1);
+  const row = evaluations[0]!;
+  assert.ok(row.stateJson !== null);
+  assert.equal(
+    row.stateJson,
+    JSON.stringify(capturedState!),
+    "stateJson must equal exactly what the member received",
+  );
+});
+
+test("engine + records: stateJson matches sent body in the client shrink-and-rebuild case", async () => {
+  // When the client's real tokenizer says the initial state overshoots the budget,
+  // stateFor() reduces the target by 0.75x and rebuilds. The row must capture the
+  // final (actually sent) state, not a separate rebuild from registry.ts.
+  //
+  // state_budget_tokens=1500 with min_state_tokens=100 ensures the member fits
+  // (effectiveBudget ~= 1500 - questionTokens - 64 > 100) while still limiting
+  // the state budget enough to clip a large record. The row's stateJson must equal
+  // exactly what was placed in the fetch body.
+  let capturedState: unknown;
+  const { fn } = fakeFetch([(call) => {
+    capturedState = call.body.state;
+    return j(200, relevantBody(0.8));
+  }]);
+  const smallBudgetDecider = decider({ decision: { state_budget_tokens: 1500 } });
+  const config = baseConfig({
+    models: { decider: smallBudgetDecider },
+    decisions: { enabled: true, model: "decider", records: { enabled: true, min_state_tokens: 100 } },
+  });
+  const { engine, evaluations } = makeEngine(config, fn);
+  const bigRecord = "r".repeat(30000); // large enough to get clipped at 1500-token budget
+  await engine.evaluate(recordsPoint, input({ record: bigRecord }), ctx);
+  assert.equal(evaluations.length, 1);
+  const row = evaluations[0]!;
+  assert.ok(row.stateJson !== null, "state must be non-null (request was sent)");
+  assert.equal(
+    row.stateJson,
+    JSON.stringify(capturedState!),
+    "stateJson must equal the actually sent body even when client shrinks the state",
+  );
+  // The record was clipped (sent state is much smaller than the raw input)
+  assert.ok(row.stateJson.length < bigRecord.length, "record was clipped by the budget");
+});
+
+test("engine + records: no-request fallbacks (disabled) have stateJson=null and questionsJson=null", async () => {
+  // Disabled point never sends a request; spec §8 says state/questions must be null.
+  const config = recordsConfig();
+  config.decisions.records.enabled = false;
+  const { fn } = fakeFetch([() => j(200, relevantBody())]);
+  const { engine, evaluations } = makeEngine(config, fn);
+  // Disabled → no row at all (disabled points produce no evaluation row)
+  const out = await engine.evaluate(recordsPoint, input(), ctx);
+  assert.equal(evaluations.length, 0, "disabled point emits no row");
+  assert.equal(out.reason, "disabled");
 });
 
 // --- selectRecordsToInject ---------------------------------------------------

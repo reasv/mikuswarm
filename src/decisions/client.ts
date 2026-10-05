@@ -66,6 +66,15 @@ export interface DecisionRequest {
   minStateTokens: number;
 }
 
+export interface SentAttempt {
+  /** The state object that was JSON-serialised and placed in the request body. */
+  state: unknown;
+  /** The questions map that was sent (same for every attempt in a call). */
+  questions: Record<string, DecisionQuestion>;
+  /** Logical model id of the member this was sent to. */
+  memberKey: string;
+}
+
 export interface DecisionCallOptions {
   /** Label for logs and the fallback resolver (`decision:<point>`). */
   consumer: string;
@@ -77,6 +86,14 @@ export interface DecisionCallOptions {
   isModelAvailable?: (logicalId: string) => boolean;
   /** One call per attempt the provider billed (a 2xx response), parsed or not. */
   onBilled?: (attempt: BilledAttempt) => void;
+  /**
+   * Called once per member attempt, immediately before the HTTP fetch, with the
+   * state and questions that were actually serialised into the request body.
+   * The last call records what the final (successful or last-tried) member saw.
+   * Evaluate() uses this to write the exact sent payload to the evaluation row
+   * (spec §8 requires the row to reflect what the member actually received).
+   */
+  onSent?: (sent: SentAttempt) => void;
 }
 
 export interface BilledAttempt {
@@ -231,6 +248,7 @@ export class DecisionClient {
             // A state builder failure is this request's content, never a health signal.
             return { ok: false, kind: "content", error };
           }
+          options.onSent?.({ state: built.state, questions: request.questions, memberKey: member.logicalId });
           const outcome = await this.attempt(member, request.questions, built.state, remaining, controller.signal, options);
           if (outcome.ok) {
             result = { ...outcome.value, stateTokens: built.tokens };
