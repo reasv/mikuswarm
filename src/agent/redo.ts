@@ -8,7 +8,7 @@
  *   attempts and their nudges) and continue on the same model. No model change
  *   is applied here, so whatever selects the session's model (its chain, or a
  *   sticky refusal pin) keeps doing so; the unchanged prefix reads from cache.
- * - `refusal` (the gate, W4): delegated to `onRefusal`, which picks the rule
+ * - `refusal` (the output gate): delegated to `onRefusal`, which picks the rule
  *   entry, pins it and forks through the same fork core. Without one, the
  *   request is logged and the session gives up as it would have.
  */
@@ -21,7 +21,7 @@ import { findForkPoint, forkSession, type ForkContext } from "./fork.js";
 import { servedModelOf } from "./contract.js";
 import { isPostingTool } from "../tools/side-effects.js";
 
-/** W4's refusal redo: pick and pin the model, then fork with `forkSession`. */
+/** The refusal redo (`createSoftRefusalRedoHandler`): pin the model, then fork with `forkSession`. */
 export type RefusalRedoHandler = (req: RedoRequest, agent: Agent, fork: ForkContext) => Promise<RedoOutcome>;
 
 export interface RedoHandlerOptions {

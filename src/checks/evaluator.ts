@@ -46,10 +46,10 @@ import { firstPatternMatch } from "./catalogue.js";
 import { hasSource, sourceText, type CheckContext, type CheckSources } from "./state.js";
 import type { CheckCatalogue, CheckDefinition, CheckKind, CheckRemedy, CheckSource, Checkpoint } from "./types.js";
 
-/** `decision_evaluations.consequence` vocabulary (CONTRACT). */
+/** `decision_evaluations.consequence` vocabulary (spec REFUSAL-HANDLING §9). */
 export type CheckConsequence = "sent" | "sent_unjudged" | "revise" | "overridden" | "redo" | "observed" | "withheld";
 
-/** A check that fired in an evaluation (CONTRACT "Gate"). */
+/** A check that fired in an evaluation. */
 export interface FiredCheck {
   code: string;
   kind: CheckKind;

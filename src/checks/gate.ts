@@ -1,5 +1,5 @@
 /**
- * The output gate (spec REFUSAL-HANDLING §5.2, §5.4, §6; CONTRACT "Gate"): one
+ * The output gate (spec REFUSAL-HANDLING §5.2, §5.4, §6): one
  * per session, judging every model-written output at its checkpoint.
  *
  * - **send**: every posting tool call (`isPostingTool`: send_message, send_dm,
@@ -17,13 +17,12 @@
  * attempt cancels the evaluations it started; `execute` reuses the started
  * evaluation by tool call id.
  *
- * **Hold path.** Phase 3 is observe-only: {@link OBSERVE_POLICY} never holds, so
- * the send runs at once and the evaluation is recorded when it completes. The
- * hold path is built: when `policy.shouldHold()` is true the wrapper waits for
- * the verdict (bounded by the checkpoint's deadline, past which the output
- * proceeds unjudged), records it with `policy.consequence()`, then lets
- * `policy.act()` block the call. Blocking remedies (redo, revise) only swap the
- * policy.
+ * **Hold path.** Under {@link OBSERVE_POLICY} nothing holds: the send runs at
+ * once and the evaluation is recorded when it completes. When the session's
+ * policy (`createActingPolicy`) says `shouldHold()`, the wrapper waits for the
+ * verdict (bounded by the checkpoint's deadline, past which the output proceeds
+ * unjudged), records it with `policy.consequence()`, then lets `policy.act()`
+ * block the call (a refusal redo, or a revise error).
  */
 import type { AgentMessage, AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
@@ -56,7 +55,7 @@ import {
 } from "./state.js";
 import type { CheckDefinition, Checkpoint } from "./types.js";
 
-/** The gate's verdict on one evaluation (CONTRACT "Gate"). */
+/** The gate's verdict on one evaluation. */
 export interface GateVerdict {
   /** Decision row ids; empty when the evaluation was not recorded yet (late). */
   evaluationIds: number[];
@@ -111,7 +110,7 @@ export interface GatePolicy {
   onDelivered?(info: GateCallInfo): void;
 }
 
-/** Observe-only (phase 3, and every check with remedy `observe`): record, never hold. */
+/** Observe-only (no acting policy, or every check with remedy `observe`): record, never hold. */
 export const OBSERVE_POLICY: GatePolicy = {
   shouldHold: () => false,
   consequence: (info, verdict, { late }) => {
@@ -687,7 +686,7 @@ export interface BackgroundChecks {
 }
 
 /**
- * What a job's `act` decided on a verdict (spec §5.2.3–4, phase 4): the rows'
+ * What a job's `act` decided on a verdict (spec §5.2.3–4): the rows'
  * consequence and, for the fired refusal it acted on, the `refusal_events`
  * outcome. Other fired refusals are recorded `observed`.
  */
@@ -737,10 +736,9 @@ export interface BackgroundRollout extends BackgroundJobScope {
 /**
  * {@link BackgroundChecks} over the shared evaluator. Each call judges with
  * the background deadline and is recorded when it completes (observe-only:
- * nothing waits on it; phase 4 routes a judged rollout refusal to the rules).
- * Never rejects. A job may pass `act` to decide on the verdict before it is
- * recorded (phase 4: a judged refusal discards the output and reruns the job
- * on a rule's model, `src/refusals/jobs.ts`).
+ * nothing waits on it). Never rejects. A job may pass `act` to decide on the
+ * verdict before it is recorded (a judged refusal discards the output and
+ * reruns the job on a rule's model, `src/refusals/jobs.ts`).
  */
 export function createBackgroundChecks(
   evaluator: CheckEvaluator,

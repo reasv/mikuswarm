@@ -43,7 +43,7 @@ export interface ActingPolicyDeps {
   refusal: SessionRefusalHandle;
   /** The session's redo control (the runner takes the request after the run settles). */
   redoControl: SessionRedoControl;
-  /** The revise half (W5's `createRevisePolicyPart`); absent = no revise verdicts. */
+  /** The revise half (`createRevisePolicyPart`); absent = no revise verdicts. */
   revise?: RevisePolicyPart;
   logger?: Logger;
 }

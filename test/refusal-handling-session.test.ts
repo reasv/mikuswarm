@@ -196,7 +196,7 @@ test("handle: a resumed pin naming an unknown model is dropped; refusalRuleModel
   assert.deepEqual(refusalRuleModels(all, { sites: ["default", "record_turn"], agent: "agent_a" }).sort(), ["open_x", "open_y"]);
 });
 
-test("handle (soft path, W4 API): tries, @same, no pin move on a same-model retry, restart after a delivery", () => {
+test("handle (soft path): tries, @same, no pin move on a same-model retry, restart after a delivery", () => {
   const { c, pins } = controller({
     rules: rules([{ name: "r", models: [{ model: "@same", tries: 2 }, "open_x"] }]),
   });

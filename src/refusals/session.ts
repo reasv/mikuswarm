@@ -6,8 +6,8 @@
  * One handle per created agent. The factory builds it with the session's site,
  * agent and rules plus a usability predicate over its own model composites
  * (health, budget, per-user limits, fits, capability); Layer 0 asks it on every
- * refused attempt ({@link SessionRefusalController.onHardRefusal}); the gate
- * (phase 3/4) reads the same handle through `CreatedAgent.refusal`.
+ * refused attempt ({@link SessionRefusalController.onHardRefusal}); the output
+ * gate's acting policy reads the same handle through `CreatedAgent.refusal`.
  */
 import { INTERNAL_SITES, type CheckCatalogue, type RefusalRule } from "../checks/types.js";
 import type { Logger } from "../observability/logger.js";
@@ -25,7 +25,7 @@ import { classifyApiRefusal, UNCATEGORIZED_REFUSAL_CODE } from "./signals.js";
 /** A refusal event as a handle records it: the session fields are filled in. */
 export type SessionRefusalEvent = Omit<RefusalEventInsert, "ts" | "site" | "agent" | "timelineKey" | "agentSessionId">;
 
-/** The session-facing refusal interface (implementation contract, wave 1). */
+/** The session-facing refusal interface: what the gate, the redo handler and the workers use. */
 export interface SessionRefusalHandle {
   /** The current site: the session type, or `record_turn` while the record turn runs. */
   readonly site: string;

@@ -15,7 +15,7 @@ import type { CheckEvaluator } from "./evaluator.js";
 import { OutputGate, type GatePolicy } from "./gate.js";
 import type { StateMessage } from "./state.js";
 
-/** What the app hands the factory (built once in app.ts, CONTRACT R2). */
+/** What the app hands the factory (built once in app.ts, around the one check catalogue). */
 export interface OutputGateServices {
   evaluator: CheckEvaluator;
   /**
@@ -23,7 +23,7 @@ export interface OutputGateServices {
    * chat messages, as check state (spec §5.5). Read when an evaluation starts.
    */
   chat?: (session: AgentSessionRecord, recentMessages: number) => { request: StateMessage[]; recent: StateMessage[] };
-  /** The policy of new gates; default observe-only (phase 3). */
+  /** The policy of new gates; default observe-only (`OBSERVE_POLICY`). */
   policy?: (session: AgentSessionRecord) => GatePolicy | undefined;
   /**
    * The session's acting policy (spec §6.3–§6.4; `createActingPolicy`), built by

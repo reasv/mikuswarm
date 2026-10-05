@@ -2,7 +2,7 @@
  * Fork core (spec REFUSAL-HANDLING §8.4, §9): discard the live transcript back
  * to a fork point, keep the discarded span as a branch, and leave the agent
  * ready to continue. Used by every redo that discards output: a refusal caught
- * at the gate (W4), a refusal at an ending without a send, and the send-contract
+ * at the gate, a refusal at an ending without a send, and the send-contract
  * redo after the nudges run out (§7.5).
  *
  * A tool cannot rewind the agent loop from inside it, so forks only happen

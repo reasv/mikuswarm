@@ -995,8 +995,8 @@ const DecisionThinkingLevelSchema = Type.Union([
 ]);
 
 const RoutingTaskSchema = StrictObject({
-  // What a request of this kind looks like. Becomes the option's criterion in
-  // the routing `task` question, so write it as a description of the request.
+  // What a request of this kind looks like. Becomes the criterion of the task's
+  // `noul` routing question, so write it as a description of the request.
   description: Type.String({ minLength: 1 }),
   // Per-task model preference cascade: `[models.*]` keys (chat models) tried in
   // order before normal selection. `model = "x"` is shorthand for `models = ["x"]`.
@@ -1041,8 +1041,8 @@ const DecisionPointCommonFields = {
 
 const DecisionRoutingSchema = StrictObject({
   ...DecisionPointCommonFields,
-  // Ask which listed skill the request needs (one `choice` over the session's
-  // listed skills plus `none`) and preload it. Default true.
+  // Ask, per listed skill (one `noul` each), whether the request needs it, and
+  // preload the selected ones. Default true.
   preload_skills: Type.Optional(Type.Boolean()),
   // How many recent messages the routing state carries. Default 10.
   recent_messages: Type.Optional(Type.Integer({ minimum: 0, maximum: 50 })),
@@ -1175,7 +1175,8 @@ const CheckSchema = StrictObject({
 
 const RefusalRuleSchema = StrictObject({
   name: Type.String({ minLength: 1 }),
-  // Conditions; omitted = any. `tasks` needs multi-label tasks (not available yet).
+  // Conditions; omitted = any. `tasks` matches when any of the session's routed
+  // tasks (or the built-in `proactive` / `other`) is listed; a taskless session never.
   sites: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
   reasons: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
   from_models: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),

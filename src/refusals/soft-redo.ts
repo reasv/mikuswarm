@@ -87,7 +87,7 @@ function lastTimestamp(messages: readonly AgentMessage[]): number | undefined {
   return latest;
 }
 
-/** The runner's `onRefusal` (W2's {@link RefusalRedoHandler}) for soft refusals. */
+/** The runner's `onRefusal` ({@link RefusalRedoHandler}) for soft refusals. */
 export function createSoftRefusalRedoHandler(deps: SoftRefusalRedoDeps = {}): RefusalRedoHandler {
   const { logger } = deps;
   return async (req: RedoRequest, agent: Agent, fork: ForkContext): Promise<RedoOutcome> => {

@@ -14,7 +14,7 @@ import { sendMessagePrecheck } from "../src/tools/send-message.js";
 
 // ---------------------------------------------------------------------------
 // The session's acting gate policy (spec REFUSAL-HANDLING §6.3–§6.4): the
-// refusal half composed with W5's real revise part, through a real OutputGate,
+// refusal half composed with the real revise part, through a real OutputGate,
 // evaluator (pattern checks) and in-memory storage. The refusal rules are a
 // stand-in handle (the real one is covered end to end in
 // refusal-handling-soft.test.ts).
