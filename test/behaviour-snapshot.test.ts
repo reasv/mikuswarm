@@ -144,6 +144,11 @@ test("diff: preference, routing task, rule and check events", () => {
   assert.deepEqual(kinds(task), ["routing_task_changed", "routing_task_changed"], "one per agent sharing the task list");
   assert.match(task[0]!.sentence, /task `coding`: models now model_c, model_b \(was model_c\)/);
 
+  // A task's own selection threshold (multi-label routing) is behaviour too.
+  const threshold = diffBehaviourSnapshots(prev, snap(config((c) => (c.decisions.routing.tasks.coding.threshold = 0.7))));
+  assert.deepEqual(kinds(threshold), ["routing_task_changed", "routing_task_changed"]);
+  assert.match(threshold[0]!.sentence, /task `coding`: threshold default → 0\.7/);
+
   const rule = diffBehaviourSnapshots(prev, snap(config((c) => c.refusal_fallback.push({ name: "any", models: ["model_b"] }))));
   assert.deepEqual(kinds(rule), ["rule_changed"]);
   assert.equal(rule[0]!.sentence, "rule `any`: added (models model_b)");

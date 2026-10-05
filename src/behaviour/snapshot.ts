@@ -67,6 +67,8 @@ export interface TaskBehaviour {
   thinking: string | null;
   skills: string[];
   tailFiles: string[];
+  /** The task's own selection threshold; absent = the routing point's floor. */
+  threshold?: number;
 }
 
 export interface CheckBehaviour {
@@ -268,6 +270,7 @@ export function buildBehaviourSnapshot({ config, catalogue, code }: BuildBehavio
         thinking: task.thinking_level ?? null,
         skills: [...(task.skills ?? [])],
         tailFiles: [...(task.tail_files ?? [])],
+        ...(task.threshold !== undefined ? { threshold: task.threshold } : {}),
       };
     }
 

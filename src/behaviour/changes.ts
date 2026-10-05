@@ -160,6 +160,7 @@ function diffTask(agent: string, key: string, a: TaskBehaviour | undefined, b: T
     if (a.thinking !== b.thinking) parts.push(`thinking ${a.thinking ?? "default"} → ${b.thinking ?? "default"}`);
     if (!same(a.skills, b.skills)) parts.push(`skills now ${list(b.skills)}`);
     if (!same(a.tailFiles, b.tailFiles)) parts.push(`tail files now ${list(b.tailFiles)}`);
+    if (a.threshold !== b.threshold) parts.push(`threshold ${a.threshold ?? "default"} → ${b.threshold ?? "default"}`);
   }
   return [{
     kind: "routing_task_changed",
