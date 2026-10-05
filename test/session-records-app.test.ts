@@ -578,11 +578,21 @@ test("app: routing and records write decision rows with separate groups; the jud
     h.say("[work] first", { mention: true });
     const [a] = await settled(h, 1);
     // Not a reply: the records point judges the recent bot sessions.
-    h.say("tell me more", { mention: true });
+    h.say("tell me more", {
+      mention: true,
+      attachments: [{ id: "att1", mediaType: "file", filename: "notes.txt", caption: "a list of three notes" }],
+    });
     const rows = await settled(h, 2);
     const b = rows[1]!;
-    const evals = h.query<{ point: string; decision_group: string; candidate_session_id: string | null; source: string; state_json: string }>(
-      "select point, decision_group, candidate_session_id, source, state_json from decision_evaluations where agent_session_id = ?",
+    const evals = h.query<{
+      point: string;
+      decision_group: string;
+      candidate_session_id: string | null;
+      source: string;
+      state_json: string;
+      trigger_event_id: string | null;
+    }>(
+      "select point, decision_group, candidate_session_id, source, state_json, trigger_event_id from decision_evaluations where agent_session_id = ?",
       b.id,
     );
     const routing = evals.filter((e) => e.point === "routing");
@@ -592,11 +602,16 @@ test("app: routing and records write decision rows with separate groups; the jud
     assert.notEqual(routing[0]!.decision_group, recs[0]!.decision_group, "separate decision groups");
     assert.equal(recs[0]!.candidate_session_id, a!.id);
     assert.equal(recs[0]!.source, "model");
+    // Both points name the trigger event.
+    assert.ok(routing[0]!.trigger_event_id, "routing row has trigger_event_id");
+    assert.equal(routing[0]!.trigger_event_id, recs[0]!.trigger_event_id);
     // Non-reply state: recent_chat carries the record's bot message where it sat.
     const state = JSON.parse(recs[0]!.state_json);
     assert.ok(Array.isArray(state.recent_chat), "non-reply framing");
     assert.ok(state.recent_chat.some((m: { self?: boolean; text: string }) => m.self === true && m.text === "done"));
     assert.equal(state.reply_to, undefined);
+    // The trigger's attachments ride on the request, as the routing point renders them.
+    assert.deepEqual(state.request.attachments, ["a list of three notes"]);
     // Injected with the records group on its harness marker.
     const injected = transcript(b).find(
       (m) => m.role === "assistant" && m.harness?.kind === "injection" && m.content?.[0]?.name === "read_session_record",

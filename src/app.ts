@@ -65,6 +65,7 @@ import {
   ROUTING_OTHER,
   routingHasQuestions,
   routingInputFrom,
+  toTranscriptMessage,
   routingPoint,
   DecisionClient,
   DecisionEngine,
@@ -6163,7 +6164,15 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       const sender = inbound.trigger?.triggeredBy ?? inbound.event.sender;
       const nameOf = (e: { sender?: { displayName?: string; username?: string; id?: string } }) =>
         e.sender?.displayName ?? e.sender?.username ?? e.sender?.id ?? "unknown";
-      const request = { from: nameOf({ sender }), text: inbound.event.body ?? "" };
+      // The trigger's media as the routing point renders it (captions, link
+      // previews), off the hydrated stored event.
+      const storedTrigger = timeline.getById(inbound.event.id) ?? inbound.event;
+      const attachments = toTranscriptMessage(hydrateEvents(storage, [storedTrigger])[0] ?? storedTrigger, 2000).attachments;
+      const request = {
+        from: nameOf({ sender }),
+        text: inbound.event.body ?? "",
+        ...(attachments?.length ? { attachments } : {}),
+      };
       const triggerIds = new Set([inbound.event.id, ...(inbound.trigger?.groupedEventIds ?? [])]);
       const window =
         recent.length > 0
@@ -6445,11 +6454,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     if (inbound.event.externalId) {
       sessionClaims.attachSession(record.timelineKey, inbound.event.externalId, record.id);
     }
-    // Re-arm the follow-up watch to this resumed session (spec FOLLOWUP-FOLDING §7
-    // resume-chain invariance): a subsequent bare follow-up folds into the resumed
-    // session, so chains stay linear across mixed reply-resume / follow-up-resume
-    // steps. Same seam as the claim attribution (post-fork), so it names the live
-    // session; `inbound.event.timestamp` re-anchors the user-gap clock to this turn.
+    // Re-arm the follow-up watch to this resumed session (spec FOLLOWUP-FOLDING §7):
+    // a subsequent follow-up folds into the resumed session (steered while it runs,
+    // a fresh session with its record once it settled). Same seam as the claim
+    // attribution (post-fork), so it names the live session; `inbound.event.timestamp`
+    // re-anchors the user-gap clock to this turn.
     // Unlike the fresh-launch arm, this call is not `!proactive`-guarded: a resumed
     // session is never proactive (proactive sessions never resume), and
     // `armFollowUpWatch` re-checks self/synthetic regardless.
@@ -6529,15 +6538,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       await awaitTriggerReadiness(inbound);
       // The trigger's enrichment download is now complete (readiness wait above), so
       // hydrate its event before the appended turn is built. `buildResumeTurn →
-      // selectImageBlocks` needs the attachment's `localPath` to deliver a media
-      // follow-up's image as REAL PIXELS (spec FOLLOWUP-FOLDING §5.3/§10), and the raw
-      // provider event never carries it — only `hydrateEvents` (reading the media_assets
-      // row) does. Without this the folded image silently degrades to its caption — the
-      // exact loss the fold exists to prevent — because the folded event has no trigger
-      // group either (it was consumed before `accept`/`setTriggerGroup`). This also
-      // hydrates a reply-resume whose reply itself carried fresh media. Mirrors the
-      // steer path's `followUpHydratedEvent`; falls back to the raw event (caption-only)
-      // if the row is somehow not stored yet.
+      // selectImageBlocks` needs the attachment's `localPath` to deliver a reply's own
+      // fresh media as REAL PIXELS, and the raw provider event never carries it — only
+      // `hydrateEvents` (reading the media_assets row) does; without it the image
+      // degrades to its caption. Mirrors the steer path's `followUpHydratedEvent`;
+      // falls back to the raw event (caption-only) if the row is not stored yet.
       record.trigger = { ...record.trigger, event: followUpHydratedEvent(record.trigger) };
       created = await factory.create(record, tools, {
         resume: material,
@@ -6722,6 +6727,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         },
         heuristicVerdict: { task: ROUTING_OTHER },
         signal: drainAbort.signal,
+        triggerEventId: inbound.event.id,
       });
       // CONTRACT 6: return the decisionGroup alongside the verdict so the
       // factory can attach it to the routing's synthetic skill-load calls.

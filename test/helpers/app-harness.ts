@@ -12,6 +12,7 @@ import Database from "better-sqlite3";
 import { loadConfig } from "../../src/config/index.js";
 import { startMikuAgent } from "../../src/app.js";
 import type {
+  AttachmentMeta,
   ChatProviderHost,
   DeliveryReceipt,
   IChatProvider,
@@ -35,7 +36,7 @@ export interface AppHarness {
   llm: FakeLlm;
   sends: HarnessSend[];
   /** Deliver a user message; `mention` makes it a trigger. Returns its external id. */
-  say(body: string, opts?: { mention?: boolean; replyTo?: string; id?: string }): string;
+  say(body: string, opts?: { mention?: boolean; replyTo?: string; id?: string; attachments?: AttachmentMeta[] }): string;
   /** Poll until `predicate` holds (default 10 s). */
   until(predicate: () => boolean, what: string, timeoutMs?: number): Promise<void>;
   /** Read-only query against the app's database. */
@@ -218,6 +219,7 @@ export async function startHarness(opts: {
           receivedAt: now,
           ...(sayOpts.mention ? { mentions: { mentionedSelf: true, userIds: [BOT_ID] } } : {}),
           ...(sayOpts.replyTo ? { replyTo: { externalId: sayOpts.replyTo } } : {}),
+          ...(sayOpts.attachments ? { attachments: sayOpts.attachments } : {}),
         },
         ...(sayOpts.mention
           ? { trigger: { type: "mention" as const, reason: "mention", triggeredBy: sender } }
