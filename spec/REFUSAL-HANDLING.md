@@ -60,6 +60,10 @@ Today the code cannot tell refusal reasons apart, cannot see soft refusals, keep
 8. **`no_reply` is not automatically a refusal**, but the text around it is judged (§5.4). It is rare enough to judge every time.
 9. **Send-contract diagnostics are diagnostic**, with one behaviour change: after the nudges run out, one same-model redo with its own nudge budget, then give up (§7.5).
 10. **Branches are preserved** and shown like conversation branches in chat interfaces: latest branch by default, a switcher at each fork point (§12).
+11. **Endings without a send are judged in every session type**, proactive included: proactive sessions are where agents most often reason "I should say this" and then end with `NO_REPLY` (§5.4).
+12. **Refusal rules can match on the session's routed task** (§8.1), as model routing already does.
+13. **Send-contract give-up settles as `NO_REPLY`**, with no failure notice: unlike a quota, it is not actionable and not caused by the user's input (§7.5).
+14. **One send-contract redo per failure point**, so per message, not per session: the bound exists to stop an endless loop, and a redo that succeeded once suggests the model will manage the next message of the same session (§7.5).
 
 ## 4. Checks
 
@@ -157,7 +161,7 @@ Artifact and rollout checks judge **declining and deflecting only**. "Did less t
 - a `no_reply` call, or a literal `NO_REPLY` text ending;
 - forced-completion exhaustion (the model wrote text and never called a send tool, §7).
 
-`no_reply` is judged **every time** in every session type (rare enough, owner decision 8). Holding it costs no visible latency (no message is coming), so its deadline is looser than a send's.
+`no_reply` is judged **every time** in every session type (rare enough, owner decision 8), **proactive sessions included** (owner decision 11): not replying is a normal proactive outcome, but proactive sessions are also where agents most often reason "I should say this" and then end with `NO_REPLY`, so their endings are exactly the ones worth judging. Holding it costs no visible latency (no message is coming), so its deadline is looser than a send's.
 
 **Sources.** Three texts around the action, each its own state field so a question can point at one:
 
@@ -281,7 +285,9 @@ After `forced_completion_retries` consecutive nudges (default 3) without a valid
 1. discard back to the fork point (§8.4), dropping the failed attempts and the nudges;
 2. continue on the **same model** (this failure is nearly always random; a session already moved to a refusal-redo model stays on it). The prefix is unchanged, so the redo reads from cache;
 3. the redo gets its own nudge budget;
-4. if that runs out too, give up (§15 Q1).
+4. if that runs out too, give up: the session settles as `NO_REPLY`, as today. No failure notice is sent: the failure is not actionable by the user and not caused by their input (owner decision 13). The statistics record it as `exhausted`.
+
+**Budget: one redo per failure point** (owner decision 14). A failure point is the span since the last delivered message, so the bound is one redo per message, not per session. A session that delivers message 1, needs a redo for message 2 and succeeds, and later fails on message 3, gets a redo for message 3 too: a redo that worked once suggests the model can recover again in the same session, and the bound only exists to stop an endless loop. A second exhaustion inside the same span (the redo's own nudges ran out) gives up.
 
 ### 7.6 When the decision-model diagnosis runs
 
@@ -298,12 +304,14 @@ sites = ["default", "proactive", "record_turn", "summarize", "condense", "diary"
 reasons = ["distillation"]        # omitted = any reason (a generic refusal fallback)
 from_models = ["model_a"]         # optional: only refusals by these models
 agents = ["agent_a"]              # optional
+tasks = ["coding", "other"]       # optional: the session's routed task (DECISION-MODEL §5.1 routing keys, plus "other")
 models = ["open_model_x", "open_model_y"]   # tried in order
 soft = "redo"                     # "redo" | "observe": whether a judged (soft) refusal of this reason triggers a redo
 on_exhausted = "send_last"        # chat sites: "send_last" (default) | "withhold" | "park"
 ```
 
 - **Sites** are session-type names plus the internal sites (`record_turn`, `summarize`, `condense`, `diary`, `caption`).
+- **Tasks**: the task key the routing point gave the session (`[decisions.routing.tasks.<key>]`, operator-defined, or `other`), the same classification that already picks the session's model cascade. A refused request of a given kind can so be sent to a model suited to that kind. A session without a routing verdict (routing off, routing fell back, internal sites) has no task, and a rule with `tasks` never matches it. Startup validation: every listed key exists in the routing tasks of each agent the rule applies to (agents may replace their task list, DECISION-MODEL §4). A redo keeps the session's routed skills and tail files; only the model changes.
 - **Precedence**: the first matching rule in file order (authored order, like PER-USER-LIMITS).
 - **Composition**: a matching rule **replaces** the implicit chain fallover for that refusal. With no matching rule, a hard refusal keeps today's implicit fallover and a soft refusal is recorded only.
 - **Gates**: a rule's model passes the usual gates (health, budget, per-user limits, context fits, capability). An entry that fails them is skipped. The redo is billed to the session's payee and counts on the redo model's caps.
@@ -413,9 +421,7 @@ Every checkpoint adds work to a task's path. **End-to-end task latency must not 
 
 ## 15. Open questions
 
-1. **Send-contract give-up outcome** (§7.5): after the redo's nudges also run out, does the session settle as today (`NO_REPLY` completed, silent), or as a distinct failure (a terminal status with reason `send_contract_exhausted`, and possibly a failure notice to the user)?
-2. **Send-contract redo budget**: one redo per session, or one per message (a session that delivered message 1, then fails on message 2, and later on message 3)? Proposed default: one per session.
-3. Default thresholds, deadlines and `min_chars` per checkpoint, and the decision chains for each (judge route for style, general route for refusal); calibration against the head decision member.
-4. The starter catalogue: built-in refusal questions per reason and source, starter style checks, the textual-tool-call patterns.
-5. Latency budgets per checkpoint and how end-to-end latency is measured (§13).
-6. Phasing: proposed order is (1) hard-refusal categories, statistics, rules and redo for hard refusals and mechanical jobs; (2) send-contract mechanics, backfill and the nudge redo; (3) the gate with observe-only checks; (4) blocking refusal checks, chat redo and branches in the console; (5) style revise; (6) offline diagnosis.
+1. Default thresholds, deadlines and `min_chars` per checkpoint, and the decision chains for each (judge route for style, general route for refusal); calibration against the head decision member.
+2. The starter catalogue: built-in refusal questions per reason and source, starter style checks, the textual-tool-call patterns.
+3. Latency budgets per checkpoint and how end-to-end latency is measured (§13).
+4. Phasing: proposed order is (1) hard-refusal categories, statistics, rules and redo for hard refusals and mechanical jobs; (2) send-contract mechanics, backfill and the nudge redo; (3) the gate with observe-only checks; (4) blocking refusal checks, chat redo and branches in the console; (5) style revise; (6) offline diagnosis.
