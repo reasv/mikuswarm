@@ -175,6 +175,8 @@ export interface EvaluateContext {
    * gate, spec REFUSAL-HANDLING §9) can complete and persist them itself.
    */
   onEvaluation?: (row: DecisionEvaluationRow) => void;
+  /** Hard deadline for this call instead of the point's `timeout_ms`. */
+  timeoutMs?: number;
 }
 
 /** A member of a point's chain, as the fits planner sees it. */
@@ -355,7 +357,7 @@ export class DecisionEngine {
         {
           consumer: `decision:${point.name}`,
           priority: ctx.priority ?? "interactive",
-          timeoutMs: settings.timeoutMs,
+          timeoutMs: ctx.timeoutMs ?? settings.timeoutMs,
           signal: ctx.signal,
           isModelAvailable: (id) => available.get(id) ?? true,
           onBilled,

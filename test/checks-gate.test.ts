@@ -66,7 +66,7 @@ function makeConfig(opts: ConfigOpts = {}): any {
       enabled: opts.decisions ?? true,
       model: "decider",
       ...(opts.calibration ? { calibration: opts.calibration } : {}),
-      checks: { enabled: opts.checksPoint ?? true, timeout_ms: 60_000, ...(opts.knobs ?? {}) },
+      checks: { enabled: opts.checksPoint ?? true, ...(opts.knobs ?? { timeout_ms: 60_000 }) },
     },
     checks: opts.checks ?? { op_refusal: opRefusal() },
     agents: {},
@@ -170,7 +170,7 @@ async function setup(opts: ConfigOpts & {
     ...(opts.now ? { now: opts.now } : {}),
     logger: l,
   });
-  return { config, storage, server, lines, usage, evaluator, gate, messages };
+  return { config, storage, server, lines, usage, evaluator, gate, messages, engine };
 }
 
 async function until(cond: () => boolean, label = "condition"): Promise<void> {
@@ -359,7 +359,7 @@ test("deadline (fake timers): a held output proceeds unjudged; the late completi
   mock.timers.enable({ apis: ["setTimeout"] });
   try {
     const holding: GatePolicy = { ...OBSERVE_POLICY, shouldHold: () => true };
-    const t = await setup({ policy: holding, now: () => clock, knobs: { send_deadline_ms: 5000 }, answer: () => ({ noul: 0.9 }) });
+    const t = await setup({ policy: holding, now: () => clock, knobs: { send_deadline_ms: 5000, timeout_ms: 60_000 }, answer: () => ({ noul: 0.9 }) });
     t.server.hold();
     const log: string[] = [];
     const [wrapped] = wrapToolsWithOutputGate([sendTool(log)], t.gate);
@@ -390,7 +390,7 @@ test("deadline (fake timers): a held output proceeds unjudged; the late completi
 
 test("deadline, observe mode: completion past the deadline is recorded sent_unjudged", async () => {
   let clock = 0;
-  const t = await setup({ now: () => clock, knobs: { send_deadline_ms: 100 }, answer: () => ({ noul: 0.1 }) });
+  const t = await setup({ now: () => clock, knobs: { send_deadline_ms: 100, timeout_ms: 60_000 }, answer: () => ({ noul: 0.1 }) });
   t.server.hold();
   const [wrapped] = wrapToolsWithOutputGate([sendTool([])], t.gate);
   await wrapped!.execute("c", { message: "fine" } as any, undefined, undefined);
@@ -614,4 +614,32 @@ test("updateDecisionEvaluationConsequence rewrites what a recorded verdict did",
   assert.equal(rows(t.storage)[0]!.consequence, "redo");
   await t.storage.updateDecisionEvaluationConsequence([], "sent");
   t.storage.close();
+});
+
+test("a check call may outlive its deadline: default timeout is twice the checkpoint deadline", async () => {
+  const t = await setup({ knobs: { send_deadline_ms: 700, ending_deadline_ms: 900 }, answer: () => ({ noul: 0.1 }) });
+  const timeouts: Array<number | undefined> = [];
+  const evaluate = t.engine.evaluate.bind(t.engine);
+  t.engine.evaluate = ((point: any, input: any, ctx: any) => {
+    timeouts.push(ctx.timeoutMs);
+    return evaluate(point, input, ctx);
+  }) as typeof t.engine.evaluate;
+  const [wrapped] = wrapToolsWithOutputGate([sendTool([])], t.gate);
+  await wrapped!.execute("c", { message: "fine" } as any, undefined, undefined);
+  await until(() => rows(t.storage).length === 1);
+  assert.deepEqual(timeouts, [1400]);
+
+  const explicit = await setup({ knobs: { timeout_ms: 2500 }, answer: () => ({ noul: 0.1 }) });
+  const seen: Array<number | undefined> = [];
+  const ev2 = explicit.engine.evaluate.bind(explicit.engine);
+  explicit.engine.evaluate = ((point: any, input: any, ctx: any) => {
+    seen.push(ctx.timeoutMs);
+    return ev2(point, input, ctx);
+  }) as typeof explicit.engine.evaluate;
+  const [w2] = wrapToolsWithOutputGate([sendTool([])], explicit.gate);
+  await w2!.execute("c", { message: "fine" } as any, undefined, undefined);
+  await until(() => rows(explicit.storage).length === 1);
+  assert.deepEqual(seen, [2500], "[decisions.checks].timeout_ms wins when set");
+  t.storage.close();
+  explicit.storage.close();
 });

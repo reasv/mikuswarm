@@ -129,6 +129,9 @@ const PATTERN_SOURCES: Record<Checkpoint, readonly CheckSource[]> = {
   rollout: ["rollout"],
 };
 
+/** A check call's default hard timeout, as a multiple of its checkpoint's deadline. */
+export const CALL_TIMEOUT_DEADLINE_FACTOR = 2;
+
 const CHECKPOINT_PRIORITY: Record<Checkpoint, PriorityClass> = {
   send: "interactive",
   ending: "interactive",
@@ -331,6 +334,11 @@ export class CheckEvaluator {
       return { fired: [], unjudgedReason: "payee_budget" };
     }
     const knobs = this.knobs(scope.agent);
+    // The deadline only stops the waiting; the call itself may finish later and
+    // is still recorded (§6.3). Unless `[decisions.checks].timeout_ms` is set,
+    // a call may run for twice its checkpoint's deadline.
+    const configuredTimeout = decisionsFor(this.options.config as AppConfig, scope.agent).checks?.timeout_ms;
+    const callTimeoutMs = configuredTimeout ?? evaluation.deadlineMs * CALL_TIMEOUT_DEADLINE_FACTOR;
     const members = engine.usableMembers("checks", scope.agent, attribution);
     const checksByCode = new Map(evaluation.checks.map((c) => [c.code, c]));
     const plan: PlannedCall[] = planCheckCalls(items, members[0], checkpoint, subject.sources, checksByCode);
@@ -357,6 +365,7 @@ export class CheckEvaluator {
               priority: CHECKPOINT_PRIORITY[checkpoint],
               signal: evaluation.controller.signal,
               decisionGroup: evaluation.decisionGroup,
+              timeoutMs: callTimeoutMs,
               onEvaluation: (row) => {
                 record.row = row;
               },
