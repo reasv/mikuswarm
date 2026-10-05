@@ -6,15 +6,15 @@ import { hasRecordTurn } from '$lib/rollout';
  * WITHOUT a manual refresh (the live rollout stream is consumed separately; this
  * only keeps `status` / actuals fresh and drives LiveRollout mount/unmount). Fast
  * while `running` (catch settlement + live actuals), slower while resumable or
- * just-completed so a resume / follow-up-fold that reuses this id (settled→running)
- * is detected and re-mounts `LiveRollout`; sticky (no poll) once durably terminal.
+ * just-completed so a resume that reuses this id (settled→running) is detected and
+ * re-mounts `LiveRollout`; sticky (no poll) once durably terminal.
  *
  * Kept in its own module free of the SvelteKit remote-function runtime so it is
  * unit-testable. `now` is injectable.
  */
 const RUNNING_POLL_MS = 3000;
 const RESUMABLE_POLL_MS = 8000;
-/** A just-completed session can be resumed within seconds by a follow-up fold. */
+/** A just-completed session can be resumed within seconds by a reply. */
 const RECENT_COMPLETION_GRACE_MS = 20_000;
 
 export function sessionPollInterval(

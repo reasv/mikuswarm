@@ -2469,11 +2469,12 @@ export function wasRunAborted(agent: {
 
 /**
  * Injected synthetic calls must reach tools the session has on the wire. A call to
- * a tool that is still deferred (a deployment whose `immediate` list leaves out
- * `read_session_record`, say) is preceded by one synthetic `tool_search` select
+ * a tool that is still deferred is preceded by one synthetic `tool_search` select
  * call that loads it, exactly as the agent itself would have to, so each
  * transport serializes the load at its native load point. Without dynamic loading
- * (no registry) every tool is already present and the specs pass through.
+ * (no registry) every tool is already present and the specs pass through. Today's
+ * targets never need it (`read_session_record` is always immediate, `load_skill` is
+ * a loading tool); it keeps any future injection target correct.
  */
 export function withDeferredLoads(
   specs: readonly SyntheticCallSpec[],
