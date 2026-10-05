@@ -79,7 +79,7 @@ async function load(extra: string) {
 
 test("TOML: checks, rules, decisions.checks, model family and forced_completion_redo load", async () => {
   const config = await load(`
-[agent]
+[agent.sessions]
 forced_completion_redo = true
 
 [models.default]
@@ -121,7 +121,7 @@ on_exhausted = "withhold"
 send_deadline_ms = 4000
 style_min_chars = 30
 `);
-  assert.equal(config.agent.forced_completion_redo, true);
+  assert.equal(config.agent.sessions.forced_completion_redo, true);
   assert.equal(config.models.default.family, "family_a");
   const catalogue = buildCheckCatalogue(config);
   const distill = catalogue.get("refusal_distillation")!;

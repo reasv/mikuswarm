@@ -23,10 +23,6 @@ cost_warn_fraction = 0.8
 # budget — it is then skipped and selection degrades to the next preferred model.
 # Only consulted when [[user_limits]] is configured (the feature is off by default).
 user_limit_min_output_tokens = 256
-# Send-contract redo (spec REFUSAL-HANDLING §7.5): when the forced-completion nudges
-# run out, discard the failed attempts and redo once on the same model (with its own
-# nudge budget) before settling as NO_REPLY. Off by default.
-forced_completion_redo = false
 
 [observability]
 # Capacity of the in-memory Layer-0 LLM request ring backing
@@ -48,6 +44,10 @@ max_concurrent = 3
 max_concurrent_dm = 1
 max_queued_per_timeline = 10000
 forced_completion_retries = 3
+# Send-contract redo (spec REFUSAL-HANDLING §7.5): when the forced-completion nudges
+# run out, discard the failed attempts and redo once per failure point on the same
+# model (with its own nudge budget) before settling as NO_REPLY. Off by default.
+forced_completion_redo = false
 # Co-target coalescing window (spec DUPLICATE-REPLY-MITIGATION §8): a new reply
 # whose reply-target matches a running session's trigger reply-target is folded
 # into that session (as a co-reply interjection) instead of spawning a twin, but
