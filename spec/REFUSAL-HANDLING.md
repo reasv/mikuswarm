@@ -3,7 +3,7 @@
 **Status**: PROPOSAL (2026-10-05). Direction from the owner; most mechanisms below are still open design questions (§10), to be settled in a planning pass before implementation.
 **Builds on**: the shipped `refusal` error class (ARCHITECTURE.md §8a "Refusals"): hard refusals are recognized from the provider's stop reason, are never a health strike, are never retried on the member that refused, fall over to the next chain member, and log `llm_refusal`. The session-record turn opts out of fallover.
 **Supersedes**: the "Refusal handling" direction recorded in spec/SESSION-RECORDS.md §9, which this document expands.
-**Related**: SESSION-RECORDS (record turn, §3.2), DECISION-MODEL (decision points, Jev), MODEL-FALLBACK, LLM-FAILURE-HANDLING, the "redo" concept of SESSION-RECORDS §9.
+**Related**: style / LLM-ism enforcement (designed jointly, §4), SESSION-RECORDS (record turn, §3.2), DECISION-MODEL (decision points, Jev), MODEL-FALLBACK, LLM-FAILURE-HANDLING, the "redo" concept of SESSION-RECORDS §9.
 
 ## 1. Problem
 
@@ -42,7 +42,7 @@ This is a false-positive vs false-negative trade-off:
 
 A decision-model point (DECISION-MODEL machinery; Jev) judges outputs for refusal (declined, deflected, did less than asked) and its reason. It runs at three kinds of checkpoint:
 
-1. **Every outgoing chat message** (§4): a gate in the send path; the reply is held until judged, before `send_message` (or any message-posting tool) takes effect.
+1. **Every outgoing message** (§4): a gate in the send path; the message is held until judged, before `send_message` (or any message-posting tool) takes effect.
 2. **Internal tasks' artifacts**: the task's output judged against its instruction. The simplest case is a caption (the caption text itself); it applies equally to outputs built over several tool calls, such as a summary or a diary entry (the finished draft at finalize), and to the session record.
 3. **Internal tasks' rollouts, when they appear to fail**: today a summarization run that produces no summary takes the semantic path and is re-run from scratch as a new attempt, up to `max_retries` (ARCHITECTURE.md §9b). That redo becomes gated by a refusal check over the failed rollout: a judged refusal goes to the refusal rules (another model, §5) instead of re-running the same model; no refusal keeps today's redo.
 
@@ -52,15 +52,22 @@ A decision-model point (DECISION-MODEL machinery; Jev) judges outputs for refusa
 - **Operator-defined reasons**: like routing's task categories, the config can define extra reasons. In effect each is an operator-written decision-model question; rules can match on them.
 - Every detection records how it was detected (`stop_reason`, `provider_category`, `judged`) and its confidence.
 
-## 4. The outgoing-message checkpoint
+## 4. The outgoing-message gate (shared with style enforcement)
 
-Every outgoing reply is **gated** on the decision model: it is held and sent only after Jev has evaluated it (or the checkpoint deadline has passed, below). This is a hard gate in the send path, not a check running beside it. This is the checkpoint that makes chat-session refusals recoverable: a refused reply is caught before it reaches the chat, so a redo has no irreversible effect to undo (§6.2).
+Every outgoing message is **gated** on the decision model: it is held and sent only after Jev has evaluated it (or the gate's deadline has passed, below). This is a hard gate in the send path, not a check running beside it. Replies are not special: proactive posts, cross-channel sends and bot-to-bot messages take the same gate. The gate is what makes chat-session refusals recoverable: a refused message is caught before it reaches the chat, so a redo has no irreversible effect to undo (§6.2).
 
-- **One evaluation, many questions.** The refusal questions ride along with every other per-message question: desired formatting and style (LLM-isms, length, markup), other potential issues, and arbitrary operator- or user-defined conditions on messages. Jev bills once per request (per context), not per question, and the context is the same for all of them, so adding questions costs little. Members billed per question (`billing = "per_question"`) change that arithmetic and must be accounted for.
-- **What the context is**: the outgoing message, the request it answers, and enough recent chat to judge it; designed once and shared by all the per-message questions.
-- **What happens on a verdict** is per question: a refusal goes to the refusal rules (§6); a style or condition violation could ask the model to revise, or only be recorded; to be designed per question family.
-- Scope: every reply. Open only for message-posting paths that are not replies (proactive posts, cross-channel sends, bot-to-bot), which likely take the same gate.
-- Fail-open: when the decision model is slow or down, the message goes out at the checkpoint deadline, unjudged, and the miss is counted (§9). The gate never blocks a reply indefinitely.
+**Designed together with style enforcement.** The gate is the same feature as LLM-ism / style enforcement: one Jev call per outgoing message carries every per-message question (refusal and its reason, formatting and style, LLM-isms, other potential issues, arbitrary operator- or user-defined conditions on messages). Jev bills once per request (per context), not per question, and the context is the same for all of them, so adding questions costs little. Members billed per question (`billing = "per_question"`) change that arithmetic and must be accounted for. The two are specified and built as one gate; this document owns its refusal side.
+
+- **Context**: the outgoing message, the request it answers, and enough recent chat to judge it; designed once and shared by all questions.
+- **Two kinds of verdict, two recoveries:**
+  - **Redo on another model** (refusal fallback, and any other check whose remedy is a different model): the message is not sent; the turn is discarded and redone on the rule's model (§6.2). Bounded by its fallback chain, explicit or implicit, so it needs no further limit.
+  - **Revise in place** (style and similar checks, where a different, less preferred model would likely do worse): the send is stopped and the `send_message` call returns a tool error listing each flagged check with its unique identifier and an explanation for the agent; the agent revises and calls `send_message` again. The same agent and model continue; nothing is discarded.
+- **Bounds on revise-in-place** (better a style issue than an unbounded, unnoticed token spend):
+  - a limit on consecutive triggers for one message, after which the message goes through regardless of style flags;
+  - a per-session limit on total style rejections, after which style checks stop blocking for the rest of the session;
+  - both counted in the statistics.
+- **Per-check override.** `send_message` takes an argument naming check identifiers to skip for this send. The tool error tells the agent to use it whenever a flagged check is a clear false positive, or the message deliberately shows the flagged pattern (an example, a quotation). Every check therefore has a stable unique identifier. An override is recorded with the statistics.
+- **Fail-open**: when the decision model is slow or down, the message goes out at the gate's deadline, unjudged, and the miss is counted (§9). The gate never blocks a message indefinitely.
 
 ## 5. Statistics
 
@@ -85,12 +92,12 @@ How to "redo" depends on where the refusal surfaced:
   - The fork point is the last state before the refusing turn(s): drop the refused assistant turn and anything after it from the live transcript, keep the earlier rollout.
   - Cache is irrelevant: the new model has no cache for this context anyway. Thinking/reasoning blocks of the old model are dropped on replay to a different model as they are today.
   - The discarded branch is kept for inspection (the transcript records the fork; the console shows the redone turn, like the "redo" concept of SESSION-RECORDS §9).
-- **Irreversible effects.** A refused turn may already have acted: sent a chat message, posted, edited a file. Options to decide between: judge before irreversible tools run (the outgoing-message checkpoint of §4, the default for chat messages), only redo when the refused turn had no irreversible effects, or redo and then correct (edit/delete the sent message). Mechanical jobs (summary, caption) have no external effects, so for them a redo is always just "discard and rerun".
+- **Irreversible effects.** A refused turn may already have acted: sent a chat message, posted, edited a file. Options to decide between: judge before irreversible tools run (the outgoing-message gate of §4, the default for chat messages), only redo when the refused turn had no irreversible effects, or redo and then correct (edit/delete the sent message). Mechanical jobs (summary, caption) have no external effects, so for them a redo is always just "discard and rerun".
 - **What a redo is billed to** and how it appears in the usage ledger (the refused attempt and the redo are separate requests; refused attempts' spend must be recorded, which today's terminal-error path does not do).
 
 ### 6.3 Per-site notes
 
-- **Chat-lane reply sessions**: the main new case. The outgoing-message checkpoint (§4) catches the refused reply before it is sent; the fork/redo machinery in the session runner then continues on the rule's model. Interacts with steering, interjections and the forced-completion loop.
+- **Chat-lane reply sessions**: the main new case. The outgoing-message gate (§4) catches the refused message before it is sent; the fork/redo machinery in the session runner then continues on the rule's model. Interacts with steering, interjections and the forced-completion loop.
 - **Session-record turn**: a refused record turn can be redone on another model (spec SESSION-RECORDS §3.2 anticipated this). The other model reads the whole rollout uncached; the record turn's own budget and timeout apply.
 - **Summarization / condense / diary / captioning**: the artifact check (§3.3) catches a refused output; a failed rollout is checked before today's redo-from-scratch (§3.3). Discard and rerun on the rule's model; never write a refusal into a summary, caption or diary; no repeated tool nudges against a refusing model.
 
@@ -121,6 +128,6 @@ Every change here adds work to the path of a task: a judgement before each outgo
 4. Fork/redo mechanics in the session runner: fork point, transcript representation of the discarded branch, steering/interjection interplay, irreversible effects policy.
 5. Statistics storage and the console views.
 6. Ledger: recording refused attempts' spend.
-7. The outgoing-message evaluation: its shared context, the question families riding along (refusal, style/LLM-isms, other issues, operator/user conditions), and what each verdict does.
+7. The outgoing-message gate, designed jointly with style enforcement: shared context, the question families (refusal, style/LLM-isms, other issues, operator/user conditions), check identifiers, which checks redo vs revise, the consecutive and per-session limits, and the override argument.
 8. Which internal tasks get artifact checks and rollout checks first, and where in each worker the check sits.
 9. Latency budgets per checkpoint, fail-open deadlines, and how latency is measured end to end (§9).
