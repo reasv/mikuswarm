@@ -7863,6 +7863,16 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       userLimitEngine,
       // Model behaviour page (spec REFUSAL-HANDLING §12.3).
       modelBehaviour,
+      // Check descriptions + nudge budget for the session view (REFUSAL-HANDLING §12.1–§12.2).
+      checks: {
+        describe: (code, timelineKey) => {
+          const check = checkCatalogue.get(code, agentNameForTimeline(timelineKey));
+          return check
+            ? { code, kind: check.kind, remedy: check.remedy, reason: check.reason ?? null, description: check.description }
+            : undefined;
+        },
+        maxNudges: config.agent.sessions.forced_completion_retries,
+      },
       logger: logger.child("console"),
     });
     await consoleServer.start();

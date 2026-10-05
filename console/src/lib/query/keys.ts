@@ -47,5 +47,8 @@ export const keys = {
 		['usage', 'leaderboard', window, agent] as const,
 	usageBudgets: () => ['usage', 'budgets'] as const,
 	// scope + page fold into the key so switching tab / page refetches that slice.
-	usageUserLimits: (scope: string, page: number) => ['usage', 'user-limits', scope, page] as const
+	usageUserLimits: (scope: string, page: number) => ['usage', 'user-limits', scope, page] as const,
+	// Model behaviour page (spec REFUSAL-HANDLING §12.3): every URL filter folds into
+	// the key, so changing one is a new cache entry.
+	modelBehaviour: (filters: Record<string, unknown>) => ['models', 'behaviour', filters] as const
 };

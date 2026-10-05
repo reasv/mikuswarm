@@ -146,6 +146,14 @@ export function rowVerdictLabel(row: DecisionEvaluation): string | null {
 		const v = parseRecordsVerdict(row.verdictJson);
 		return v ? (v.inject ? 'inject' : 'skip') : null;
 	}
+	if (row.point === 'checks') {
+		// Output gate rows (spec REFUSAL-HANDLING §9): the fired codes, else clean.
+		const v = parse(row.verdictJson);
+		if (!isObject(v)) return null;
+		if (v.unjudged === true) return 'unjudged';
+		const fired = strings(v.fired);
+		return fired.length > 0 ? `fired ${fired.join(', ')}` : 'clean';
+	}
 	return null;
 }
 

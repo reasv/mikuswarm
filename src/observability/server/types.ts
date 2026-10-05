@@ -46,6 +46,27 @@ export interface BackfetchConsoleDeps {
 }
 
 /**
+ * What the session view needs from the refusal-handling config (spec
+ * REFUSAL-HANDLING §12.1–§12.2): check descriptions for the fork markers and
+ * gate cards, and the nudge budget for "nudge 2/3".
+ */
+export interface ConsoleChecksDeps {
+  /** The catalogue entry of `code` as the session's agent sees it, or undefined. */
+  describe(code: string, timelineKey: string): ConsoleCheckInfo | undefined;
+  /** `[agent.sessions].forced_completion_retries`. */
+  maxNudges: number;
+}
+
+/** One check as the console shows it. */
+export interface ConsoleCheckInfo {
+  code: string;
+  kind: string;
+  remedy: string;
+  reason: string | null;
+  description: string;
+}
+
+/**
  * Live references the read-only observability console holds (spec §8). In-process
  * is mandatory: the room view needs the real `ContextBuilder` (via the factory's
  * `buildPreview`), live streaming needs the in-memory `Agent` (via `SessionManager`),
@@ -151,6 +172,12 @@ export interface ConsoleServerDeps {
    * `GET /api/models/behaviour` and its incident pages. Optional: absent = 503.
    */
   modelBehaviour?: ModelBehaviourApi;
+  /**
+   * Check descriptions and the nudge budget for the session view (spec
+   * REFUSAL-HANDLING §12.1–§12.2). Optional: absent = session detail carries no
+   * check descriptions and no nudge budget.
+   */
+  checks?: ConsoleChecksDeps;
   logger: Logger;
 }
 

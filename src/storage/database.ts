@@ -1336,6 +1336,20 @@ export interface SessionBranchRow {
 }
 
 /**
+ * Per-session refusal-handling counters for the console's session list chips
+ * (spec REFUSAL-HANDLING §12.2): refusal events, redos (rule redos of either
+ * kind plus send-contract redos), corrective nudges, and distinct judged calls
+ * whose verdict was `revise` or `sent_unjudged`.
+ */
+export interface SessionCheckChips {
+  refused: number;
+  redone: number;
+  nudged: number;
+  revised: number;
+  unjudged: number;
+}
+
+/**
  * One row of the auxiliary tool-use usage ledger (spec AUXILIARY-USAGE-TRACKING
  * §8.2): a generic per-invocation record for provider calls made by a tool via
  * raw fetch (today `image_generate`). Attributed to the ambient
@@ -10132,6 +10146,50 @@ export class Storage {
         .prepare(`select * from agent_session_branches where session_id = ? order by branch_no asc`)
         .all(sessionId) as SessionBranchRow[],
     );
+  }
+
+  /**
+   * Session-list chip counters for a page of sessions (spec REFUSAL-HANDLING
+   * §12.2), keyed by session id; sessions with nothing to show are absent.
+   * `redone` counts rule redos (`refusal_events.outcome = 'redo'`, hard or soft:
+   * a soft redo's branch is the same redo) plus send-contract redo branches.
+   * Judged calls are distinct (branch, checkpoint, tool call, attempt) anchors,
+   * as split calls and pattern rows of one evaluation share theirs. Read-only.
+   */
+  getSessionCheckChips(sessionIds: readonly string[]): Map<string, SessionCheckChips> {
+    const out = new Map<string, SessionCheckChips>();
+    if (sessionIds.length === 0) return out;
+    const anchor = `coalesce(d.branch_no, 0) || '|' || coalesce(d.checkpoint, '') || '|' ||
+      coalesce(d.tool_call_id, '') || '|' || coalesce(d.attempt_no, '') || '|' ||
+      case when d.tool_call_id is null and d.attempt_no is null then d.id else '' end`;
+    const judged = (consequence: string) =>
+      `(select count(distinct ${anchor}) from decision_evaluations d
+         where d.agent_session_id = s.id and d.point = 'checks' and d.consequence = '${consequence}')`;
+    return this.read((db) => {
+      // SQLite's default host-parameter limit is far above a list page; chunk anyway.
+      for (let i = 0; i < sessionIds.length; i += 500) {
+        const ids = sessionIds.slice(i, i + 500);
+        const rows = db
+          .prepare(
+            `select s.id as id,
+               (select count(*) from refusal_events r where r.agent_session_id = s.id) as refused,
+               (select count(*) from refusal_events r
+                  where r.agent_session_id = s.id and r.outcome = 'redo')
+                 + (select count(*) from agent_session_branches b
+                  where b.session_id = s.id and b.reason = 'contract_redo') as redone,
+               coalesce(s.contract_nudges, 0) as nudged,
+               ${judged("revise")} as revised,
+               ${judged("sent_unjudged")} as unjudged
+             from agent_sessions s
+             where s.id in (${ids.map(() => "?").join(", ")})`,
+          )
+          .all(...ids) as Array<SessionCheckChips & { id: string }>;
+        for (const { id, ...chips } of rows) {
+          if (chips.refused + chips.redone + chips.nudged + chips.revised + chips.unjudged > 0) out.set(id, chips);
+        }
+      }
+      return out;
+    });
   }
 
   /** Set (or clear, with null) a session's sticky refusal pin (spec REFUSAL-HANDLING §8.3). */

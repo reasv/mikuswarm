@@ -11,6 +11,7 @@ import type {
   AgentSessionMetaRow,
   AgentSessionStatus,
   RoomSummaryRow,
+  SessionCheckChips,
   Storage,
   ToolInvocationRow,
 } from "../../storage/index.js";
@@ -18,6 +19,7 @@ import { parseTimelineKey } from "../../storage/timeline-key.js";
 import { sanitizeTriggerFtsMatch } from "../../search/query.js";
 import { sendJson, sendError } from "./responses.js";
 import { openSse } from "./sse.js";
+import { decisionAnchorWire, sessionCheckChips, sessionRefusalDetail } from "./refusal-detail.js";
 import type { RequestContext, RouteHandler } from "./types.js";
 
 /** GET /api/rooms — timelines, reverse-chron by last activity (spec §8). */
@@ -177,7 +179,8 @@ export function roomSessions(
           statuses,
           sessionTypes,
         });
-  const sessions = rows.map((row) => sessionMeta(row, ctx.deps.factory));
+  const chips = sessionCheckChips(ctx.deps.storage, rows.map((row) => row.id));
+  const sessions = rows.map((row) => sessionMeta(row, ctx.deps.factory, chips.get(row.id)));
   sendJson(res, 200, { sessions });
 }
 
@@ -230,8 +233,9 @@ export function sessionDetail(
   // `toolCallId` to annotate the image_generate block.
   const toolUsage = ctx.deps.storage.getSessionToolUsage(row.id);
   const toolInvocations = ctx.deps.storage.getToolInvocationsBySession(row.id);
+  const chips = sessionCheckChips(ctx.deps.storage, [row.id]);
   sendJson(res, 200, {
-    session: { ...sessionMeta(row, ctx.deps.factory), toolUsage },
+    session: { ...sessionMeta(row, ctx.deps.factory, chips.get(row.id)), toolUsage },
     toolInvocations: toolInvocations.map(toolInvocationWire),
     // Normalize to the same wire shape as the room-context endpoint: the
     // persisted snapshot is raw ContextMessage JSON whose optional keys
@@ -255,6 +259,15 @@ export function sessionDetail(
     contextDumpPath: row.context_dump_path,
     // Model prompts the served members sent (ARCHITECTURE.md §8 "Model prompts").
     modelPrompts: ctx.deps.storage.getSessionModelPrompts(row.id),
+    // Refusal handling (spec REFUSAL-HANDLING §9, §12.1–§12.2): discarded branches
+    // for the branch switcher, refusal events, send-contract attempts + outcome,
+    // and the descriptions of the checks they name.
+    ...sessionRefusalDetail(
+      ctx.deps.storage,
+      row,
+      ctx.deps.storage.getDecisionEvaluationsForSession(row.id),
+      ctx.deps.checks,
+    ),
   });
 }
 
@@ -332,6 +345,9 @@ export function sessionDecisions(
       latencyMs: row.latency_ms,
       inputTokens: row.input_tokens,
       costUsd: row.cost_usd,
+      // Check-gate anchor (spec REFUSAL-HANDLING §9): checkpoint, branch, judged
+      // tool call or ending attempt, and what the verdict did.
+      ...decisionAnchorWire(row),
     })),
   });
 }
@@ -762,6 +778,19 @@ export function sessionStream(
     const unsubscribeLive = ctx.deps.liveEvents.subscribe(id, (event) => {
       if (stream.closed) return;
       stream.send(event.type, event);
+      // A redo forked the session (spec REFUSAL-HANDLING §9, §12.1): the fork core
+      // has already cut `agent.state.messages` to the new live branch (a sibling
+      // edit keeps an edited copy the client cannot rebuild), so re-seed the
+      // client onto it with the same record a mid-run attach gets.
+      if (event.type === "branch_forked") {
+        const messages = agent.state.messages;
+        stream.send("rollout_seed", {
+          type: "rollout_seed",
+          sessionId: id,
+          messages,
+          rolloutStartIndex: rolloutStartIndex(messages),
+        });
+      }
     });
     stream.onClose(unsubscribeLive);
   }
@@ -969,6 +998,7 @@ export function summaryDetail(
 function sessionMeta(
   row: AgentSessionMetaRow,
   factory: RequestContext["deps"]["factory"],
+  checkChips?: SessionCheckChips,
 ): Record<string, unknown> {
   const hasUsage = row.llm_requests !== null;
   return {
@@ -1001,6 +1031,9 @@ function sessionMeta(
     // numerator is `usage.cost` (§8b) + the §8c tool spend (`toolUsage.cost`).
     maxSessionCostUsd: factory.resolveSessionCostCeiling(row.session_type) ?? null,
     noReply: row.no_reply === 1,
+    // Session-list chips (spec REFUSAL-HANDLING §12.2): refused, redone, nudged,
+    // revised, unjudged. null = nothing to show.
+    checkChips: checkChips ?? null,
     error: row.error,
     createdAt: row.created_at,
     startedAt: row.started_at,

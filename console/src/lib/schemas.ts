@@ -130,6 +130,16 @@ export const RoomContextResponse = Schema.Struct({
 });
 export type RoomContextResponse = Schema.Schema.Type<typeof RoomContextResponse>;
 
+/** Session-list chip counters (refusal-detail.ts `getSessionCheckChips`). */
+export const SessionCheckChips = Schema.Struct({
+	refused: Schema.Number,
+	redone: Schema.Number,
+	nudged: Schema.Number,
+	revised: Schema.Number,
+	unjudged: Schema.Number
+});
+export type SessionCheckChips = Schema.Schema.Type<typeof SessionCheckChips>;
+
 /** session meta (handlers.ts `sessionMeta`) */
 export const SessionMeta = Schema.Struct({
 	id: Schema.String,
@@ -181,6 +191,10 @@ export const SessionMeta = Schema.Struct({
 		})
 	),
 	noReply: Schema.Boolean,
+	// Session-list chips (spec REFUSAL-HANDLING §12.2): refusal events, redos,
+	// nudges, revised and unjudged judged calls. null = nothing to show; optional
+	// so a pre-feature backend still decodes.
+	checkChips: Schema.optional(Schema.NullOr(SessionCheckChips)),
 	error: Schema.NullOr(Schema.String),
 	createdAt: Schema.Number,
 	startedAt: Schema.NullOr(Schema.Number),
@@ -216,6 +230,94 @@ export const ToolInvocation = Schema.Struct({
 });
 export type ToolInvocation = Schema.Schema.Type<typeof ToolInvocation>;
 
+// ── Refusal handling in the session view (spec REFUSAL-HANDLING §9, §12.1–§12.2;
+// src/observability/server/refusal-detail.ts) ────────────────────────────────
+
+/**
+ * One discarded span (`agent_session_branches`). `forkIndex` is the index in the
+ * live message list at fork time; `messages` the span (a sibling-edit fork's
+ * first message is the ORIGINAL assistant message). Branch 0 is the live transcript.
+ */
+export const SessionBranch = Schema.Struct({
+	branchNo: Schema.Number,
+	parentBranchNo: Schema.Number,
+	forkIndex: Schema.Number,
+	/** refusal_redo | contract_redo */
+	reason: Schema.String,
+	checkCode: Schema.NullOr(Schema.String),
+	decisionEvaluationId: Schema.NullOr(Schema.Number),
+	fromModel: Schema.NullOr(Schema.String),
+	toModel: Schema.NullOr(Schema.String),
+	messages: Schema.Array(PassthroughObject),
+	costUsd: Schema.NullOr(Schema.Number),
+	createdAt: Schema.Number
+});
+export type SessionBranch = Schema.Schema.Type<typeof SessionBranch>;
+
+/** One detected refusal (`refusal_events`), hard (checkpoint `request`) or judged. */
+export const RefusalEvent = Schema.Struct({
+	id: Schema.Number,
+	ts: Schema.Number,
+	branchNo: Schema.Number,
+	site: Schema.String,
+	servedModel: Schema.NullOr(Schema.String),
+	wireModel: Schema.NullOr(Schema.String),
+	/** hard | soft */
+	kind: Schema.String,
+	checkCode: Schema.String,
+	reason: Schema.String,
+	subReason: Schema.NullOr(Schema.String),
+	/** stop_reason | provider_category | pattern | judged */
+	method: Schema.String,
+	source: Schema.NullOr(Schema.String),
+	probability: Schema.NullOr(Schema.Number),
+	rawStopReason: Schema.NullOr(Schema.String),
+	category: Schema.NullOr(Schema.String),
+	explanation: Schema.NullOr(Schema.String),
+	/** request | send | ending | artifact | rollout */
+	checkpoint: Schema.String,
+	ruleName: Schema.NullOr(Schema.String),
+	/** fallover | redo | exhausted_* | failed | observed */
+	outcome: Schema.String,
+	toModel: Schema.NullOr(Schema.String),
+	decisionEvaluationId: Schema.NullOr(Schema.Number)
+});
+export type RefusalEvent = Schema.Schema.Type<typeof RefusalEvent>;
+
+/** One send-contract attempt (`contract_attempts`); `failureTypes` [] = a valid ending. */
+export const ContractAttempt = Schema.Struct({
+	branchNo: Schema.Number,
+	redoNo: Schema.Number,
+	attemptNo: Schema.Number,
+	ts: Schema.NullOr(Schema.Number),
+	servedModel: Schema.NullOr(Schema.String),
+	wireModel: Schema.NullOr(Schema.String),
+	/** original | not_sent | sent_not_final */
+	variant: Schema.String,
+	failureTypes: Schema.Array(Schema.String),
+	primaryType: Schema.NullOr(Schema.String)
+});
+export type ContractAttempt = Schema.Schema.Type<typeof ContractAttempt>;
+
+/** The session's send-contract record; `maxNudges` = the configured nudge budget. */
+export const SessionContract = Schema.Struct({
+	outcome: Schema.NullOr(Schema.String),
+	nudges: Schema.NullOr(Schema.Number),
+	maxNudges: Schema.NullOr(Schema.Number),
+	attempts: Schema.Array(ContractAttempt)
+});
+export type SessionContract = Schema.Schema.Type<typeof SessionContract>;
+
+/** A check named by the session's rows, as its agent's catalogue describes it. */
+export const CheckInfo = Schema.Struct({
+	code: Schema.String,
+	kind: Schema.String,
+	remedy: Schema.String,
+	reason: Schema.NullOr(Schema.String),
+	description: Schema.String
+});
+export type CheckInfo = Schema.Schema.Type<typeof CheckInfo>;
+
 /** GET /api/sessions/:id — transcript/snapshot elements kept permissive. */
 export const SessionDetailResponse = Schema.Struct({
 	session: SessionMeta,
@@ -237,7 +339,13 @@ export const SessionDetailResponse = Schema.Struct({
 				requests: Schema.Number
 			})
 		)
-	)
+	),
+	// Refusal handling (spec REFUSAL-HANDLING §9, §12); optional so a pre-feature
+	// backend still decodes.
+	branches: Schema.optional(Schema.Array(SessionBranch)),
+	refusalEvents: Schema.optional(Schema.Array(RefusalEvent)),
+	contract: Schema.optional(SessionContract),
+	checks: Schema.optional(Schema.Array(CheckInfo))
 });
 export type SessionDetailResponse = Schema.Schema.Type<typeof SessionDetailResponse>;
 
@@ -919,7 +1027,7 @@ export const DecisionEvaluation = Schema.Struct({
 	id: Schema.Number,
 	ts: Schema.Number,
 	decisionGroup: Schema.String,
-	point: Schema.String,              // 'routing' | 'records'
+	point: Schema.String,              // 'routing' | 'records' | 'checks' | 'audit'
 	agent: Schema.NullOr(Schema.String),
 	timelineKey: Schema.NullOr(Schema.String),
 	agentSessionId: Schema.NullOr(Schema.String),
@@ -935,7 +1043,16 @@ export const DecisionEvaluation = Schema.Struct({
 	servedVersion: Schema.NullOr(Schema.String),
 	latencyMs: Schema.NullOr(Schema.Number),
 	inputTokens: Schema.NullOr(Schema.Number),
-	costUsd: Schema.NullOr(Schema.Number)
+	costUsd: Schema.NullOr(Schema.Number),
+	// Check-gate anchor (spec REFUSAL-HANDLING §9), `checks` rows only; optional
+	// so a pre-feature backend still decodes. `checkpoint`: send | ending |
+	// artifact | rollout; `consequence`: sent | sent_unjudged | revise |
+	// overridden | redo | observed | withheld.
+	checkpoint: Schema.optional(Schema.NullOr(Schema.String)),
+	branchNo: Schema.optional(Schema.NullOr(Schema.Number)),
+	toolCallId: Schema.optional(Schema.NullOr(Schema.String)),
+	attemptNo: Schema.optional(Schema.NullOr(Schema.Number)),
+	consequence: Schema.optional(Schema.NullOr(Schema.String))
 });
 export type DecisionEvaluation = Schema.Schema.Type<typeof DecisionEvaluation>;
 

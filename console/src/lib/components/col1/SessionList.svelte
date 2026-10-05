@@ -6,6 +6,7 @@
 	import { conversationsHref } from '$lib/nav';
 	import StatusBadge from './StatusBadge.svelte';
 	import SessionFilters from './SessionFilters.svelte';
+	import SessionChips from './SessionChips.svelte';
 	import { cn } from '$lib/utils';
 
 	const sessions = roomSessionsQuery(
@@ -74,6 +75,7 @@
 							<span class="line-clamp-2 text-xs text-muted-foreground">
 								{session.triggerBody ?? session.id}
 							</span>
+							<SessionChips chips={session.checkChips} />
 						</a>
 					</li>
 				{/each}

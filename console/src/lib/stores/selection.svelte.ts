@@ -21,6 +21,18 @@ class Selection {
 		return page.url.searchParams.get('session');
 	}
 
+	/**
+	 * Deep link into a session's rollout (spec REFUSAL-HANDLING §12.3 incident
+	 * log): `branch` (a stored branch number; 0/absent = live), `call` (a judged
+	 * tool call id) and `attempt` (a send-contract ending attempt).
+	 */
+	get focus(): { branchNo: number | null; toolCallId: string | null; attemptNo: number | null } | null {
+		const sp = page.url.searchParams;
+		const int = (v: string | null) => (v != null && /^\d+$/.test(v) ? Number(v) : null);
+		const focus = { branchNo: int(sp.get('branch')), toolCallId: sp.get('call') || null, attemptNo: int(sp.get('attempt')) };
+		return focus.branchNo == null && focus.toolCallId == null && focus.attemptNo == null ? null : focus;
+	}
+
 	get mode(): 'empty' | 'room' | 'session' {
 		if (this.sessionId) return 'session';
 		if (this.roomKey) return 'room';

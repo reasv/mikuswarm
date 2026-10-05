@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { conversationsHref, pipelinesHref } from './nav';
+import { conversationsHref, modelsHref, pipelinesHref } from './nav';
 
 describe('conversationsHref', () => {
 	it('omits the query entirely when nothing is selected', () => {
@@ -33,6 +33,14 @@ describe('conversationsHref', () => {
 		expect(conversationsHref({ agent: 'nova', room: 'discord:nova:room:1002' })).toBe(
 			'/?agent=nova&room=discord%3Anova%3Aroom%3A1002'
 		);
+	});
+
+	it('deep-links a rollout branch, tool call and attempt (REFUSAL-HANDLING §12.3)', () => {
+		expect(conversationsHref({ room: 'r', session: 's', branch: 2, call: 'call-1' })).toBe(
+			'/?room=r&session=s&branch=2&call=call-1'
+		);
+		expect(conversationsHref({ session: 's', branch: 0, attempt: 0 })).toBe('/?session=s&attempt=0');
+		expect(modelsHref({ window: '7d', agent: null })).toBe('/models?window=7d');
 	});
 
 	it('drops a null/empty agent (clears the filter)', () => {

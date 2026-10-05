@@ -25,7 +25,9 @@
 						? 'backfetch'
 						: page.url.pathname.startsWith('/usage-cost')
 							? 'usage-cost'
-							: 'conversations'
+							: page.url.pathname.startsWith('/models')
+								? 'models'
+								: 'conversations'
 	);
 
 	// ── Agent chip in the conversations breadcrumb (spec CONSOLE-MULTI-AGENT §4) ──
@@ -135,6 +137,17 @@
 		>
 			Usage & Cost
 		</a>
+		<a
+			href="/models"
+			class={cn(
+				'rounded px-2 py-0.5 transition-colors',
+				area === 'models'
+					? 'bg-background font-medium text-foreground shadow-sm'
+					: 'text-muted-foreground hover:text-foreground'
+			)}
+		>
+			Models
+		</a>
 	</nav>
 
 	<span class="text-muted-foreground">/</span>
@@ -154,6 +167,10 @@
 	{:else if area === 'usage-cost'}
 		<nav class="flex min-w-0 items-center gap-1 text-muted-foreground">
 			<span>usage &amp; cost</span>
+		</nav>
+	{:else if area === 'models'}
+		<nav class="flex min-w-0 items-center gap-1 text-muted-foreground">
+			<span>model behaviour</span>
 		</nav>
 	{:else if area === 'conversations'}
 		<nav class="flex min-w-0 items-center gap-1 text-muted-foreground">
