@@ -12,6 +12,7 @@ import {
   MODEL_BEHAVIOUR_SCHEMA,
   MODEL_BEHAVIOUR_TABLES_SCHEMA,
 } from "./model-behaviour-schema.js";
+import { SESSION_AUDITS_SCHEMA } from "./session-audits-schema.js";
 
 /**
  * The resolved replacement content an edit carries: the post-edit body and the
@@ -1333,6 +1334,73 @@ export interface SessionBranchRow {
   messages_json: string;
   cost_usd: number | null;
   created_at: number;
+}
+
+/** `session_audits.status` (spec REFUSAL-HANDLING §7.6, DECISION-MODEL §5.8). */
+export type SessionAuditStatus = "done" | "skipped" | "unauditable" | "failed";
+
+/** Insert payload for {@link Storage.writeSessionAudits}: replaces the row with the same key. */
+export interface SessionAuditInsert {
+  sessionId: string;
+  audit: string;
+  /** Per-message audits: the sent message's timeline event id; null/omitted = the whole session. */
+  eventId?: string | null;
+  status: SessionAuditStatus;
+  answersJson?: string | null;
+  verdictJson?: string | null;
+  confidence?: number | null;
+  modelId?: string | null;
+  costUsd?: number | null;
+  version: number;
+  createdAt?: number;
+}
+
+/** A persisted `session_audits` row (snake_case columns). */
+export interface SessionAuditRow {
+  id: number;
+  session_id: string;
+  audit: string;
+  event_id: string | null;
+  status: string;
+  answers_json: string | null;
+  verdict_json: string | null;
+  confidence: number | null;
+  model_id: string | null;
+  cost_usd: number | null;
+  version: number;
+  created_at: number;
+}
+
+/** A diagnosed send-contract attempt's new failure types (the offline audit's `self_talk` etc.). */
+export interface ContractAttemptTypesUpdate {
+  branchNo: number;
+  redoNo: number;
+  attemptNo: number;
+  failureTypes: string[];
+  primaryType: string | null;
+}
+
+/** A session the offline audit worker may claim ({@link Storage.listAuditCandidates}). */
+export interface AuditCandidateRow {
+  id: string;
+  timeline_key: string;
+  session_type: string;
+  status: string;
+  created_at: number;
+  completed_at: number | null;
+  contract_version: number | null;
+  contract_nudges: number | null;
+  trigger_body: string | null;
+  trigger_sender_id: string | null;
+  trigger_sender_display_name: string | null;
+  initial_preloads: string | null;
+}
+
+/** One audit the candidate query considers: pending = no row for it since the session last completed. */
+export interface AuditQueueAudit {
+  name: string;
+  /** Only sessions whose send-contract record is derived (`contract_version` set). */
+  requiresContract?: boolean;
 }
 
 /**
@@ -9949,6 +10017,144 @@ export class Storage {
   }
 
   /**
+   * Record offline audit results (spec REFUSAL-HANDLING §7.6, DECISION-MODEL §5.8)
+   * in one transaction: each row replaces the one with the same (session, audit,
+   * event) key, and `attemptTypes` rewrites the failure types of the named
+   * `contract_attempts` rows (the audit's judged `self_talk` / `textual_tool_call`).
+   */
+  writeSessionAudits(
+    rows: readonly SessionAuditInsert[],
+    opts: { attemptTypes?: { sessionId: string; updates: readonly ContractAttemptTypesUpdate[] } } = {},
+  ): Promise<void> {
+    if (rows.length === 0 && !opts.attemptTypes?.updates.length) return Promise.resolve();
+    return this.write((db) => {
+      const remove = db.prepare(
+        `delete from session_audits where session_id = ? and audit = ? and coalesce(event_id, '') = ?`,
+      );
+      const insert = db.prepare(
+        `insert into session_audits
+           (session_id, audit, event_id, status, answers_json, verdict_json, confidence, model_id, cost_usd,
+            version, created_at)
+         values
+           (@sessionId, @audit, @eventId, @status, @answersJson, @verdictJson, @confidence, @modelId, @costUsd,
+            @version, @createdAt)`,
+      );
+      const updateAttempt = db.prepare(
+        `update contract_attempts set failure_types_json = @types, primary_type = @primary
+          where agent_session_id = @sessionId and branch_no = @branchNo and redo_no = @redoNo
+            and attempt_no = @attemptNo`,
+      );
+      db.transaction(() => {
+        for (const row of rows) {
+          remove.run(row.sessionId, row.audit, row.eventId ?? "");
+          insert.run({
+            sessionId: row.sessionId,
+            audit: row.audit,
+            eventId: row.eventId ?? null,
+            status: row.status,
+            answersJson: row.answersJson ?? null,
+            verdictJson: row.verdictJson ?? null,
+            confidence: row.confidence ?? null,
+            modelId: row.modelId ?? null,
+            costUsd: row.costUsd ?? null,
+            version: row.version,
+            createdAt: row.createdAt ?? Date.now(),
+          });
+        }
+        const attempts = opts.attemptTypes;
+        for (const u of attempts?.updates ?? []) {
+          updateAttempt.run({
+            sessionId: attempts!.sessionId,
+            branchNo: u.branchNo,
+            redoNo: u.redoNo,
+            attemptNo: u.attemptNo,
+            types: JSON.stringify(u.failureTypes),
+            primary: u.primaryType,
+          });
+        }
+      })();
+    });
+  }
+
+  /** A session's audit rows, oldest first. */
+  listSessionAudits(sessionId: string): SessionAuditRow[] {
+    return this.read((db) =>
+      db
+        .prepare(`select * from session_audits where session_id = ? order by created_at asc, id asc`)
+        .all(sessionId) as SessionAuditRow[],
+    );
+  }
+
+  /**
+   * One page of sessions the offline audit worker still has to audit (spec
+   * REFUSAL-HANDLING §7.6, DECISION-MODEL §5.8): not mid-run, not an excluded
+   * (generation) session type, settled (`completed_at`, else `updated_at`, at or
+   * before `settledBefore`), and pending for at least one of `audits` (no
+   * whole-session row for it written since the session last completed, so a
+   * resumed session is audited again). The backlog walks oldest-first with a
+   * `(created_at, id)` keyset cursor (`after`); the live lane passes `order:
+   * "desc"` with `settledSince` to take the newest recently settled sessions.
+   */
+  listAuditCandidates(opts: {
+    audits: readonly AuditQueueAudit[];
+    excludeSessionTypes: readonly string[];
+    settledBefore: number;
+    order: "asc" | "desc";
+    limit: number;
+    after?: { createdAt: number; id: string };
+    settledSince?: number;
+    minCreatedAt?: number;
+  }): AuditCandidateRow[] {
+    if (opts.audits.length === 0) return [];
+    return this.read((db) => {
+      const params: unknown[] = [];
+      const pending = opts.audits.map((audit) => {
+        params.push(audit.name);
+        return `(${audit.requiresContract ? "s.contract_version is not null and " : ""}not exists (
+            select 1 from session_audits a
+             where a.session_id = s.id and a.audit = ? and a.event_id is null
+               and a.created_at >= coalesce(s.completed_at, 0)))`;
+      });
+      const where: string[] = [
+        `s.status not in ('created', 'running', 'resuming')`,
+        `coalesce(s.completed_at, s.updated_at) <= ?`,
+        `(${pending.join(" or ")})`,
+      ];
+      const head: unknown[] = [opts.settledBefore];
+      const types = [...opts.excludeSessionTypes];
+      if (types.length > 0) {
+        where.push(`s.session_type not in (${types.map(() => "?").join(", ")})`);
+        head.push(...types);
+      }
+      const tail: unknown[] = [];
+      if (opts.settledSince !== undefined) {
+        where.push(`coalesce(s.completed_at, s.updated_at) >= ?`);
+        tail.push(opts.settledSince);
+      }
+      if (opts.minCreatedAt !== undefined) {
+        where.push(`s.created_at >= ?`);
+        tail.push(opts.minCreatedAt);
+      }
+      if (opts.after) {
+        const cmp = opts.order === "asc" ? ">" : "<";
+        where.push(`(s.created_at ${cmp} ? or (s.created_at = ? and s.id ${cmp} ?))`);
+        tail.push(opts.after.createdAt, opts.after.createdAt, opts.after.id);
+      }
+      const dir = opts.order === "asc" ? "asc" : "desc";
+      // Parameter order follows the WHERE clause order.
+      const ordered = [head[0], ...params, ...head.slice(1), ...tail];
+      const sql = `select s.id, s.timeline_key, s.session_type, s.status, s.created_at, s.completed_at,
+                          s.contract_version, s.contract_nudges, s.trigger_body, s.trigger_sender_id,
+                          s.trigger_sender_display_name, s.initial_preloads
+                     from agent_sessions s
+                    where ${where[0]} and ${where[1]} and ${where[2]}${where.length > 3 ? ` and ${where.slice(3).join(" and ")}` : ""}
+                    order by s.created_at ${dir}, s.id ${dir}
+                    limit ?`;
+      return db.prepare(sql).all(...ordered, opts.limit) as AuditCandidateRow[];
+    });
+  }
+
+  /**
    * Persist a session's send-contract outcome (spec REFUSAL-HANDLING §7.1). A
    * null outcome = no run reached a verdict (aborted/failed), still stamped.
    */
@@ -11893,7 +12099,8 @@ create index if not exists idx_decision_evaluations_session
 create index if not exists idx_decision_evaluations_ts
   on decision_evaluations(ts);
 ${REFUSAL_HANDLING_SCHEMA}
-${MODEL_BEHAVIOUR_SCHEMA}`;
+${MODEL_BEHAVIOUR_SCHEMA}
+${SESSION_AUDITS_SCHEMA}`;
 
 // SCHEMA above defines the complete current shape with idempotent
 // `create … if not exists` DDL, so a fresh database is built directly at the
@@ -12859,10 +13066,23 @@ function addModelBehaviourTables(db: Database.Database): void {
   if (["agent_sessions", "usage_events", "refusal_events"].every(exists)) db.exec(MARK_ALL_MODEL_BEHAVIOUR_HOURS_DIRTY);
 }
 
-// v26→v29: reserved, no-op steps (one per refusal-handling workstream that may
+/**
+ * v26→v27: the offline audit worker's `session_audits` table (spec
+ * REFUSAL-HANDLING §7.6, §10.2; DECISION-MODEL §5.8) and its dirty-hour triggers
+ * (shared DDL with SCHEMA, src/storage/session-audits-schema.ts). Idempotent; on a
+ * very old database without `agent_sessions` it is left to SCHEMA, which runs
+ * after the migrations.
+ */
+function addSessionAuditsTable(db: Database.Database): void {
+  const exists = (table: string) =>
+    (db.prepare(`select count(*) as n from sqlite_master where type = 'table' and name = ?`).get(table) as { n: number }).n > 0;
+  if (!exists("agent_sessions") || !exists("model_behaviour_dirty_hours")) return;
+  db.exec(SESSION_AUDITS_SCHEMA);
+}
+
+// v27→v29: reserved, no-op steps (one per refusal-handling workstream that may
 // need DDL). A workstream fills only its own step (idempotent, PRAGMA table_info
 // guarded) and adds the same shape to SCHEMA; unused slots stay no-ops.
-function reservedW1(_db: Database.Database): void {}
 function reservedW2(_db: Database.Database): void {}
 function reservedW3(_db: Database.Database): void {}
 
@@ -12897,7 +13117,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   addSessionRecordsTables,              // v23→v24
   addRefusalHandlingTables,             // v24→v25
   addModelBehaviourTables,              // v25→v26
-  reservedW1,                           // v26→v27
+  addSessionAuditsTable,                // v26→v27
   reservedW2,                           // v27→v28
   reservedW3,                           // v28→v29
 ];

@@ -82,6 +82,12 @@ export {
   type RefusalPin,
   type SessionBranchInsert,
   type SessionBranchRow,
+  type SessionAuditStatus,
+  type SessionAuditInsert,
+  type SessionAuditRow,
+  type ContractAttemptTypesUpdate,
+  type AuditCandidateRow,
+  type AuditQueueAudit,
   type UsageEventClass,
 } from "./database.js";
 // Re-export DmOptout + cross-channel helper return types implicitly — callers
