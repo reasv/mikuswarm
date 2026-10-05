@@ -207,6 +207,11 @@ export function modelPromptHash(preamble: string | undefined, tail: string | und
     .slice(0, 12);
 }
 
+/** Short content hash (12 hex) of the model-neutral system prompt a session sends (ledger `system_prompt_hash`). */
+export function systemPromptHashOf(systemPrompt: string): string {
+  return createHash("sha256").update(systemPrompt).digest("hex").slice(0, 12);
+}
+
 /** Insert a tail block into text at a recorded slot, with the satellite's part separator. */
 export function spliceModelTail(text: string, at: ModelTailAt, block: string): string {
   if (!Number.isInteger(at.offset) || at.offset < 0 || at.offset > text.length) return text;

@@ -175,5 +175,12 @@ COPY docker/95-docker.toml ./config/95-docker.toml
 # agent's own uid:gid via process.getuid() — aligns automatically. The image
 # needs no writable paths of its own (all state lives under the binds; HOME is
 # pointed at /tmp by compose since the arbitrary uid has no passwd entry).
+# Build revision for the model behaviour page's code-change markers (spec
+# REFUSAL-HANDLING §12.4): pass `--build-arg MIKUSWARM_BUILD_REVISION=<commit>`;
+# the snapshot records "<package version>+<revision>" ("unknown" when not passed).
+# Declared last so changing it does not invalidate the cached layers above.
+ARG MIKUSWARM_BUILD_REVISION=unknown
+ENV MIKUSWARM_BUILD_REVISION=${MIKUSWARM_BUILD_REVISION}
+
 ENTRYPOINT ["tini", "--"]
 CMD ["node", "--enable-source-maps", "dist/index.js"]

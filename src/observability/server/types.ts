@@ -10,6 +10,7 @@ import type { LlmScheduler } from "../../agent/scheduler.js";
 import type { LlmRequestRing } from "../../agent/request-ring.js";
 import type { BudgetEngine, UserLimitEngine } from "../../budget/index.js";
 import type { BackfetchJobInput, BackfetchJobRow } from "../../storage/index.js";
+import type { ModelBehaviourApi } from "../../behaviour/index.js";
 
 /**
  * Static snapshot of the agents model served by `GET /api/agents`
@@ -145,6 +146,11 @@ export interface ConsoleServerDeps {
    * meters). Optional: absent / disabled = an empty list.
    */
   userLimitEngine?: UserLimitEngine;
+  /**
+   * Model behaviour statistics (spec REFUSAL-HANDLING §12.3), for
+   * `GET /api/models/behaviour` and its incident pages. Optional: absent = 503.
+   */
+  modelBehaviour?: ModelBehaviourApi;
   logger: Logger;
 }
 

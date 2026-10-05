@@ -32,7 +32,7 @@ import { loadWorkspace, renderSystemPrompt } from "../workspace/index.js";
 import type { WorkspaceContent, SessionTypeConfig, SkillMeta, RoutedSatellite } from "../workspace/types.js";
 import type { RoutingVerdict } from "../decisions/points/routing.js";
 import { resolveWorkspacePath } from "../tools/workspace.js";
-import { loadModelPrompts, withModelPrompt, type ResolvedModelPrompt } from "./model-prompts.js";
+import { loadModelPrompts, systemPromptHashOf, withModelPrompt, type ResolvedModelPrompt } from "./model-prompts.js";
 import { SessionRedoControl } from "./redo-signal.js";
 import { stampServedModel } from "./contract.js";
 import type { ForkChange, ForkContext } from "./fork.js";
@@ -1461,6 +1461,8 @@ export class AgentSessionFactory {
               // The model prompt the served member sent (ARCHITECTURE.md §8 "Model prompts").
               modelPrompt: modelPrompts.get(resolvedMember.logicalId)?.profile ?? null,
               modelPromptHash: modelPrompts.get(resolvedMember.logicalId)?.hash ?? null,
+              // The frozen, model-neutral system prompt (spec REFUSAL-HANDLING §12.4).
+              systemPromptHash,
               provider: message.provider ?? model.provider ?? null,
               inputTokens: u.input ?? null,
               outputTokens: u.output ?? null,
@@ -1939,6 +1941,9 @@ export class AgentSessionFactory {
     // on every API call), and the builder's version populates the system message in
     // transformContext output. They must produce identical results.
     const systemPrompt = renderSystemPrompt(workspace, fallbackPrompt);
+    // Short hash of it for the ledger rows (observed prompt changes, spec
+    // REFUSAL-HANDLING §12.4); the per-model preamble is covered by model_prompt_hash.
+    const systemPromptHash = systemPromptHashOf(systemPrompt);
 
     // Phase 0 — frozen sessions (§2b). Build the context ONCE, here at creation, and
     // freeze it. The prefix (`frozenBase`) is append-only thereafter; the final user

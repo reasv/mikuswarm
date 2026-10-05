@@ -6,6 +6,12 @@ import type { AttachmentMeta, CanonicalChatEvent, TimelineState } from "../types
 import { nanoid } from "nanoid";
 import type { RawTokenUsage, SessionUsageTotals } from "../agent/usage.js";
 import { buildTimelineKey, parseTimelineKey, roomIdFromTimelineKeyOpt, threadKeyLikePattern } from "./timeline-key.js";
+import {
+  MARK_ALL_MODEL_BEHAVIOUR_HOURS_DIRTY,
+  MODEL_BEHAVIOUR_RAW_TABLE_DDL,
+  MODEL_BEHAVIOUR_SCHEMA,
+  MODEL_BEHAVIOUR_TABLES_SCHEMA,
+} from "./model-behaviour-schema.js";
 
 /**
  * The resolved replacement content an edit carries: the post-edit body and the
@@ -11872,7 +11878,8 @@ create index if not exists idx_decision_evaluations_session
   on decision_evaluations(agent_session_id, ts);
 create index if not exists idx_decision_evaluations_ts
   on decision_evaluations(ts);
-${REFUSAL_HANDLING_SCHEMA}`;
+${REFUSAL_HANDLING_SCHEMA}
+${MODEL_BEHAVIOUR_SCHEMA}`;
 
 // SCHEMA above defines the complete current shape with idempotent
 // `create … if not exists` DDL, so a fresh database is built directly at the
@@ -12819,10 +12826,28 @@ function addRefusalHandlingTables(db: Database.Database): void {
   addColumns("usage_events", [["system_prompt_hash", "TEXT"]]);
 }
 
-// v25→v29: reserved, no-op steps (one per refusal-handling workstream that may
+/**
+ * v25→v26: model behaviour statistics (spec REFUSAL-HANDLING §12.3, §12.4):
+ * `behaviour_snapshots`, `behaviour_changes`, the hourly rollup tables and their
+ * dirty-hour queue, plus the session-time and session-message indexes and the
+ * dirty-marking triggers on the raw tables (shared DDL with SCHEMA, see
+ * src/storage/model-behaviour-schema.ts). Every hour with history is marked dirty so
+ * the rollup service fills the tables in the background. Idempotent; a raw table a
+ * very old database lacks is left to SCHEMA, which runs after the migrations.
+ */
+function addModelBehaviourTables(db: Database.Database): void {
+  db.exec(MODEL_BEHAVIOUR_TABLES_SCHEMA);
+  const exists = (table: string) =>
+    (db.prepare(`select count(*) as n from sqlite_master where type = 'table' and name = ?`).get(table) as { n: number }).n > 0;
+  for (const ddl of MODEL_BEHAVIOUR_RAW_TABLE_DDL) {
+    if (exists(ddl.table)) db.exec(ddl.sql);
+  }
+  if (["agent_sessions", "usage_events", "refusal_events"].every(exists)) db.exec(MARK_ALL_MODEL_BEHAVIOUR_HOURS_DIRTY);
+}
+
+// v26→v29: reserved, no-op steps (one per refusal-handling workstream that may
 // need DDL). A workstream fills only its own step (idempotent, PRAGMA table_info
 // guarded) and adds the same shape to SCHEMA; unused slots stay no-ops.
-function reservedW6a(_db: Database.Database): void {}
 function reservedW1(_db: Database.Database): void {}
 function reservedW2(_db: Database.Database): void {}
 function reservedW3(_db: Database.Database): void {}
@@ -12857,7 +12882,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   addUsageEventModelPrompt,             // v22→v23
   addSessionRecordsTables,              // v23→v24
   addRefusalHandlingTables,             // v24→v25
-  reservedW6a,                          // v25→v26
+  addModelBehaviourTables,              // v25→v26
   reservedW1,                           // v26→v27
   reservedW2,                           // v27→v28
   reservedW3,                           // v28→v29

@@ -116,6 +116,10 @@ jobs:
           platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Code version on the model behaviour page's change markers (agent image;
+          # other images ignore it).
+          build-args: |
+            MIKUSWARM_BUILD_REVISION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=min
 
