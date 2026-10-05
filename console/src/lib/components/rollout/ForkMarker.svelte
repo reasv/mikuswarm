@@ -72,7 +72,7 @@
 		</button>
 	</span>
 	<span class="text-[10px] font-semibold tracking-wide text-sky-600 uppercase dark:text-sky-400">
-		{subject?.reason === 'contract_redo' ? 'contract redo' : 'refusal redo'}
+		{(subject?.reason ?? 'redo').replaceAll('_', ' ')}
 	</span>
 	<span class="text-foreground">{why}</span>
 	{#if probability != null}
