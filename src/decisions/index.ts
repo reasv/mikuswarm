@@ -26,6 +26,7 @@ export {
 export {
   DecisionEngine,
   type DecisionAttribution,
+  type DecisionChainMember,
   type DecisionEvaluationRow,
   type DecisionOutcome,
   type DecisionPoint,
@@ -61,3 +62,14 @@ export {
   type SelectRecordsInput,
   type SelectRecordsResult,
 } from "./points/records-select.js";
+export {
+  JUDGE_OUTPUT_SOURCES,
+  assignItemIds,
+  checksPoint,
+  planCheckCalls,
+  type CheckItem,
+  type ChecksCallInput,
+  type ChecksCallVerdict,
+  type PlannedCall,
+  type QuestionResult,
+} from "./points/checks.js";

@@ -14,6 +14,8 @@ import { withStaleThinkingDropped } from "./stale-thinking.js";
 import { makeDeferLoadingInjector, withDeclaredDeferredTools, type DeclaredToolSet } from "./declared-tools.js";
 import { executeSyntheticCalls, type SyntheticCallSpec } from "./synthetic-calls.js";
 import { wrapToolsWithRecordTurnGate, type RecordTurnGate } from "./record-turn.js";
+import { wrapToolsWithOutputGate, type OutputGate } from "../checks/gate.js";
+import { createSessionOutputGate, withGateTap, type OutputGateServices } from "../checks/session.js";
 import { estimateLiveSliceTokens } from "./live-token-estimate.js";
 import { extractLlmRequestClass, withRequestRetry } from "./request-retry.js";
 import {
@@ -248,6 +250,13 @@ export interface AgentFactoryOptions {
    * storage is wired, as uncategorized.
    */
   refusals?: { catalogue: CheckCatalogue; rules: RefusalRule[] };
+  /**
+   * Output gate services (spec REFUSAL-HANDLING §6), built once in app.ts.
+   * When set, every chat-lane session (fresh, resumed, proactive) gets an
+   * {@link OutputGate} on `CreatedAgent.gate`: its gated tools pass the gate and
+   * the attempt tap starts evaluations early. Absent = no gate (tests, headless).
+   */
+  outputChecks?: OutputGateServices;
 }
 
 /** Result of a room-context preview build (spec §9). */
@@ -536,6 +545,12 @@ export interface CreatedAgent {
    * running context counter, the loaded dynamic tools) after each fork.
    */
   forkContext: (deps: ForkContextDeps) => ForkContext;
+  /**
+   * The session's output gate (spec REFUSAL-HANDLING §6), when the app wired
+   * checks; undefined for internal job builds. The runner's ending hook and the
+   * record turn's artifact check use it.
+   */
+  gate?: OutputGate;
 }
 
 /** What the caller adds to {@link CreatedAgent.forkContext}. */
@@ -809,6 +824,16 @@ export class AgentSessionFactory {
     // composite chose for the in-flight attempt, so the ledger row is attributed
     // to the member actually billed even when the head fell to a fallback.
     const resolvedMember: { logicalId: string } = { logicalId: modelKey };
+    // The output gate (spec REFUSAL-HANDLING §6): chat-lane sessions only; it
+    // reads the live messages through the late-bound `agentRef` below.
+    const outputGate = createSessionOutputGate(this.options.outputChecks, {
+      session,
+      agentName: this.options.resolveAgentName?.(session.timelineKey) ?? null,
+      triggerSenderId,
+      internalJob: Boolean(opts?.summarizationCutoff || opts?.condenseInputs || opts?.diaryRange),
+      getMessages: () => agentRef.agent?.state.messages ?? [],
+      servingModel: () => resolvedMember.logicalId,
+    });
     // Per-attempt served-model tracker for the request ring (served-model
     // attribution). Starts undefined; set by onResolve when the fallback fn
     // dispatches; reset to undefined at the start of each retry-loop iteration
@@ -1352,14 +1377,19 @@ export class AgentSessionFactory {
         resetServedModel: () => { servedModelForAttempt = undefined; },
         // Observability tap (spec LLM-FAILURE-HANDLING §4.2): raw attempt
         // events → per-session tentative bus → console SSE. Observe-only.
-        ...(this.options.liveEvents
-          ? {
-              onAttemptEvent: (attempt: number, event: unknown) =>
-                this.options.liveEvents!.publish(session.id, { type: "tentative_event", attempt, event }),
-              onAttemptDiscarded: (attempt: number, reason: string) =>
-                this.options.liveEvents!.publish(session.id, { type: "attempt_discarded", attempt, reason }),
-            }
-          : {}),
+        // The output gate joins the same tap to start judging a send at
+        // `toolcall_end` (spec REFUSAL-HANDLING §6.3).
+        ...withGateTap(
+          this.options.liveEvents
+            ? {
+                onAttemptEvent: (attempt: number, event: unknown) =>
+                  this.options.liveEvents!.publish(session.id, { type: "tentative_event", attempt, event }),
+                onAttemptDiscarded: (attempt: number, reason: string) =>
+                  this.options.liveEvents!.publish(session.id, { type: "attempt_discarded", attempt, reason }),
+              }
+            : {},
+          outputGate,
+        ),
         // Per-request usage capture (spec TOKEN-USAGE-TRACKING §3.1): the
         // committed `done` message's authoritative usage feeds the tracker AND
         // (spec USAGE-COST-LIMITS §3.1) emits one per-request agent-loop row to
@@ -1807,9 +1837,13 @@ export class AgentSessionFactory {
     // so the loading tools created above obey it like the app's own tools: while
     // the record turn runs only session_record_tool executes, outside it
     // session_record_tool never does. Definitions are untouched (wire-stable).
+    // The output gate (spec REFUSAL-HANDLING §6.1) wraps inside the record-turn
+    // gate, so a call the record turn blocks is never judged, and outside the
+    // prefill stripping, so it sees the call's `analysis` argument.
+    const gatedTools = outputGate ? wrapToolsWithOutputGate(budgetedTools, outputGate) : budgetedTools;
     const wrappedTools = opts?.recordTurnGate
-      ? wrapToolsWithRecordTurnGate(budgetedTools, opts.recordTurnGate)
-      : budgetedTools;
+      ? wrapToolsWithRecordTurnGate(gatedTools, opts.recordTurnGate)
+      : gatedTools;
 
     // The per-session registry (spec §7): immediate = config patterns ∪ the
     // loading tools ∪ any always_loaded skill's declared tools. Resume recomputes
@@ -2318,6 +2352,7 @@ export class AgentSessionFactory {
           rewindRunningContext(ctxCounter, change, removedToolTokens);
         },
       }),
+      ...(outputGate ? { gate: outputGate } : {}),
     };
   }
 

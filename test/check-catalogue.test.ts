@@ -11,7 +11,7 @@ import {
   compileWordList,
   firstPatternMatch,
 } from "../src/checks/catalogue.js";
-import { BUILTIN_CHECKS, BUILTIN_REFUSAL_CHECKS } from "../src/checks/builtin/index.js";
+import { BUILTIN_CHECKS, BUILTIN_CONTRACT_CHECKS, BUILTIN_REFUSAL_CHECKS } from "../src/checks/builtin/index.js";
 import type { CheckDefinition } from "../src/checks/types.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -45,9 +45,17 @@ test("built-ins: the seven refusal checks, enabled, redo, all checkpoints", () =
     assert.equal(c.remedy, "redo");
     assert.equal(c.builtin, true);
     assert.deepEqual(c.checkpoints, ["send", "ending", "artifact", "rollout"]);
-    assert.deepEqual(c.questions, []);
+    // One judged question per useful source (spec §5.4–§5.5).
+    assert.deepEqual(
+      c.questions.map((q) => q.source),
+      ["message", "analysis", "text", "thinking", "artifact", "rollout"],
+    );
   }
-  assert.equal(BUILTIN_CHECKS.length, BUILTIN_REFUSAL_CHECKS.length, "style/contract built-ins arrive later");
+  assert.equal(
+    BUILTIN_CHECKS.length,
+    BUILTIN_REFUSAL_CHECKS.length + BUILTIN_CONTRACT_CHECKS.length,
+    "style built-ins arrive later",
+  );
 });
 
 test("override: a built-in is overridden field by field, the rest kept", () => {

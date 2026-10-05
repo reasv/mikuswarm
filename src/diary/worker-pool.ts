@@ -18,6 +18,7 @@ import { agentDateStamp } from "../time/index.js";
 import { buildDiaryHeader, draftBeginsWithHeader } from "./header.js";
 import { recentMemoryWindow } from "./recent-window.js";
 import type { ChannelVisibilityResolver } from "../visibility/index.js";
+import type { BackgroundChecks } from "../checks/gate.js";
 
 export interface DiaryWorkerPoolOptions {
   storage: Storage;
@@ -66,7 +67,27 @@ export interface DiaryWorkerPoolOptions {
    * treated as "shared" (zero behaviour change).
    */
   visibilityResolver?: ChannelVisibilityResolver;
+  /**
+   * Output checks (spec REFUSAL-HANDLING §5.2): the diary draft at finalize
+   * (artifact) and a failed rollout before its re-run, judged off the job's
+   * path. Observe-only; absent = no checks.
+   */
+  outputChecks?: BackgroundChecks;
   logger: Logger;
+}
+
+/** Where an output check of a diary run is attributed (spec REFUSAL-HANDLING §10.1). */
+function diaryCheckScope(job: DiaryJob, session: AgentSessionRecord, messages: readonly unknown[] | undefined) {
+  const lastAssistant = [...(messages ?? [])]
+    .reverse()
+    .find((m) => (m as { role?: string }).role === "assistant") as { model?: unknown } | undefined;
+  return {
+    site: "diary",
+    timelineKey: job.timelineKey,
+    sessionId: session.id,
+    sessionType: session.sessionType,
+    ...(typeof lastAssistant?.model === "string" ? { wireModel: lastAssistant.model } : {}),
+  };
 }
 
 const DEFAULT_PER_SESSION_BUDGET = 1200;
@@ -441,6 +462,8 @@ export class DiaryWorkerPool {
     // Set when a refusal rule's entries were all exhausted (spec REFUSAL-HANDLING
     // §8.2): the entry is not written and the job is not re-run.
     let refusalExhausted = false;
+    // The run's messages, kept for the rollout check of a failed run.
+    let runMessages: readonly unknown[] | undefined;
     try {
       // Diary-range build (spec DIARY-CONTEXT-PARITY §3): the summarize-style
       // prefix — system prompt, prior chunks' summaries bounded at the range
@@ -518,6 +541,7 @@ export class DiaryWorkerPool {
       } finally {
         this.activeAgents.delete(agent);
         capture.detach();
+        runMessages = agent.state.messages;
       }
     } catch (err) {
       agentError = err;
@@ -548,6 +572,7 @@ export class DiaryWorkerPool {
       await storage.updateAgentSessionStatus(syntheticSession.id, "completed", { completedAt: Date.now() });
       if (created && content.trim().length > 0) {
         await memoryWriter.appendEntry(targetDate, content);
+        void this.options.outputChecks?.artifact({ ...diaryCheckScope(job, syntheticSession, runMessages), kind: "diary", text: content });
         logger.info("diary_entry_written", {
           summaryId: job.summaryId,
           timelineKey: job.timelineKey,
@@ -558,6 +583,14 @@ export class DiaryWorkerPool {
       } else {
         // finalize on an empty draft = the agent judged "nothing worth recording".
         logger.info("diary_entry_empty", { summaryId: job.summaryId, timelineKey: job.timelineKey });
+        // A run that never created a draft may have declined the task (§5.2.4).
+        if (!created && runMessages && runMessages.length > 0) {
+          void this.options.outputChecks?.rollout({
+            ...diaryCheckScope(job, syntheticSession, runMessages),
+            kind: "diary",
+            messages: runMessages,
+          });
+        }
       }
       await storage.setDiaryStatus(job.summaryId, "done");
       this.options.onComplete?.(job.summaryId);
@@ -575,6 +608,15 @@ export class DiaryWorkerPool {
       completedAt: Date.now(),
       error: errMsg,
     });
+    // A run that produced no entry is judged for a refusal before its re-run
+    // (spec REFUSAL-HANDLING §5.2.4); observe-only, the re-run is unchanged.
+    if (runMessages && runMessages.length > 0) {
+      void this.options.outputChecks?.rollout({
+        ...diaryCheckScope(job, syntheticSession, runMessages),
+        kind: "diary",
+        messages: runMessages,
+      });
+    }
     logger.error("diary_failed", {
       summaryId: job.summaryId,
       timelineKey: job.timelineKey,

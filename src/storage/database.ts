@@ -9823,6 +9823,20 @@ export class Storage {
     );
   }
 
+  /**
+   * Rewrite the consequence of recorded check evaluations (spec
+   * REFUSAL-HANDLING §9): a gate records its rows when the verdict is in, and a
+   * later action on it (a redo that found no usable model, an override) may
+   * change what the verdict did. Empty `ids` is a no-op.
+   */
+  updateDecisionEvaluationConsequence(ids: readonly number[], consequence: string): Promise<void> {
+    if (ids.length === 0) return Promise.resolve();
+    return this.write((db) => {
+      const stmt = db.prepare(`update decision_evaluations set consequence = ? where id = ?`);
+      for (const id of ids) stmt.run(consequence, id);
+    });
+  }
+
   // ── Refusal handling (spec REFUSAL-HANDLING §9, §10.1) ───────────────────────
 
   /** Record one detected refusal; returns the row id. */

@@ -19,6 +19,11 @@ export interface CaptionWorkerOptions {
     result: { model: string; logicalModelId: string; provider: string | null; usage: RawTokenUsage | null; cost: number | null },
     asset: MediaAssetRow,
   ) => void;
+  /**
+   * Output checks (spec REFUSAL-HANDLING §5.2.3): told of every persisted
+   * caption so the caption text is judged off the pipeline's path.
+   */
+  onCaptioned?: (asset: MediaAssetRow, result: { caption: string; model: string; logicalModelId: string }) => void;
 }
 
 function mimeTypeDefault(modality: MediaModality): string {
@@ -43,6 +48,11 @@ export class CaptionWorker {
   ): Promise<void> {
     await this.options.storage.updateCaptionResult(asset.id, result.caption, result.model, result.usage, result.cost);
     this.options.recordUsage?.(result, asset);
+    try {
+      this.options.onCaptioned?.(asset, result);
+    } catch {
+      /* observe-only: a check can never fail a caption */
+    }
   }
 
   /**
