@@ -10,6 +10,8 @@ import {
   roomSessions,
   roomSessionFacets,
   sessionDetail,
+  sessionRecord,
+  sessionDecisions,
   sessionStream,
   abortSession,
   resumeSession,
@@ -91,6 +93,8 @@ export function createObservabilityServer(deps: ConsoleServerDeps): ConsoleServe
     .add("GET", "/api/rooms/:key/sessions", roomSessions)
     .add("GET", "/api/rooms/:key/session-facets", roomSessionFacets)
     .add("GET", "/api/sessions/:id", sessionDetail)
+    .add("GET", "/api/sessions/:id/record", sessionRecord)
+    .add("GET", "/api/sessions/:id/decisions", sessionDecisions)
     .add("GET", "/api/sessions/:id/stream", sessionStream)
     .add("POST", "/api/sessions/:id/abort", abortSession)
     .add("POST", "/api/sessions/:id/resume", resumeSession)

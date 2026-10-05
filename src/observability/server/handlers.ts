@@ -259,6 +259,97 @@ export function sessionDetail(
 }
 
 /**
+ * Safely parse a JSON string, returning `fallback` on any parse error.
+ * Used to recover gracefully from malformed stored JSON without a 500.
+ */
+function safeJsonParse<T>(text: string | null | undefined, fallback: T): T | unknown {
+  if (text == null) return fallback;
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * GET /api/sessions/:id/record — the session's own record (null if none or
+ * tables absent). Always 200 when the session exists; 404 for an unknown id.
+ * The `builds_on` column is stored as a JSON string and is parsed here before
+ * sending; malformed JSON degrades to an empty array.
+ */
+export function sessionRecord(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+): void {
+  // Verify the session exists (same 404 convention as sessionDetail).
+  const session = ctx.deps.storage.getAgentSession(ctx.params.id);
+  if (!session) return sendError(res, 404, `Unknown session: ${ctx.params.id}`);
+
+  const row = ctx.deps.storage.getSessionRecord(ctx.params.id);
+  if (!row) {
+    sendJson(res, 200, { sessionRecord: null });
+    return;
+  }
+  sendJson(res, 200, {
+    sessionRecord: {
+      sessionId: row.session_id,
+      timelineKey: row.timeline_key,
+      agent: row.agent,
+      text: row.text,
+      tokenCount: row.token_count,
+      // builds_on is stored as a JSON string (string[]); parse it here.
+      buildsOn: safeJsonParse(row.builds_on, []),
+      modelId: row.model_id,
+      createdAt: row.created_at,
+    },
+  });
+}
+
+/**
+ * GET /api/sessions/:id/decisions — all `decision_evaluations` rows for this
+ * session, in `ts` order. Always 200 when the session exists; 404 for an
+ * unknown id. JSON columns (verdict_json, answers_json, state_json,
+ * questions_json) are kept as strings — the console schema expects strings and
+ * pretty-prints them in the inspector.
+ */
+export function sessionDecisions(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+): void {
+  // Verify the session exists (same 404 convention as sessionDetail).
+  const session = ctx.deps.storage.getAgentSession(ctx.params.id);
+  if (!session) return sendError(res, 404, `Unknown session: ${ctx.params.id}`);
+
+  const rows = ctx.deps.storage.getDecisionEvaluationsForSession(ctx.params.id);
+  sendJson(res, 200, {
+    evaluations: rows.map((row) => ({
+      id: row.id,
+      ts: row.ts,
+      decisionGroup: row.decision_group,
+      point: row.point,
+      agent: row.agent,
+      timelineKey: row.timeline_key,
+      agentSessionId: row.agent_session_id,
+      triggerEventId: row.trigger_event_id,
+      candidateSessionId: row.candidate_session_id,
+      source: row.source,
+      reason: row.reason,
+      verdictJson: row.verdict_json,
+      answersJson: row.answers_json,
+      stateJson: row.state_json,
+      questionsJson: row.questions_json,
+      servedModel: row.served_model,
+      servedVersion: row.served_version,
+      latencyMs: row.latency_ms,
+      inputTokens: row.input_tokens,
+      costUsd: row.cost_usd,
+    })),
+  });
+}
+
+/**
  * GET /api/cost-overview — global spend across the three lanes (spec
  * AUXILIARY-USAGE-TRACKING §10.4): agent-loop cost, auxiliary tool-call cost, and
  * captioning cost. Each is an independent SUM; presented side-by-side, never

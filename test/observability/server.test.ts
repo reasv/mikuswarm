@@ -4,7 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { Storage } from "../../src/storage/index.js";
-import type { AgentSessionInsert } from "../../src/storage/index.js";
+import type {
+  AgentSessionInsert,
+  SessionRecordInsert,
+  DecisionEvaluationInsert,
+} from "../../src/storage/index.js";
 import { SessionManager } from "../../src/agent/index.js";
 import type { AgentSessionFactory } from "../../src/agent/factory.js";
 import type { PreviewContext } from "../../src/agent/factory.js";
@@ -1233,6 +1237,200 @@ test("POST /api/backfetch/jobs clamps absurd safetyCap/timeoutMs operator overri
       // A sane value passes through untouched.
       assert.equal(starts[0]!.accountId, "miku");
       assert.equal(starts[0]!.roomId, "!room:example.org");
+    });
+  });
+});
+
+// ===========================================================================
+// Session record + decisions endpoints (spec SESSION-RECORDS §8, W3b)
+// ===========================================================================
+
+function sessionRecordInsert(sessionId: string, overrides: Partial<SessionRecordInsert> = {}): SessionRecordInsert {
+  return {
+    session_id: sessionId,
+    timeline_key: TK,
+    agent: "aria",
+    text: "Found some info.",
+    token_count: 10,
+    builds_on: [],
+    model_id: "anthropic/claude-haiku-4",
+    created_at: 5_000,
+    ...overrides,
+  };
+}
+
+function decisionEvalInsert(sessionId: string, overrides: Partial<DecisionEvaluationInsert> = {}): DecisionEvaluationInsert {
+  return {
+    ts: 4_000,
+    decision_group: "dg-abc",
+    point: "routing",
+    agent: "aria",
+    timeline_key: TK,
+    agent_session_id: sessionId,
+    source: "model",
+    ...overrides,
+  };
+}
+
+test("GET /api/sessions/:id/record returns null when no record exists", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(sessionInsert({ id: "s-rec-1" }));
+    await withServer({ storage }, async (base) => {
+      const res = await fetch(`${base}/api/sessions/s-rec-1/record`);
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as any;
+      assert.equal(body.sessionRecord, null);
+    });
+  });
+});
+
+test("GET /api/sessions/:id/record returns 404 for unknown session", async () => {
+  await withStorage(async (storage) => {
+    await withServer({ storage }, async (base) => {
+      const res = await fetch(`${base}/api/sessions/s-nope/record`);
+      assert.equal(res.status, 404);
+    });
+  });
+});
+
+test("GET /api/sessions/:id/record returns the record with camelCase fields", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(sessionInsert({ id: "s-rec-2" }));
+    await storage.upsertSessionRecord(
+      sessionRecordInsert("s-rec-2", {
+        agent: "aria",
+        text: "Searched and found the answer.",
+        token_count: 25,
+        builds_on: ["s-prior-1", "s-prior-2"],
+        model_id: "anthropic/claude-sonnet-4",
+        created_at: 7_000,
+      }),
+    );
+    await withServer({ storage }, async (base) => {
+      const res = await fetch(`${base}/api/sessions/s-rec-2/record`);
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as any;
+      const r = body.sessionRecord;
+      assert.ok(r, "sessionRecord must be non-null");
+      assert.equal(r.sessionId, "s-rec-2");
+      assert.equal(r.timelineKey, TK);
+      assert.equal(r.agent, "aria");
+      assert.equal(r.text, "Searched and found the answer.");
+      assert.equal(r.tokenCount, 25);
+      assert.deepEqual(r.buildsOn, ["s-prior-1", "s-prior-2"]);
+      assert.equal(r.modelId, "anthropic/claude-sonnet-4");
+      assert.equal(r.createdAt, 7_000);
+    });
+  });
+});
+
+test("GET /api/sessions/:id/record parses builds_on and handles empty array", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(sessionInsert({ id: "s-rec-3" }));
+    await storage.upsertSessionRecord(sessionRecordInsert("s-rec-3", { builds_on: [] }));
+    await withServer({ storage }, async (base) => {
+      const res = await fetch(`${base}/api/sessions/s-rec-3/record`);
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as any;
+      assert.deepEqual(body.sessionRecord.buildsOn, []);
+    });
+  });
+});
+
+test("GET /api/sessions/:id/decisions returns empty array when no decisions exist", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(sessionInsert({ id: "s-dec-1" }));
+    await withServer({ storage }, async (base) => {
+      const res = await fetch(`${base}/api/sessions/s-dec-1/decisions`);
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as any;
+      assert.deepEqual(body.evaluations, []);
+    });
+  });
+});
+
+test("GET /api/sessions/:id/decisions returns 404 for unknown session", async () => {
+  await withStorage(async (storage) => {
+    await withServer({ storage }, async (base) => {
+      const res = await fetch(`${base}/api/sessions/s-nope/decisions`);
+      assert.equal(res.status, 404);
+    });
+  });
+});
+
+test("GET /api/sessions/:id/decisions returns camelCase rows in ts order", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession(sessionInsert({ id: "s-dec-2" }));
+    await storage.insertDecisionEvaluation(
+      decisionEvalInsert("s-dec-2", {
+        ts: 4_100,
+        decision_group: "dg-routing",
+        point: "routing",
+        source: "model",
+        verdict_json: JSON.stringify({ model: "sol61_aws" }),
+        answers_json: JSON.stringify([{ label: "sol61_aws", probability: 0.9 }]),
+        state_json: JSON.stringify({ request: "help" }),
+        questions_json: JSON.stringify([{ key: "q1", label: "What model?" }]),
+        served_model: "anthropic/claude-haiku-4",
+        served_version: "20250307",
+        latency_ms: 150,
+        input_tokens: 500,
+        cost_usd: 0.0005,
+      }),
+    );
+    await storage.insertDecisionEvaluation(
+      decisionEvalInsert("s-dec-2", {
+        ts: 4_200,
+        decision_group: "dg-records",
+        point: "records",
+        source: "heuristic",
+        reason: "short session",
+        candidate_session_id: "s-cand-1",
+      }),
+    );
+    await withServer({ storage }, async (base) => {
+      const res = await fetch(`${base}/api/sessions/s-dec-2/decisions`);
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as any;
+      assert.equal(body.evaluations.length, 2);
+
+      const first = body.evaluations[0];
+      assert.equal(first.ts, 4_100);
+      assert.equal(first.decisionGroup, "dg-routing");
+      assert.equal(first.point, "routing");
+      assert.equal(first.agent, "aria");
+      assert.equal(first.timelineKey, TK);
+      assert.equal(first.agentSessionId, "s-dec-2");
+      assert.equal(first.triggerEventId, null);
+      assert.equal(first.candidateSessionId, null);
+      assert.equal(first.source, "model");
+      assert.equal(first.reason, null);
+      // JSON columns are strings (the console pretty-prints them).
+      assert.equal(typeof first.verdictJson, "string");
+      assert.equal(typeof first.answersJson, "string");
+      assert.equal(typeof first.stateJson, "string");
+      assert.equal(typeof first.questionsJson, "string");
+      assert.equal(first.servedModel, "anthropic/claude-haiku-4");
+      assert.equal(first.servedVersion, "20250307");
+      assert.equal(first.latencyMs, 150);
+      assert.equal(first.inputTokens, 500);
+      assert.equal(first.costUsd, 0.0005);
+
+      const second = body.evaluations[1];
+      assert.equal(second.ts, 4_200);
+      assert.equal(second.decisionGroup, "dg-records");
+      assert.equal(second.point, "records");
+      assert.equal(second.source, "heuristic");
+      assert.equal(second.reason, "short session");
+      assert.equal(second.candidateSessionId, "s-cand-1");
+      // Null JSON columns come through as null.
+      assert.equal(second.verdictJson, null);
+      assert.equal(second.answersJson, null);
+      assert.equal(second.stateJson, null);
+      assert.equal(second.questionsJson, null);
+      assert.equal(second.latencyMs, null);
+      assert.equal(second.inputTokens, null);
+      assert.equal(second.costUsd, null);
     });
   });
 });
