@@ -46,6 +46,11 @@ test("nudges and inbound turns are told apart (tag or known wording)", () => {
   assert.equal(isNudgeMessage(nudge()), true);
   assert.equal(isNudgeMessage(user("anything", { harness: { kind: "forced_completion", attempt: 1 } })), true);
   assert.equal(isNudgeMessage(user("You already sent a message but your turn did not end cleanly. Either: ...")), true);
+  // A historical wording (untagged history the audit and calibration read).
+  assert.equal(
+    isNudgeMessage(user("Your previous turn ended without visible text. Produce the final chat response now, or exactly NO_REPLY.")),
+    true,
+  );
   assert.equal(isInboundMessage(user("hello bot")), true);
   assert.equal(isInboundMessage(nudge()), false);
   assert.equal(isInboundMessage(user("record now", { harness: { kind: "record_turn" } })), false);

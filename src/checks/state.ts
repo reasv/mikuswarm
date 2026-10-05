@@ -21,6 +21,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { estimateTokens } from "../context/tokens.js";
 import { clipText, packNewest } from "../decisions/state.js";
+import { matchForcedCompletionPrompt } from "../agent/contract.js";
 import type { CheckSource, Checkpoint } from "./types.js";
 
 /** One chat message in check state. */
@@ -146,7 +147,8 @@ export function isNudgeMessage(message: unknown): boolean {
   const harness = (message as { harness?: { kind?: unknown } }).harness;
   if (harness?.kind === "forced_completion") return true;
   const text = userText(message).trimStart();
-  return NUDGE_PREFIXES.some((prefix) => text.startsWith(prefix));
+  // Every wording the runner ever sent (FORCED_COMPLETION_PROMPTS, history included).
+  return NUDGE_PREFIXES.some((prefix) => text.startsWith(prefix)) || matchForcedCompletionPrompt(text) !== undefined;
 }
 
 /** A user turn that brought new input (a trigger, an interjection), not a harness turn. */
