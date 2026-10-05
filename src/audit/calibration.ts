@@ -183,6 +183,12 @@ export interface SampleOptions {
   /** Only sessions created at or after this time (ms). */
   since?: number;
   agent?: string | null;
+  /**
+   * Only outputs this check already fired on (soft `refusal_events` linked to a
+   * check row, from the live gate or the offline audit): measures precision at the
+   * operating threshold, where a random sample of rare refusals has no positives.
+   */
+  firedOnly?: boolean;
 }
 
 export interface SampleResult {
@@ -210,6 +216,24 @@ function contentOf(m: unknown): Record<string, unknown> | undefined {
  * Sample the outputs `check` judges at `checkpoint` that carry `source`
  * (reservoir sampling, seeded), and collect the known positives.
  */
+/** The anchors a check fired on, from soft refusal events linked to their check rows. */
+function firedAnchors(db: Database.Database, code: string): { sessions: Set<string>; anchors: Set<string> } {
+  const rows = db
+    .prepare(
+      `select d.agent_session_id as s, d.tool_call_id as t, d.attempt_no as a
+         from refusal_events r join decision_evaluations d on d.id = r.decision_evaluation_id
+        where r.kind = 'soft' and r.check_code = ? and d.agent_session_id is not null`,
+    )
+    .all(code) as Array<{ s: string; t: string | null; a: number | null }>;
+  const sessions = new Set<string>();
+  const anchors = new Set<string>();
+  for (const r of rows) {
+    sessions.add(r.s);
+    anchors.add(r.t ? `${r.s}|${r.t}` : `${r.s}|#${r.a ?? 0}`);
+  }
+  return { sessions, anchors };
+}
+
 export function sampleCalibrationItems(db: Database.Database, opts: SampleOptions): SampleResult {
   const rand = random(opts.seed);
   const reservoir: CalibrationItem[] = [];
@@ -217,6 +241,8 @@ export function sampleCalibrationItems(db: Database.Database, opts: SampleOption
   let eligible = 0;
   let sessions = 0;
   const types = [...SYNTHETIC_SESSION_TYPES];
+  // Anchors (session + tool call id, or session + ending attempt) the check fired on.
+  const fired = opts.firedOnly ? firedAnchors(db, opts.check.code) : undefined;
   const rows = db
     .prepare(
       `select s.id, s.created_at, s.trigger_body, s.trigger_sender_display_name, s.trigger_sender_id, p.transcript_json
@@ -227,6 +253,7 @@ export function sampleCalibrationItems(db: Database.Database, opts: SampleOption
     )
     .iterate(opts.since ?? 0, ...types) as IterableIterator<SessionScanRow>;
   for (const row of rows) {
+    if (fired && !fired.sessions.has(row.id)) continue;
     const transcript = parseTranscript(row.transcript_json);
     if (!transcript) continue;
     sessions += 1;
@@ -238,6 +265,7 @@ export function sampleCalibrationItems(db: Database.Database, opts: SampleOption
       if (item.checkpoint !== opts.checkpoint) continue;
       const text = item.sources[opts.source];
       if (typeof text !== "string" || !text.trim()) continue;
+      if (fired && !fired.anchors.has(item.toolCallId ? `${row.id}|${item.toolCallId}` : `${row.id}|#${item.attemptNo ?? 0}`)) continue;
       const base = item.toolCallId ?? `${item.action}:${item.attemptNo ?? 0}`;
       const n = (counters.get(base) ?? 0) + 1;
       counters.set(base, n);
@@ -542,6 +570,7 @@ export interface CalibrationRunOptions {
   check: CheckDefinition;
   question: CheckQuestion;
   checkpoint: Extract<Checkpoint, "send" | "ending">;
+  firedOnly?: boolean;
   sample: number;
   seed: number;
   since?: number;
@@ -570,6 +599,7 @@ export async function runCalibration(opts: CalibrationRunOptions): Promise<Calib
     seed: opts.seed,
     ...(opts.since !== undefined ? { since: opts.since } : {}),
     ...(opts.agent !== undefined ? { agent: opts.agent } : {}),
+      ...(opts.firedOnly ? { firedOnly: true } : {}),
   });
   const reasons = labelReasons(opts.check);
   const stateFor = (item: CalibrationItem) => (budget: number) =>

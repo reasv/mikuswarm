@@ -18,6 +18,7 @@
  *   --source <source>       which question of the check (default: message at send, text at ending)
  *   --agent <name>          use this agent's catalogue overrides of the check
  *   --sample <n>            items to label (default 200)
+ *   --fired-only            only outputs the check already fired on (precision at the threshold)
  *   --seed <n>              sampling seed (default 1)
  *   --since <YYYY-MM-DD>    only sessions created since this date
  *   --thresholds a,b,...    candidate thresholds (default 0.05 … 0.95)
@@ -65,7 +66,7 @@ for (let i = 0; i < argv.length; i++) {
   const arg = argv[i]!;
   if (!arg.startsWith("--")) fail(`unexpected argument ${arg}`);
   const name = arg.slice(2);
-  if (name === "json") switches.add(name);
+  if (name === "json" || name === "fired-only") switches.add(name);
   else {
     const value = argv[i + 1];
     if (value === undefined || value.startsWith("--")) fail(`--${name} needs a value`);
@@ -177,6 +178,7 @@ try {
     question,
     checkpoint,
     sample: num("sample", 200),
+    ...(switches.has("fired-only") ? { firedOnly: true } : {}),
     seed: num("seed", 1),
     ...(sinceMs !== undefined ? { since: sinceMs } : {}),
     agent,
