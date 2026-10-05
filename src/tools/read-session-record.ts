@@ -175,8 +175,17 @@ function collectEntries(messages: unknown[]): { entries: TranscriptEntry[]; tota
 
   const entries: TranscriptEntry[] = [];
   let turn = 0;
+  // The record turn (from its harness prompt to the next real user turn, which
+  // only a resumed generation has) is left out: its product is the record
+  // itself, which read_session_record returns.
+  let inRecordTurn = false;
   for (const msg of messages) {
     const m = msg as { role?: string; content?: unknown; harness?: unknown };
+    if (m?.role === "user") {
+      inRecordTurn = (m.harness as { kind?: unknown } | undefined)?.kind === "record_turn";
+      continue;
+    }
+    if (inRecordTurn) continue;
     if (m?.role !== "assistant" || !Array.isArray(m.content)) continue;
     const calls = (m.content as { type?: string; id?: string; name?: string; arguments?: unknown }[])
       .filter((b) => b?.type === "toolCall");
@@ -188,13 +197,24 @@ function collectEntries(messages: unknown[]): { entries: TranscriptEntry[]; tota
         turn,
         isHarness: typeof m.harness === "object" && m.harness !== null,
         name: call.name ?? "(unknown)",
-        argsJson: call.arguments !== undefined ? JSON.stringify(call.arguments) : "",
+        argsJson: call.arguments !== undefined ? JSON.stringify(withoutPrefillAnalysis(call.arguments)) : "",
         resultText: result?.text,
         resultIsError: result?.isError ?? false,
       });
     }
   }
   return { entries, totalTurns: turn };
+}
+
+/**
+ * Drop the OpenAI-prefill `analysis` argument (ARCHITECTURE.md "Model-scoped
+ * OpenAI prefill"): it is the model's forced reasoning prefix, never part of
+ * what the call did, and is not replayed to the model either.
+ */
+function withoutPrefillAnalysis(args: unknown): unknown {
+  if (!args || typeof args !== "object" || Array.isArray(args) || !("analysis" in args)) return args;
+  const { analysis: _analysis, ...rest } = args as Record<string, unknown>;
+  return rest;
 }
 
 /** All match offsets of `needle` (already lowercased) in `haystack`. */

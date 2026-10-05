@@ -188,3 +188,33 @@ test("read_session_transcript: huge tool arguments are clipped", async () => {
     assert.match(text, /Created\./);
   });
 });
+
+// ── The record turn is not part of the rollout shown; prefill analysis is stripped ──
+
+test("read_session_transcript: omits the record turn and strips prefill analysis", async () => {
+  await withStorage(async (storage) => {
+    const now = Date.now();
+    const sessionId = "s-record-turn";
+    await storage.insertAgentSession({
+      id: sessionId,
+      timelineKey: "!room:example.com",
+      sessionType: "default",
+      status: "completed",
+      createdAt: now,
+      updatedAt: now,
+    });
+    const work = buildTranscript("web_search", { analysis: "Need to look this up.", query: "venue" }, "Found the venue.", "tc_work");
+    const recordPrompt = { role: "user", content: [{ type: "text", text: "Write the record." }], timestamp: now, harness: { kind: "record_turn" } } as unknown as AgentMessage;
+    const record = buildTranscript("session_record_tool", { command: "create", file_text: "secret record body" }, "Finalized.", "tc_rec");
+    await storage.saveAgentSessionTranscript(sessionId, JSON.stringify([...work, recordPrompt, ...record]));
+
+    const tool = createReadSessionTranscriptTool({ storage });
+    const result = await tool.execute("call-1", { session_id: sessionId });
+    const text = (result.content as Array<{ type: string; text?: string }>).map((b) => b.text ?? "").join("");
+    assert.match(text, /web_search/);
+    assert.match(text, /venue/);
+    assert.doesNotMatch(text, /Need to look this up/);
+    assert.doesNotMatch(text, /session_record_tool/);
+    assert.doesNotMatch(text, /secret record body/);
+  });
+});
