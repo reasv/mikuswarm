@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, rm, readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
@@ -204,6 +204,22 @@ describe("skills frontmatter tools parsing", () => {
     assert.equal(parsed!.frontmatter.description, "after-list");
     assert.deepEqual(parsed!.frontmatter.tools, ["a"]);
     assert.equal(parsed!.body, "Body");
+  });
+
+  it("shipped skill templates parse to descriptions without backslash escapes", async () => {
+    // The parser strips one layer of quotes but never unescapes, so a `\"` in
+    // a template description reaches the agent's skills index verbatim.
+    const templatesDir = path.join(import.meta.dirname, "..", "templates");
+    const skillFiles = (await readdir(templatesDir, { recursive: true }))
+      .filter((rel) => path.basename(rel) === "SKILL.md")
+      .map((rel) => path.join(templatesDir, rel));
+    assert.ok(skillFiles.length > 0, "expected shipped SKILL.md templates");
+    for (const file of skillFiles) {
+      const parsed = parseFrontmatter(await readFile(file, "utf8"));
+      const description = parsed?.frontmatter.description;
+      assert.equal(typeof description, "string", `${file}: missing description`);
+      assert.ok(!/\\["']/.test(description as string), `${file}: description contains \\" or \\'`);
+    }
   });
 });
 

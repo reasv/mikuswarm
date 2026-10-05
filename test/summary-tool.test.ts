@@ -1,191 +1,246 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { SummaryDraft, createSummaryTool } from "../src/tools/index.js";
+import { resultText as text, runToolCalls, type ToolRun } from "./helpers/pi-tool-run.js";
+
+// Every call runs through a real pi-agent-core Agent, so `isError` is the flag
+// the agent loop put on the toolResult (set only when execute() throws).
 
 function toolFor(targetTokenCount = 100, maxOverageFactor = 2) {
   const draft = new SummaryDraft();
   const tool = createSummaryTool({ draft, targetTokenCount, maxOverageFactor });
-  return { draft, tool };
+  const run = (...calls: Array<Record<string, unknown>>) => runToolCalls(tool, calls);
+  return { draft, run };
 }
 
-function text(result: { content: Array<{ type: string; text?: string }> }): string {
-  return result.content.map((c) => c.text ?? "").join("");
+/** A terminating result ends the run with no further model turn. */
+function terminated(run: ToolRun): boolean {
+  return run.turns === run.results.length;
 }
 
 test("create then view returns line-numbered content", async () => {
-  const { draft, tool } = toolFor();
-  await tool.execute("1", { command: "create", file_text: "line one\nline two" });
+  const { draft, run } = toolFor();
+  const { results } = await run({ command: "create", file_text: "line one\nline two" }, { command: "view" });
   assert.equal(draft.isCreated(), true);
-  const view = await tool.execute("2", { command: "view" });
-  assert.match(text(view), /1: line one/);
-  assert.match(text(view), /2: line two/);
+  assert.equal(results[0]!.isError, false);
+  assert.equal(results[1]!.isError, false);
+  assert.match(text(results[1]!), /1: line one/);
+  assert.match(text(results[1]!), /2: line two/);
 });
 
 test("str_replace edits in place", async () => {
-  const { draft, tool } = toolFor();
-  await tool.execute("1", { command: "create", file_text: "hello world" });
-  await tool.execute("2", { command: "str_replace", old_str: "world", new_str: "there" });
+  const { draft, run } = toolFor();
+  const { results } = await run(
+    { command: "create", file_text: "hello world" },
+    { command: "str_replace", old_str: "world", new_str: "there" },
+  );
+  assert.equal(results[1]!.isError, false);
   assert.equal(draft.getContent(), "hello there");
 });
 
 test("insert adds a line at the given position", async () => {
-  const { draft, tool } = toolFor();
-  await tool.execute("1", { command: "create", file_text: "a\nc" });
-  await tool.execute("2", { command: "insert", insert_line: 1, new_str: "b" });
+  const { draft, run } = toolFor();
+  await run({ command: "create", file_text: "a\nc" }, { command: "insert", insert_line: 1, new_str: "b" });
   assert.equal(draft.getContent(), "a\nb\nc");
 });
 
 test("finalize terminates the turn", async () => {
-  const { tool } = toolFor();
-  const result = await tool.execute("1", { command: "create", file_text: "done", finalize: true });
-  assert.equal(result.terminate, true);
+  const { run } = toolFor();
+  const result = await run({ command: "create", file_text: "done", finalize: true });
+  assert.equal(result.results[0]!.isError, false);
+  assert.equal(terminated(result), true);
 });
 
-test("double create returns isError: true with already created message", async () => {
-  const { tool } = toolFor();
-  const first = await tool.execute("1", { command: "create", file_text: "initial content" });
-  assert.notEqual(first.isError, true);
-
-  const second = await tool.execute("2", { command: "create", file_text: "second attempt" });
-  assert.equal(second.isError, true);
-  assert.match(text(second), /already created/);
+test("double create is an error tool result with the already-created message", async () => {
+  const { draft, run } = toolFor();
+  const { results } = await run(
+    { command: "create", file_text: "initial content" },
+    { command: "create", file_text: "second attempt" },
+  );
+  assert.equal(results[0]!.isError, false);
+  assert.equal(results[1]!.isError, true);
+  assert.match(text(results[1]!), /already created/);
+  assert.equal(draft.getContent(), "initial content", "failed create leaves the draft as it was");
 });
 
 test("create with empty string is rejected and does not lock the draft", async () => {
-  const { draft, tool } = toolFor();
-  const result = await tool.execute("1", { command: "create", file_text: "" });
-  assert.match(text(result), /must not be empty/);
-  assert.equal(draft.isCreated(), false);
+  const { draft, run } = toolFor();
+  const { results } = await run({ command: "create", file_text: "" }, { command: "create", file_text: "actual content" });
+  assert.equal(results[0]!.isError, true);
+  assert.match(text(results[0]!), /must not be empty/);
   // Model can retry with real content.
-  await tool.execute("2", { command: "create", file_text: "actual content" });
+  assert.equal(results[1]!.isError, false);
   assert.equal(draft.isCreated(), true);
   assert.equal(draft.getContent(), "actual content");
 });
 
 test("over-budget mutation is rejected atomically and does not create the draft", async () => {
-  const { draft, tool } = toolFor(10, 2); // limit ≈ 20 tokens
+  const { draft, run } = toolFor(10, 2); // limit ≈ 20 tokens
   const huge = "word ".repeat(500);
-  const result = await tool.execute("1", { command: "create", file_text: huge });
-  assert.match(text(result), /exceed token limit/i);
+  const result = await run({ command: "create", file_text: huge });
+  const toolResult = result.results[0]!;
+  assert.equal(toolResult.isError, true);
+  assert.match(text(toolResult), /exceed token limit/i);
+  assert.match(text(toolResult), /limit: 20 tokens \(target: 10\)/);
+  assert.match(text(toolResult), /Shorten the summary and try again/);
   assert.equal(draft.isCreated(), false);
-  assert.notEqual(result.terminate, true);
 });
 
 test("finalize is suppressed when a mutation fails the token limit", async () => {
-  const { tool } = toolFor(10, 2);
+  const { draft, run } = toolFor(10, 2);
   const huge = "word ".repeat(500);
-  const result = await tool.execute("1", { command: "create", file_text: huge, finalize: true });
-  assert.notEqual(result.terminate, true);
+  const result = await run({ command: "create", file_text: huge, finalize: true });
+  assert.equal(result.results[0]!.isError, true);
+  assert.equal(terminated(result), false, "the model gets another turn to fix the error");
+  assert.equal(draft.isCreated(), false);
+});
+
+test("an over-budget edit reverts to the last good draft", async () => {
+  const { draft, run } = toolFor(10, 2);
+  const { results } = await run(
+    { command: "create", file_text: "short" },
+    { command: "str_replace", old_str: "short", new_str: "word ".repeat(500) },
+  );
+  assert.equal(results[1]!.isError, true);
+  assert.equal(draft.getContent(), "short");
 });
 
 // --- str_replace error paths ---
 
-test("str_replace with non-matching old_str returns error and leaves draft unchanged", async () => {
-  const { draft, tool } = toolFor();
-  await tool.execute("1", { command: "create", file_text: "hello world" });
-  const result = await tool.execute("2", { command: "str_replace", old_str: "xyz", new_str: "abc" });
-  assert.match(text(result), /old_str was not found/);
+test("str_replace with non-matching old_str is an error and leaves draft unchanged", async () => {
+  const { draft, run } = toolFor();
+  const { results } = await run(
+    { command: "create", file_text: "hello world" },
+    { command: "str_replace", old_str: "xyz", new_str: "abc" },
+  );
+  assert.equal(results[1]!.isError, true);
+  assert.match(text(results[1]!), /old_str was not found/);
+  assert.match(text(results[1]!), /Current draft contents:\nhello world/);
   assert.equal(draft.getContent(), "hello world");
 });
 
-test("str_replace matching more than once returns error and leaves draft unchanged", async () => {
-  const { draft, tool } = toolFor();
-  await tool.execute("1", { command: "create", file_text: "aaa bbb aaa" });
-  const result = await tool.execute("2", { command: "str_replace", old_str: "aaa", new_str: "ccc" });
-  assert.match(text(result), /old_str matched more than once/);
+test("str_replace matching more than once is an error and leaves draft unchanged", async () => {
+  const { draft, run } = toolFor();
+  const { results } = await run(
+    { command: "create", file_text: "aaa bbb aaa" },
+    { command: "str_replace", old_str: "aaa", new_str: "ccc" },
+  );
+  assert.equal(results[1]!.isError, true);
+  assert.match(text(results[1]!), /old_str matched more than once/);
   assert.equal(draft.getContent(), "aaa bbb aaa");
+});
+
+test("insert past the end of the draft is an error and leaves draft unchanged", async () => {
+  const { draft, run } = toolFor();
+  const { results } = await run({ command: "create", file_text: "a" }, { command: "insert", insert_line: 5, new_str: "b" });
+  assert.equal(results[1]!.isError, true);
+  assert.match(text(results[1]!), /past end of draft/);
+  assert.equal(draft.getContent(), "a");
 });
 
 // --- view error paths ---
 
-test("view with start < 1 returns error", async () => {
-  const { tool } = toolFor();
-  await tool.execute("1", { command: "create", file_text: "line one\nline two" });
-  const result = await tool.execute("2", { command: "view", view_range: [0, 2] });
-  assert.match(text(result), /view_range start must be >= 1/);
+test("view with start < 1 is an error", async () => {
+  const { run } = toolFor();
+  const { results } = await run({ command: "create", file_text: "line one\nline two" }, { command: "view", view_range: [0, 2] });
+  assert.equal(results[1]!.isError, true);
+  assert.match(text(results[1]!), /view_range start must be >= 1/);
 });
 
-test("view with start past end of draft returns error", async () => {
-  const { tool } = toolFor();
-  await tool.execute("1", { command: "create", file_text: "line one\nline two" });
-  const result = await tool.execute("2", { command: "view", view_range: [5, 6] });
-  assert.match(text(result), /past end of draft/);
+test("view with start past end of draft is an error", async () => {
+  const { run } = toolFor();
+  const { results } = await run({ command: "create", file_text: "line one\nline two" }, { command: "view", view_range: [5, 6] });
+  assert.equal(results[1]!.isError, true);
+  assert.match(text(results[1]!), /past end of draft/);
 });
 
-test("view with end < start returns error", async () => {
-  const { tool } = toolFor();
-  await tool.execute("1", { command: "create", file_text: "line one\nline two\nline three" });
-  const result = await tool.execute("2", { command: "view", view_range: [3, 1] });
-  assert.match(text(result), /view_range end must be >= start/);
+test("view with end < start is an error", async () => {
+  const { run } = toolFor();
+  const { results } = await run(
+    { command: "create", file_text: "line one\nline two\nline three" },
+    { command: "view", view_range: [3, 1] },
+  );
+  assert.equal(results[1]!.isError, true);
+  assert.match(text(results[1]!), /view_range end must be >= start/);
 });
 
-// --- parameter-validation errors return isError: true ---
-
-test("create without file_text returns isError: true", async () => {
-  const { tool } = toolFor();
-  const result = await tool.execute("1", { command: "create" });
-  assert.match(text(result), /create requires file_text/);
-  assert.equal(result.isError, true);
+test("a failing view with finalize: true does not terminate", async () => {
+  const { run } = toolFor();
+  const result = await run({ command: "create", file_text: "x" }, { command: "view", view_range: [0, 1], finalize: true });
+  assert.equal(result.results[1]!.isError, true);
+  assert.equal(terminated(result), false);
 });
 
-test("str_replace without old_str returns isError: true", async () => {
-  const { tool } = toolFor();
-  await tool.execute("1", { command: "create", file_text: "hello" });
-  const result = await tool.execute("2", { command: "str_replace" });
-  assert.match(text(result), /str_replace requires old_str/);
-  assert.equal(result.isError, true);
+// --- parameter-validation errors ---
+
+test("create without file_text is an error tool result", async () => {
+  const { draft, run } = toolFor();
+  const { results } = await run({ command: "create" });
+  assert.equal(results[0]!.isError, true);
+  assert.match(text(results[0]!), /create requires file_text/);
+  assert.equal(draft.isCreated(), false);
 });
 
-test("insert without insert_line returns isError: true", async () => {
-  const { tool } = toolFor();
-  await tool.execute("1", { command: "create", file_text: "hello" });
-  const result = await tool.execute("2", { command: "insert" });
-  assert.match(text(result), /insert requires insert_line/);
-  assert.equal(result.isError, true);
+test("str_replace without old_str is an error tool result", async () => {
+  const { run } = toolFor();
+  const { results } = await run({ command: "create", file_text: "hello" }, { command: "str_replace" });
+  assert.equal(results[1]!.isError, true);
+  assert.match(text(results[1]!), /str_replace requires old_str/);
+});
+
+test("insert without insert_line is an error tool result", async () => {
+  const { run } = toolFor();
+  const { results } = await run({ command: "create", file_text: "hello" }, { command: "insert" });
+  assert.equal(results[1]!.isError, true);
+  assert.match(text(results[1]!), /insert requires insert_line/);
 });
 
 // --- finalize: true on non-create commands ---
 
-test("view with finalize: true sets terminate: true", async () => {
-  const { tool } = toolFor();
-  await tool.execute("1", { command: "create", file_text: "some content" });
-  const result = await tool.execute("2", { command: "view", finalize: true });
-  assert.equal(result.terminate, true);
-  assert.match(text(result), /1: some content/);
+test("view with finalize: true terminates", async () => {
+  const { run } = toolFor();
+  const result = await run({ command: "create", file_text: "some content" }, { command: "view", finalize: true });
+  assert.equal(terminated(result), true);
+  assert.match(text(result.results[1]!), /1: some content/);
 });
 
-test("str_replace with finalize: true sets terminate: true", async () => {
-  const { tool } = toolFor();
-  await tool.execute("1", { command: "create", file_text: "hello world" });
-  const result = await tool.execute("2", { command: "str_replace", old_str: "world", new_str: "there", finalize: true });
-  assert.equal(result.terminate, true);
-  assert.match(text(result), /str_replace applied/);
+test("str_replace with finalize: true terminates", async () => {
+  const { run } = toolFor();
+  const result = await run(
+    { command: "create", file_text: "hello world" },
+    { command: "str_replace", old_str: "world", new_str: "there", finalize: true },
+  );
+  assert.equal(terminated(result), true);
+  assert.match(text(result.results[1]!), /str_replace applied/);
 });
 
-test("insert with finalize: true sets terminate: true", async () => {
-  const { tool } = toolFor();
-  await tool.execute("1", { command: "create", file_text: "a\nc" });
-  const result = await tool.execute("2", { command: "insert", insert_line: 1, new_str: "b", finalize: true });
-  assert.equal(result.terminate, true);
-  assert.match(text(result), /insert applied/);
+test("insert with finalize: true terminates", async () => {
+  const { run } = toolFor();
+  const result = await run(
+    { command: "create", file_text: "a\nc" },
+    { command: "insert", insert_line: 1, new_str: "b", finalize: true },
+  );
+  assert.equal(terminated(result), true);
+  assert.match(text(result.results[1]!), /insert applied/);
 });
 
 // --- standalone `finalize` command ---
 
 test("finalize command terminates without mutating the draft", async () => {
-  const { draft, tool } = toolFor();
-  await tool.execute("1", { command: "create", file_text: "the summary" });
-  const result = await tool.execute("2", { command: "finalize" });
-  assert.equal(result.terminate, true);
-  assert.match(text(result), /finalized/);
+  const { draft, run } = toolFor();
+  const result = await run({ command: "create", file_text: "the summary" }, { command: "finalize" });
+  assert.equal(result.results[1]!.isError, false);
+  assert.equal(terminated(result), true);
+  assert.match(text(result.results[1]!), /finalized/);
   // The draft is committed exactly as written — no spurious edit.
   assert.equal(draft.getContent(), "the summary");
 });
 
 test("finalize command on an uncreated draft is an error and does not terminate", async () => {
-  const { tool } = toolFor();
-  const result = await tool.execute("1", { command: "finalize" });
-  assert.equal(result.isError, true);
-  assert.notEqual(result.terminate, true);
-  assert.match(text(result), /nothing to finalize/i);
+  const { run } = toolFor();
+  const result = await run({ command: "finalize" });
+  assert.equal(result.results[0]!.isError, true);
+  assert.equal(terminated(result), false);
+  assert.match(text(result.results[0]!), /nothing to finalize/i);
+  assert.match(text(result.results[0]!), /use `create`/);
 });

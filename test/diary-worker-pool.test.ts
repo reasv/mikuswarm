@@ -11,6 +11,7 @@ import { configureAgentTimezone } from "../src/time/index.js";
 import type { Logger } from "../src/observability/index.js";
 import type { CanonicalChatEvent } from "../src/types.js";
 import { SessionUsageTracker } from "../src/agent/usage.js";
+import { runToolCalls } from "./helpers/pi-tool-run.js";
 
 configureAgentTimezone("UTC");
 
@@ -510,15 +511,18 @@ test("a rejected over-budget edit that recovers to a valid draft appends the rev
     await insertLevel1(storage, "sum1", [event("a0", 2000, "assistant")]);
 
     // per_session_budget_tokens is 1000 (makePool default). First write a valid
-    // small draft, then attempt a wildly over-budget insert (reverted via isError),
-    // then finalize on the still-valid reverted content.
+    // small draft, then attempt a wildly over-budget insert (thrown → a pi tool
+    // error, reverted), then finalize on the still-valid reverted content. The
+    // calls go through a real pi Agent loop, as in a live diary session.
     const header = expectedHeader({ earliestTimestamp: 2000, latestTimestamp: 2000 });
     const factory = makeFakeFactory(async (tool) => {
-      await tool.execute("t", { command: "create", file_text: `${header}\nvalid recovered entry` });
       const huge = "x ".repeat(5000); // >> 1000-token budget → rejected + reverted
-      const rejected = await tool.execute("t", { command: "insert", insert_line: 2, new_str: huge });
-      assert.equal((rejected as any).isError, true, "over-budget edit is reported as error and reverted");
-      await tool.execute("t", { command: "view", finalize: true });
+      const { results } = await runToolCalls(tool, [
+        { command: "create", file_text: `${header}\nvalid recovered entry` },
+        { command: "insert", insert_line: 2, new_str: huge },
+        { command: "view", finalize: true },
+      ]);
+      assert.deepEqual(results.map((r) => r.isError), [false, true, false], "over-budget edit is a tool error, reverted");
     });
     const pool = makePool({ storage, memoryWriter, workspaceRoot, factory });
     await pool.start();

@@ -5,6 +5,18 @@ import { estimateTokens } from "../context/tokens.js";
 /** Thrown by draft mutations on a semantic failure (surfaced to the model, not fatal). */
 class SummaryDraftError extends Error {}
 
+/**
+ * The error an editor tool (`summary_tool`, `diary_tool`) throws from `execute()`.
+ * pi-agent-core marks a tool result as an error only when `execute()` throws, so
+ * every failure path throws this rather than returning a result. The `Error:`
+ * prefix keeps the failure legible on transports with no tool-error flag (OpenAI
+ * Chat Completions / Responses); the message itself names the fix.
+ */
+export function draftToolError(err: unknown): Error {
+  const message = err instanceof Error ? err.message : String(err);
+  return new Error(`Error: ${message}`);
+}
+
 interface DraftSnapshot {
   content: string;
   created: boolean;
@@ -139,13 +151,14 @@ export function createSummaryTool(options: {
 
       // view never mutates; report current draft and honor finalize.
       if (args.command === "view") {
+        let text: string;
         try {
           const [start, end] = args.view_range ?? [];
-          const text = draft.isCreated() ? draft.view(start, end) : "(draft is empty — use create first)";
-          return { content: [{ type: "text", text }], details: { command: "view" }, terminate: finalize };
+          text = draft.isCreated() ? draft.view(start, end) : "(draft is empty — use create first)";
         } catch (err) {
-          return errorResult(err);
+          throw draftToolError(err);
         }
+        return { content: [{ type: "text", text }], details: { command: "view" }, terminate: finalize };
       }
 
       // `finalize` is a standalone terminal command: commit the current draft and
@@ -157,13 +170,7 @@ export function createSummaryTool(options: {
       // content, so finalizing an empty/uncreated draft is an error, not a skip.
       if (args.command === "finalize") {
         if (!draft.isCreated() || draft.getContent().trim().length === 0) {
-          return {
-            content: [
-              { type: "text", text: "Error: nothing to finalize — use `create` to write the summary first." },
-            ],
-            details: { command: "finalize" },
-            isError: true,
-          };
+          throw draftToolError("nothing to finalize — use `create` to write the summary first.");
         }
         return {
           content: [{ type: "text", text: `Summary finalized (${draft.getTokenCount()} tokens).` }],
@@ -175,45 +182,31 @@ export function createSummaryTool(options: {
       const snapshot = draft.snapshot();
       try {
         if (args.command === "create") {
-          if (args.file_text === undefined) {
-            return { content: [{ type: "text", text: "Error: create requires file_text." }], details: null, isError: true };
-          }
+          if (args.file_text === undefined) throw new SummaryDraftError("create requires file_text.");
           draft.create(args.file_text);
         } else if (args.command === "str_replace") {
-          if (args.old_str === undefined) {
-            return { content: [{ type: "text", text: "Error: str_replace requires old_str." }], details: null, isError: true };
-          }
+          if (args.old_str === undefined) throw new SummaryDraftError("str_replace requires old_str.");
           draft.strReplace(args.old_str, args.new_str ?? "");
         } else {
           // insert
-          if (args.insert_line === undefined) {
-            return { content: [{ type: "text", text: "Error: insert requires insert_line." }], details: null, isError: true };
-          }
+          if (args.insert_line === undefined) throw new SummaryDraftError("insert requires insert_line.");
           draft.insert(args.insert_line, args.new_str ?? "");
         }
       } catch (err) {
         draft.restore(snapshot);
-        return errorResult(err);
+        throw draftToolError(err);
       }
 
       // Token-limit enforcement: reject the mutation atomically if over budget.
       const currentTokens = draft.getTokenCount();
       if (currentTokens > limit) {
         draft.restore(snapshot);
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                `Error: Summary would exceed token limit. ` +
-                `Current: ${currentTokens} tokens, limit: ${limit} tokens (target: ${targetTokenCount}). ` +
-                `Shorten the summary and try again.`,
-            },
-          ],
-          details: { command: args.command, tokens: currentTokens, limit },
-          isError: true,
-          // Do NOT terminate even if finalize was true — the error needs handling.
-        };
+        // Thrown, so a `finalize: true` on this call never terminates — the error needs handling.
+        throw draftToolError(
+          `Summary would exceed token limit. ` +
+            `Current: ${currentTokens} tokens, limit: ${limit} tokens (target: ${targetTokenCount}). ` +
+            `Shorten the summary and try again.`,
+        );
       }
 
       return {
@@ -225,9 +218,4 @@ export function createSummaryTool(options: {
       };
     },
   };
-}
-
-function errorResult(err: unknown): { content: [{ type: "text"; text: string }]; details: null; isError: true } {
-  const message = err instanceof Error ? err.message : String(err);
-  return { content: [{ type: "text", text: `Error: ${message}` }], details: null, isError: true };
 }
