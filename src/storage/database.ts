@@ -12219,7 +12219,7 @@ ${SESSION_AUDITS_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 29;
+export const LATEST_SCHEMA_VERSION = 27;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -13191,12 +13191,6 @@ function addSessionAuditsTable(db: Database.Database): void {
   db.exec(SESSION_AUDITS_SCHEMA);
 }
 
-// v27→v29: reserved, no-op steps (one per refusal-handling workstream that may
-// need DDL). A workstream fills only its own step (idempotent, PRAGMA table_info
-// guarded) and adds the same shape to SCHEMA; unused slots stay no-ops.
-function reservedW2(_db: Database.Database): void {}
-function reservedW3(_db: Database.Database): void {}
-
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -13229,8 +13223,6 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   addRefusalHandlingTables,             // v24→v25
   addModelBehaviourTables,              // v25→v26
   addSessionAuditsTable,                // v26→v27
-  reservedW2,                           // v27→v28
-  reservedW3,                           // v28→v29
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write

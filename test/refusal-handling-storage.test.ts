@@ -1,7 +1,7 @@
 /**
  * Refusal handling storage (spec REFUSAL-HANDLING §9, §10.1): schema v25
  * (refusal_events, contract_attempts, agent_session_branches + new columns), the
- * reserved no-op steps up to v29, and the storage methods.
+ * later v26/v27 steps re-run on top, and the storage methods.
  */
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -82,8 +82,8 @@ function downgradeToV24(storage: Storage): Promise<void> {
   });
 }
 
-test("schema: LATEST_SCHEMA_VERSION is 29 (v25 + four reserved steps)", () => {
-  assert.equal(LATEST_SCHEMA_VERSION, 29);
+test("schema: LATEST_SCHEMA_VERSION is 27 (v25 refusal handling, v26 behaviour, v27 audits)", () => {
+  assert.equal(LATEST_SCHEMA_VERSION, 27);
 });
 
 test("migration: a v24 database migrates to the fresh-DB shape, rows kept", async () => {
@@ -119,7 +119,7 @@ test("migration: a v24 database migrates to the fresh-DB shape, rows kept", asyn
   });
 });
 
-test("migration: re-running the v24→v29 steps on a latest-shape DB is a no-op", async () => {
+test("migration: re-running the v24→v27 steps on a latest-shape DB is a no-op", async () => {
   await withTempDir(async (dir) => {
     const dbPath = path.join(dir, "rerun.db");
     let before: unknown;
