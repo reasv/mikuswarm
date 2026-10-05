@@ -34,8 +34,31 @@ export interface CheckQuestion {
   source: CheckSource;
   instructions: string;
   criteria: { true: string; false: string };
-  /** The question fires at or above this `noul` probability. */
+  /**
+   * The question fires at or above this `noul` probability (a `choice`
+   * question: when it picks `fireOption` with at least this confidence).
+   */
   threshold: number;
+  /**
+   * Answer type; undefined = `noul`. `choice` is used by built-in contract
+   * checks only (config questions are `noul`); `criteria` then documents what
+   * firing means and `options` is what the decision model is asked.
+   */
+  type?: "noul" | "choice";
+  /** `choice` questions: option key → description. */
+  options?: Record<string, string>;
+  /** `choice` questions: the option that counts as the check firing. */
+  fireOption?: string;
+  /**
+   * Asked only after at least one forced-completion nudge in the current turn,
+   * whether or not the question's source has text (spec §7.4).
+   */
+  afterNudge?: boolean;
+  /**
+   * Asked only for these actions (the judged tool name, `NO_REPLY` for the
+   * text marker, `exhausted` for forced-completion exhaustion); undefined = any.
+   */
+  actions?: string[];
 }
 
 /** A provider refusal signal mapped to a check (hard refusals, spec §4.2). */
