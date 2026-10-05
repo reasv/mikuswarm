@@ -11,7 +11,12 @@ import {
   compileWordList,
   firstPatternMatch,
 } from "../src/checks/catalogue.js";
-import { BUILTIN_CHECKS, BUILTIN_CONTRACT_CHECKS, BUILTIN_REFUSAL_CHECKS } from "../src/checks/builtin/index.js";
+import {
+  BUILTIN_CHECKS,
+  BUILTIN_CONTRACT_CHECKS,
+  BUILTIN_REFUSAL_CHECKS,
+  BUILTIN_STYLE_CHECKS,
+} from "../src/checks/builtin/index.js";
 import type { CheckDefinition } from "../src/checks/types.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -53,9 +58,9 @@ test("built-ins: the seven refusal checks, enabled, redo, all checkpoints", () =
   }
   assert.equal(
     BUILTIN_CHECKS.length,
-    BUILTIN_REFUSAL_CHECKS.length + BUILTIN_CONTRACT_CHECKS.length,
-    "style built-ins arrive later",
+    BUILTIN_REFUSAL_CHECKS.length + BUILTIN_STYLE_CHECKS.length + BUILTIN_CONTRACT_CHECKS.length,
   );
+  assert.equal(BUILTIN_STYLE_CHECKS.length, 11, "the starter style catalogue (§4.5)");
 });
 
 test("override: a built-in is overridden field by field, the rest kept", () => {
