@@ -70,7 +70,7 @@
 
 	// Collapsed summary from the group.
 	const topProb = $derived(topProbability(first?.answersJson));
-	const verdict = $derived(verdictLabel(first?.answersJson ? null : first?.verdictJson) ?? verdictLabel(first?.verdictJson));
+	const verdict = $derived(verdictLabel(first?.verdictJson));
 	const fallbackReason = $derived(first?.reason);
 
 	// For the records point, show one row per candidate (candidateSessionId).

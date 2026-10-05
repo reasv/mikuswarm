@@ -27,7 +27,7 @@
 	//   from the transcript by extractRecordsGiven)
 	const sessionRecord = sessionRecordQuery(() => activeId);
 	const decisionsQ = sessionDecisionsQuery(() => activeId);
-	const decisionGroups = $derived(() => {
+	const decisionGroups = $derived.by(() => {
 		const evs = decisionsQ.data?.evaluations ?? [];
 		const map = new Map<string, (typeof evs)[number][]>();
 		for (const ev of evs) {
@@ -228,7 +228,7 @@
 			<!-- Decisions (spec SESSION-RECORDS §8): one row per decision group with a
 			     scroll-jump link to the inline card in the rollout. -->
 			{#if decisionsQ.data && decisionsQ.data.evaluations.length > 0}
-				{@const groups = decisionGroups()}
+				{@const groups = decisionGroups}
 				<div>
 					<div class="mb-1 text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">Decisions ({groups.size})</div>
 					<div class="space-y-1">
