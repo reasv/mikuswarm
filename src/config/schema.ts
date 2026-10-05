@@ -2078,7 +2078,7 @@ const SessionRecordsSchema = StrictObject({
   // Token cap for a single session record (summary_tool analogue). Default 1500.
   max_tokens: Type.Optional(Type.Integer({ minimum: 64 })),
   // Max assistant turns the harness waits for session_record_tool finalization.
-  // Default 30. Exceeding this: record turn aborts without writing a row.
+  // Default 4. Exceeding this: record turn aborts without writing a row.
   max_turns: Type.Optional(Type.Integer({ minimum: 1 })),
   // When true (default), an available record is injected at the start of a reply
   // session for the same timeline key (same as inject_on_reply in spec §5).

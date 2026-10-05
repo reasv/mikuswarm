@@ -247,13 +247,14 @@ export function createReadSessionTranscriptTool(context: ReadSessionRecordToolCo
       session_id: Type.String({ description: "The agent_session_id." }),
       query: Type.Optional(
         Type.String({
+          maxLength: 500,
           description:
             "Case-insensitive substring filter on tool name, arguments, or result text. " +
             "Omit to see all tool calls.",
         }),
       ),
       range: Type.Optional(
-        Type.Array(Type.Integer({ minimum: 1 }), {
+        Type.Array(Type.Integer({ minimum: 1, maximum: 10000 }), {
           minItems: 2,
           maxItems: 2,
           description:
@@ -316,15 +317,23 @@ export function createReadSessionTranscriptTool(context: ReadSessionRecordToolCo
 
       // Extract assistant turns (with tool calls), ignoring thinking blocks.
       // Build an index of toolResults keyed by toolCallId for quick lookup.
+      //
+      // Real pi-agent-core toolResult messages carry toolCallId at the MESSAGE
+      // level (not inside a content block): { role: "toolResult", toolCallId, content: [...] }.
+      // The previous per-block scan never found anything because content blocks are
+      // TextContent/ImageContent only — there is no inner toolResult-typed block.
       const resultIndex = new Map<string, ToolResultBlock>();
       for (const msg of messages) {
-        if (msg.role === "toolResult" && Array.isArray(msg.content)) {
-          for (const b of msg.content) {
-            const res = b as ToolResultBlock;
-            if (res.type === "toolResult" && res.toolCallId) {
-              resultIndex.set(res.toolCallId, res);
-            }
-          }
+        const m = msg as Record<string, unknown>;
+        if (m["role"] === "toolResult" && typeof m["toolCallId"] === "string") {
+          const content = Array.isArray(m["content"])
+            ? (m["content"] as { type: string; text?: string }[])
+            : [];
+          resultIndex.set(m["toolCallId"], {
+            type: "toolResult",
+            toolCallId: m["toolCallId"],
+            content,
+          });
         }
       }
 
