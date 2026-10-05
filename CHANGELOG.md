@@ -143,6 +143,13 @@ Unreleased section; it is not part of any release's notes.
 
 ### Fixed
 
+- **Summary and diary editor errors were recorded as successful tool calls.**
+  `summary_tool` and `diary_tool` returned their failures (token budget overage,
+  missing diary header, `old_str` misses) instead of throwing, so the transcript
+  and the console showed them as successes and the provider request carried no
+  tool-error flag. They now throw, and each error still names the fix. A failed edit still reverts the draft and never
+  finalizes.
+
 - **Explicit cache breakpoints missed the timeline whenever auto-retrieval ran.**
   The per-session tail was recognised only by a bare `<retrieved_memory>` tag,
   but the block is rendered with a `note` attribute, so the last-stable-timeline

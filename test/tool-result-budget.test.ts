@@ -1040,9 +1040,9 @@ test("wrapToolsWithResultBudget: terminate+details intact through wrapper (trunc
 
 test("wrapToolsWithResultBudget: isError:true returned without throwing — preserved, content shaped", async () => {
   // Contract gap documented in ARCHITECTURE.md §10 "Exemptions and pass-throughs":
-  // the wrapper always passes isError=false to shapeContentBlocks, so tools that
-  // return { isError: true } without throwing (e.g. summary_tool draft-error paths)
-  // are shaped as ordinary successes — not exempt like a thrown error.
+  // the wrapper always passes isError=false to shapeContentBlocks, so a tool that
+  // returns { isError: true } without throwing (no built-in tool does) is shaped
+  // as an ordinary success — not exempt like a thrown error.
   const budget = new TurnResultBudget(200_000, 1_000, 100);
   const bigText = makeText(500);
   const tool: AgentTool = {
