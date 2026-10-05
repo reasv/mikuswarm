@@ -91,11 +91,8 @@ export function createLoadSkillTool(context: LoadSkillContext): AgentTool {
         throw new Error(`Skill "${name}" could not be read from ${meta.path}.`);
       }
 
-      // Harness-only tools cannot be claimed by skill patterns (CONTRACT §2).
-      const matchedNames = registry.matchCatalog(patterns).filter((toolName) => {
-        const tool = registry.catalogTools.find((t) => t.name === toolName);
-        return !(tool as (typeof tool & { harnessOnly?: boolean }) | undefined)?.harnessOnly;
-      });
+      // matchCatalog already excludes harness-only tools (CONTRACT §2).
+      const matchedNames = registry.matchCatalog(patterns);
       const { added, alreadyLoaded, unknown } = registry.load(matchedNames);
       const addedNames = added.map((tool) => tool.name);
 

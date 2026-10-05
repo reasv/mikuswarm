@@ -131,9 +131,16 @@ export class DynamicToolRegistry {
     return this.byName.has(name);
   }
 
-  /** Catalog names matching any of `patterns` (loaded or not), catalog order. */
+  /**
+   * Catalog names matching any of `patterns` (loaded or not), catalog order.
+   * Harness-only tools are excluded: they are never loadable via skill patterns or
+   * the editor-view activation path (CONTRACT §2).
+   */
   matchCatalog(patterns: readonly string[]): string[] {
-    return matchToolPatterns(this.catalogNames(), patterns);
+    const names = this.catalog
+      .filter((tool) => !(tool as { harnessOnly?: boolean }).harnessOnly)
+      .map((tool) => tool.name);
+    return matchToolPatterns(names, patterns);
   }
 
   /**

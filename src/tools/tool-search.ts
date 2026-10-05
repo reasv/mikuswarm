@@ -136,7 +136,11 @@ export function createToolSearchTool(context: ToolSearchContext): AgentTool {
         parts.push(`Not in this session's catalog: ${unknown.join(", ")}.`);
       }
       if (parts.length === 0) {
-        const deferredNames = registry.deferredTools().map((tool) => tool.name);
+        // Exclude harness-only tools from the fallback listing (CONTRACT §2).
+        const deferredNames = registry
+          .deferredTools()
+          .filter((tool) => !(tool as { harnessOnly?: boolean }).harnessOnly)
+          .map((tool) => tool.name);
         parts.push(
           deferredNames.length > 0
             ? `No deferred tools matched "${query}". Deferred catalog: ${deferredNames.join(", ")}. ` +
