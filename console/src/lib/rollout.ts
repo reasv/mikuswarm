@@ -213,7 +213,12 @@ function coerceImageRefs(o: RolloutMsg): readonly ImageRef[] | undefined {
 export type HarnessMarker =
 	| { kind: 'injection'; decisionGroup?: string }
 	| { kind: 'record_turn' }
-	| { kind: 'record_load' };
+	| { kind: 'record_load' }
+	// A send-contract nudge (spec REFUSAL-HANDLING §7, src/agent/contract.ts).
+	| { kind: 'forced_completion'; attempt?: number; variant?: string }
+	// The stand-in turn of a withheld refusal (`on_exhausted = "withhold"`, §8.2):
+	// nothing was sent, the run settled as NO_REPLY.
+	| { kind: 'refusal_withheld' };
 
 /**
  * Extract the harness marker from a transcript message, or null when the message
@@ -229,6 +234,16 @@ export function getHarness(m: RolloutMsg): HarnessMarker | null {
 	}
 	if (kind === 'record_turn') return { kind: 'record_turn' };
 	if (kind === 'record_load') return { kind: 'record_load' };
+	if (kind === 'refusal_withheld') return { kind: 'refusal_withheld' };
+	if (kind === 'forced_completion') {
+		const attempt = (h as { attempt?: unknown }).attempt;
+		const variant = (h as { variant?: unknown }).variant;
+		return {
+			kind: 'forced_completion',
+			...(typeof attempt === 'number' ? { attempt } : {}),
+			...(typeof variant === 'string' ? { variant } : {})
+		};
+	}
 	return null;
 }
 

@@ -4,7 +4,8 @@ import {
 	resolveFixture,
 	DEMO_FEATURED_SESSION,
 	DEMO_FEATURED_ROOM,
-	DEMO_FEATURED_CAPTION_ITEM
+	DEMO_FEATURED_CAPTION_ITEM,
+	DEMO_REFUSAL_SESSION
 } from './fixtures';
 import {
 	UsageSummary,
@@ -25,7 +26,9 @@ import {
 	CostOverview,
 	AgentsResponse,
 	SessionRecordResponse,
-	SessionDecisionsResponse
+	SessionDecisionsResponse,
+	ModelBehaviourResponse,
+	BehaviourIncidentPage
 } from '$lib/schemas';
 
 /**
@@ -52,6 +55,10 @@ const cases: Case[] = [
 	{ path: `/api/sessions/${encodeURIComponent(DEMO_FEATURED_SESSION)}`, schema: SessionDetailResponse as never },
 	{ path: `/api/sessions/${encodeURIComponent(DEMO_FEATURED_SESSION)}/record`, schema: SessionRecordResponse as never },
 	{ path: `/api/sessions/${encodeURIComponent(DEMO_FEATURED_SESSION)}/decisions`, schema: SessionDecisionsResponse as never },
+	{ path: `/api/sessions/${DEMO_REFUSAL_SESSION}`, schema: SessionDetailResponse as never },
+	{ path: `/api/sessions/${DEMO_REFUSAL_SESSION}/decisions`, schema: SessionDecisionsResponse as never },
+	{ path: '/api/models/behaviour', query: { window: '24h' }, schema: ModelBehaviourResponse as never },
+	{ path: '/api/models/behaviour/incidents', schema: BehaviourIncidentPage as never },
 	{ path: '/api/pipelines', schema: PipelinesResponse as never },
 	{ path: '/api/cost-overview', schema: CostOverview as never },
 	{ path: '/api/pipelines/captioning/items', schema: PipelineItemsResponse as never },

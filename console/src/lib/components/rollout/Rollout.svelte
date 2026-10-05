@@ -1,8 +1,6 @@
 <script lang="ts">
 	import {
-		asMsg,
 		assistantBlocks,
-		buildRolloutPlan,
 		coerceContextMessage,
 		collectToolResults,
 		contentText,
@@ -14,6 +12,16 @@
 	import { isCollapsible as collapsibleFor, defaultOpen } from '$lib/tiers';
 	import { decisionElementId } from '$lib/decisions';
 	import { formatTokens, formatUsd } from '$lib/format';
+	import {
+		CONTINUATION,
+		LIVE_BRANCH,
+		buildBranchTree,
+		forkKey,
+		nodeOfToolCall,
+		selectionFor
+	} from '$lib/branches';
+	import { buildBranchPlan } from '$lib/branch-plan';
+	import { evaluationsForCall, eventsForEvaluation, gateEvaluations } from '$lib/checks';
 	import AssistantTextCard from './AssistantTextCard.svelte';
 	import ThinkingCard from './ThinkingCard.svelte';
 	import ToolCallCard from './ToolCallCard.svelte';
@@ -21,44 +29,177 @@
 	import DecisionCard from './DecisionCard.svelte';
 	import RecordTurnSection from './RecordTurnSection.svelte';
 	import InterjectionCard from './InterjectionCard.svelte';
+	import GateCard from './GateCard.svelte';
+	import ForkMarker from './ForkMarker.svelte';
+	import NudgeCard from './NudgeCard.svelte';
+	import HardRefusalMarker from './HardRefusalMarker.svelte';
 	import MessageBlock from '$lib/components/verbatim/MessageBlock.svelte';
-	import type { DecisionEvaluation, ToolInvocation } from '$lib/schemas';
+	import type {
+		CheckInfo,
+		DecisionEvaluation,
+		RefusalEvent,
+		SessionBranch,
+		SessionContract,
+		ToolInvocation
+	} from '$lib/schemas';
 
 	// `toolUsage` maps a tool-call id → its auxiliary usage ledger row (spec
 	// AUXILIARY-USAGE-TRACKING §10.3) so a tool-call block can be annotated with its
 	// own spend (today image_generate). Empty for live rollouts (ledger is durable).
 	// `decisionEvaluations` — all decision_evaluations rows for the session; the
-	// render plan interleaves decision cards at the right positions (spec §8).
+	// render plan interleaves decision cards at the right positions (spec §8), and
+	// the `checks` rows become gate / ending cards on the judged output.
+	// Refusal handling (spec REFUSAL-HANDLING §12.1–§12.2): `messages` is the live
+	// branch's rollout slice and `liveStart` its index in the live transcript;
+	// `branches` the discarded spans, shown through `‹ x/y ›` switchers at their
+	// fork points (the latest branch by default); `focus` deep-links a branch and
+	// a tool call or ending attempt (the incident log's links).
 	let {
 		messages,
 		toolUsage,
-		decisionEvaluations
+		decisionEvaluations,
+		liveStart = 0,
+		branches = [],
+		refusalEvents = [],
+		contract,
+		checks = [],
+		focus
 	}: {
 		messages: readonly unknown[];
 		toolUsage?: Map<string, ToolInvocation>;
 		decisionEvaluations?: DecisionEvaluation[];
+		liveStart?: number;
+		branches?: readonly SessionBranch[];
+		refusalEvents?: readonly RefusalEvent[];
+		contract?: SessionContract;
+		checks?: readonly CheckInfo[];
+		focus?: { branchNo?: number | null; toolCallId?: string | null; attemptNo?: number | null } | null;
 	} = $props();
 
-	const toolResults = $derived(collectToolResults(messages));
-	const rows = $derived(messages.map(asMsg));
+	// Fork choices the operator made with the switchers (fork key → option).
+	// Declared before every derived that reads it (initialization order).
+	let chosen = $state<Record<string, number>>({});
 
-	// Build the flat render plan: messages interleaved with decision cards.
-	const plan = $derived(buildRolloutPlan(rows, decisionEvaluations ?? []));
+	const tree = $derived(buildBranchTree(messages, liveStart, branches));
+	const focusKey = $derived(
+		focus ? `${focus.branchNo ?? ''}|${focus.toolCallId ?? ''}|${focus.attemptNo ?? ''}` : ''
+	);
+	// The branch a deep link points at: its branch number, else the branch holding the call.
+	const focusBranch = $derived.by(() => {
+		if (!focus) return undefined;
+		if (focus.branchNo != null && tree.nodes.has(focus.branchNo)) return focus.branchNo;
+		if (focus.toolCallId) return nodeOfToolCall(tree, focus.toolCallId);
+		return undefined;
+	});
+	const selection = $derived.by(() => {
+		const map =
+			focusBranch !== undefined && focusBranch !== LIVE_BRANCH
+				? selectionFor(tree, focusBranch)
+				: new Map<string, number>();
+		for (const [key, option] of Object.entries(chosen)) map.set(key, option);
+		return map;
+	});
+	// A new deep link resets the operator's switcher choices.
+	let lastFocusKey = '';
+	$effect(() => {
+		if (focusKey !== lastFocusKey) {
+			lastFocusKey = focusKey;
+			chosen = {};
+		}
+	});
+
+	const gate = $derived(gateEvaluations(decisionEvaluations ?? [], checks));
+	const plan = $derived(
+		buildBranchPlan({
+			tree,
+			selection,
+			evaluations: decisionEvaluations ?? [],
+			gate,
+			refusalEvents,
+			contract
+		})
+	);
+	const shown = $derived(plan.flatMap((item) => (item.type === 'message' ? [item.msg] : [])));
+	const toolResults = $derived(collectToolResults(shown));
+
+	function choose(key: string, option: number): void {
+		chosen = { ...chosen, [key]: option };
+	}
+
+	/** From a discarded branch, show the alternative that redid it (the next option at its fork). */
+	function showRedoOf(node: number): (() => void) | undefined {
+		const anchor = tree.nodes.get(node)?.anchor;
+		if (!anchor) return undefined;
+		const key = forkKey(anchor.parent, anchor.offset);
+		const options = [...(tree.forks.get(key) ?? []), CONTINUATION];
+		const next = options[options.indexOf(node) + 1];
+		return next === undefined ? undefined : () => choose(key, next);
+	}
+
+	// Scroll a deep-linked tool call (or ending attempt) into view once per link.
+	let scrolledFor = '';
+	$effect(() => {
+		void plan;
+		if (!focus || !focusKey || scrolledFor === focusKey) return;
+		const id = focus.toolCallId
+			? `toolcall-${focus.toolCallId}`
+			: focus.attemptNo != null && focusBranch !== undefined
+				? `attempt-${focusBranch}-${focus.attemptNo}`
+				: null;
+		if (!id || typeof document === 'undefined') return;
+		const el = document.getElementById(id);
+		if (!el) return;
+		scrolledFor = focusKey;
+		el.scrollIntoView?.({ block: 'center' });
+	});
 </script>
 
 <div class="space-y-2 p-3">
-	{#each plan as item (item.type === 'decision' ? 'decision:' + item.decisionGroup : item.index)}
+	{#each plan as item (item.key)}
 		{#if item.type === 'decision'}
 			<DecisionCard
 				evaluations={item.evaluations}
 				injected={item.injected}
 				elementId={decisionElementId(item.decisionGroup)}
 			/>
+		{:else if item.type === 'fork'}
+			<ForkMarker info={item.info} {checks} maxNudges={contract?.maxNudges ?? null} onSelect={choose} />
+		{:else if item.type === 'hard_refusal'}
+			<HardRefusalMarker event={item.event} />
+		{:else if item.type === 'ending'}
+			<GateCard
+				evaluation={item.evaluation}
+				variant="ending"
+				events={eventsForEvaluation(refusalEvents, item.evaluation)}
+				onShowRedo={showRedoOf(item.node)}
+			/>
 		{:else}
 			{@const msg = item.msg}
 			{@const harness = getHarness(msg)}
 
-			{#if harness?.kind === 'record_turn'}
+			{#if item.nudge}
+				<!-- A send-contract nudge (spec REFUSAL-HANDLING §12.2): its number, the
+				     closed attempt's failure types, and for a recovered run the diff. -->
+				<NudgeCard
+					nudge={item.nudge}
+					text={contentText(msg.content)}
+					elementId={`attempt-${item.node}-${item.nudge.index}`}
+				/>
+			{:else if msg.role === 'assistant' && harness?.kind === 'refusal_withheld'}
+				<!-- A withheld refusal (spec REFUSAL-HANDLING §8.2 on_exhausted = "withhold"):
+				     every rule entry refused, nothing was sent, the run settled as NO_REPLY. -->
+				<div
+					data-testid="refusal-withheld"
+					class="rounded-md border border-red-500/30 bg-red-500/5 px-3 py-1.5 text-xs"
+				>
+					<span class="text-[10px] font-semibold tracking-wide text-red-600 uppercase dark:text-red-400"
+						>refusal withheld</span
+					>
+					<span class="text-muted-foreground">
+						Every rule entry refused; nothing was sent and the run ended as NO_REPLY.</span
+					>
+				</div>
+			{:else if harness?.kind === 'record_turn'}
 				<!-- The harness record-turn user prompt: a section header, with the prompt
 				     itself collapsed and marked harness-made. -->
 				<RecordTurnSection prompt={contentText(msg.content)} />
@@ -97,12 +238,28 @@
 					{:else if block.type === 'thinking'}
 						<ThinkingCard thinking={block.thinking} redacted={block.redacted} />
 					{:else if block.type === 'toolCall'}
-						<ToolCallCard
-							name={block.name}
-							args={block.arguments}
-							result={toolResults.get(block.id)}
-							usage={toolUsage?.get(block.id)}
-						/>
+						<div
+							id={`toolcall-${block.id}`}
+							class="scroll-mt-10 rounded-md {focus?.toolCallId === block.id ? 'ring-2 ring-sky-500/60' : ''}"
+						>
+							<ToolCallCard
+								name={block.name}
+								args={block.arguments}
+								result={toolResults.get(block.id)}
+								usage={toolUsage?.get(block.id)}
+							/>
+						</div>
+						<!-- The output gate's verdict on this call (spec REFUSAL-HANDLING §12.2). -->
+						{#each evaluationsForCall(gate, block.id, item.node) as evaluation (evaluation.decisionGroup)}
+							<GateCard
+								{evaluation}
+								variant={evaluation.checkpoint === 'ending' ? 'ending' : 'gate'}
+								events={eventsForEvaluation(refusalEvents, evaluation)}
+								result={toolResults.get(block.id)}
+								args={block.arguments}
+								onShowRedo={showRedoOf(item.node)}
+							/>
+						{/each}
 					{/if}
 				{/each}
 				<!-- Per-request usage (spec TOKEN-USAGE-TRACKING §7.3): attached once at the
@@ -154,7 +311,7 @@
 			{/if}
 		{/if}
 	{/each}
-	{#if rows.length === 0}
+	{#if shown.length === 0}
 		<div class="text-sm text-muted-foreground">No rollout yet.</div>
 	{/if}
 </div>

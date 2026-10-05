@@ -47,6 +47,16 @@
 	recordRef = record;
 	const decisions = sessionDecisionsQuery(() => activeId, () => session.data);
 	const decisionEvaluations = $derived(decisions.data ? [...decisions.data.evaluations] : []);
+	// Refusal handling (spec REFUSAL-HANDLING §12.1–§12.2): discarded branches,
+	// refusal events, the send contract and check descriptions, from the session
+	// detail; empty on a pre-feature backend.
+	const branches = $derived(session.data?.branches ?? []);
+	const refusalEvents = $derived(session.data?.refusalEvents ?? []);
+	const contract = $derived(session.data?.contract);
+	const checks = $derived(session.data?.checks ?? []);
+	// A rollout deep link (`branch` / `call` / `attempt` URL params) applies to the
+	// session the URL selects, never to an embedded or explicitly-passed one.
+	const focus = $derived(!embedded && sessionIdProp == null ? selection.focus : null);
 
 	let stopping = $state(false);
 	let resuming = $state(false);
@@ -332,11 +342,26 @@
 					sessionId={activeId}
 					onEnd={onStreamEnd}
 					onHead={(h) => (liveHead = h)}
+					onBranchForked={() => queryClient.invalidateQueries({ queryKey: keys.session(activeId) })}
 					{decisionEvaluations}
+					{branches}
+					{refusalEvents}
+					{contract}
+					{checks}
 				/>
 			{/key}
 		{:else}
-			<Rollout messages={rolloutMessages} toolUsage={toolUsageByCallId} {decisionEvaluations} />
+			<Rollout
+				messages={rolloutMessages}
+				toolUsage={toolUsageByCallId}
+				{decisionEvaluations}
+				liveStart={session.data?.rolloutStartIndex ?? 0}
+				{branches}
+				{refusalEvents}
+				{contract}
+				{checks}
+				{focus}
+			/>
 		{/if}
 	{/if}
 </div>

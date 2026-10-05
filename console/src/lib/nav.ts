@@ -8,6 +8,7 @@ import type { PipelineId } from '$lib/schemas';
  * these helpers BUILD the hrefs the list/detail components navigate with.
  *
  * Conversations (`/`):   ?agent=<name>&room=<timelineKey>&session=<sessionId>
+ *                         [&branch=<n>&call=<toolCallId>&attempt=<n>] (rollout deep link)
  * Pipelines (`/pipelines`): ?pool=<pool>&status=<chip>&room=<roomFilter>&item=<itemId>
  *
  * `agent` (spec CONSOLE-MULTI-AGENT §3.5): the selected room-list agent tab; absent
@@ -26,8 +27,29 @@ export function conversationsHref(opts: {
 	agent?: string | null;
 	room?: string | null;
 	session?: string | null;
+	/** Deep link into the rollout (REFUSAL-HANDLING §12.3): a stored branch (0 = live, omitted). */
+	branch?: number | null;
+	/** …a judged tool call… */
+	call?: string | null;
+	/** …or a send-contract ending attempt. */
+	attempt?: number | null;
 }): string {
-	return href('/', { agent: opts.agent, room: opts.room, session: opts.session });
+	return href('/', {
+		agent: opts.agent,
+		room: opts.room,
+		session: opts.session,
+		branch: opts.branch ? String(opts.branch) : null,
+		call: opts.call,
+		attempt: opts.attempt != null ? String(opts.attempt) : null
+	});
+}
+
+/**
+ * The model behaviour page (`/models`, spec REFUSAL-HANDLING §12.3); its filters
+ * are URL params too (`$lib/model-behaviour-view`).
+ */
+export function modelsHref(params: Record<string, string | null | undefined> = {}): string {
+	return href('/models', params);
 }
 
 export function pipelinesHref(opts: {

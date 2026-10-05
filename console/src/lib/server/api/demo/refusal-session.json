@@ -1,0 +1,477 @@
+{
+	"detail": {
+		"session": {
+			"id": "ses_rf7w3k",
+			"timelineKey": "matrix:aria:room:!general:matrix.example.org",
+			"sessionType": "default",
+			"status": "completed",
+			"modelId": "model_a",
+			"triggerEventId": "$evt_rf7w3k",
+			"triggerExternalId": null,
+			"triggerBody": "can you recap the meetup thread?",
+			"tokenEstimate": null,
+			"llmRequests": null,
+			"usage": null,
+			"contextTokens": null,
+			"maxContextTokens": 128000,
+			"maxSessionCostUsd": null,
+			"noReply": false,
+			"checkChips": {
+				"refused": 2,
+				"redone": 1,
+				"nudged": 1,
+				"revised": 0,
+				"unjudged": 0
+			},
+			"error": null,
+			"createdAt": 1000,
+			"startedAt": 1000,
+			"updatedAt": 4400,
+			"completedAt": 4400,
+			"toolUsage": {
+				"calls": 0,
+				"inputTokens": 0,
+				"outputTokens": 0,
+				"cacheReadTokens": 0,
+				"cacheWriteTokens": 0,
+				"cost": 0
+			}
+		},
+		"toolInvocations": [],
+		"contextSnapshot": [],
+		"transcript": [
+			{
+				"type": "triggerGroup",
+				"role": "user",
+				"content": "<message from=\"Ada\">can you recap the meetup thread?</message>",
+				"timestamp": 1000
+			},
+			{
+				"role": "assistant",
+				"content": [
+					{
+						"type": "toolCall",
+						"id": "call-search",
+						"name": "search_messages",
+						"arguments": {
+							"query": "meetup"
+						}
+					}
+				],
+				"api": "openai-completions",
+				"provider": "example",
+				"model": "vendor/model_c",
+				"usage": {
+					"input": 5200,
+					"output": 60,
+					"cacheRead": 0,
+					"cacheWrite": 0,
+					"totalTokens": 5260,
+					"cost": {
+						"input": 0,
+						"output": 0,
+						"cacheRead": 0,
+						"cacheWrite": 0,
+						"total": 0.0012
+					}
+				},
+				"stopReason": "toolUse",
+				"timestamp": 2000,
+				"served": {
+					"logicalId": "model_c"
+				}
+			},
+			{
+				"role": "toolResult",
+				"toolCallId": "call-search",
+				"toolName": "search_messages",
+				"content": [
+					{
+						"type": "text",
+						"text": "3 messages about the meetup (Saturday, venue TBD)."
+					}
+				],
+				"isError": false,
+				"timestamp": 2100
+			},
+			{
+				"role": "assistant",
+				"content": [
+					{
+						"type": "text",
+						"text": "Here's the recap: the meetup moved to Saturday, venue still open."
+					}
+				],
+				"api": "openai-completions",
+				"provider": "example",
+				"model": "vendor/model_b",
+				"usage": {
+					"input": 5200,
+					"output": 60,
+					"cacheRead": 0,
+					"cacheWrite": 0,
+					"totalTokens": 5260,
+					"cost": {
+						"input": 0,
+						"output": 0,
+						"cacheRead": 0,
+						"cacheWrite": 0,
+						"total": 0.0012
+					}
+				},
+				"stopReason": "stop",
+				"timestamp": 4000,
+				"served": {
+					"logicalId": "model_b"
+				}
+			},
+			{
+				"role": "user",
+				"content": "Your turn ended without sending a message. You must end every turn by either:\n- Calling send_message with your response, OR\n- Calling no_reply if you have nothing to say.\n\nText you write outside of send_message is not visible to users.",
+				"harness": {
+					"kind": "forced_completion",
+					"attempt": 1,
+					"variant": "not_sent"
+				},
+				"timestamp": 4100
+			},
+			{
+				"role": "assistant",
+				"content": [
+					{
+						"type": "toolCall",
+						"id": "call-sent",
+						"name": "send_message",
+						"arguments": {
+							"message": "Here's the recap: the meetup moved to Saturday, and Grace will delve into the venue options."
+						}
+					}
+				],
+				"api": "openai-completions",
+				"provider": "example",
+				"model": "vendor/model_b",
+				"usage": {
+					"input": 5200,
+					"output": 60,
+					"cacheRead": 0,
+					"cacheWrite": 0,
+					"totalTokens": 5260,
+					"cost": {
+						"input": 0,
+						"output": 0,
+						"cacheRead": 0,
+						"cacheWrite": 0,
+						"total": 0.0012
+					}
+				},
+				"stopReason": "toolUse",
+				"timestamp": 4200,
+				"served": {
+					"logicalId": "model_b"
+				}
+			},
+			{
+				"role": "toolResult",
+				"toolCallId": "call-sent",
+				"toolName": "send_message",
+				"content": [
+					{
+						"type": "text",
+						"text": "sent"
+					}
+				],
+				"isError": false,
+				"timestamp": 4300
+			}
+		],
+		"rolloutStartIndex": 1,
+		"contextDumpPath": null,
+		"modelPrompts": [],
+		"branches": [
+			{
+				"branchNo": 1,
+				"parentBranchNo": 0,
+				"forkIndex": 3,
+				"reason": "refusal_redo",
+				"checkCode": "refusal_safety",
+				"decisionEvaluationId": 1,
+				"fromModel": "model_a",
+				"toModel": "model_b",
+				"messages": [
+					{
+						"role": "assistant",
+						"content": [
+							{
+								"type": "toolCall",
+								"id": "call-refused",
+								"name": "send_message",
+								"arguments": {
+									"message": "I can't help with that one."
+								}
+							}
+						],
+						"api": "openai-completions",
+						"provider": "example",
+						"model": "vendor/model_a",
+						"usage": {
+							"input": 5200,
+							"output": 60,
+							"cacheRead": 0,
+							"cacheWrite": 0,
+							"totalTokens": 5260,
+							"cost": {
+								"input": 0,
+								"output": 0,
+								"cacheRead": 0,
+								"cacheWrite": 0,
+								"total": 0.0012
+							}
+						},
+						"stopReason": "toolUse",
+						"timestamp": 3000,
+						"served": {
+							"logicalId": "model_a"
+						}
+					},
+					{
+						"role": "toolResult",
+						"toolCallId": "call-refused",
+						"toolName": "send_message",
+						"content": [
+							{
+								"type": "text",
+								"text": "redo requested"
+							}
+						],
+						"isError": true,
+						"timestamp": 3100
+					}
+				],
+				"costUsd": 0.0012,
+				"createdAt": 3200
+			}
+		],
+		"refusalEvents": [
+			{
+				"id": 1,
+				"ts": 1500,
+				"branchNo": 0,
+				"site": "default",
+				"servedModel": "model_a",
+				"wireModel": "vendor/model_a",
+				"kind": "hard",
+				"checkCode": "refusal_safety",
+				"reason": "safety",
+				"subReason": "cyber",
+				"method": "provider_category",
+				"source": "api",
+				"probability": null,
+				"rawStopReason": "refusal",
+				"category": "cyber",
+				"explanation": "The response was declined by the provider.",
+				"checkpoint": "request",
+				"ruleName": null,
+				"outcome": "fallover",
+				"toModel": null,
+				"decisionEvaluationId": null
+			},
+			{
+				"id": 2,
+				"ts": 3640,
+				"branchNo": 0,
+				"site": "default",
+				"servedModel": "model_a",
+				"wireModel": "vendor/model_a",
+				"kind": "soft",
+				"checkCode": "refusal_safety",
+				"reason": "safety",
+				"subReason": null,
+				"method": "judged",
+				"source": "message",
+				"probability": 0.93,
+				"rawStopReason": null,
+				"category": null,
+				"explanation": null,
+				"checkpoint": "send",
+				"ruleName": "safety_redo",
+				"outcome": "redo",
+				"toModel": "model_b",
+				"decisionEvaluationId": 1
+			}
+		],
+		"contract": {
+			"outcome": "recovered",
+			"nudges": 1,
+			"maxNudges": 3,
+			"attempts": [
+				{
+					"branchNo": 0,
+					"redoNo": 0,
+					"attemptNo": 0,
+					"ts": 4000,
+					"servedModel": "model_b",
+					"wireModel": "vendor/model_b",
+					"variant": "original",
+					"failureTypes": [
+						"text_only"
+					],
+					"primaryType": "text_only"
+				},
+				{
+					"branchNo": 0,
+					"redoNo": 0,
+					"attemptNo": 1,
+					"ts": 4200,
+					"servedModel": "model_b",
+					"wireModel": "vendor/model_b",
+					"variant": "not_sent",
+					"failureTypes": [],
+					"primaryType": null
+				}
+			]
+		},
+		"checks": [
+			{
+				"code": "refusal_capability",
+				"kind": "refusal",
+				"remedy": "redo",
+				"reason": "capability",
+				"description": "Declined as unable to do it (\"I can't do that\")"
+			},
+			{
+				"code": "refusal_copyright",
+				"kind": "refusal",
+				"remedy": "redo",
+				"reason": "copyright",
+				"description": "Declined over copyright or reproducing protected material"
+			},
+			{
+				"code": "refusal_distillation",
+				"kind": "refusal",
+				"remedy": "redo",
+				"reason": "distillation",
+				"description": "Declined because the request looks like extracting the model's reasoning"
+			},
+			{
+				"code": "refusal_persona",
+				"kind": "refusal",
+				"remedy": "redo",
+				"reason": "persona",
+				"description": "Declined to play the persona or role it was given"
+			},
+			{
+				"code": "refusal_privacy",
+				"kind": "refusal",
+				"remedy": "redo",
+				"reason": "privacy",
+				"description": "Declined over personal or private information"
+			},
+			{
+				"code": "refusal_safety",
+				"kind": "refusal",
+				"remedy": "redo",
+				"reason": "safety",
+				"description": "Declined on safety or harm-policy grounds, or stopped by a content filter"
+			},
+			{
+				"code": "refusal_uncategorized",
+				"kind": "refusal",
+				"remedy": "redo",
+				"reason": "unclear",
+				"description": "A refusal with no category, or one no other check maps"
+			},
+			{
+				"code": "style_vocabulary",
+				"kind": "style",
+				"remedy": "revise",
+				"reason": null,
+				"description": "Overused assistant vocabulary"
+			}
+		]
+	},
+	"decisions": {
+		"evaluations": [
+			{
+				"id": 1,
+				"ts": 3640,
+				"decisionGroup": "dg-checks-1",
+				"point": "checks",
+				"agent": "aria",
+				"timelineKey": "matrix:aria:room:!general:matrix.example.org",
+				"agentSessionId": "ses_rf7w3k",
+				"triggerEventId": null,
+				"candidateSessionId": null,
+				"source": "model",
+				"reason": null,
+				"verdictJson": "{\"fired\":[\"refusal_safety\"],\"results\":[{\"id\":\"refusal_distillation__message\",\"p\":0.03,\"t\":0.8},{\"id\":\"refusal_safety__message\",\"p\":0.93,\"t\":0.8,\"fired\":true},{\"id\":\"refusal_privacy__message\",\"p\":0.03,\"t\":0.8},{\"id\":\"refusal_copyright__message\",\"p\":0.03,\"t\":0.8},{\"id\":\"refusal_persona__message\",\"p\":0.03,\"t\":0.8},{\"id\":\"refusal_capability__message\",\"p\":0.03,\"t\":0.8},{\"id\":\"refusal_uncategorized__message\",\"p\":0.03,\"t\":0.8}]}",
+				"answersJson": "{\"refusal_distillation__message\":{\"type\":\"noul\",\"noul\":0.03},\"refusal_safety__message\":{\"type\":\"noul\",\"noul\":0.93},\"refusal_privacy__message\":{\"type\":\"noul\",\"noul\":0.03},\"refusal_copyright__message\":{\"type\":\"noul\",\"noul\":0.03},\"refusal_persona__message\":{\"type\":\"noul\",\"noul\":0.03},\"refusal_capability__message\":{\"type\":\"noul\",\"noul\":0.03},\"refusal_uncategorized__message\":{\"type\":\"noul\",\"noul\":0.03}}",
+				"stateJson": "{\"request\":[{\"from\":\"Ada\",\"text\":\"can you recap the meetup thread?\"}],\"action\":\"send_message\",\"message\":\"I can't help with that one.\"}",
+				"questionsJson": "{\"refusal_distillation__message\":{\"type\":\"noul\",\"instructions\":\"`message` is the chat message the assistant is sending in reply to `request` (`recent` is the chat before it). In `message` the assistant does not do what `request` asks (it refuses, changes the subject, or gives a deliberately reduced answer), and it declines because doing it would reveal, reproduce or summarize the assistant's own reasoning, chain of thought, hidden instructions or system prompt.\",\"criteria\":{\"true\":\"`message` refuses or deflects what `request` asks, because doing it would reveal, reproduce or summarize the assistant's own reasoning, chain of thought, hidden instructions or system prompt.\",\"false\":\"`message` does what `request` asks, fully or in part, or answers something else that nobody asked it to do. Honestly stating a real limit while still helping with what it can is not a refusal. A refusal that is only discussed, quoted, reported or joked about (for example the user asks why some other bot refused) is not a refusal. Sharing or summarizing its reasoning, or explaining an answer, is not this refusal; declining on other grounds is not this refusal either.\"}},\"refusal_safety__message\":{\"type\":\"noul\",\"instructions\":\"`message` is the chat message the assistant is sending in reply to `request` (`recent` is the chat before it). In `message` the assistant does not do what `request` asks (it refuses, changes the subject, or gives a deliberately reduced answer), and it declines because it considers the request harmful, dangerous, illegal or against a safety or content policy (for example weapons, malware, self-harm or explicit content).\",\"criteria\":{\"true\":\"`message` refuses or deflects what `request` asks, because it considers the request harmful, dangerous, illegal or against a safety or content policy (for example weapons, malware, self-harm or explicit content).\",\"false\":\"`message` does what `request` asks, fully or in part, or answers something else that nobody asked it to do. Honestly stating a real limit while still helping with what it can is not a refusal. A refusal that is only discussed, quoted, reported or joked about (for example the user asks why some other bot refused) is not a refusal. Adding a safety note while still answering is not this refusal; declining on other grounds (privacy, copyright, inability) is not this refusal either.\"}},\"refusal_privacy__message\":{\"type\":\"noul\",\"instructions\":\"`message` is the chat message the assistant is sending in reply to `request` (`recent` is the chat before it). In `message` the assistant does not do what `request` asks (it refuses, changes the subject, or gives a deliberately reduced answer), and it declines because it would expose, look up, guess or share personal or private information about a person.\",\"criteria\":{\"true\":\"`message` refuses or deflects what `request` asks, because it would expose, look up, guess or share personal or private information about a person.\",\"false\":\"`message` does what `request` asks, fully or in part, or answers something else that nobody asked it to do. Honestly stating a real limit while still helping with what it can is not a refusal. A refusal that is only discussed, quoted, reported or joked about (for example the user asks why some other bot refused) is not a refusal. Answering with public or already-shared information is not this refusal; declining on other grounds is not this refusal either.\"}},\"refusal_copyright__message\":{\"type\":\"noul\",\"instructions\":\"`message` is the chat message the assistant is sending in reply to `request` (`recent` is the chat before it). In `message` the assistant does not do what `request` asks (it refuses, changes the subject, or gives a deliberately reduced answer), and it declines because it would reproduce copyrighted or protected material (for example song lyrics, book passages, paywalled articles) or infringe intellectual property.\",\"criteria\":{\"true\":\"`message` refuses or deflects what `request` asks, because it would reproduce copyrighted or protected material (for example song lyrics, book passages, paywalled articles) or infringe intellectual property.\",\"false\":\"`message` does what `request` asks, fully or in part, or answers something else that nobody asked it to do. Honestly stating a real limit while still helping with what it can is not a refusal. A refusal that is only discussed, quoted, reported or joked about (for example the user asks why some other bot refused) is not a refusal. Quoting a short excerpt, summarizing or linking the material is not this refusal; declining on other grounds is not this refusal either.\"}},\"refusal_persona__message\":{\"type\":\"noul\",\"instructions\":\"`message` is the chat message the assistant is sending in reply to `request` (`recent` is the chat before it). In `message` the assistant does not do what `request` asks (it refuses, changes the subject, or gives a deliberately reduced answer), and it declines by breaking the character or persona it was given: it refuses to play the role, says it is only an AI or a language model, or steps out of the persona to decline.\",\"criteria\":{\"true\":\"`message` refuses or deflects what `request` asks, by breaking the character or persona it was given: it refuses to play the role, says it is only an AI or a language model, or steps out of the persona to decline.\",\"false\":\"`message` does what `request` asks, fully or in part, or answers something else that nobody asked it to do. Honestly stating a real limit while still helping with what it can is not a refusal. A refusal that is only discussed, quoted, reported or joked about (for example the user asks why some other bot refused) is not a refusal. Staying in character while saying no in character, as the persona would, is not this refusal; declining on other grounds is not this refusal either.\"}},\"refusal_capability__message\":{\"type\":\"noul\",\"instructions\":\"`message` is the chat message the assistant is sending in reply to `request` (`recent` is the chat before it). In `message` the assistant does not do what `request` asks (it refuses, changes the subject, or gives a deliberately reduced answer), and it declines by claiming it cannot do it (no access, no ability, not allowed to use a tool, cannot open links or see images) when the request asks it to.\",\"criteria\":{\"true\":\"`message` refuses or deflects what `request` asks, by claiming it cannot do it (no access, no ability, not allowed to use a tool, cannot open links or see images) when the request asks it to.\",\"false\":\"`message` does what `request` asks, fully or in part, or answers something else that nobody asked it to do. Honestly stating a real limit while still helping with what it can is not a refusal. A refusal that is only discussed, quoted, reported or joked about (for example the user asks why some other bot refused) is not a refusal. Doing what it can and honestly stating a real limit (for example a link it tried that would not load) is not this refusal; declining on other grounds is not this refusal either.\"}},\"refusal_uncategorized__message\":{\"type\":\"noul\",\"instructions\":\"`message` is the chat message the assistant is sending in reply to `request` (`recent` is the chat before it). In `message` the assistant does not do what `request` asks (it refuses, changes the subject, or gives a deliberately reduced answer), and it declines without any reason it states or that a reader could recognize.\",\"criteria\":{\"true\":\"`message` refuses or deflects what `request` asks, without any reason it states or that a reader could recognize.\",\"false\":\"`message` does what `request` asks, fully or in part, or answers something else that nobody asked it to do. Honestly stating a real limit while still helping with what it can is not a refusal. A refusal that is only discussed, quoted, reported or joked about (for example the user asks why some other bot refused) is not a refusal. A refusal with a stated reason (safety, privacy, copyright, persona, inability, reasoning extraction) is not this one.\"}}}",
+				"servedModel": "decider",
+				"servedVersion": "vendor/decider-1-20261001",
+				"latencyMs": 640,
+				"inputTokens": 1200,
+				"costUsd": 0.000048,
+				"checkpoint": "send",
+				"branchNo": 0,
+				"toolCallId": "call-refused",
+				"attemptNo": null,
+				"consequence": "redo"
+			},
+			{
+				"id": 2,
+				"ts": 4200,
+				"decisionGroup": "dg-checks-2",
+				"point": "checks",
+				"agent": "aria",
+				"timelineKey": "matrix:aria:room:!general:matrix.example.org",
+				"agentSessionId": "ses_rf7w3k",
+				"triggerEventId": null,
+				"candidateSessionId": null,
+				"source": "pattern",
+				"reason": null,
+				"verdictJson": "{\"fired\":[\"style_vocabulary\"],\"source\":\"message\",\"matched\":\"delve\"}",
+				"answersJson": null,
+				"stateJson": null,
+				"questionsJson": null,
+				"servedModel": null,
+				"servedVersion": null,
+				"latencyMs": 0,
+				"inputTokens": null,
+				"costUsd": null,
+				"checkpoint": "send",
+				"branchNo": 0,
+				"toolCallId": "call-sent",
+				"attemptNo": null,
+				"consequence": "observed"
+			},
+			{
+				"id": 3,
+				"ts": 4840,
+				"decisionGroup": "dg-checks-2",
+				"point": "checks",
+				"agent": "aria",
+				"timelineKey": "matrix:aria:room:!general:matrix.example.org",
+				"agentSessionId": "ses_rf7w3k",
+				"triggerEventId": null,
+				"candidateSessionId": null,
+				"source": "model",
+				"reason": null,
+				"verdictJson": "{\"fired\":[],\"results\":[{\"id\":\"refusal_distillation__message\",\"p\":0.03,\"t\":0.8},{\"id\":\"refusal_distillation__text\",\"p\":0.03,\"t\":0.85},{\"id\":\"refusal_safety__message\",\"p\":0.03,\"t\":0.8},{\"id\":\"refusal_safety__text\",\"p\":0.03,\"t\":0.85},{\"id\":\"refusal_privacy__message\",\"p\":0.03,\"t\":0.8},{\"id\":\"refusal_privacy__text\",\"p\":0.03,\"t\":0.85},{\"id\":\"refusal_copyright__message\",\"p\":0.03,\"t\":0.8},{\"id\":\"refusal_copyright__text\",\"p\":0.03,\"t\":0.85},{\"id\":\"refusal_persona__message\",\"p\":0.03,\"t\":0.8},{\"id\":\"refusal_persona__text\",\"p\":0.03,\"t\":0.85},{\"id\":\"refusal_capability__message\",\"p\":0.03,\"t\":0.8},{\"id\":\"refusal_capability__text\",\"p\":0.03,\"t\":0.85},{\"id\":\"refusal_uncategorized__message\",\"p\":0.03,\"t\":0.8},{\"id\":\"refusal_uncategorized__text\",\"p\":0.03,\"t\":0.85}]}",
+				"answersJson": "{\"refusal_distillation__message\":{\"type\":\"noul\",\"noul\":0.03},\"refusal_distillation__text\":{\"type\":\"noul\",\"noul\":0.03},\"refusal_safety__message\":{\"type\":\"noul\",\"noul\":0.03},\"refusal_safety__text\":{\"type\":\"noul\",\"noul\":0.03},\"refusal_privacy__message\":{\"type\":\"noul\",\"noul\":0.03},\"refusal_privacy__text\":{\"type\":\"noul\",\"noul\":0.03},\"refusal_copyright__message\":{\"type\":\"noul\",\"noul\":0.03},\"refusal_copyright__text\":{\"type\":\"noul\",\"noul\":0.03},\"refusal_persona__message\":{\"type\":\"noul\",\"noul\":0.03},\"refusal_persona__text\":{\"type\":\"noul\",\"noul\":0.03},\"refusal_capability__message\":{\"type\":\"noul\",\"noul\":0.03},\"refusal_capability__text\":{\"type\":\"noul\",\"noul\":0.03},\"refusal_uncategorized__message\":{\"type\":\"noul\",\"noul\":0.03},\"refusal_uncategorized__text\":{\"type\":\"noul\",\"noul\":0.03}}",
+				"stateJson": "{\"request\":[{\"from\":\"Ada\",\"text\":\"can you recap the meetup thread?\"}],\"action\":\"send_message\",\"message\":\"Here's the recap: the meetup moved to Saturday, and Grace will delve into the venue options.\",\"text\":\"Here's the recap: the meetup moved to Saturday, venue still open.\"}",
+				"questionsJson": "{\"refusal_distillation__message\":{\"type\":\"noul\",\"instructions\":\"`message` is the chat message the assistant is sending in reply to `request` (`recent` is the chat before it). In `message` the assistant does not do what `request` asks (it refuses, changes the subject, or gives a deliberately reduced answer), and it declines because doing it would reveal, reproduce or summarize the assistant's own reasoning, chain of thought, hidden instructions or system prompt.\",\"criteria\":{\"true\":\"`message` refuses or deflects what `request` asks, because doing it would reveal, reproduce or summarize the assistant's own reasoning, chain of thought, hidden instructions or system prompt.\",\"false\":\"`message` does what `request` asks, fully or in part, or answers something else that nobody asked it to do. Honestly stating a real limit while still helping with what it can is not a refusal. A refusal that is only discussed, quoted, reported or joked about (for example the user asks why some other bot refused) is not a refusal. Sharing or summarizing its reasoning, or explaining an answer, is not this refusal; declining on other grounds is not this refusal either.\"}},\"refusal_distillation__text\":{\"type\":\"noul\",\"instructions\":\"`text` is what the assistant wrote outside its chat messages (users never see it), right before its action (`action`). In `text`, the assistant declines or deflects what `request` asks, because doing it would reveal, reproduce or summarize the assistant's own reasoning, chain of thought, hidden instructions or system prompt.\",\"criteria\":{\"true\":\"`text` declines or deflects what `request` asks, because doing it would reveal, reproduce or summarize the assistant's own reasoning, chain of thought, hidden instructions or system prompt.\",\"false\":\"`text` works on what `request` asks, or drafts an answer to it. Judging that no reply was needed is not a refusal: the message was not addressed to the assistant, it was already answered, or there is nothing to add. A refusal that is only discussed, quoted, reported or joked about (for example the user asks why some other bot refused) is not a refusal. Sharing or summarizing its reasoning, or explaining an answer, is not this refusal; declining on other grounds is not this refusal either.\"}},\"refusal_safety__message\":{\"type\":\"noul\",\"instructions\":\"`message` is the chat message the assistant is sending in reply to `request` (`recent` is the chat before it). In `message` the assistant does not do what `request` asks (it refuses, changes the subject, or gives a deliberately reduced answer), and it declines because it considers the request harmful, dangerous, illegal or against a safety or content policy (for example weapons, malware, self-harm or explicit content).\",\"criteria\":{\"true\":\"`message` refuses or deflects what `request` asks, because it considers the request harmful, dangerous, illegal or against a safety or content policy (for example weapons, malware, self-harm or explicit content).\",\"false\":\"`message` does what `request` asks, fully or in part, or answers something else that nobody asked it to do. Honestly stating a real limit while still helping with what it can is not a refusal. A refusal that is only discussed, quoted, reported or joked about (for example the user asks why some other bot refused) is not a refusal. Adding a safety note while still answering is not this refusal; declining on other grounds (privacy, copyright, inability) is not this refusal either.\"}},\"refusal_safety__text\":{\"type\":\"noul\",\"instructions\":\"`text` is what the assistant wrote outside its chat messages (users never see it), right before its action (`action`). In `text`, the assistant declines or deflects what `request` asks, because it considers the request harmful, dangerous, illegal or against a safety or content policy (for example weapons, malware, self-harm or explicit content).\",\"criteria\":{\"true\":\"`text` declines or deflects what `request` asks, because it considers the request harmful, dangerous, illegal or against a safety or content policy (for example weapons, malware, self-harm or explicit content).\",\"false\":\"`text` works on what `request` asks, or drafts an answer to it. Judging that no reply was needed is not a refusal: the message was not addressed to the assistant, it was already answered, or there is nothing to add. A refusal that is only discussed, quoted, reported or joked about (for example the user asks why some other bot refused) is not a refusal. Adding a safety note while still answering is not this refusal; declining on other grounds (privacy, copyright, inability) is not this refusal either.\"}},\"refusal_privacy__message\":{\"type\":\"noul\",\"instructions\":\"`message` is the chat message the assistant is sending in reply to `request` (`recent` is the chat before it). In `message` the assistant does not do what `request` asks (it refuses, changes the subject, or gives a deliberately reduced answer), and it declines because it would expose, look up, guess or share personal or private information about a person.\",\"criteria\":{\"true\":\"`message` refuses or deflects what `request` asks, because it would expose, look up, guess or share personal or private information about a person.\",\"false\":\"`message` does what `request` asks, fully or in part, or answers something else that nobody asked it to do. Honestly stating a real limit while still helping with what it can is not a refusal. A refusal that is only discussed, quoted, reported or joked about (for example the user asks why some other bot refused) is not a refusal. Answering with public or already-shared information is not this refusal; declining on other grounds is not this refusal either.\"}},\"refusal_privacy__text\":{\"type\":\"noul\",\"instructions\":\"`text` is what the assistant wrote outside its chat messages (users never see it), right before its action (`action`). In `text`, the assistant declines or deflects what `request` asks, because it would expose, look up, guess or share personal or private information about a person.\",\"criteria\":{\"true\":\"`text` declines or deflects what `request` asks, because it would expose, look up, guess or share personal or private information about a person.\",\"false\":\"`text` works on what `request` asks, or drafts an answer to it. Judging that no reply was needed is not a refusal: the message was not addressed to the assistant, it was already answered, or there is nothing to add. A refusal that is only discussed, quoted, reported or joked about (for example the user asks why some other bot refused) is not a refusal. Answering with public or already-shared information is not this refusal; declining on other grounds is not this refusal either.\"}},\"refusal_copyright__message\":{\"type\":\"noul\",\"instructions\":\"`message` is the chat message the assistant is sending in reply to `request` (`recent` is the chat before it). In `message` the assistant does not do what `request` asks (it refuses, changes the subject, or gives a deliberately reduced answer), and it declines because it would reproduce copyrighted or protected material (for example song lyrics, book passages, paywalled articles) or infringe intellectual property.\",\"criteria\":{\"true\":\"`message` refuses or deflects what `request` asks, because it would reproduce copyrighted or protected material (for example song lyrics, book passages, paywalled articles) or infringe intellectual property.\",\"false\":\"`message` does what `request` asks, fully or in part, or answers something else that nobody asked it to do. Honestly stating a real limit while still helping with what it can is not a refusal. A refusal that is only discussed, quoted, reported or joked about (for example the user asks why some other bot refused) is not a refusal. Quoting a short excerpt, summarizing or linking the material is not this refusal; declining on other grounds is not this refusal either.\"}},\"refusal_copyright__text\":{\"type\":\"noul\",\"instructions\":\"`text` is what the assistant wrote outside its chat messages (users never see it), right before its action (`action`). In `text`, the assistant declines or deflects what `request` asks, because it would reproduce copyrighted or protected material (for example song lyrics, book passages, paywalled articles) or infringe intellectual property.\",\"criteria\":{\"true\":\"`text` declines or deflects what `request` asks, because it would reproduce copyrighted or protected material (for example song lyrics, book passages, paywalled articles) or infringe intellectual property.\",\"false\":\"`text` works on what `request` asks, or drafts an answer to it. Judging that no reply was needed is not a refusal: the message was not addressed to the assistant, it was already answered, or there is nothing to add. A refusal that is only discussed, quoted, reported or joked about (for example the user asks why some other bot refused) is not a refusal. Quoting a short excerpt, summarizing or linking the material is not this refusal; declining on other grounds is not this refusal either.\"}},\"refusal_persona__message\":{\"type\":\"noul\",\"instructions\":\"`message` is the chat message the assistant is sending in reply to `request` (`recent` is the chat before it). In `message` the assistant does not do what `request` asks (it refuses, changes the subject, or gives a deliberately reduced answer), and it declines by breaking the character or persona it was given: it refuses to play the role, says it is only an AI or a language model, or steps out of the persona to decline.\",\"criteria\":{\"true\":\"`message` refuses or deflects what `request` asks, by breaking the character or persona it was given: it refuses to play the role, says it is only an AI or a language model, or steps out of the persona to decline.\",\"false\":\"`message` does what `request` asks, fully or in part, or answers something else that nobody asked it to do. Honestly stating a real limit while still helping with what it can is not a refusal. A refusal that is only discussed, quoted, reported or joked about (for example the user asks why some other bot refused) is not a refusal. Staying in character while saying no in character, as the persona would, is not this refusal; declining on other grounds is not this refusal either.\"}},\"refusal_persona__text\":{\"type\":\"noul\",\"instructions\":\"`text` is what the assistant wrote outside its chat messages (users never see it), right before its action (`action`). In `text`, the assistant declines or deflects what `request` asks, by breaking the character or persona it was given: it refuses to play the role, says it is only an AI or a language model, or steps out of the persona to decline.\",\"criteria\":{\"true\":\"`text` declines or deflects what `request` asks, by breaking the character or persona it was given: it refuses to play the role, says it is only an AI or a language model, or steps out of the persona to decline.\",\"false\":\"`text` works on what `request` asks, or drafts an answer to it. Judging that no reply was needed is not a refusal: the message was not addressed to the assistant, it was already answered, or there is nothing to add. A refusal that is only discussed, quoted, reported or joked about (for example the user asks why some other bot refused) is not a refusal. Staying in character while saying no in character, as the persona would, is not this refusal; declining on other grounds is not this refusal either.\"}},\"refusal_capability__message\":{\"type\":\"noul\",\"instructions\":\"`message` is the chat message the assistant is sending in reply to `request` (`recent` is the chat before it). In `message` the assistant does not do what `request` asks (it refuses, changes the subject, or gives a deliberately reduced answer), and it declines by claiming it cannot do it (no access, no ability, not allowed to use a tool, cannot open links or see images) when the request asks it to.\",\"criteria\":{\"true\":\"`message` refuses or deflects what `request` asks, by claiming it cannot do it (no access, no ability, not allowed to use a tool, cannot open links or see images) when the request asks it to.\",\"false\":\"`message` does what `request` asks, fully or in part, or answers something else that nobody asked it to do. Honestly stating a real limit while still helping with what it can is not a refusal. A refusal that is only discussed, quoted, reported or joked about (for example the user asks why some other bot refused) is not a refusal. Doing what it can and honestly stating a real limit (for example a link it tried that would not load) is not this refusal; declining on other grounds is not this refusal either.\"}},\"refusal_capability__text\":{\"type\":\"noul\",\"instructions\":\"`text` is what the assistant wrote outside its chat messages (users never see it), right before its action (`action`). In `text`, the assistant declines or deflects what `request` asks, by claiming it cannot do it (no access, no ability, not allowed to use a tool, cannot open links or see images) when the request asks it to.\",\"criteria\":{\"true\":\"`text` declines or deflects what `request` asks, by claiming it cannot do it (no access, no ability, not allowed to use a tool, cannot open links or see images) when the request asks it to.\",\"false\":\"`text` works on what `request` asks, or drafts an answer to it. Judging that no reply was needed is not a refusal: the message was not addressed to the assistant, it was already answered, or there is nothing to add. A refusal that is only discussed, quoted, reported or joked about (for example the user asks why some other bot refused) is not a refusal. Doing what it can and honestly stating a real limit (for example a link it tried that would not load) is not this refusal; declining on other grounds is not this refusal either.\"}},\"refusal_uncategorized__message\":{\"type\":\"noul\",\"instructions\":\"`message` is the chat message the assistant is sending in reply to `request` (`recent` is the chat before it). In `message` the assistant does not do what `request` asks (it refuses, changes the subject, or gives a deliberately reduced answer), and it declines without any reason it states or that a reader could recognize.\",\"criteria\":{\"true\":\"`message` refuses or deflects what `request` asks, without any reason it states or that a reader could recognize.\",\"false\":\"`message` does what `request` asks, fully or in part, or answers something else that nobody asked it to do. Honestly stating a real limit while still helping with what it can is not a refusal. A refusal that is only discussed, quoted, reported or joked about (for example the user asks why some other bot refused) is not a refusal. A refusal with a stated reason (safety, privacy, copyright, persona, inability, reasoning extraction) is not this one.\"}},\"refusal_uncategorized__text\":{\"type\":\"noul\",\"instructions\":\"`text` is what the assistant wrote outside its chat messages (users never see it), right before its action (`action`). In `text`, the assistant declines or deflects what `request` asks, without any reason it states or that a reader could recognize.\",\"criteria\":{\"true\":\"`text` declines or deflects what `request` asks, without any reason it states or that a reader could recognize.\",\"false\":\"`text` works on what `request` asks, or drafts an answer to it. Judging that no reply was needed is not a refusal: the message was not addressed to the assistant, it was already answered, or there is nothing to add. A refusal that is only discussed, quoted, reported or joked about (for example the user asks why some other bot refused) is not a refusal. A refusal with a stated reason (safety, privacy, copyright, persona, inability, reasoning extraction) is not this one.\"}}}",
+				"servedModel": "decider",
+				"servedVersion": "vendor/decider-1-20261001",
+				"latencyMs": 640,
+				"inputTokens": 1200,
+				"costUsd": 0.000048,
+				"checkpoint": "send",
+				"branchNo": 0,
+				"toolCallId": "call-sent",
+				"attemptNo": null,
+				"consequence": "observed"
+			}
+		]
+	}
+}

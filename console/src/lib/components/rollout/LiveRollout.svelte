@@ -2,8 +2,15 @@
 	import { consumeSessionStream } from '$lib/api/live';
 	import { contextSummary } from '$lib/stores/context-summary.svelte';
 	import { isDuplicateInjectedTurn, isInjectedUserTurn, type RolloutMsg } from '$lib/rollout';
+	import { cutAtFork } from '$lib/branches';
 	import Rollout from './Rollout.svelte';
-	import type { DecisionEvaluation } from '$lib/schemas';
+	import type {
+		CheckInfo,
+		DecisionEvaluation,
+		RefusalEvent,
+		SessionBranch,
+		SessionContract
+	} from '$lib/schemas';
 
 	// `onHead` surfaces the seed's sliced-off leading final-turn messages (the
 	// trigger turn) to the parent. They belong to the verbatim input view, not the
@@ -12,19 +19,36 @@
 	// trigger turn is missing from the verbatim view until the run completes.
 	// `decisionEvaluations` are the session's decision rows (spec SESSION-RECORDS
 	// §8), fetched by the parent; their cards interleave with the live messages.
+	// Refusal handling (spec REFUSAL-HANDLING §12.1): `branches` & co. come from the
+	// session query; a `branch_forked` event cuts the live list at the fork (the
+	// server re-seeds right after it) and `onBranchForked` lets the parent refetch
+	// the session so the new branch's switcher appears.
 	let {
 		sessionId,
 		onEnd,
 		onHead,
-		decisionEvaluations
+		onBranchForked,
+		decisionEvaluations,
+		branches = [],
+		refusalEvents = [],
+		contract,
+		checks = []
 	}: {
 		sessionId: string;
 		onEnd?: () => void;
 		onHead?: (head: RolloutMsg[]) => void;
+		onBranchForked?: () => void;
 		decisionEvaluations?: DecisionEvaluation[];
+		branches?: readonly SessionBranch[];
+		refusalEvents?: readonly RefusalEvent[];
+		contract?: SessionContract;
+		checks?: readonly CheckInfo[];
 	} = $props();
 
 	let messages = $state<RolloutMsg[]>([]);
+	// Index of `messages[0]` in the live transcript (the seed's rolloutStartIndex):
+	// fork indexes are absolute.
+	let liveStart = $state(0);
 	let streaming = $state<RolloutMsg | null>(null);
 	// Tentative tokens (spec LLM-FAILURE-HANDLING §4.2): Layer-0 buffers each LLM
 	// attempt to its terminal event, so tokens stream live ONLY via the tap's
@@ -53,6 +77,7 @@
 				const msgs = Array.isArray(evt.messages) ? (evt.messages as RolloutMsg[]) : [];
 				const start = typeof evt.rolloutStartIndex === 'number' ? evt.rolloutStartIndex : 0;
 				messages = msgs.slice(start);
+				liveStart = start;
 				// A seed is a fresh canonical snapshot: drop any in-flight ephemeral left
 				// over from a prior (dropped) connection, else a stale `streaming`/
 				// `tentative` partial would render on top of the now-committed message
@@ -80,6 +105,18 @@
 					tentative = inner.partial;
 					retryNotice = null;
 				}
+				break;
+			}
+			case 'branch_forked': {
+				// A redo discarded the tail of the live list (spec REFUSAL-HANDLING §9):
+				// cut it now; the server's re-seed that follows carries the new live
+				// branch exactly (a sibling edit's edited message included).
+				const forkIndex = typeof evt.forkIndex === 'number' ? evt.forkIndex : null;
+				if (forkIndex !== null) messages = cutAtFork(messages, liveStart, forkIndex);
+				streaming = null;
+				tentative = null;
+				retryNotice = null;
+				onBranchForked?.();
 				break;
 			}
 			case 'attempt_discarded': {
@@ -163,6 +200,7 @@
 	$effect(() => {
 		const id = sessionId;
 		messages = [];
+		liveStart = 0;
 		streaming = null;
 		tentative = null;
 		retryNotice = null;
@@ -194,7 +232,15 @@
 	const rows = $derived(streaming ? [...messages, streaming] : messages);
 </script>
 
-<Rollout messages={rows} {decisionEvaluations} />
+<Rollout
+	messages={rows}
+	{decisionEvaluations}
+	{liveStart}
+	{branches}
+	{refusalEvents}
+	{contract}
+	{checks}
+/>
 {#if !streaming && tentative}
 	<div class="px-3 opacity-60" title="Tentative — this attempt has not committed yet">
 		<div
