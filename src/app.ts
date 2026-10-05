@@ -6088,15 +6088,21 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       }
       for (const row of recent) {
         // The record's bot message where it actually sat, never as a reply target:
-        // the window from a few messages before it up to the trigger (the point
-        // packs newest-first under its budget).
+        // the window from a few messages before it up to the trigger, the message
+        // itself marked `ofRecord` so the point's packing keeps it in place.
+        // A message older than the window is put first (it precedes all of it).
         const at = window.findIndex((e) => e.id === row.eventId);
+        const older = at < 0 ? timeline.getById(row.eventId) : undefined;
+        const recentChat =
+          at >= 0
+            ? chat.slice(Math.max(0, at - RECORDS_RECENT_CHAT_LEAD)).map((m) => (m === chat[at] ? { ...m, ofRecord: true as const } : m))
+            : [...(older ? [{ from: nameOf(older), text: older.body ?? "", self: true as const, ofRecord: true as const }] : []), ...chat];
         candidates.push({
           sessionId: row.sessionId,
           record: ownRecord(row.sessionId)!.text,
           isReplyTarget: false,
           request,
-          recentChat: at >= 0 ? chat.slice(Math.max(0, at - RECORDS_RECENT_CHAT_LEAD)) : chat,
+          recentChat,
         });
       }
       const { inject, decisionGroup } = await selectRecordsToInject(

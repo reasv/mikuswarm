@@ -294,7 +294,8 @@ interface ModelHealthState {
   lastFailure?: { ts: number; status?: number; class: LlmErrorClass };
 }
 
-const DEFAULT_MAX_IN_FLIGHT = 2;
+/** A group's `max_in_flight` when its config sets none. */
+export const DEFAULT_MAX_IN_FLIGHT = 2;
 const DEFAULT_BACKOFF_BASE_MS = 1000;
 const DEFAULT_BACKOFF_MAX_MS = 60_000;
 const DEFAULT_UNHEALTHY_THRESHOLD = 3;

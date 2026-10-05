@@ -8,6 +8,9 @@ import { isAbsolute, normalize, resolve as resolvePath } from "node:path";
 import type { AppConfig } from "../config/index.js";
 import type { DecisionsRawConfig } from "../config/schema.js";
 import { DEFAULT_MIN_STATE_TOKENS } from "./client.js";
+// The scheduler's per-group default: decision models get an implicit
+// `decision:<key>` group with no settings, so this is their real cap.
+import { DEFAULT_MAX_IN_FLIGHT } from "../agent/scheduler.js";
 
 type ModelConfig = AppConfig["models"]["default"];
 
@@ -234,13 +237,6 @@ export function validateDecisionsConfig(config: AppConfig, opts: DecisionValidat
 }
 
 /**
- * The scheduler's per-group `max_in_flight` when a group sets none (mirrors
- * `DEFAULT_MAX_IN_FLIGHT` in src/agent/scheduler.ts). Decision models get an
- * implicit `decision:<key>` group with no settings, so this is their real cap.
- */
-const SCHEDULER_DEFAULT_MAX_IN_FLIGHT = 2;
-
-/**
  * One trigger can send up to `candidates + 1` records requests (the reply
  * target plus `candidates` bot-message sessions) and one routing request, all
  * at once (spec SESSION-RECORDS §6.2 "Capacity"). Sum that demand per
@@ -263,7 +259,7 @@ function warnRecordsCapacity(
   add(decisions.records?.model ?? decisions.model, candidates + 1);
   if (decisions.routing?.enabled === true) add(decisions.routing.model ?? decisions.model, 1);
   for (const [group, needed] of demand) {
-    const maxInFlight = config.rate_limits?.llm?.[group]?.max_in_flight ?? SCHEDULER_DEFAULT_MAX_IN_FLIGHT;
+    const maxInFlight = config.rate_limits?.llm?.[group]?.max_in_flight ?? DEFAULT_MAX_IN_FLIGHT;
     if (maxInFlight >= needed) continue;
     opts.warn?.("decisions_records_capacity_low", {
       where,
