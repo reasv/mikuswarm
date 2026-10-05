@@ -124,6 +124,7 @@ const fetchGuard = guardFetch([labellerConfig.endpoint, memberConfig.endpoint]);
 globalThis.fetch = fetchGuard;
 
 const model = createModelFromConfig(labellerConfig);
+let labellerDiagnosed = false;
 const labeller: Labeller = requireGuardedTransport(
   (request) =>
     completeSimple(
@@ -133,8 +134,23 @@ const labeller: Labeller = requireGuardedTransport(
         messages: [{ role: "user", content: request.prompt, timestamp: Date.now() }],
         tools: [request.tool as never],
       },
-      { apiKey: labellerConfig.api_key, maxTokens: 300 },
-    ),
+      // A reasoning model gets low effort (some reject thinking disabled) and room for it.
+      labellerConfig.reasoning === false
+        ? { apiKey: labellerConfig.api_key, maxTokens: 300 }
+        : { apiKey: labellerConfig.api_key, maxTokens: 4000, reasoning: "low" },
+    ).then((response) => {
+      // Diagnose a response that carries no label without printing any of its text:
+      // the stop reason, the API's own error text, and the content block types.
+      if (!labellerDiagnosed && !(response.content ?? []).some((b) => b.type === "toolCall")) {
+        labellerDiagnosed = true;
+        process.stderr.write(
+          `labeller: no submit_label call (stopReason ${response.stopReason}; blocks ` +
+            `${(response.content ?? []).map((b) => b.type).join(",") || "none"}` +
+            `${response.errorMessage ? `; error ${response.errorMessage.slice(0, 200)}` : ""})\n`,
+        );
+      }
+      return response;
+    }),
   fetchGuard,
 );
 

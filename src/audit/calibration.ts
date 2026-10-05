@@ -425,7 +425,9 @@ export function parseLabelResponse(response: unknown, reasons: readonly string[]
     }
   }
   if (!args) return invalid;
-  const keys = Object.keys(args);
+  // `analysis` is the leading argument a prefill-enabled model must write on every
+  // tool call (ARCHITECTURE.md §8 "Model-scoped OpenAI prefill"): ignored, never kept.
+  const keys = Object.keys(args).filter((k) => k !== "analysis");
   if (keys.some((k) => k !== "label" && k !== "reason")) return invalid;
   const label = args["label"];
   const reason = args["reason"];
