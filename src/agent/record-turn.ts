@@ -42,10 +42,10 @@ export interface SessionRecordHandles {
  * Wrap a session's full tool list with the record-turn gate (CONTRACT §3):
  *
  * - Outside the record turn (`gate.active === false`): `session_record_tool`
- *   throws before doing anything — the message tells the agent it is only for
+ *   throws before doing anything; the message tells the agent it is only for
  *   the harness.
  * - During the record turn (`gate.active === true`): every tool EXCEPT
- *   `session_record_tool` throws — the agent may only use the record tool.
+ *   `session_record_tool` throws, naming the record tool.
  *
  * The wrappers are thin — they short-circuit only on the blocked side; the
  * original `execute` runs unchanged on the allowed side. Tool definitions
@@ -60,39 +60,24 @@ export function wrapToolsWithRecordTurnGate(
     const original = tool.execute;
     const isRecordTool = tool.name === "session_record_tool";
 
-    const wrappedExecute: typeof original = async (toolCallId, params, context) => {
-      if (isRecordTool) {
-        if (!gate.active) {
-          // Block: normal session run — session_record_tool is harness-only.
-          return {
-            content: [
-              {
-                type: "text",
-                text: "session_record_tool is only used by the harness at the end of a session.",
-              },
-            ],
-            details: null,
-            isError: true,
-          };
-        }
-        // gate.active: allowed — fall through to the real execute.
-      } else {
-        if (gate.active) {
-          // Block: record turn — only session_record_tool is available.
-          return {
-            content: [
-              {
-                type: "text",
-                text: "Only session_record_tool is available while writing the session record.",
-              },
-            ],
-            details: null,
-            isError: true,
-          };
-        }
-        // !gate.active: allowed — fall through to the real execute.
+    // Blocked calls THROW: pi-agent-core marks a tool result `isError` only on a
+    // throw (a returned result is a success on the wire), and a throw also stops
+    // any outer wrapper (e.g. the editor's skill activation) from acting on it.
+    const wrappedExecute: typeof original = async (toolCallId, params, signal, onUpdate) => {
+      if (isRecordTool && !gate.active) {
+        throw new Error(
+          "session_record_tool is only used by the harness at the end of a session. " +
+            "Carry on with your other tools.",
+        );
       }
-      return original.call(tool, toolCallId, params, context);
+      if (!isRecordTool && gate.active) {
+        throw new Error(
+          "Only session_record_tool is available while writing the session record. " +
+            "Write it with session_record_tool (command \"create\", then \"finalize\"), or call " +
+            "session_record_tool(command: \"finalize\") on the empty draft if nothing is worth recording.",
+        );
+      }
+      return original.call(tool, toolCallId, params, signal, onUpdate);
     };
 
     return { ...tool, execute: wrappedExecute };

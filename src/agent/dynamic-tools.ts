@@ -330,7 +330,11 @@ export function wrapEditorWithSkillActivation(
     signal?: AbortSignal,
     onUpdate?: unknown,
   ): Promise<AgentToolResult<unknown>> => {
+    // A failed view activates nothing: a throw (how pi tools fail, including a
+    // call blocked by the record-turn gate) propagates from this await, and a
+    // result still carrying the non-pi `isError` flag is passed through as is.
     const result = await originalExecute(toolCallId, params, signal, onUpdate);
+    if ((result as { isError?: unknown }).isError === true) return result;
     const args = params as { command?: unknown; path?: unknown };
     if (args?.command !== "view" || typeof args.path !== "string" || !args.path.endsWith(".md")) {
       return result;
