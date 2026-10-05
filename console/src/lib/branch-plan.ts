@@ -2,6 +2,7 @@ import type {
 	ContractAttempt,
 	DecisionEvaluation,
 	RefusalEvent,
+	SessionAudit,
 	SessionBranch,
 	SessionContract
 } from '$lib/schemas';
@@ -83,6 +84,8 @@ export interface BranchPlanInput {
 	gate: readonly GateEvaluation[];
 	refusalEvents: readonly RefusalEvent[];
 	contract?: SessionContract;
+	/** The offline audit's rows (`session_audits`), when it has run. */
+	audits?: readonly SessionAudit[];
 }
 
 /** Points rendered as their own cards elsewhere, never as decision cards. */
@@ -148,7 +151,7 @@ export function buildBranchPlan(input: BranchPlanInput): BranchPlanItem[] {
 
 	// Nudges: numbered by their marker, else counted since the run start or fork.
 	const contract = input.contract;
-	const audits = auditFindings(input.evaluations);
+	const audits = auditFindings(input.audits ?? []);
 	const nudges = new Map<number, NudgeInfo>();
 	let count = 0;
 	let group: number[] = [];
@@ -186,18 +189,19 @@ export function buildBranchPlan(input: BranchPlanInput): BranchPlanItem[] {
 				count,
 				typeof p.msg.timestamp === 'number' ? p.msg.timestamp : undefined
 			),
-			audit: audits.filter((a) => a.attemptNo === count - 1)
+			audit: []
 		};
+		const attempt = info.attempt;
+		info.audit = audits.filter(
+			(a) =>
+				a.attemptNo === count - 1 &&
+				a.branchNo === (attempt?.branchNo ?? p.node) &&
+				(attempt === undefined || a.redoNo === attempt.redoNo)
+		);
 		nudges.set(i, info);
 		group.push(i);
 	}
 	closeGroup(msgs.length);
-	// Session-level audit findings with no attempt anchor go on the last nudge.
-	const unanchored = audits.filter((a) => a.attemptNo === null);
-	if (unanchored.length > 0 && nudges.size > 0) {
-		const last = nudges.get(Math.max(...nudges.keys()))!;
-		last.audit = [...last.audit, ...unanchored];
-	}
 
 	const out: BranchPlanItem[] = [];
 	msgIndex = 0;

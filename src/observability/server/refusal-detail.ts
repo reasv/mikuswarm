@@ -3,6 +3,7 @@ import type {
   ContractAttemptRow,
   DecisionEvaluationRow,
   RefusalEventRow,
+  SessionAuditRow,
   SessionBranchRow,
   SessionCheckChips,
   Storage,
@@ -13,8 +14,9 @@ import type { ConsoleCheckInfo, ConsoleChecksDeps } from "./types.js";
 // Session-view refusal-handling projections (spec REFUSAL-HANDLING §9, §12.1,
 // §12.2): the discarded branches, refusal events, send-contract attempts and
 // the check descriptions the console's branch switcher and cards render, plus
-// the decision rows' anchor and the session-list chip counters. Wire shapes are
-// camelCase like every other console route; JSON columns are parsed here.
+// the offline audit's rows, the decision rows' anchor and the session-list chip
+// counters. Wire shapes are camelCase like every other console route; JSON
+// columns are parsed here.
 // =============================================================================
 
 /** The refusal-handling part of `GET /api/sessions/:id`. */
@@ -28,6 +30,8 @@ export interface SessionRefusalDetail {
     attempts: Array<Record<string, unknown>>;
   };
   checks: ConsoleCheckInfo[];
+  /** The offline audit's rows (`session_audits`), verdicts parsed; [] before the audit ran. */
+  audits: Array<Record<string, unknown>>;
 }
 
 export function sessionRefusalDetail(
@@ -60,6 +64,7 @@ export function sessionRefusalDetail(
       attempts: attempts.map(contractAttemptWire),
     },
     checks: described,
+    audits: typeof storage.listSessionAudits === "function" ? storage.listSessionAudits(row.id).map(auditWire) : [],
   };
 }
 
@@ -133,6 +138,29 @@ function contractAttemptWire(row: ContractAttemptRow): Record<string, unknown> {
     failureTypes: parseArray(row.failure_types_json).filter((t): t is string => typeof t === "string"),
     primaryType: row.primary_type,
   };
+}
+
+function auditWire(row: SessionAuditRow): Record<string, unknown> {
+  return {
+    audit: row.audit,
+    eventId: row.event_id,
+    status: row.status,
+    verdict: parseJson(row.verdict_json),
+    confidence: row.confidence,
+    modelId: row.model_id,
+    costUsd: row.cost_usd,
+    version: row.version,
+    createdAt: row.created_at,
+  };
+}
+
+function parseJson(json: string | null): unknown {
+  if (!json) return null;
+  try {
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
 }
 
 /**

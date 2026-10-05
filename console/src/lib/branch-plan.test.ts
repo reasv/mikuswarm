@@ -90,6 +90,38 @@ describe('buildBranchPlan', () => {
 		expect(item.nudge.recovery?.sent).toContain('delve into the venue options');
 	});
 
+	it('the nudge carries the offline audit findings of the attempt it closed', () => {
+		const verdict = {
+			runs: [
+				{
+					run: 1, nudges: 1, result: 'sent',
+					afterCorrection: { choice: 'minor_rewording', source: 'model', confidence: 0.8 },
+					attempts: [
+						{ branchNo: 1, redoNo: 0, attemptNo: 0, textual: true },
+						{ branchNo: 0, redoNo: 0, attemptNo: 0, selfTalk: true }
+					]
+				}
+			]
+		};
+		const items = buildBranchPlan({
+			tree,
+			selection: new Map(),
+			evaluations: rows,
+			gate: gateEvaluations(rows, detail.checks),
+			refusalEvents: detail.refusalEvents ?? [],
+			contract: detail.contract,
+			audits: [
+				{ audit: 'send_contract', eventId: null, status: 'done', verdict, confidence: null, modelId: 'decider', costUsd: null, version: 1, createdAt: 1 }
+			]
+		});
+		const item = items.find((i) => i.type === 'message' && i.nudge);
+		if (item?.type !== 'message' || !item.nudge) throw new Error('no nudge');
+		expect(item.nudge.audit).toEqual([
+			{ branchNo: 0, redoNo: 0, attemptNo: 0, afterCorrection: 'minor_rewording', chips: ['self_talk'] }
+		]);
+		expect(plan().find((i) => i.type === 'message' && i.nudge)).toMatchObject({ nudge: { audit: [] } });
+	});
+
 	it('routing/records decision cards keep their places; checks rows never become decision cards', () => {
 		const decisionRows = demoDecisionRows.map((r, i) => ({ ...r, id: 100 + i, ts: 1 + i, latencyMs: 10 })) as DecisionEvaluation[];
 		const items = plan(new Map(), [...decisionRows, ...rows]);

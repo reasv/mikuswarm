@@ -54,6 +54,8 @@
 	const refusalEvents = $derived(session.data?.refusalEvents ?? []);
 	const contract = $derived(session.data?.contract);
 	const checks = $derived(session.data?.checks ?? []);
+	// The offline audit's rows (send-contract diagnosis); [] until it has run.
+	const audits = $derived(session.data?.audits ?? []);
 	// A rollout deep link (`branch` / `call` / `attempt` URL params) applies to the
 	// session the URL selects, never to an embedded or explicitly-passed one.
 	const focus = $derived(!embedded && sessionIdProp == null ? selection.focus : null);
@@ -360,6 +362,7 @@
 				{refusalEvents}
 				{contract}
 				{checks}
+				{audits}
 				{focus}
 			/>
 		{/if}

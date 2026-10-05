@@ -1,4 +1,4 @@
-import type { CheckInfo, ContractAttempt, DecisionEvaluation, RefusalEvent } from '$lib/schemas';
+import type { CheckInfo, ContractAttempt, DecisionEvaluation, RefusalEvent, SessionAudit } from '$lib/schemas';
 import { assistantBlocks, contentText, type RolloutMsg } from '$lib/rollout';
 
 /**
@@ -334,38 +334,63 @@ export const isPostingTool = (name: string): boolean => POSTING.has(name);
 // ── Offline audit findings (spec §7.2–§7.3, DECISION-MODEL §5.8) ─────────────
 
 /**
- * Findings of the offline audit for a session, when it has run: decision rows
- * of the `audit` point. Read tolerantly: `after_correction` (or
- * `afterCorrection`) is the §7.3 verdict; other string, boolean-true and
- * string-array verdict fields become chips (e.g. `self_talk`, failure types).
+ * Findings of the offline audit for one send-contract attempt, read from the
+ * session's `send_contract` audit row (src/audit/contract-audit.ts
+ * `RunDiagnosis`): `verdict.runs[]`, each with its failed `attempts[]`
+ * (`{ branchNo, redoNo, attemptNo, selfTalk?, textual? }`) and the run's
+ * `afterCorrection` (`{ choice, source, picked? }`), which is attached to the
+ * run's last failed attempt (the one the last nudge closed). Defensive: a
+ * malformed row yields nothing.
  */
 export interface AuditFinding {
-	attemptNo: number | null;
+	branchNo: number;
+	redoNo: number;
+	attemptNo: number;
+	/** The §7.3 verdict on the run (last attempt only): a choice, `uncertain (picked)`, or a mechanical fact. */
 	afterCorrection: string | null;
 	chips: string[];
 }
 
-export function auditFindings(rows: readonly DecisionEvaluation[]): AuditFinding[] {
+export function auditFindings(audits: readonly SessionAudit[]): AuditFinding[] {
 	const out: AuditFinding[] = [];
-	for (const row of rows) {
-		if (row.point !== 'audit') continue;
-		const v = parse(row.verdictJson);
-		if (!isObject(v)) continue;
-		let after: string | null = null;
-		const chips: string[] = [];
-		for (const [key, value] of Object.entries(v)) {
-			if (key === 'after_correction' || key === 'afterCorrection') {
-				if (typeof value === 'string') after = value;
-				continue;
-			}
-			if (value === true) chips.push(key);
-			else if (typeof value === 'string' && value.length <= 40) chips.push(`${key}: ${value}`);
-			else if (Array.isArray(value)) for (const s of value) if (typeof s === 'string') chips.push(s);
+	for (const row of audits) {
+		if (row.audit !== 'send_contract' || row.status !== 'done' || !isObject(row.verdict)) continue;
+		const runs = row.verdict.runs;
+		if (!Array.isArray(runs)) continue;
+		for (const run of runs) {
+			if (!isObject(run) || !Array.isArray(run.attempts)) continue;
+			const attempts = run.attempts.filter(isObject);
+			attempts.forEach((a, i) => {
+				const attemptNo = num(a.attemptNo);
+				if (attemptNo === null) return;
+				const chips: string[] = [];
+				if (a.selfTalk === true) chips.push('self_talk');
+				if (a.textual === true) chips.push('textual_tool_call');
+				const last = i === attempts.length - 1;
+				const after = last ? afterCorrectionLabel(run.afterCorrection) : null;
+				if (chips.length === 0 && after === null) return;
+				out.push({
+					branchNo: num(a.branchNo) ?? 0,
+					redoNo: num(a.redoNo) ?? 0,
+					attemptNo,
+					afterCorrection: after,
+					chips
+				});
+			});
 		}
-		out.push({ attemptNo: row.attemptNo ?? null, afterCorrection: after, chips });
 	}
 	return out;
 }
+
+function afterCorrectionLabel(v: unknown): string | null {
+	if (!isObject(v) || typeof v.choice !== 'string') return null;
+	if (v.choice === 'uncertain' && typeof v.picked === 'string') return `uncertain (${v.picked}?)`;
+	return v.choice;
+}
+
+/** An evaluation the offline audit recorded (its decision group carries the `audit:` prefix). */
+export const isAuditEvaluation = (evaluation: GateEvaluation): boolean =>
+	evaluation.decisionGroup.startsWith('audit:');
 
 // ── Word diff (first attempt vs sent message) ────────────────────────────────
 

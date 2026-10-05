@@ -387,7 +387,8 @@
 				"reason": null,
 				"description": "Overused assistant vocabulary"
 			}
-		]
+		],
+		"audits": []
 	},
 	"decisions": {
 		"evaluations": [

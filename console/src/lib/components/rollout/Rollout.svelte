@@ -39,6 +39,7 @@
 		DecisionEvaluation,
 		RefusalEvent,
 		SessionBranch,
+		SessionAudit,
 		SessionContract,
 		ToolInvocation
 	} from '$lib/schemas';
@@ -63,6 +64,7 @@
 		refusalEvents = [],
 		contract,
 		checks = [],
+		audits = [],
 		focus
 	}: {
 		messages: readonly unknown[];
@@ -73,6 +75,8 @@
 		refusalEvents?: readonly RefusalEvent[];
 		contract?: SessionContract;
 		checks?: readonly CheckInfo[];
+		/** The offline audit's rows (nudge cards' diagnosis chips and after-correction verdict). */
+		audits?: readonly SessionAudit[];
 		focus?: { branchNo?: number | null; toolCallId?: string | null; attemptNo?: number | null } | null;
 	} = $props();
 
@@ -116,7 +120,8 @@
 			evaluations: decisionEvaluations ?? [],
 			gate,
 			refusalEvents,
-			contract
+			contract,
+			audits
 		})
 	);
 	const shown = $derived(plan.flatMap((item) => (item.type === 'message' ? [item.msg] : [])));

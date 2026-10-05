@@ -318,6 +318,24 @@ export const CheckInfo = Schema.Struct({
 });
 export type CheckInfo = Schema.Schema.Type<typeof CheckInfo>;
 
+/**
+ * One row of the offline audit (`session_audits`): `audit` = send_contract |
+ * refusal, `status` = done | skipped | unauditable | failed, `verdict` = the
+ * audit's parsed result (kept permissive; `$lib/checks` reads it).
+ */
+export const SessionAudit = Schema.Struct({
+	audit: Schema.String,
+	eventId: Schema.NullOr(Schema.String),
+	status: Schema.String,
+	verdict: Schema.Unknown,
+	confidence: Schema.NullOr(Schema.Number),
+	modelId: Schema.NullOr(Schema.String),
+	costUsd: Schema.NullOr(Schema.Number),
+	version: Schema.Number,
+	createdAt: Schema.Number
+});
+export type SessionAudit = Schema.Schema.Type<typeof SessionAudit>;
+
 /** GET /api/sessions/:id — transcript/snapshot elements kept permissive. */
 export const SessionDetailResponse = Schema.Struct({
 	session: SessionMeta,
@@ -345,7 +363,8 @@ export const SessionDetailResponse = Schema.Struct({
 	branches: Schema.optional(Schema.Array(SessionBranch)),
 	refusalEvents: Schema.optional(Schema.Array(RefusalEvent)),
 	contract: Schema.optional(SessionContract),
-	checks: Schema.optional(Schema.Array(CheckInfo))
+	checks: Schema.optional(Schema.Array(CheckInfo)),
+	audits: Schema.optional(Schema.Array(SessionAudit))
 });
 export type SessionDetailResponse = Schema.Schema.Type<typeof SessionDetailResponse>;
 

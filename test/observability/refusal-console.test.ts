@@ -91,6 +91,11 @@ test("session detail: branches, refusal events, contract attempts and the checks
       outcome: "recovered", nudges: 1, version: 1,
     });
     await storage.insertDecisionEvaluation(checkRow("s-1", { verdict_json: JSON.stringify({ fired: ["style_x"], source: "message", matched: "m" }) }));
+    const runs = [{ run: 1, nudges: 1, result: "sent", afterCorrection: { choice: "same", source: "mechanical" }, attempts: [] }];
+    await storage.writeSessionAudits([
+      { sessionId: "s-1", audit: "send_contract", status: "done", verdictJson: JSON.stringify({ runs }), modelId: "decider", costUsd: 0.002, version: 1, createdAt: 9 },
+      { sessionId: "s-1", audit: "refusal", status: "skipped", verdictJson: JSON.stringify({ reason: "not_sampled" }), version: 1, createdAt: 9 },
+    ]);
 
     await withServer({ storage, checks: describeChecks }, async (base) => {
       const body = (await (await fetch(`${base}/api/sessions/s-1`)).json()) as any;
@@ -113,6 +118,11 @@ test("session detail: branches, refusal events, contract attempts and the checks
         { code: "op_refusal", kind: "refusal", remedy: "redo", reason: "safety", description: "Declines on safety grounds" },
       ]);
       assert.deepEqual(body.session.checkChips, { refused: 1, redone: 1, nudged: 1, revised: 0, unjudged: 0 });
+      // The offline audit's rows, verdicts parsed (oldest first).
+      assert.deepEqual(body.audits, [
+        { audit: "send_contract", eventId: null, status: "done", verdict: { runs }, confidence: null, modelId: "decider", costUsd: 0.002, version: 1, createdAt: 9 },
+        { audit: "refusal", eventId: null, status: "skipped", verdict: { reason: "not_sampled" }, confidence: null, modelId: null, costUsd: null, version: 1, createdAt: 9 },
+      ]);
     });
 
     // Without the checks deps: no descriptions, no nudge budget.
@@ -132,6 +142,7 @@ test("session detail of a session without refusal handling: empty lists, null ch
       assert.deepEqual(body.branches, []);
       assert.deepEqual(body.refusalEvents, []);
       assert.deepEqual(body.contract, { outcome: null, nudges: null, maxNudges: null, attempts: [] });
+      assert.deepEqual(body.audits, []);
       assert.equal(body.session.checkChips, null);
     });
   });

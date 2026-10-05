@@ -14,7 +14,12 @@ import {
 	wordDiff
 } from './checks';
 import { rowVerdictLabel } from './decisions';
-import { SessionDecisionsResponse, SessionDetailResponse, type DecisionEvaluation } from './schemas';
+import {
+	SessionDecisionsResponse,
+	SessionDetailResponse,
+	type DecisionEvaluation,
+	type SessionAudit
+} from './schemas';
 import fixture from '$lib/server/api/demo/refusal-session.json';
 
 // Gate records as the agent's evaluator writes them (refusal-session.json is
@@ -122,12 +127,43 @@ describe('small readers', () => {
 		expect(attemptBeforeNudge(attempts, 1, 1, 4100)).toBeUndefined();
 	});
 
-	it('audit findings (offline audit rows, read tolerantly)', () => {
-		const found = auditFindings([
-			row({ point: 'audit', attemptNo: 0, verdictJson: JSON.stringify({ after_correction: 'minor_rewording', self_talk: true, types: ['text_only'] }) }),
-			row({ point: 'checks' })
+	it('audit findings (the send_contract session_audits row the audit worker writes)', () => {
+		const audit = (over: Partial<SessionAudit>): SessionAudit => ({
+			audit: 'send_contract', eventId: null, status: 'done', verdict: null, confidence: null,
+			modelId: 'decider', costUsd: 0.001, version: 1, createdAt: 50, ...over
+		});
+		const verdict = {
+			runs: [
+				{
+					run: 1, ts: 10, servedModel: 'model_a', wireModel: 'w', nudges: 2, result: 'sent',
+					firstAttemptSource: 'text',
+					afterCorrection: { choice: 'parts_removed', source: 'model', confidence: 0.9, picked: 'parts_removed' },
+					mechanical: { normalizedEqual: false, similarity: 0.8, lengthRatio: 0.7 },
+					attempts: [
+						{ branchNo: 0, redoNo: 0, attemptNo: 0, userMessage: 0.1, selfTalk: true },
+						{ branchNo: 0, redoNo: 0, attemptNo: 1, textualToolCall: 0.95, textual: true, selfTalk: false }
+					]
+				},
+				{
+					run: 2, ts: 90, servedModel: null, wireModel: null, nudges: 1, result: 'sent', firstAttemptSource: 'text',
+					afterCorrection: { choice: 'uncertain', source: 'model', confidence: 0.4, picked: 'same' },
+					mechanical: null,
+					attempts: [{ branchNo: 1, redoNo: 1, attemptNo: 0 }]
+				}
+			]
+		};
+		expect(
+			auditFindings([
+				audit({ verdict }),
+				audit({ audit: 'refusal', verdict: { items: 3, judged: 3, skippedLive: 0, deferred: 0, fired: {} } }),
+				audit({ status: 'skipped', verdict: { reason: 'not_nudged' } }),
+				audit({ verdict: 'garbage' })
+			])
+		).toEqual([
+			{ branchNo: 0, redoNo: 0, attemptNo: 0, afterCorrection: null, chips: ['self_talk'] },
+			{ branchNo: 0, redoNo: 0, attemptNo: 1, afterCorrection: 'parts_removed', chips: ['textual_tool_call'] },
+			{ branchNo: 1, redoNo: 1, attemptNo: 0, afterCorrection: 'uncertain (same?)', chips: [] }
 		]);
-		expect(found).toEqual([{ attemptNo: 0, afterCorrection: 'minor_rewording', chips: ['self_talk', 'text_only'] }]);
 	});
 
 	it('word diff', () => {

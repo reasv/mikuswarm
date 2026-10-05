@@ -4,7 +4,7 @@
 	import ChevronDownIcon from '@lucide/svelte/icons/chevron-down';
 	import ChevronRightIcon from '@lucide/svelte/icons/chevron-right';
 	import { contentText, type RolloutMsg } from '$lib/rollout';
-	import { consequenceLabel, overrideCodes, type GateEvaluation } from '$lib/checks';
+	import { consequenceLabel, isAuditEvaluation, overrideCodes, type GateEvaluation } from '$lib/checks';
 	import { decisionElementId } from '$lib/decisions';
 	import type { RefusalEvent } from '$lib/schemas';
 	import { cn } from '$lib/utils';
@@ -85,6 +85,11 @@
 			<ShieldAlertIcon class={cn('size-3.5 shrink-0', tone === 'refusal' ? 'text-red-500' : 'text-amber-500')} />
 		{/if}
 		<span class="text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">{label}</span>
+		{#if isAuditEvaluation(evaluation)}
+			<span class="rounded bg-violet-500/15 px-1 py-0.5 text-[10px] text-violet-600 dark:text-violet-300" title="judged after the session by the offline audit"
+				>offline audit</span
+			>
+		{/if}
 		{#if evaluation.checkpoint && variant === 'ending'}
 			<span class="font-mono text-[10px] text-muted-foreground">attempt {evaluation.attemptNo ?? 0}</span>
 		{/if}
