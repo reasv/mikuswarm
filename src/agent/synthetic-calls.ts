@@ -161,6 +161,7 @@ export async function executeSyntheticCalls(
     let resultContent: { type: "text"; text: string }[];
     let addedToolNames: string[] | undefined;
     let isError = false;
+    let resultDetails: unknown = null;
 
     if (!tool) {
       isError = true;
@@ -175,6 +176,7 @@ export async function executeSyntheticCalls(
         resultContent = (result.content ?? []).filter(
           (c): c is { type: "text"; text: string } => c.type === "text",
         );
+        resultDetails = result.details ?? null;
         if (result.addedToolNames?.length) {
           addedToolNames = result.addedToolNames;
           if (options.registry) {
@@ -199,7 +201,7 @@ export async function executeSyntheticCalls(
       toolCallId: id,
       toolName: spec.name,
       content: resultContent,
-      details: {},
+      details: resultDetails,
       isError,
       timestamp: now,
       harness: spec.harness,
