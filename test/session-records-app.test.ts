@@ -568,6 +568,76 @@ test("app: a steered reply whose trigger-hold twin is still due is left to the t
   }
 });
 
+/**
+ * Session A posts a progress message, then (while its rollout is still going) the
+ * trigger hold's raw emission of a reply to it is steered in; A reads it on its next
+ * turn and finishes. `onRawSteered` runs once the raw emission has steered.
+ */
+function readSteerScript(h: () => AppHarness, replyId: string, onRawSteered?: () => Promise<void>) {
+  let raw = false;
+  return async (req: FakeLlmRequest): Promise<FakeLlmReply> => {
+    if (isRecordTurnRequest(req)) return finalize("record A");
+    const text = triggerText(req);
+    if (!text.includes("[work] first")) {
+      return { toolCalls: [{ name: "send_message", args: { message: "again", is_reply: false, final: true } }] };
+    }
+    const last = lastCallName(req);
+    if (last === undefined) {
+      return { toolCalls: [{ name: "send_message", args: { message: "on it", is_reply: false, final: false } }] };
+    }
+    if (last === "send_message" && !raw) {
+      raw = true;
+      h().say("wait, also this", { replyTo: h().sends.at(-1)!.externalId, id: replyId });
+      await h().until(() => hasLog(h(), "reply_steered"), "the raw emission steered");
+      await onRawSteered?.();
+      return { toolCalls: [{ name: "search_memory", args: { pattern: "x" } }] };
+    }
+    return { toolCalls: [{ name: "send_message", args: { message: "done", is_reply: false, final: true } }] };
+  };
+}
+
+test("app: a steered reply the session read consumes its twin after settle (no duplicate)", async () => {
+  let h!: AppHarness;
+  h = await startHarness({ script: readSteerScript(() => h, "$twin") });
+  try {
+    h.say("[work] first", { mention: true });
+    const [a] = await settled(h, 1);
+    await h.until(() => hasLog(h, "session_record_written"), "A's record");
+    assert.ok(transcript(a!).some((m) => JSON.stringify(m).includes("wait, also this")), "A read the reply");
+    // The twin (post-hold, trigger-bearing) arrives after A settled.
+    h.say("wait, also this", { mention: true, replyTo: h.sends[0]!.externalId, id: "$twin" });
+    await h.until(() => hasLog(h, "reply_twin_consumed"), "the twin consumed");
+    await new Promise((r) => setTimeout(r, 300));
+    assert.ok(hasLog(h, "reply_twin_consumed", { sessionId: a!.id, eventId: "evt-$twin" }));
+    assert.equal(sessions(h).length, 1, "no duplicate session");
+    assert.ok(!hasLog(h, "steer_unread_redelivered"));
+    assert.equal(h.logs.filter((l) => l.message === "session_started").length, 1, "no second launch");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("app: a steered reply read by the session suppresses a twin that arrives while it is live", async () => {
+  let h!: AppHarness;
+  h = await startHarness({
+    script: readSteerScript(() => h, "$twin", async () => {
+      h.say("wait, also this", { mention: true, replyTo: h.sends[0]!.externalId, id: "$twin" });
+    }),
+  });
+  try {
+    h.say("[work] first", { mention: true });
+    const [a] = await settled(h, 1);
+    await h.until(() => hasLog(h, "session_record_written"), "A's record");
+    await new Promise((r) => setTimeout(r, 300));
+    assert.ok(transcript(a!).some((m) => JSON.stringify(m).includes("wait, also this")), "A read the reply");
+    assert.equal(sessions(h).length, 1, "no duplicate session");
+    assert.ok(!hasLog(h, "steer_unread_redelivered"));
+    assert.ok(!hasLog(h, "reply_twin_consumed"), "the live twin is suppressed by the live path");
+  } finally {
+    await h.stop();
+  }
+});
+
 test("app: routing and records write decision rows with separate groups; the judged record is injected", async () => {
   const h = await startHarness({
     script: chatScript({ recordTurn: () => finalize("judged record") }),

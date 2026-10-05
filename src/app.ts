@@ -3748,18 +3748,19 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   function steerReplyToActiveSession(inbound: InboundChatEvent): boolean {
     const replyExternalId = inbound.event.replyTo?.externalId;
     if (!replyExternalId) return false;
+    // A reply already steered on the trigger hold's raw emission is decided by that
+    // steer, BEFORE the liveness check below: its twin can arrive after the session
+    // settled, and must not spawn a second session for a reply the first one read.
+    if (steeredEventIds.has(inbound.event.id) && consumeSteeredReplyTwin(inbound, replyExternalId)) return true;
     const activeIds = new Set(sessions.activeForTimeline(inbound.timelineKey).map((session) => session.id));
     if (activeIds.size === 0) return false;
     const target = timeline.getByExternalId(inbound.provider, replyExternalId, inbound.timelineKey);
     if (target?.timelineKey !== inbound.timelineKey) return false;
     if (!target?.agentSessionId || !activeIds.has(target.agentSessionId)) return false;
 
-    // The trigger-hold re-delivery already steered this event on its immediate
-    // emission. Suppress the spawn (return true) but do not re-inject.
-    if (steeredEventIds.has(inbound.event.id)) {
-      noteSteeredReplyTwin(target.agentSessionId, inbound);
-      return true;
-    }
+    // Already steered into this live session: suppress the spawn (return true) but do
+    // not re-inject.
+    if (steeredEventIds.has(inbound.event.id)) return true;
 
     // The steered (injected) turn bypasses the trigger path's enrichment-readiness
     // wait + hydrateEvents, so `inbound.event.replyTo` carries only `externalId`.
@@ -4707,8 +4708,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     delivery: FoldDelivery;
     /**
      * A reply steered on the trigger hold's immediate (trigger-less) emission: its
-     * trigger-bearing twin is still due. Once the session settled the twin takes the
-     * native path itself, so this one is not redelivered.
+     * trigger-bearing twin is still due, so this one is not redelivered. Once the
+     * session settled the twin is consumed if the session read the reply, and takes
+     * the native path itself if it did not.
      */
     twinPending: boolean;
   }
@@ -4734,12 +4736,44 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     });
   }
 
+  /**
+   * Replies steered on the trigger hold's raw emission whose session settled having
+   * READ them, while their trigger-bearing twin was still due: event id → session id.
+   * The twin is consumed here, exactly once (bounded FIFO, like `steeredEventIds`).
+   */
+  const readReplySteersAwaitingTwin = new Map<string, string>();
+
   /** The trigger hold's twin of a steered reply arrived while the session was live. */
-  function noteSteeredReplyTwin(sessionId: string, inbound: InboundChatEvent): void {
+  function noteSteeredReplyTwin(sessionId: string, inbound: InboundChatEvent): boolean {
     const entry = pendingSteers.get(sessionId)?.entries.get(inbound.event.id);
-    if (!entry || !inbound.trigger) return;
+    if (!entry || !inbound.trigger) return false;
     entry.delivery = { ...entry.delivery, inbound };
     entry.twinPending = false;
+    return true;
+  }
+
+  /**
+   * The trigger-bearing twin of a reply steered on its raw emission: true when the
+   * steer already consumed it. Either the steering session has not settled (the
+   * entry takes the twin's inbound; settle redelivers it if unread) or it settled
+   * having read the reply. False when it settled without reading it: the twin then
+   * takes the native path, so the reply is still answered.
+   */
+  function consumeSteeredReplyTwin(inbound: InboundChatEvent, replyExternalId: string): boolean {
+    if (!inbound.trigger) return false;
+    const readBy = readReplySteersAwaitingTwin.get(inbound.event.id);
+    if (readBy !== undefined) {
+      readReplySteersAwaitingTwin.delete(inbound.event.id);
+      logger.info("reply_twin_consumed", {
+        sessionId: readBy,
+        eventId: inbound.event.id,
+        timelineKey: inbound.timelineKey,
+      });
+      return true;
+    }
+    const target = timeline.getByExternalId(inbound.provider, replyExternalId, inbound.timelineKey);
+    if (target?.timelineKey !== inbound.timelineKey || !target.agentSessionId) return false;
+    return noteSteeredReplyTwin(target.agentSessionId, inbound);
   }
 
   function redeliverUnreadSteers(
@@ -4748,8 +4782,18 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     status: string | undefined,
   ): void {
     if (pendingSteers.get(sessionId) === slot) pendingSteers.delete(sessionId);
-    if (status !== "completed" || draining) return;
     const read = new Set<unknown>(slot.agent.state.messages);
+    // A raw-emission reply steer the session read: its twin is consumed whatever the
+    // final status (as it would have been, had it arrived while the session was live).
+    for (const [eventId, entry] of slot.entries) {
+      if (!entry.twinPending || !read.has(entry.message)) continue;
+      readReplySteersAwaitingTwin.set(eventId, sessionId);
+      if (readReplySteersAwaitingTwin.size > STEERED_EVENT_ID_CAP) {
+        const oldest = readReplySteersAwaitingTwin.keys().next().value;
+        if (oldest !== undefined) readReplySteersAwaitingTwin.delete(oldest);
+      }
+    }
+    if (status !== "completed" || draining) return;
     for (const entry of slot.entries.values()) {
       if (read.has(entry.message) || entry.twinPending) continue;
       logger.warn("steer_unread_redelivered", {
