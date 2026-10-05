@@ -534,7 +534,7 @@ Every checkpoint adds work to a task's path. **End-to-end task latency must not 
 
 None that block implementation. Calibrated during implementation:
 
-1. Per-question thresholds, calibrated against the head decision member on labelled examples (DECISION-MODEL §3.6), and the default decision chain per checkpoint.
+1. Per-question thresholds, calibrated against the head decision member on labelled examples (DECISION-MODEL §3.6), and the default decision chain per checkpoint. **Labels come from a model, and whoever runs the calibration never reads the messages.** An offline calibration tool samples history, sends each item to a labeller (any configured chat model; an operator picks one whose data policy already covers chat content), and asks it for a constrained verdict only: the check's label and a reason from a fixed enum, never free text, with an instruction not to reproduce any message content. The tool records the decision member's probability for the same item and reports only item ids, labels, probabilities and aggregates (precision and recall per candidate threshold, score histograms). Hard refusals with an API signal are known positives and anchor the refusal checks. The same tool re-runs after a threshold or question change.
 2. The built-in refusal questions per reason and source, and the textual-tool-call and context-mimicry patterns (§7.2), written in phase 1–3 and checked against history by the backfill (§10.2).
 3. The owner reviews the starter style catalogue (§4.5) before phase 5 ships it.
 
