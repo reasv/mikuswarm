@@ -259,19 +259,6 @@ export function sessionDetail(
 }
 
 /**
- * Safely parse a JSON string, returning `fallback` on any parse error.
- * Used to recover gracefully from malformed stored JSON without a 500.
- */
-function safeJsonParse<T>(text: string | null | undefined, fallback: T): T | unknown {
-  if (text == null) return fallback;
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return fallback;
-  }
-}
-
-/**
  * GET /api/sessions/:id/record — the session's own record (null if none or
  * tables absent). Always 200 when the session exists; 404 for an unknown id.
  * The `builds_on` column is stored as a JSON string and is parsed here before
@@ -299,7 +286,7 @@ export function sessionRecord(
       text: row.text,
       tokenCount: row.token_count,
       // builds_on is stored as a JSON string (string[]); parse it here.
-      buildsOn: safeJsonParse(row.builds_on, []),
+      buildsOn: parseJsonArray(row.builds_on),
       modelId: row.model_id,
       createdAt: row.created_at,
     },
