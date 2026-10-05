@@ -1,3 +1,21 @@
+diff --git a/dist/api/anthropic-messages.js b/dist/api/anthropic-messages.js
+index 591beb84b1be68d77c920fa65a25af1267ce97c2..6082b36cfe0a4c94b1a0997dab583792b5cbe3eb 100644
+--- a/dist/api/anthropic-messages.js
++++ b/dist/api/anthropic-messages.js
+@@ -539,6 +539,13 @@ export const stream = (model, context, options) => {
+                 else if (event.type === "message_delta") {
+                     if (event.delta.stop_reason) {
+                         output.rawStopReason = event.delta.stop_reason;
++                        // The refusal category (`stop_details.category`: "cyber", "bio", or
++                        // values outside the SDK's typed union), an open string; null when
++                        // the refusal carries none. Only set on a refusal stop.
++                        if (event.delta.stop_reason === "refusal") {
++                            const category = event.delta.stop_details?.category;
++                            output.stopCategory = typeof category === "string" && category.length > 0 ? category : null;
++                        }
+                         const stopReasonResult = mapStopReason(event.delta.stop_reason, event.delta.stop_details);
+                         output.stopReason = stopReasonResult.stopReason;
+                         if (stopReasonResult.errorMessage) {
 diff --git a/dist/api/openai-responses-shared.js b/dist/api/openai-responses-shared.js
 index c35771dcc9b2173d0b459d13c6d86e622de45e9a..da80ad9e8219e09844c0c15edc2ed929cd417754 100644
 --- a/dist/api/openai-responses-shared.js
@@ -41,3 +59,20 @@ index c35771dcc9b2173d0b459d13c6d86e622de45e9a..da80ad9e8219e09844c0c15edc2ed929
                                  : {}),
                          });
                      }
+diff --git a/dist/types.d.ts b/dist/types.d.ts
+index 77b46da2d31e472e519772b0d739766fa86dc3d0..a3cf5315d0fc79e3d616274dc9cb8af5127217e7 100644
+--- a/dist/types.d.ts
++++ b/dist/types.d.ts
+@@ -308,6 +308,12 @@ export interface AssistantMessage {
+     deferred?: DeferredHandle;
+     errorMessage?: string;
+     rawStopReason?: string;
++    /**
++     * Provider refusal category, when the provider reports one beside a refusal
++     * stop (Anthropic `stop_details.category`). Open string; null when the
++     * refusal carried no category; absent for other stops and APIs.
++     */
++    stopCategory?: string | null;
+     /**
+      * Provider indication of whether the model explicitly ended its turn.
+      * Preserved for debugging and does not currently affect agent control flow.
