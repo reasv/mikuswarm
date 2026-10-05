@@ -1225,3 +1225,11 @@ session_page_idle_ms = 600000           # close a session's tab after this idle 
 [messaging]
 enabled = true            # master switch: send_dm + send_to_channel
 dm_initiation = true      # DM-open leg of send_dm (send_to_channel unaffected)
+
+# Session records (spec SESSION-RECORDS §8). Default-on.
+[session_records]
+enabled = true          # master switch: write + inject records
+max_tokens = 1500       # token budget per record
+max_turns = 30          # max harness record-turn iterations before abort
+inject_on_reply = true  # inject record at start of reply sessions
+timeout_ms = 60000      # record-turn wall-clock timeout in ms

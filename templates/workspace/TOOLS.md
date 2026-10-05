@@ -58,6 +58,7 @@ something is gone. Entries marked with a skill live behind it; load it first.
 | Catch up an absence ("what did I miss") | `recap` — chat-history skill (no args = the asker's own gap) |
 | The real history beneath a `<summary>` block | `expand_summary` with the summary's `id` |
 | How much someone posts / who's gone quiet | `user_activity` — chat-history skill |
+| What an earlier session found / did ("where did you get that?") | `read_session_record` — pass the `agent_session_id` from the bot message; for raw tool calls add `read_session_transcript` (sessions skill) |
 
 - `search_messages` hits cite an `event_id` you can hand to `read_messages`; use `format:"snippet"` to scan many hits cheaply rather than dumping history.
 - People won't name these tools ("what did I miss?" is a `recap` request) — recognize the intent; see **Catching People Up** in `AGENTS.md`.

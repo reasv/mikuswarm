@@ -56,6 +56,9 @@ export function createToolSearchTool(context: ToolSearchContext): AgentTool {
     label: "Tool search",
     description: TOOL_SEARCH_DESCRIPTION,
     parameters: TOOL_SEARCH_PARAMETERS,
+    // Pure control-flow: searching/loading tools does no stateful work a fresh
+    // session would lack (spec SESSION-RECORDS CONTRACT §4).
+    resumeWorkExempt: true,
     execute: async (_toolCallId, params) => {
       const args = params as { query: string; max_results?: number };
       const registry = context.getRegistry();
@@ -70,8 +73,13 @@ export function createToolSearchTool(context: ToolSearchContext): AgentTool {
           .split(",")
           .map((name) => name.trim())
           .filter((name) => name.length > 0);
-        toLoad = requested.filter((name) => registry.inCatalog(name));
-        unknown = requested.filter((name) => !registry.inCatalog(name));
+        // Harness-only tools cannot be loaded via tool_search (CONTRACT §2).
+        const isHarnessOnly = (name: string): boolean => {
+          const tool = registry.catalogTools.find((t) => t.name === name);
+          return !!(tool as (typeof tool & { harnessOnly?: boolean }) | undefined)?.harnessOnly;
+        };
+        toLoad = requested.filter((name) => registry.inCatalog(name) && !isHarnessOnly(name));
+        unknown = requested.filter((name) => !registry.inCatalog(name) || isHarnessOnly(name));
       } else {
         const terms = query
           .toLowerCase()
@@ -79,8 +87,10 @@ export function createToolSearchTool(context: ToolSearchContext): AgentTool {
           .filter((term) => term.length > 0);
         if (terms.length === 0) throw new Error("Empty tool_search query.");
         const maxResults = args.max_results ?? DEFAULT_MAX_RESULTS;
-        const scored = registry
+        // Harness-only tools are excluded from tool_search (CONTRACT §2).
+      const scored = registry
           .deferredTools()
+          .filter((tool) => !(tool as { harnessOnly?: boolean }).harnessOnly)
           .map((tool) => {
             const name = tool.name.toLowerCase();
             const description = tool.description.toLowerCase();

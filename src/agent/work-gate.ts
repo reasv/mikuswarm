@@ -12,15 +12,9 @@ import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 // =============================================================================
 
 declare module "@earendil-works/pi-agent-core" {
-  // Declaration-merge an optional classification flag onto EVERY tool definition
-  // (spec §7a "a flag on the AgentTool definition rather than a hidden central
-  // list, so a new tool is forced to declare its bucket and can't silently
-  // drift"). The flag is the single source of truth; the gate derives its exempt
-  // NAME set from the live tools via {@link collectExemptToolNames}. Named for
-  // its meaning (exempt from the resume WORK gate) rather than the spec's
-  // `chatSurface` example, because two of the exempt tools — the `spawn_session`/
-  // `delegate_to_session` control tools and `media` — are not chat-surface tools;
-  // they share only their non-work status.
+  // Declaration-merge optional classification flags onto EVERY tool definition.
+  // Each flag is the single source of truth for its classification; central lists
+  // are always derived from the live tool set (see collectExemptToolNames).
   interface AgentTool {
     /**
      * When true, this tool does NOT count as resumable work (spec §7a): its
@@ -32,6 +26,17 @@ declare module "@earendil-works/pi-agent-core" {
      * ambiguous — the safe failure direction is "didn't resume".
      */
     resumeWorkExempt?: boolean;
+
+    /**
+     * When true, this tool is harness-only (spec SESSION-RECORDS, CONTRACT §2):
+     * the harness manages its availability explicitly via the record-turn gate.
+     * Under dynamic tool loading a harness-only tool is always deferred but is
+     * NEVER surfaced in the rendered deferred-tools index, never matched by
+     * `tool_search`, and never claimed by any skill's tool patterns. Without
+     * dynamic loading it simply appears in `tools`. The session catalog always
+     * includes it (so declared-deferred wire arrays stay byte-stable).
+     */
+    harnessOnly?: boolean;
   }
 }
 

@@ -15,6 +15,11 @@ import { createSetProfileTool } from "../src/tools/set-profile.ts";
 import { createSpawnSessionTool } from "../src/tools/spawn-session.ts";
 import { createDelegateToSessionTool } from "../src/tools/delegate.ts";
 import { createMediaTool } from "../src/tools/media.ts";
+// SESSION-RECORDS CONTRACT §4: the 4 new exempt control-flow tools.
+import { createNoReplyTool } from "../src/tools/no-reply.ts";
+import { createLoadSkillTool } from "../src/tools/load-skill.ts";
+import { createToolSearchTool } from "../src/tools/tool-search.ts";
+import { createSessionRecordTool, SummaryDraft } from "../src/tools/session-record-tool.ts";
 // Representative WORK tools that must NOT be flagged exempt.
 import { createReactTool as _unused } from "../src/tools/react.ts"; // keep import grouping
 import { createWebSearchTool } from "../src/tools/web.ts";
@@ -111,11 +116,12 @@ test("collectExemptToolNames reads the per-tool flag and merges extras", () => {
   assert.ok(set.has("mcp__x__y"));
 });
 
-test("drift: the spec's 11 built-in exempt tools are all flagged resumeWorkExempt", () => {
+test("drift: the spec's 15 built-in exempt tools are all flagged resumeWorkExempt", () => {
   // Construct each exempt factory with a stub context (factories build a plain
   // object and never touch the context until execute). The flagged set must equal
-  // the spec §7a enumeration exactly — a tool that loses its flag, or a new
-  // chat-surface tool added without one, fails here.
+  // the spec §7a + SESSION-RECORDS CONTRACT §4 enumeration exactly — a tool that
+  // loses its flag, or a new chat-surface/control-flow tool added without one,
+  // fails here.
   const stub = {} as never;
   const exemptTools: AgentTool[] = [
     createSendMessageTool(stub),
@@ -129,6 +135,11 @@ test("drift: the spec's 11 built-in exempt tools are all flagged resumeWorkExemp
     createSpawnSessionTool(stub),
     createDelegateToSessionTool(stub),
     createMediaTool(stub),
+    // SESSION-RECORDS CONTRACT §4: control-flow tools that are resumeWorkExempt.
+    createNoReplyTool(),
+    createLoadSkillTool(stub),
+    createToolSearchTool(stub),
+    createSessionRecordTool({ draft: new SummaryDraft(), maxTokens: 1500 }),
   ];
   for (const tool of exemptTools) {
     assert.equal(tool.resumeWorkExempt, true, `${tool.name} must be resumeWorkExempt`);
@@ -141,13 +152,17 @@ test("drift: the spec's 11 built-in exempt tools are all flagged resumeWorkExemp
       "delegate_to_session",
       "delete_message",
       "edit_message",
+      "load_skill",
       "media",
+      "no_reply",
       "pins",
       "poll_vote",
       "react",
       "send_message",
+      "session_record_tool",
       "set_profile",
       "spawn_session",
+      "tool_search",
     ],
   );
 });
@@ -161,28 +176,36 @@ test("drift: representative work tools are NOT flagged exempt", () => {
 
 // ── Issue #15: EXHAUSTIVE both-directions drift over the FULL tool set ────────
 //
-// The drift tests above pin the 11 exempt names positively and three work tools
+// The drift tests above pin the 15 exempt names positively and three work tools
 // negatively, but neither can catch a stray `resumeWorkExempt: true` accidentally
 // added to some OTHER work tool (e.g. `bash`, `browser`, `recap`). This test
 // constructs EVERY first-party tool factory exported from `src/tools/index.ts`,
 // reads each one's static flag, and asserts the flagged set equals EXACTLY the
-// spec §7a eleven — so a stray flag on any of the ~28 work tools fails here, and
-// dropping a flag off an exempt tool fails too. It is the symmetric closure of the
-// two one-directional tests (which are kept as readable, low-dependency guards).
+// spec §7a + CONTRACT §4 fifteen — so a stray flag on any of the ~31 work tools
+// fails here, and dropping a flag off an exempt tool fails too. It is the
+// symmetric closure of the two one-directional tests (which are kept as readable,
+// low-dependency guards).
 
-/** The spec §7a built-in exempt set, verbatim — the EXACT expected flagged set. */
+/**
+ * The spec §7a built-in exempt set + SESSION-RECORDS CONTRACT §4 additions,
+ * verbatim — the EXACT expected flagged set (15 tools).
+ */
 const SPEC_EXEMPT_NAMES = [
   "create_poll",
   "delegate_to_session",
   "delete_message",
   "edit_message",
+  "load_skill",
   "media",
+  "no_reply",
   "pins",
   "poll_vote",
   "react",
   "send_message",
+  "session_record_tool",
   "set_profile",
   "spawn_session",
+  "tool_search",
 ] as const;
 
 /**
@@ -252,13 +275,15 @@ const STRICT_FACTORY_CONTEXTS: Record<string, () => unknown> = {
   }),
 };
 
-test("issue #15: across the ENTIRE first-party tool set, exactly the 11 spec tools are resumeWorkExempt", () => {
+test("issue #15: across the ENTIRE first-party tool set, exactly the 15 spec tools are resumeWorkExempt", () => {
   const factoryNames = Object.keys(allTools).filter(
     (k) => k.startsWith("create") && typeof (allTools as Record<string, unknown>)[k] === "function",
   );
   // Sanity: the index really exports the full tool surface, not a stub subset — so
   // a future work tool added there without a context override is exercised here.
-  assert.ok(factoryNames.length >= 38, `expected the full factory set; saw ${factoryNames.length}`);
+  // SESSION-RECORDS adds 3 new factories (session_record_tool, read_session_record,
+  // read_session_transcript) → minimum bumped from 38 to 41.
+  assert.ok(factoryNames.length >= 41, `expected the full factory set; saw ${factoryNames.length}`);
 
   const flaggedExempt: string[] = [];
   const builtNames: string[] = [];
@@ -277,7 +302,7 @@ test("issue #15: across the ENTIRE first-party tool set, exactly the 11 spec too
   assert.deepEqual(
     [...new Set(flaggedExempt)].sort(),
     [...SPEC_EXEMPT_NAMES].sort(),
-    `resumeWorkExempt set drifted from the spec §7a eleven; flagged: ${flaggedExempt.sort().join(", ")}`,
+    `resumeWorkExempt set drifted from the spec §7a + CONTRACT §4 fifteen; flagged: ${flaggedExempt.sort().join(", ")}`,
   );
   // And it agrees with the shipped context-free derivation.
   assert.deepEqual(
