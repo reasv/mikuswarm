@@ -56,16 +56,17 @@ export const BUILTIN_CONTRACT_CHECKS: readonly CheckDefinition[] = [
   },
   {
     // §5.4: the reasoning concludes it should reply, or a reply was written but
-    // never sent. Revise remedy (the tool error and override are phase 5).
+    // never sent. Revise remedy: the no_reply call is blocked with a tool error (revise.ts).
     code: "no_reply_contradiction",
     kind: "contract",
     enabled: false,
     remedy: "revise",
     description:
       "Ends without a reply although its reasoning concluded it should reply, or after writing a reply it never sent",
+    // The revise error adds the override line ("If not replying is intended,
+    // call no_reply again with override_checks: [...]", src/checks/revise.ts).
     agentExplanation:
-      "Your reasoning concluded you should reply, or you wrote a reply without sending it. Send it with send_message, " +
-      "or call no_reply again with override `no_reply_contradiction` if not replying is intended.",
+      "Your reasoning concluded you should reply, or you wrote a reply without sending it. Send it with send_message.",
     checkpoints: ["ending"],
     apiSignals: [],
     patterns: [],
