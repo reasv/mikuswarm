@@ -1296,3 +1296,118 @@ max_choices = 3
     await assert.rejects(() => loadConfig(dir, { env: false }));
   });
 });
+
+// R3: [decisions.continuation] was removed; the field must be rejected.
+test("config: [decisions.continuation] is rejected (removed field)", async () => {
+  const toml = `${BASE_CONFIG}
+[models.decider]
+id = "vendor/decider-1"
+provider = "openrouter"
+api = "system-one"
+endpoint = "http://localhost/decisions"
+api_key = "k"
+input_modalities = ["text"]
+max_tokens = 1
+
+[decisions]
+enabled = true
+model = "decider"
+
+[decisions.continuation]
+enabled = true
+window_ms = 60000
+`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(
+      () => loadConfig(dir, { env: false }),
+      /continuation|Invalid config|additional/i,
+      "[decisions.continuation] must be rejected as an unknown field",
+    );
+  });
+});
+
+// R7: [decisions.records] round-trip; range validation (inject_threshold must be in [0,1]).
+test("config: [decisions.records] parses with valid values", async () => {
+  const toml = `${BASE_CONFIG}
+[models.decider]
+id = "vendor/decider-1"
+provider = "openrouter"
+api = "system-one"
+endpoint = "http://localhost/decisions"
+api_key = "k"
+input_modalities = ["text"]
+max_tokens = 1
+context_window = 32000
+
+[decisions]
+enabled = true
+model = "decider"
+
+[decisions.records]
+enabled = true
+inject_threshold = 0.7
+candidates = 5
+max_injected = 3
+`;
+  await withConfigDir(toml, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    assert.equal(config.decisions?.records?.enabled, true);
+    assert.equal(config.decisions?.records?.inject_threshold, 0.7);
+    assert.equal(config.decisions?.records?.candidates, 5);
+    assert.equal(config.decisions?.records?.max_injected, 3);
+  });
+});
+
+test("config: [decisions.records] inject_threshold out of range is rejected", async () => {
+  const toml = `${BASE_CONFIG}
+[models.decider]
+id = "vendor/decider-1"
+provider = "openrouter"
+api = "system-one"
+endpoint = "http://localhost/decisions"
+api_key = "k"
+input_modalities = ["text"]
+max_tokens = 1
+
+[decisions]
+enabled = true
+model = "decider"
+
+[decisions.records]
+inject_threshold = 1.5
+`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(
+      () => loadConfig(dir, { env: false }),
+      /inject_threshold|Invalid config|range|maximum/i,
+      "inject_threshold > 1 must be rejected",
+    );
+  });
+});
+
+test("config: [decisions.records] candidates out of range is rejected", async () => {
+  const toml = `${BASE_CONFIG}
+[models.decider]
+id = "vendor/decider-1"
+provider = "openrouter"
+api = "system-one"
+endpoint = "http://localhost/decisions"
+api_key = "k"
+input_modalities = ["text"]
+max_tokens = 1
+
+[decisions]
+enabled = true
+model = "decider"
+
+[decisions.records]
+candidates = 100
+`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(
+      () => loadConfig(dir, { env: false }),
+      /candidates|Invalid config|range|maximum/i,
+      "candidates > 20 must be rejected",
+    );
+  });
+});
