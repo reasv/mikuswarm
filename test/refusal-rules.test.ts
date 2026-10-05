@@ -147,6 +147,41 @@ test("validateRefusalRules: a valid set passes; no rules is fine", () => {
   validateRefusalRules(config(), buildCheckCatalogue(config()));
 });
 
+test("validateRefusalRules: tasks are routing tasks of every agent the rule applies to, plus other and proactive", () => {
+  const routing = (keys: string[]) => ({ routing: { tasks: Object.fromEntries(keys.map((k) => [k, { description: k }])) } });
+  const cfg = config({
+    decisions: routing(["coding", "research"]),
+    agents: {
+      agent_a: { workspace_root: "/a" },
+      // agent_b replaces the task list wholesale.
+      agent_b: { workspace_root: "/b", decisions: routing(["art"]) },
+    },
+    refusal_fallback: [
+      { name: "a-only", agents: ["agent_a"], tasks: ["coding", "research"], models: ["open_model_x"] },
+      { name: "b-only", agents: ["agent_b"], tasks: ["art"], models: ["open_model_x"] },
+      { name: "everyone", tasks: ["other", "proactive"], models: ["open_model_x"] },
+    ],
+  });
+  validateRefusalRules(cfg, buildCheckCatalogue(cfg));
+  const bad = config({
+    ...cfg,
+    refusal_fallback: [{ name: "x", tasks: ["coding"], models: ["open_model_x"] }],
+  });
+  assert.throws(() => validateRefusalRules(bad, buildCheckCatalogue(bad)), /"coding" is not one of agent "agent_b"'s routing tasks/);
+  // Legacy mode (no [agents]): the global routing tasks.
+  const legacy = config({ agents: undefined, decisions: routing(["coding"]), refusal_fallback: [{ name: "l", tasks: ["coding"], models: ["open_model_x"] }] });
+  validateRefusalRules(legacy, buildCheckCatalogue(legacy));
+});
+
+test("matchRefusalRule: a session matches a tasks rule when any of its tasks is listed", () => {
+  const rules = [rule("coding", { tasks: ["coding"] }), rule("proactive", { tasks: ["proactive"] }), rule("any")];
+  const match = (tasks: string[] | null) => matchRefusalRule(rules, { site: "default", tasks, reason: "safety", kind: "soft" })?.name;
+  assert.equal(match(["research", "coding"]), "coding");
+  assert.equal(match(["proactive"]), "proactive");
+  assert.equal(match(["other"]), "any");
+  assert.equal(match(null), "any", "a taskless session never matches a tasks rule");
+});
+
 test("validateRefusalRules: operator reasons from the catalogue are known", () => {
   const cfg = config({
     checks: { refusal_policy: { kind: "refusal", reason: "policy_x" } },
@@ -162,7 +197,20 @@ test("validateRefusalRules: startup errors", () => {
     [[{ name: "a", models: [] }], /models must list at least one model/],
     [[{ name: "a", models: ["open_model_x"] }, { name: "a", models: ["open_model_y"] }], /refusal_fallback\[1\] \("a"\): duplicate rule name/],
     [[{ name: "", models: ["open_model_x"] }], /refusal_fallback\[0\]: name is required/],
-    [[{ name: "a", models: ["open_model_x"], tasks: ["coding"] }], /tasks: .*phase 4/],
+    // Rules' tasks name each applying agent's routing tasks (DECISION-MODEL §5.1a).
+    [[{ name: "a", models: ["open_model_x"], tasks: ["coding"] }], /\.tasks: "coding" is not one of agent "agent_a"'s routing tasks/],
+    [
+      [{ name: "a", models: ["open_model_x"], tasks: ["coding"] }],
+      /agent "agent_b"'s routing tasks \(known: chat, other, proactive\)/,
+      {
+        decisions: { routing: { tasks: { coding: { description: "c" } } } },
+        agents: {
+          agent_a: { workspace_root: "/a" },
+          agent_b: { workspace_root: "/b", decisions: { routing: { tasks: { chat: { description: "t" } } } } },
+        },
+      },
+    ],
+    [[{ name: "a", models: ["open_model_x"], tasks: ["coding"] }], /\[decisions\.routing\.tasks\]/, { agents: undefined }],
     [[{ name: "a", models: ["open_model_x"], agents: ["agent_z"] }], /agents: "agent_z" names no agent \(known: agent_a, agent_b\)/],
     [[{ name: "a", models: ["open_model_x"], agents: ["agent_a"] }], /names no agent \(no \[agents\] table/, { agents: undefined }],
     [[{ name: "a", models: ["open_model_x"], from_models: ["ghost"] }], /from_models: "ghost" does not name/],

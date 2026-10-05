@@ -15,6 +15,15 @@ export interface RedoRequest {
   decisionEvaluationId?: number;
   refusedModel?: string;
   ruleName?: string;
+  /** The rule entry a refusal redo continues on (already pinned by `refusal.advance`). */
+  toModel?: string;
+  /**
+   * A refusal whose rule is exhausted (spec §8.2): `withhold` settles the
+   * session as NO_REPLY with no notice, `park` parks it; no redo either way.
+   */
+  exhausted?: "withhold" | "park";
+  /** Every decision row of the verdict (re-anchored to the new branch after the fork). */
+  evaluationIds?: number[];
 }
 
 /** One per session: the gate requests, the runner takes. */

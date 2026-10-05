@@ -1483,6 +1483,11 @@ export interface SessionRoutingState {
   cascade?: string[];
   thinkingLevel?: string;
   /**
+   * The routed session's task keys (multi-label, DECISION-MODEL §5.1a), so a
+   * resume, refusal rules and statistics read them without the routing row.
+   */
+  tasks?: string[];
+  /**
    * Legacy compat read-only (I3): present only when the persisted row was written
    * before W5 replaced explicit tool preloads with synthetic load_skill calls.
    * The resume branch loads these into the registry before `seedFromTranscript`
@@ -8438,6 +8443,7 @@ export class Storage {
         ...(typeof parsed["model"] === "string" ? { model: parsed["model"] } : {}),
         ...(Array.isArray(parsed["cascade"]) ? { cascade: strings(parsed["cascade"]) } : {}),
         ...(typeof parsed["thinkingLevel"] === "string" ? { thinkingLevel: parsed["thinkingLevel"] } : {}),
+        ...(strings(parsed["tasks"]).length > 0 ? { tasks: strings(parsed["tasks"]) } : {}),
         ...(legacyTools.length > 0 ? { legacyTools } : {}),
       };
     } catch {
@@ -9916,6 +9922,53 @@ export class Storage {
     return this.write((db) => {
       const stmt = db.prepare(`update decision_evaluations set consequence = ? where id = ?`);
       for (const id of ids) stmt.run(consequence, id);
+    });
+  }
+
+  /**
+   * Re-anchor the statistics of a discarded span to the branch a fork stored it
+   * in (spec REFUSAL-HANDLING §9): the session's live-branch (0 / null)
+   * `decision_evaluations` rows whose `tool_call_id` is one of `toolCallIds` or
+   * whose id is in `evaluationIds`, the soft `refusal_events` linked to them,
+   * and the hard `refusal_events` written after `sinceTs` (requests issued
+   * inside the span). One transaction; returns the rows moved per table.
+   */
+  reanchorSessionBranch(
+    sessionId: string,
+    args: { branchNo: number; toolCallIds?: readonly string[]; evaluationIds?: readonly number[]; sinceTs?: number },
+  ): Promise<{ decisions: number; refusals: number }> {
+    const toolCallIds = [...new Set(args.toolCallIds ?? [])];
+    const evaluationIds = [...new Set(args.evaluationIds ?? [])];
+    return this.write((db) => {
+      const moved = new Set<number>();
+      const live = `agent_session_id = @sessionId and coalesce(branch_no, 0) = 0`;
+      const selectByCall = db.prepare(`select id from decision_evaluations where ${live} and tool_call_id = @toolCallId`);
+      const selectById = db.prepare(`select id from decision_evaluations where ${live} and id = @id`);
+      for (const toolCallId of toolCallIds) {
+        for (const row of selectByCall.all({ sessionId, toolCallId }) as Array<{ id: number }>) moved.add(row.id);
+      }
+      for (const id of evaluationIds) {
+        for (const row of selectById.all({ sessionId, id }) as Array<{ id: number }>) moved.add(row.id);
+      }
+      const moveDecision = db.prepare(`update decision_evaluations set branch_no = @branchNo where id = @id`);
+      const moveLinked = db.prepare(
+        `update refusal_events set branch_no = @branchNo
+          where agent_session_id = @sessionId and branch_no = 0 and decision_evaluation_id = @id`,
+      );
+      let refusals = 0;
+      for (const id of moved) {
+        moveDecision.run({ branchNo: args.branchNo, id });
+        refusals += moveLinked.run({ branchNo: args.branchNo, sessionId, id }).changes;
+      }
+      if (args.sinceTs !== undefined && Number.isFinite(args.sinceTs)) {
+        refusals += db
+          .prepare(
+            `update refusal_events set branch_no = @branchNo
+              where agent_session_id = @sessionId and branch_no = 0 and kind = 'hard' and ts > @sinceTs`,
+          )
+          .run({ branchNo: args.branchNo, sessionId, sinceTs: args.sinceTs }).changes;
+      }
+      return { decisions: moved.size, refusals };
     });
   }
 

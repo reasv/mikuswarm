@@ -75,6 +75,11 @@ import {
 } from "./decisions/index.js";
 import { attachSessionCapture, type SessionCaptureHandle } from "./agent/session-capture.js";
 import { createRedoHandler } from "./agent/redo.js";
+import { createSoftRefusalRedoHandler } from "./refusals/soft-redo.js";
+import { JobSoftRefusalRedo, decideSessionArtifactRefusal } from "./refusals/jobs.js";
+import { forkSession } from "./agent/fork.js";
+import { createActingPolicy } from "./checks/acting-policy.js";
+import { createRevisePolicyPart, priorRejections } from "./checks/revise.js";
 import { ContractReconciler, persistSessionContract } from "./agent/contract-store.js";
 import type { CreatedAgent } from "./agent/factory.js";
 import type { SessionRunnerOptions } from "./agent/runner.js";
@@ -324,6 +329,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // overrides, kind/remedy pairs, regexes, per-agent codes; rule models, agents,
   // sites and reasons. Built once here; consumers read this catalogue.
   const checkCatalogue = buildCheckCatalogue(config);
+  // `[[refusal_fallback]]` in authored order (spec REFUSAL-HANDLING §8.1), shared
+  // by the factory (sessions), the worker pools (jobs) and the record turn.
+  const refusalRules = normalizeRefusalRules(config);
   validateRefusalRules(config, checkCatalogue);
   // [fxtwitter.tool] cross-field sanity (same fail-fast convention): the
   // per-window default must fit under the per-window hard cap, which must fit
@@ -1605,6 +1613,31 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         "default",
       config.models,
     ).map((m) => m.logicalId),
+    // A judged refusal of a caption re-captions on a soft refusal rule's model
+    // (spec REFUSAL-HANDLING §5.2.3); only when a soft rule admits the site.
+    softRefusal: (asset) => {
+      const checks = backgroundChecksRef.current;
+      if (!checks || refusalRules.length === 0) return undefined;
+      const modality = asset.media_type;
+      const redo = new JobSoftRefusalRedo({
+        checks,
+        rules: refusalRules,
+        site: "caption",
+        agent: asset.timeline_key ? agentNameForTimeline(asset.timeline_key) : null,
+        // The entry must exist and take this lane's modality (its chain's health
+        // and budget are handled by the caption call's own fallback).
+        usable: (model) => config.models[model]?.input_modalities.includes(modality as "image") ?? false,
+        chainOf: (model) => {
+          try {
+            return resolveModelChain(model, config.models).map((m) => m.logicalId);
+          } catch {
+            return [model];
+          }
+        },
+        logger: logger.child("checks"),
+      });
+      return redo.active ? redo : undefined;
+    },
     onCaptioned: (asset, result) =>
       void backgroundChecksRef.current?.artifact({
         site: "caption",
@@ -2017,7 +2050,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     resolveWorkspaceRoot: (timelineKey) => resolveWorkspaceForTimeline(timelineKey)?.workspaceRoot,
     // Refusal handling (spec REFUSAL-HANDLING §8): the one check catalogue built
     // above classifies hard refusals; the rules may redo them on another model.
-    refusals: { catalogue: checkCatalogue, rules: normalizeRefusalRules(config) },
+    refusals: { catalogue: checkCatalogue, rules: refusalRules },
     // Per-agent model override ladder (spec PER-AGENT-MODEL-OVERRIDES §4/§8).
     // Only active in agents mode (agentWorkspaces.length > 0); in legacy mode the
     // resolver is absent → factory falls back to the global-only path (§2).
@@ -2040,7 +2073,26 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // runs at runtime it is fully populated).
     mcpToolServerMap,
     // The output gate of every chat-lane session (spec REFUSAL-HANDLING §6).
-    outputChecks: { evaluator: checkEvaluator, chat: checkChatState, logger: logger.child("checks") },
+    outputChecks: {
+      evaluator: checkEvaluator,
+      chat: checkChatState,
+      // Blocking refusal checks (spec REFUSAL-HANDLING §6.3–§6.4): holds only
+      // when a soft rule could act; the revise half (style) plugs in here.
+      actingPolicy: (session, handles) =>
+        createActingPolicy({
+          ...handles,
+          // The revise half (style checks, §6.4): one per session object, so its
+          // counters persist across a refusal redo; a resume re-seeds the
+          // per-session bound from the session's recorded rejections.
+          revise: createRevisePolicyPart({
+            evaluator: checkEvaluator,
+            priorRejections: priorRejections(storage.getDecisionEvaluationsForSession(session.id)),
+            logger: logger.child("checks"),
+          }),
+          logger: logger.child("checks"),
+        }),
+      logger: logger.child("checks"),
+    },
   });
 
   // ---------------------------------------------------------------------------
@@ -2528,6 +2580,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // can be constructed before mirrorWorker exists.
         isMirroredTimeline: (tk) => mirrorWorkerRef?.isMirroredTimeline(tk) ?? false,
         outputChecks: backgroundChecksRef.current,
+        refusals: { rules: refusalRules, agentFor: agentNameForTimeline },
         onComplete: (jobId, summaryId) => {
           logger.info("summarization_job_complete", { jobId, summaryId });
           // The job is terminal — drop any sticky escalation pinned to it (§5.5).
@@ -2804,6 +2857,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // for channels whose mode is not "shared" as `excluded`.
         visibilityResolver,
         outputChecks: backgroundChecksRef.current,
+        refusals: { rules: refusalRules, agentFor: agentNameForTimeline },
         logger: logger.child("diary"),
       })
     : null;
@@ -5673,12 +5727,19 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
    * the `[agent.sessions].forced_completion_redo` switch.
    */
   function sessionRedoOptions(
-    created: Pick<CreatedAgent, "redoControl" | "forkContext">,
+    created: Pick<CreatedAgent, "redoControl" | "forkContext" | "gate">,
     capture: SessionCaptureHandle,
   ): Pick<SessionRunnerOptions, "redo" | "contractRedo" | "logger"> {
     const fork = created.forkContext({ storage, flushTranscript: () => capture.flushNow(), logger });
+    // Soft-refusal redo (spec REFUSAL-HANDLING §6.4, §8.4): the acting gate
+    // policy files it; this forks, re-anchors the discarded span, continues.
+    const onRefusal = createSoftRefusalRedoHandler({
+      storage,
+      ...(created.gate ? { gate: created.gate } : {}),
+      logger,
+    });
     return {
-      redo: { control: created.redoControl, onRedo: createRedoHandler({ fork, logger }) },
+      redo: { control: created.redoControl, onRedo: createRedoHandler({ fork, logger, onRefusal }) },
       contractRedo: config.agent.sessions.forced_completion_redo === true,
       logger,
     };
@@ -6114,6 +6175,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       return { outcome, error: message };
     } finally {
       captureHandle.detach();
+      // The session is over: unclaimed gate evaluations are dropped (claimed ones still record).
+      created?.gate?.dispose();
       costWarnUnsub();
     }
   }
@@ -6274,7 +6337,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     inbound: InboundChatEvent;
     created: Pick<
       Awaited<ReturnType<typeof factory.create>>,
-      "agent" | "registry" | "setPriority" | "setRefusalFallover" | "setRefusalSite" | "gate"
+      "agent" | "registry" | "setPriority" | "setRefusalFallover" | "setRefusalSite" | "gate" | "refusal" | "forkContext"
     >;
     handles: SessionRecordHandles;
     /** The run's capture flush (`captureHandle.flushNow`). */
@@ -6298,6 +6361,37 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       flush: args.flush,
       // The written record is judged as an artifact (spec REFUSAL-HANDLING §5.2.3).
       onRecordWritten: (text) => void args.created.gate?.judgeArtifact("session_record", text, { site: "record_turn" }),
+      // A soft rule that could act on the record turn: the record is judged
+      // before it is written, a judged refusal reruns the turn on the rule's
+      // model, every entry spent = no record (spec REFUSAL-HANDLING §5.2.3).
+      judgeRecord: async (text) => {
+        const { refusal, gate } = args.created;
+        const checks = backgroundChecksRef.current;
+        if (!gate || !checks || !refusal.softRuleCouldMatch()) return undefined;
+        let decision: "accept" | "rerun" | "exhausted" = "accept";
+        const servedModel = refusal.servingModel();
+        await checks.artifact({
+          site: "record_turn",
+          kind: "session_record",
+          text,
+          timelineKey: args.timelineKey,
+          agent: gate.scope.agent,
+          sessionId: args.sessionId,
+          sessionType: args.sessionType,
+          tasks: refusal.tasks(),
+          ...(servedModel ? { servedModel } : {}),
+          act: (verdict, { late }) => {
+            const taken = decideSessionArtifactRefusal(refusal, verdict, late, logger.child("checks"));
+            decision = taken.decision;
+            return taken.act;
+          },
+        });
+        return decision;
+      },
+      discardTurn: async (startIndex) => {
+        const fork = args.created.forkContext({ storage, flushTranscript: args.flush, logger });
+        await forkSession(fork, { index: startIndex }, { reason: "refusal_redo", toModel: args.created.refusal.pinnedModel() });
+      },
       logger,
     });
   }
@@ -6919,6 +7013,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       })
       .finally(() => {
         captureHandle.detach();
+        // The session is over: unclaimed gate evaluations are dropped (claimed ones still record).
+        created?.gate?.dispose();
         costWarnUnsub();
         activeRuns.delete(run);
         // Per-session browser close (§10a): close this session's tab(s). Use the
@@ -7427,6 +7523,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       })
       .finally(() => {
         captureHandle.detach();
+        // The session is over: unclaimed gate evaluations are dropped (claimed ones still record).
+        created?.gate?.dispose();
         costWarnUnsub();
         activeRuns.delete(run);
         // Close this session's browser tab(s) when the run settles (the idle

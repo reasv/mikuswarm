@@ -9,6 +9,8 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
 import type { AgentSessionRecord } from "../agent/session-manager.js";
 import type { Logger } from "../observability/logger.js";
+import type { SessionRedoControl } from "../agent/redo-signal.js";
+import type { SessionRefusalHandle } from "../refusals/session.js";
 import type { CheckEvaluator } from "./evaluator.js";
 import { OutputGate, type GatePolicy } from "./gate.js";
 import type { StateMessage } from "./state.js";
@@ -23,6 +25,15 @@ export interface OutputGateServices {
   chat?: (session: AgentSessionRecord, recentMessages: number) => { request: StateMessage[]; recent: StateMessage[] };
   /** The policy of new gates; default observe-only (phase 3). */
   policy?: (session: AgentSessionRecord) => GatePolicy | undefined;
+  /**
+   * The session's acting policy (spec §6.3–§6.4; `createActingPolicy`), built by
+   * the factory once the session's refusal handle and redo control exist; it
+   * replaces `policy` on the gate. Absent = the gate keeps `policy`.
+   */
+  actingPolicy?: (
+    session: AgentSessionRecord,
+    handles: { refusal: SessionRefusalHandle; redoControl: SessionRedoControl },
+  ) => GatePolicy | undefined;
   logger?: Logger;
 }
 
@@ -40,6 +51,8 @@ export function createSessionOutputGate(
     internalJob: boolean;
     getMessages: () => readonly AgentMessage[];
     servingModel: () => string | undefined;
+    /** The session's task keys (`refusal.tasks()`); null/absent = taskless. */
+    tasks?: readonly string[] | null;
   },
 ): OutputGate | undefined {
   if (!services || args.internalJob) return undefined;
@@ -54,7 +67,7 @@ export function createSessionOutputGate(
       sessionType: session.sessionType,
       timelineKey: session.timelineKey,
       triggerSenderId: args.triggerSenderId,
-      tasks: null,
+      tasks: args.tasks && args.tasks.length > 0 ? [...args.tasks] : null,
     },
     getMessages: args.getMessages,
     ...(services.chat ? { chat: (recent: number) => services.chat!(session, recent) } : {}),

@@ -38,27 +38,30 @@ function input(over: Partial<RoutingInput> = {}): RoutingInput {
   };
 }
 
-const choice = (c: string, confidence: number) => ({ type: "choice" as const, choice: c, probabilities: {}, confidence });
+const noul = (p: number) => ({ type: "noul" as const, noul: p });
 
-test("routing questions: task choice with implicit other, skill choice with none, optional difficulty score", () => {
+test("routing questions: one noul per task and per listed skill (multi-label), optional difficulty score", () => {
   const q = routingPoint.questions(input({ difficulty: { levels: ["easy", "hard"] } }), settings);
-  assert.deepEqual(Object.keys(q), ["task", "difficulty", "skill"]);
-  assert.deepEqual(Object.keys((q.task as any).criteria), ["coding", "chat", "other"]);
-  assert.deepEqual(Object.keys((q.skill as any).criteria), ["shell", "media", "none"]);
+  assert.deepEqual(Object.keys(q), ["task__coding", "task__chat", "difficulty", "skill__shell", "skill__media"]);
+  assert.equal(q.task__coding!.type, "noul");
+  assert.match(JSON.stringify(q.task__coding), /Writing or fixing code/);
+  assert.equal(q.skill__media!.type, "noul");
+  assert.match(JSON.stringify(q.skill__media), /Work with media/);
   assert.deepEqual((q.difficulty as any).criteria, ["easy", "hard"]);
   const noSkills = routingPoint.questions(input({ preloadSkills: false, tasks: {} }), settings);
   assert.deepEqual(Object.keys(noSkills), []);
 });
 
-test("routing resolve: confident task → its cascade, thinking level, skills ∪ skill answer, tail files", () => {
+test("routing resolve: selected task → its cascade, thinking level, skills ∪ selected skills, tail files", () => {
   const v = routingPoint.resolve(
-    { task: choice("coding", 0.9), skill: choice("media", 0.8) },
+    { task__coding: noul(0.9), task__chat: noul(0.2), skill__shell: noul(0.1), skill__media: noul(0.8) },
     input(),
     sameThreshold,
     settings,
   )!;
   assert.deepEqual(v, {
     task: "coding",
+    tasks: ["coding"],
     models: ["big", "mid"],
     thinkingLevel: "high",
     skills: ["shell", "media"],
@@ -66,38 +69,67 @@ test("routing resolve: confident task → its cascade, thinking level, skills �
   });
 });
 
-test("routing resolve: `model` is shorthand for a one-entry cascade; skill `none` adds nothing", () => {
+test("routing resolve: several tasks merge (cascades and unions in authored order, highest thinking level)", () => {
+  const tasks = {
+    coding: { description: "code", models: ["big", "mid"], thinking_level: "medium" as const, skills: ["shell"], tail_files: ["tail/a.md"] },
+    research: { description: "lookup", model: "mid", thinking_level: "xhigh" as const, skills: ["media", "shell"], tail_files: ["tail/b.md", "tail/a.md"] },
+    art: { description: "draw", models: ["plain"] },
+    label: { description: "a tag-only task" },
+  };
+  // Selected in reverse authored order on the wire: merging follows the config.
   const v = routingPoint.resolve(
-    { task: choice("coding", 0.9), skill: choice("none", 0.9) },
-    input({ tasks: { coding: { description: "x", model: "big", tail_files: ["tail/code.md"] } } }),
+    { task__label: noul(0.95), task__research: noul(0.8), task__coding: noul(0.76), task__art: noul(0.3) },
+    input({ tasks }),
     sameThreshold,
     settings,
   )!;
-  assert.deepEqual(v.models, ["big"]);
-  assert.deepEqual(v.skills, []);
-  assert.deepEqual(v.tailFiles, ["tail/code.md"]);
+  assert.deepEqual(v.tasks, ["coding", "research", "label"]);
+  assert.equal(v.task, "coding");
+  assert.deepEqual(v.models, ["big", "mid"], "duplicates dropped; the first task with models heads");
+  assert.equal(v.thinkingLevel, "xhigh");
+  assert.deepEqual(v.skills, ["shell", "media"]);
+  assert.deepEqual(v.tailFiles, ["tail/a.md", "tail/b.md"]);
+  // A tag-only task alone changes nothing but the labels.
+  const tag = routingPoint.resolve({ task__label: noul(0.9) }, input({ tasks }), sameThreshold, settings)!;
+  assert.deepEqual([tag.tasks, tag.models, tag.skills, tag.tailFiles, tag.thinkingLevel], [["label"], [], [], [], undefined]);
 });
 
-test("routing resolve: nothing confident → null (falls back to no routing)", () => {
-  assert.equal(
-    routingPoint.resolve({ task: choice("coding", 0.5), skill: choice("shell", 0.4) }, input(), sameThreshold, settings),
-    null,
-  );
-  // A confident skill alone still routes (a preload, no model change).
-  const v = routingPoint.resolve({ task: choice("coding", 0.5), skill: choice("shell", 0.9) }, input(), sameThreshold, settings)!;
-  assert.deepEqual([v.task, v.models, v.skills], ["other", [], ["shell"]]);
+test("routing resolve: per-task threshold (default the point floor), calibrated by name", () => {
+  const tasks = {
+    coding: { description: "code", models: ["big"], threshold: 0.5 },
+    chat: { description: "talk" },
+  };
+  const answers = { task__coding: noul(0.6), task__chat: noul(0.7) };
+  const v = routingPoint.resolve(answers, input({ tasks }), sameThreshold, settings)!;
+  assert.deepEqual(v.tasks, ["coding"], "0.6 ≥ coding's 0.5; 0.7 < the point floor 0.75");
+  const calibrated = routingPoint.resolve(
+    answers,
+    input({ tasks }),
+    (name, value) => (name === "task.coding" ? 0.65 : name === "task.chat" ? 0.6 : value),
+    settings,
+  )!;
+  assert.deepEqual(calibrated.tasks, ["chat"]);
 });
 
-test("routing resolve: difficulty routes only when no category matched", () => {
+test("routing resolve: no task selected → `other`; nothing answered at all → null (no routing)", () => {
+  const v = routingPoint.resolve({ task__coding: noul(0.5), task__chat: noul(0.1) }, input(), sameThreshold, settings)!;
+  assert.deepEqual([v.task, v.tasks, v.models, v.skills], ["other", ["other"], [], []]);
+  // A selected skill alone still routes (a preload, no model change).
+  const s = routingPoint.resolve({ task__coding: noul(0.5), skill__shell: noul(0.9) }, input(), sameThreshold, settings)!;
+  assert.deepEqual([s.tasks, s.skills], [["other"], ["shell"]]);
+  // No task questions (none configured) and nothing confident: fall back.
+  assert.equal(routingPoint.resolve({ skill__shell: noul(0.2) }, input({ tasks: {} }), sameThreshold, settings), null);
+});
+
+test("routing resolve: difficulty routes when no selected task names models", () => {
   const difficulty = { levels: ["a", "b", "c"], models: { "2": ["big"] }, thinking_levels: { "2": "xhigh" as const } };
-  const answers = (task: string) => ({
-    task: choice(task, 0.9),
-    difficulty: { type: "score" as const, score: 2, probabilities: {}, confidence: 0.9 },
-  });
-  const other = routingPoint.resolve(answers("other"), input({ difficulty }), sameThreshold, settings)!;
-  assert.deepEqual([other.models, other.thinkingLevel, other.difficulty], [["big"], "xhigh", 2]);
-  const coding = routingPoint.resolve(answers("chat"), input({ difficulty }), sameThreshold, settings)!;
-  assert.deepEqual(coding.models, [], "a matched category without models keeps normal selection");
+  const score = { type: "score" as const, score: 2, probabilities: {}, confidence: 0.9 };
+  const other = routingPoint.resolve({ task__coding: noul(0.1), difficulty: score }, input({ difficulty }), sameThreshold, settings)!;
+  assert.deepEqual([other.tasks, other.models, other.thinkingLevel, other.difficulty], [["other"], ["big"], "xhigh", 2]);
+  const chat = routingPoint.resolve({ task__chat: noul(0.9), difficulty: score }, input({ difficulty }), sameThreshold, settings)!;
+  assert.deepEqual([chat.tasks, chat.models], [["chat"], ["big"]], "a selected task without models: the difficulty axis applies");
+  const coding = routingPoint.resolve({ task__coding: noul(0.9), difficulty: score }, input({ difficulty }), sameThreshold, settings)!;
+  assert.deepEqual([coding.models, coding.thinkingLevel], [["big", "mid"], "high"], "a task naming models wins");
 });
 
 test("routing state: request kept whole, recent packed newest-first to the budget", () => {
@@ -390,7 +422,7 @@ test("factory: routing skill preloads inject synthetic load_skill calls; satelli
 
     // Persisted state has skills, no tools (W5: transcript is the tool source of truth).
     await new Promise((r) => setImmediate(r));
-    assert.deepEqual(persisted.get("s-route"), { skills: ["shell", "ghost"] });
+    assert.deepEqual(persisted.get("s-route"), { skills: ["shell", "ghost"], tasks: ["coding"] });
 
     // Resume: routing callback NOT called; tools derived from transcript addedToolNames.
     let routedOnResume = false;
@@ -541,14 +573,18 @@ test("factory: a resumed routed session keeps its routed model and effort", asyn
     });
     assert.equal(fresh.agent.state.model.id, "mid-wire");
     await new Promise((r) => setImmediate(r));
-    assert.deepEqual(persisted.get("s-route"), { skills: [], model: "mid", thinkingLevel: "high" });
+    assert.deepEqual(persisted.get("s-route"), { skills: [], model: "mid", thinkingLevel: "high", tasks: ["coding"] });
+    assert.deepEqual(fresh.refusal.tasks(), ["coding"]);
     const resumed = await factory.create(session(), [fakeTool("send_message")], {
       resume: { snapshot: [{ type: "chatEvent", role: "user", content: "x", timestamp: 1 } as any], transcript: [] },
     });
     assert.equal(resumed.agent.state.model.id, "mid-wire");
     assert.equal(resumed.agent.state.thinkingLevel, "high");
-    // An unrouted session persists nothing.
-    await factory.create(session("plain"), [fakeTool("send_message")], { route: async () => verdict() });
+    // A resume keeps the routed tasks (DECISION-MODEL §5.1a).
+    assert.deepEqual(resumed.refusal.tasks(), ["coding"]);
+    // An unrouted session persists nothing and is taskless.
+    const plain = await factory.create(session("plain"), [fakeTool("send_message")], { route: async () => undefined });
+    assert.equal(plain.refusal.tasks(), null);
     await new Promise((r) => setImmediate(r));
     assert.equal(persisted.has("plain"), false);
   });

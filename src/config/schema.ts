@@ -1008,6 +1008,9 @@ const RoutingTaskSchema = StrictObject({
   skills: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
   // Workspace-relative files appended to the tail instructions of a routed session.
   tail_files: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  // Probability at or above which the task is selected (its `noul` question;
+  // tasks are multi-label). Default the point's `min_confidence`.
+  threshold: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
 });
 
 const RoutingDifficultySchema = StrictObject({

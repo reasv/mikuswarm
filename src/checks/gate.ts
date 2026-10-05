@@ -25,7 +25,7 @@
  * `policy.act()` block the call. Blocking remedies (redo, revise) only swap the
  * policy.
  */
-import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
 import type { SessionEnding, SessionEndingHook } from "../agent/runner.js";
 import type { Logger } from "../observability/logger.js";
@@ -435,9 +435,11 @@ export class OutputGate implements SessionEndingHook {
 
   /**
    * Runner hook (spec §5.4): a run that ended with the `NO_REPLY` text or
-   * exhausted its nudges. Observe-only: starts the evaluation and returns.
+   * exhausted its nudges. Observe-only unless the policy holds it (§6.3): then
+   * the ending waits for its verdict (bounded by the ending deadline) and the
+   * policy acts (a refusal files the session's redo; the runner takes it).
    */
-  onEnding(ending: SessionEnding): void {
+  async onEnding(ending: SessionEnding): Promise<void> {
     if (this.disposed || !this.evaluator.mightJudge("ending", this.scope.agent)) return;
     const messages = this.options.getMessages();
     let lastIndex = -1;
@@ -464,7 +466,44 @@ export class OutputGate implements SessionEndingHook {
     if (typeof wire === "string") subject.wireModel = wire;
     const key = `ending:${this.branchNo}:${ending.kind}:${ending.nudges}:${messages.length}`;
     if (!this.begin("ending", key, subject)) return;
-    this.observe(key);
+    const entry = this.entries.get(key)!;
+    if (!this.shouldHold(key)) {
+      this.observe(key);
+      return;
+    }
+    const verdict = await this.settle(key, { held: true });
+    try {
+      await this.policy.act(entry.info, verdict);
+    } catch (error) {
+      this.options.logger?.warn("check_gate_act_failed", {
+        sessionId: this.scope.sessionId,
+        key,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * A gated call that will not run (its tool's own precheck refused it, e.g.
+   * the claim guard, spec §6.2): its evaluation is canceled and never recorded.
+   */
+  discard(toolCallId: string): void {
+    const entry = this.entries.get(toolCallId);
+    if (!entry || entry.recording) return;
+    entry.evaluation.cancel();
+    this.entries.delete(toolCallId);
+  }
+
+  /**
+   * Move evaluations still pending under these keys (tool call ids) to
+   * `branchNo`: their output was discarded by a fork into that branch, so their
+   * rows, written when they complete, are anchored there (spec §9).
+   */
+  reanchor(keys: Iterable<string>, branchNo: number): void {
+    for (const key of keys) {
+      const entry = this.entries.get(key);
+      if (entry) entry.evaluation.anchor.branchNo = branchNo;
+    }
   }
 
   /** Judge a session-bound artifact (the session record), off the interactive path. */
@@ -589,7 +628,23 @@ export function wrapToolsWithOutputGate(tools: readonly AgentTool[], gate: Outpu
   return tools.map((tool) => {
     if (!gatedCheckpoint(tool.name)) return tool;
     const original = tool.execute;
+    const precheck = (tool as GatedTool).gatePrecheck;
     const execute: typeof original = async (toolCallId, params, signal, onUpdate) => {
+      // Claim guard → evaluation → send (spec §6.2): a call the tool would
+      // refuse anyway (claimed by another session, malformed) is never held or
+      // judged; the evaluation started at toolcall_end is dropped.
+      if (precheck) {
+        let refused: AgentToolResult<unknown> | undefined;
+        try {
+          refused = precheck(params);
+        } catch {
+          refused = undefined;
+        }
+        if (refused) {
+          gate.discard(toolCallId);
+          return refused;
+        }
+      }
       let action: GateAction = { kind: "proceed" };
       try {
         action = await gate.gateCall(tool.name, toolCallId, params as Record<string, unknown> | undefined);
@@ -606,6 +661,15 @@ export function wrapToolsWithOutputGate(tools: readonly AgentTool[], gate: Outpu
   });
 }
 
+/**
+ * A gated tool's optional precheck (spec §6.2 "claim guard → evaluation →
+ * send"): the tool's own cheap refusals (the reply claim guard, a malformed
+ * call), run before the gate holds the call. A result = the tool refuses the
+ * call with it; undefined = go on to the gate.
+ */
+export type GatePrecheck = (params: unknown) => AgentToolResult<unknown> | undefined;
+export type GatedTool = AgentTool & { gatePrecheck?: GatePrecheck };
+
 /** A tool result reporting a failure as text (the tools' `error: …` convention), not a delivery. */
 function isErrorResult(result: unknown): boolean {
   const content = (result as { content?: unknown } | undefined)?.content;
@@ -617,9 +681,25 @@ function isErrorResult(result: unknown): boolean {
 /** Judging internal tasks' outputs (spec §5.2.3–4), off the interactive path. */
 export interface BackgroundChecks {
   /** An internal task's output: a caption, a summary or diary draft at finalize. */
-  artifact(input: BackgroundArtifact): Promise<void>;
+  artifact(input: BackgroundArtifact): Promise<BackgroundOutcome | void>;
   /** A failed rollout (no output) before its re-run: the assistant-authored text of its last turns. */
-  rollout(input: BackgroundRollout): Promise<void>;
+  rollout(input: BackgroundRollout): Promise<BackgroundOutcome | void>;
+}
+
+/**
+ * What a job's `act` decided on a verdict (spec §5.2.3–4, phase 4): the rows'
+ * consequence and, for the fired refusal it acted on, the `refusal_events`
+ * outcome. Other fired refusals are recorded `observed`.
+ */
+export interface BackgroundAct {
+  consequence: CheckConsequence;
+  refusal?: { code: string; outcome: RefusalOutcome; ruleName?: string; toModel?: string };
+}
+
+/** A judged background output: the recorded verdict and what `act` decided. */
+export interface BackgroundOutcome {
+  verdict: GateVerdict;
+  act?: BackgroundAct;
 }
 
 export interface BackgroundJobScope {
@@ -630,8 +710,16 @@ export interface BackgroundJobScope {
   agent?: string | null;
   sessionId?: string | null;
   sessionType?: string | null;
+  /** The session's task keys (a session-bound artifact, e.g. the record); default taskless. */
+  tasks?: string[] | null;
   servedModel?: string;
   wireModel?: string;
+  /**
+   * Decide on the verdict before it is recorded (a job that acts on a judged
+   * refusal: discard and rerun on a rule's model). `late` = past the background
+   * deadline. Absent = observe-only. Never throws (a throw = observe).
+   */
+  act?: (verdict: GateVerdict, opts: { late: boolean }) => BackgroundAct | undefined;
 }
 
 export interface BackgroundArtifact extends BackgroundJobScope {
@@ -650,13 +738,20 @@ export interface BackgroundRollout extends BackgroundJobScope {
  * {@link BackgroundChecks} over the shared evaluator. Each call judges with
  * the background deadline and is recorded when it completes (observe-only:
  * nothing waits on it; phase 4 routes a judged rollout refusal to the rules).
- * Never rejects.
+ * Never rejects. A job may pass `act` to decide on the verdict before it is
+ * recorded (phase 4: a judged refusal discards the output and reruns the job
+ * on a rule's model, `src/refusals/jobs.ts`).
  */
 export function createBackgroundChecks(
   evaluator: CheckEvaluator,
   opts: { agentFor?: (timelineKey: string) => string | null; logger?: Logger } = {},
 ): BackgroundChecks {
-  const run = async (job: BackgroundJobScope, checkpoint: Checkpoint, kind: string, sources: CheckSources) => {
+  const run = async (
+    job: BackgroundJobScope,
+    checkpoint: Checkpoint,
+    kind: string,
+    sources: CheckSources,
+  ): Promise<BackgroundOutcome | undefined> => {
     try {
       const agent = job.agent !== undefined ? job.agent : job.timelineKey ? (opts.agentFor?.(job.timelineKey) ?? null) : null;
       const scope: CheckScope = {
@@ -665,7 +760,7 @@ export function createBackgroundChecks(
         sessionId: job.sessionId ?? null,
         sessionType: job.sessionType ?? null,
         timelineKey: job.timelineKey,
-        tasks: null,
+        tasks: job.tasks && job.tasks.length > 0 ? [...job.tasks] : null,
       };
       const evaluation = evaluator.start(
         scope,
@@ -687,25 +782,47 @@ export function createBackgroundChecks(
         latencyMs: result.latencyMs,
       };
       const info: GateCallInfo = { checkpoint, action: kind, scope };
-      await evaluator.record(evaluation, {
-        consequence: OBSERVE_POLICY.consequence(info, verdict, { held: false, late }),
+      let act: BackgroundAct | undefined;
+      if (job.act) {
+        try {
+          act = job.act(verdict, { late });
+        } catch (error) {
+          opts.logger?.warn("check_background_act_failed", {
+            site: job.site,
+            checkpoint,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      const ids = await evaluator.record(evaluation, {
+        consequence: act?.consequence ?? OBSERVE_POLICY.consequence(info, verdict, { held: false, late }),
         late,
-        heldMs: 0,
+        heldMs: act ? result.latencyMs : 0,
+        refusalOutcome: (fired) =>
+          act?.refusal && act.refusal.code === fired.code
+            ? {
+                outcome: act.refusal.outcome,
+                ...(act.refusal.ruleName ? { ruleName: act.refusal.ruleName } : {}),
+                ...(act.refusal.toModel ? { toModel: act.refusal.toModel } : {}),
+              }
+            : { outcome: "observed" },
       });
+      return { verdict: { ...verdict, evaluationIds: ids }, ...(act ? { act } : {}) };
     } catch (error) {
       opts.logger?.warn("check_background_failed", {
         site: job.site,
         checkpoint,
         error: error instanceof Error ? error.message : String(error),
       });
+      return undefined;
     }
   };
   return {
     artifact: (input) =>
-      input.text.trim() ? run(input, "artifact", input.kind, { artifact: input.text }) : Promise.resolve(),
+      input.text.trim() ? run(input, "artifact", input.kind, { artifact: input.text }) : Promise.resolve(undefined),
     rollout: (input) => {
       const rollout = rolloutTexts(input.messages);
-      return rollout.length > 0 ? run(input, "rollout", input.kind, { rollout }) : Promise.resolve();
+      return rollout.length > 0 ? run(input, "rollout", input.kind, { rollout }) : Promise.resolve(undefined);
     },
   };
 }

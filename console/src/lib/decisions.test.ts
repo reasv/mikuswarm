@@ -35,9 +35,13 @@ describe('decision rows as the engine writes them', () => {
 
 	it('parses the answer map keyed by question name', () => {
 		const answers = parseAnswers(routing.answersJson);
-		expect(Object.keys(answers)).toEqual(['task', 'skill']);
-		expect(answers.task).toMatchObject({ type: 'choice', choice: 'image', confidence: 0.91 });
-		expect(answers.task.type === 'choice' && answers.task.probabilities.image).toBe(0.86);
+		expect(Object.keys(answers)).toEqual([
+			'task__image',
+			'task__research',
+			'skill__image-generation',
+			'skill__web-research'
+		]);
+		expect(answers.task__image).toEqual({ type: 'noul', noul: 0.91 });
 		expect(rowTopConfidence(routing)).toBe(0.91);
 
 		const injectedRow = records.find((r) => r.candidateSessionId === 'ses_v8n2ke')!;

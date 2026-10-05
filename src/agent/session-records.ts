@@ -180,6 +180,20 @@ export interface StartRecordTurnParams {
    * artifact off the turn's path (spec REFUSAL-HANDLING §5.2.3). Never awaited.
    */
   onRecordWritten?: (text: string) => void;
+  /**
+   * Judge the finalized record before it is written (spec REFUSAL-HANDLING
+   * §5.2.3), when a soft refusal rule could act on it: `rerun` = the record was
+   * judged a refusal and the session is now pinned to the rule's entry (the
+   * turn is discarded and run again), `exhausted` = every entry refused (no
+   * record), `accept` = write it (then `onRecordWritten` is not called again).
+   * Absent or undefined result = observe-only (`onRecordWritten`). Never rejects.
+   */
+  judgeRecord?: (text: string) => Promise<"accept" | "rerun" | "exhausted" | undefined>;
+  /**
+   * Discard the record turn's messages from `startIndex` on (a fork into a
+   * branch, spec §9) before a rerun. Needed with `judgeRecord`.
+   */
+  discardTurn?: (startIndex: number) => Promise<void>;
   logger: Logger;
 }
 
@@ -323,32 +337,38 @@ export class SessionRecordService {
       logger.warn("session_record_queue_cleared", { sessionId });
     }
 
-    const kickoff: AgentMessage[] = [
-      {
-        role: "user",
-        content: [{ type: "text", text: RECORD_TURN_PROMPT }],
-        timestamp: Date.now(),
-        harness: { kind: "record_turn" },
-      } as AgentMessage,
-    ];
-    // Under dynamic loading the record tool is deferred (never immediate, never
-    // findable): load it at the native load point with a synthetic tool_search
-    // select call, so the wire `tools` array never changes and each transport
-    // serializes the load in its cache-friendly form. The result is supplied here
-    // (tool_search itself refuses harness-only tools); loading the registry fires
-    // onChange, which updates agent.state.tools before the prompt. Without dynamic
-    // loading, or on a resumed rollout that loaded it already, it is in tools.
-    if (registry && registry.inCatalog(RECORD_TOOL) && !registry.isLoaded(RECORD_TOOL)) {
-      const tool = registry.catalogTools.find((t) => t.name === RECORD_TOOL)!;
-      const model = agent.state.model;
-      const { assistantMessage, toolResultMessage } = buildSyntheticCallFromResult(
-        { name: "tool_search", params: { query: `select:${RECORD_TOOL}` }, harness: { kind: "record_load" } },
-        { content: [{ type: "text", text: formatLoadedTools([tool]) }], addedToolNames: [RECORD_TOOL] },
-        { api: model.api, provider: model.provider, model: model.id },
-        registry,
-      );
-      kickoff.push(assistantMessage, toolResultMessage);
-    }
+    // The kickoff: the record prompt, plus the record tool's load when it is
+    // not loaded yet. Rebuilt for a rerun (a fork unloads what only the
+    // discarded turn loaded).
+    const buildKickoff = (): AgentMessage[] => {
+      const kickoff: AgentMessage[] = [
+        {
+          role: "user",
+          content: [{ type: "text", text: RECORD_TURN_PROMPT }],
+          timestamp: Date.now(),
+          harness: { kind: "record_turn" },
+        } as AgentMessage,
+      ];
+      // Under dynamic loading the record tool is deferred (never immediate, never
+      // findable): load it at the native load point with a synthetic tool_search
+      // select call, so the wire `tools` array never changes and each transport
+      // serializes the load in its cache-friendly form. The result is supplied here
+      // (tool_search itself refuses harness-only tools); loading the registry fires
+      // onChange, which updates agent.state.tools before the prompt. Without dynamic
+      // loading, or on a resumed rollout that loaded it already, it is in tools.
+      if (registry && registry.inCatalog(RECORD_TOOL) && !registry.isLoaded(RECORD_TOOL)) {
+        const tool = registry.catalogTools.find((t) => t.name === RECORD_TOOL)!;
+        const model = agent.state.model;
+        const { assistantMessage, toolResultMessage } = buildSyntheticCallFromResult(
+          { name: "tool_search", params: { query: `select:${RECORD_TOOL}` }, harness: { kind: "record_load" } },
+          { content: [{ type: "text", text: formatLoadedTools([tool]) }], addedToolNames: [RECORD_TOOL] },
+          { api: model.api, provider: model.provider, model: model.id },
+          registry,
+        );
+        kickoff.push(assistantMessage, toolResultMessage);
+      }
+      return kickoff;
+    };
 
     const maxTurns = params.config?.max_turns ?? DEFAULT_MAX_TURNS;
     const startIndex = agent.state.messages.length;
@@ -374,9 +394,30 @@ export class SessionRecordService {
     });
     const timer = setTimeout(() => entry.abort?.("timeout"), timeoutMs);
     handles.gate.active = true;
+    // The record's soft-refusal verdict (spec REFUSAL-HANDLING §5.2.3), when judged.
+    let judged: "accept" | "exhausted" | undefined;
     try {
-      await agent.prompt(kickoff);
-      await agent.waitForIdle();
+      for (;;) {
+        await agent.prompt(buildKickoff());
+        await agent.waitForIdle();
+        if (!params.judgeRecord || abortReason || !finalized || this.stopping) break;
+        const draftText = handles.draft.isCreated() ? handles.draft.getContent() : "";
+        if (draftText.trim().length === 0) break;
+        const verdict = await params.judgeRecord(draftText);
+        if (verdict === undefined) break;
+        if (verdict !== "rerun") {
+          judged = verdict;
+          break;
+        }
+        // Judged a refusal: discard the turn and write the record again on the
+        // rule's model (the session is pinned to it; the site stays `record_turn`
+        // so the rule's tries continue across reruns).
+        await params.discardTurn?.(startIndex);
+        handles.draft.reset();
+        finalized = false;
+        turns = 0;
+        logger.info("session_record_refusal_redo", { sessionId });
+      }
     } finally {
       clearTimeout(timer);
       unsubscribe();
@@ -388,6 +429,11 @@ export class SessionRecordService {
 
     if (abortReason && !finalized) {
       fail(abortReason, { turns });
+      return;
+    }
+    if (judged === "exhausted") {
+      // Never a refusal written as a record (spec §8.2): every rule entry refused.
+      fail("refusal", { turns, soft: true });
       return;
     }
     const turnMessages = agent.state.messages.slice(startIndex);
@@ -437,10 +483,12 @@ export class SessionRecordService {
       modelId: served?.model,
       ...(buildsOn.length > 0 ? { buildsOn } : {}),
     });
-    try {
-      params.onRecordWritten?.(text);
-    } catch {
-      /* observe-only */
+    if (judged === undefined) {
+      try {
+        params.onRecordWritten?.(text);
+      } catch {
+        /* observe-only */
+      }
     }
   }
 }

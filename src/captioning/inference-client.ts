@@ -4,6 +4,7 @@ import { runFetchWithRefusalRules, type FetchRefusalRouting } from "../refusals/
 import { type LlmScheduler } from "../agent/scheduler.js";
 import { extractStatus } from "../agent/request-retry.js";
 import {
+  resolveModelChain,
   type ModelChainEntry,
   type FetchChainMember,
 } from "../agent/model-fallback.js";
@@ -93,6 +94,12 @@ export interface RefusedCaptionAttempt {
 }
 
 export interface CaptionRequest {
+  /**
+   * A `[models.*]` key whose chain serves this call instead of the client's
+   * (a soft-refusal rerun on a refusal rule's entry, spec REFUSAL-HANDLING
+   * §5.2.3). Needs the client's `refusals` routing (its model table).
+   */
+  model?: string;
   filePath: string;
   mimeType: string;
   filename: string;
@@ -263,8 +270,12 @@ export class InferenceClient {
     // treats as a NEUTRAL teardown (never a health-streak hit), so the pool's
     // stop() never stalls for a probe window during a caption-model outage.
     let billed: FetchChainMember | undefined;
+    const chain =
+      request.model && this.options.refusals
+        ? resolveModelChain(request.model, this.options.refusals.models)
+        : this.options.chain;
     const result = await runFetchWithRefusalRules(
-      this.options.chain,
+      chain,
       {
         consumer: `caption:${this.options.modality}`,
         priority: "background",

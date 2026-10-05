@@ -4,6 +4,8 @@ import type { InferenceClient } from "./inference-client.js";
 import type { MediaModality } from "./describe.js";
 import { isAnimatedImage, convertAnimatedToVideo, extractFirstFrame } from "./animated.js";
 import type { RawTokenUsage } from "../agent/usage.js";
+import type { JobSoftRefusalRedo } from "../refusals/jobs.js";
+import { isRefusalExhausted, markRefusalExhausted } from "../refusals/fetch.js";
 
 export interface CaptionWorkerOptions {
   storage: Storage;
@@ -24,7 +26,16 @@ export interface CaptionWorkerOptions {
    * caption so the caption text is judged off the pipeline's path.
    */
   onCaptioned?: (asset: MediaAssetRow, result: { caption: string; model: string; logicalModelId: string }) => void;
+  /**
+   * Soft refusals (spec REFUSAL-HANDLING §5.2.3): the asset's refusal walk when a
+   * soft rule could act on its caption. The caption is then judged before it is
+   * persisted; a judged refusal discards it and re-captions on the rule's
+   * model; every entry spent = no caption (the asset fails, never re-run).
+   */
+  softRefusal?: (asset: MediaAssetRow) => JobSoftRefusalRedo | undefined;
 }
+
+type CaptionResult = Awaited<ReturnType<InferenceClient["caption"]>>;
 
 function mimeTypeDefault(modality: MediaModality): string {
   switch (modality) {
@@ -45,13 +56,50 @@ export class CaptionWorker {
   private async persist(
     asset: MediaAssetRow,
     result: { caption: string; model: string; logicalModelId: string; provider: string | null; usage: RawTokenUsage | null; cost: number | null },
+    opts: { judged?: boolean } = {},
   ): Promise<void> {
     await this.options.storage.updateCaptionResult(asset.id, result.caption, result.model, result.usage, result.cost);
     this.options.recordUsage?.(result, asset);
+    if (opts.judged) return;
     try {
       this.options.onCaptioned?.(asset, result);
     } catch {
       /* observe-only: a check can never fail a caption */
+    }
+  }
+
+  /**
+   * Persist a caption, judging it first when a soft refusal rule could act
+   * (spec REFUSAL-HANDLING §5.2.3): a judged refusal re-captions on the rule's
+   * entry (`recaption`), the discarded caption still billed; exhausted → the
+   * asset fails terminally with no caption.
+   */
+  private async finish(
+    asset: MediaAssetRow,
+    first: CaptionResult,
+    recaption: (model: string) => Promise<CaptionResult>,
+  ): Promise<void> {
+    const redo = this.options.softRefusal?.(asset);
+    if (!redo) return this.persist(asset, first);
+    let result = first;
+    for (;;) {
+      const decision = await redo.artifact({
+        site: "caption",
+        kind: "caption",
+        text: result.caption,
+        timelineKey: asset.timeline_key ?? null,
+        servedModel: result.logicalModelId,
+        wireModel: result.model,
+      });
+      if (decision.action === "accept") return this.persist(asset, result, { judged: true });
+      // The refused caption was billed: its ledger row stays.
+      this.options.recordUsage?.(result, asset);
+      if (decision.action === "exhausted") {
+        throw markRefusalExhausted(
+          new Error(`caption refused: every entry of refusal rule "${decision.rule}" refused (${decision.checkCode})`),
+        );
+      }
+      result = await recaption(decision.pin.model);
     }
   }
 
@@ -84,14 +132,15 @@ export class CaptionWorker {
       throw new Error(`No inference client configured for modality: ${modality}`);
     }
 
-    const result = await client.caption({
+    const request = {
       filePath: absolutePath,
       mimeType: asset.mime_type ?? mimeTypeDefault(modality),
       filename: asset.original_filename ?? path.basename(asset.local_path!),
-      context: "pipeline",
-    });
+      context: "pipeline" as const,
+    };
+    const result = await client.caption(request);
 
-    await this.persist(asset, result);
+    await this.finish(asset, result, (model) => client.caption({ ...request, model }));
     return asset.event_id;
   }
 
@@ -101,15 +150,17 @@ export class CaptionWorker {
       const converted = await convertAnimatedToVideo(absolutePath);
       if (converted) {
         try {
-          const result = await videoClient.caption({
+          const request = {
             filePath: converted.path,
             mimeType: converted.mimeType,
             filename: asset.original_filename ?? path.basename(asset.local_path!),
-            context: "pipeline",
-          });
-          await this.persist(asset, result);
+            context: "pipeline" as const,
+          };
+          const result = await videoClient.caption(request);
+          await this.finish(asset, result, (model) => videoClient.caption({ ...request, model }));
           return asset.event_id;
         } catch (error) {
+          if (isRefusalExhausted(error)) throw error;
           const msg = error instanceof Error ? error.message : String(error);
           console.warn(`[captioning] Video captioning failed for animated image ${asset.id}, falling back to first-frame: ${msg}`);
         } finally {
@@ -131,13 +182,14 @@ export class CaptionWorker {
     await writeFile(tmpPath, firstFrame);
 
     try {
-      const result = await imageClient.caption({
+      const request = {
         filePath: tmpPath,
         mimeType: "image/jpeg",
         filename: asset.original_filename ?? path.basename(asset.local_path!),
-        context: "pipeline",
-      });
-      await this.persist(asset, result);
+        context: "pipeline" as const,
+      };
+      const result = await imageClient.caption(request);
+      await this.finish(asset, result, (model) => imageClient.caption({ ...request, model }));
       return asset.event_id;
     } finally {
       await unlink(tmpPath).catch(() => {});

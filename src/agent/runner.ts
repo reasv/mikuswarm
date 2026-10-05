@@ -107,8 +107,15 @@ export interface SessionEndingHook {
   onEnding(ending: SessionEnding): void | Promise<void>;
 }
 
-/** What the runner does after `onRedo` (CONTRACT "Redo loop"). */
-export type RedoOutcome = { action: "continue" } | { action: "give_up"; noReply: boolean };
+/**
+ * What the runner does after `onRedo` (CONTRACT "Redo loop"). `park` ends the
+ * run as a refusal-class LLM failure (parked `failed-resumable`, like a hard
+ * refusal): a soft refusal whose rule is exhausted with `on_exhausted = "park"`.
+ */
+export type RedoOutcome =
+  | { action: "continue" }
+  | { action: "give_up"; noReply: boolean }
+  | { action: "park"; message: string };
 
 // matrix-sdk sends typing notices to the homeserver with a fixed 4s server-side
 // expiry (`TYPING_NOTICE_TIMEOUT`), and internally dedups repeated calls,
@@ -175,20 +182,37 @@ export class SessionRunner {
         await continueAgent(agent);
       }
 
+      // Hand a redo request to `onRedo` and apply its outcome: undefined =
+      // continue the loop (the agent was continued from the forked transcript),
+      // else the run's result. A `park` outcome throws.
+      const applyRedo = async (req: RedoRequest): Promise<SessionRunResult | undefined> => {
+        const outcome = await this.redo(req, agent, session);
+        if (outcome.action === "give_up") return { sessionId: session.id, noReply: outcome.noReply, retries: nudges };
+        if (outcome.action === "park") {
+          throw new SessionRunnerError(`agent run failed at the LLM layer (refusal): ${outcome.message}`, "llm", {
+            llmClass: "refusal",
+          });
+        }
+        // The nudge counter resets on a refusal redo; a contract redo starts its
+        // own budget (spec §8.4 "Forced completion", §7.5).
+        retries = 0;
+        await continueAgent(agent);
+        return undefined;
+      };
+      // A redo the ending hook filed (a refusal judged at an ending, spec §5.4).
+      const takeRedo = (): RedoRequest | undefined =>
+        !lifecycle?.isInterrupted() ? this.options.redo?.control.take() : undefined;
+
       for (;;) {
         await waitForAgentIdle(agent);
 
         // A redo request filed during the run (the gate, spec §8.4) is taken
-        // before anything reads the settled turn: the run was aborted on purpose
+        // before anything reads the settled turn: the run stopped on purpose
         // and its tail is about to be discarded. An operator Stop still wins.
-        const pending = !lifecycle?.isInterrupted() ? this.options.redo?.control.take() : undefined;
+        const pending = takeRedo();
         if (pending) {
-          const outcome = await this.redo(pending, agent, session);
-          if (outcome.action === "give_up") return { sessionId: session.id, noReply: outcome.noReply, retries: nudges };
-          // The nudge counter resets on a refusal redo; a contract redo starts its
-          // own budget (spec §8.4 "Forced completion", §7.5).
-          retries = 0;
-          await continueAgent(agent);
+          const result = await applyRedo(pending);
+          if (result) return result;
           continue;
         }
 
@@ -209,6 +233,15 @@ export class SessionRunner {
           // never reach forced completion.
           wasAborted(agent.state.messages)
         ) {
+          // An ending without a send is judged (spec §5.4); a refusal there
+          // discards it and redoes the turn on the rule's model (§8.4).
+          await reportEnding(this.options.endings, agent, nudges, lifecycle);
+          const endingRedo = takeRedo();
+          if (endingRedo) {
+            const result = await applyRedo(endingRedo);
+            if (result) return result;
+            continue;
+          }
           break;
         }
 
@@ -220,19 +253,24 @@ export class SessionRunner {
           continue;
         }
 
-        // Nudges exhausted. One same-model redo per failure point (spec §7.5);
+        // Nudges exhausted. The ending is judged first (spec §5.4, §8.4): a
+        // judged refusal with a matching rule redoes the turn on the rule's
+        // model; otherwise one same-model contract redo per failure point (§7.5);
         // a second exhaustion in the same span gives up as before.
+        await reportEnding(this.options.endings, agent, nudges, lifecycle);
+        const refusalRedo = takeRedo();
+        if (refusalRedo) {
+          const result = await applyRedo(refusalRedo);
+          if (result) return result;
+          continue;
+        }
         if (this.options.contractRedo && this.options.redo) {
           const point = failurePoint(agent.state.messages);
           if (!contractRedone.has(point)) {
             contractRedone.add(point);
-            const outcome = await this.redo({ kind: "contract" }, agent, session);
-            if (outcome.action === "continue") {
-              retries = 0;
-              await continueAgent(agent);
-              continue;
-            }
-            return { sessionId: session.id, noReply: outcome.noReply, retries: nudges };
+            const result = await applyRedo({ kind: "contract" });
+            if (result) return result;
+            continue;
           }
         }
         this.options.logger?.info("contract_exhausted", {
@@ -243,8 +281,6 @@ export class SessionRunner {
         break;
       }
 
-      await reportEnding(this.options.endings, agent, nudges, lifecycle);
-
       const noReply = !isTerminallyValid(agent.state.messages) ||
         (isExplicitNoReply(agent.state.messages) && !hasSendMessageCall(agent.state.messages));
       return {
@@ -253,6 +289,9 @@ export class SessionRunner {
         retries: nudges,
       };
     } finally {
+      // A redo nobody took (an operator Stop won) must not outlive the run: it
+      // would stop the record turn's loop after its first turn.
+      this.options.redo?.control.take();
       // The run has settled: clear the logically-running flag so a late Stop is
       // (correctly) reported as "not running" and defers to the terminal handler.
       lifecycle?.clearRunInProgress();

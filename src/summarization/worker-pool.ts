@@ -16,6 +16,9 @@ import { estimateTokens, truncateToTokens } from "../context/index.js";
 import { attachSessionCapture } from "../agent/session-capture.js";
 import { evaluateCondensation } from "./evaluator.js";
 import type { BackgroundChecks } from "../checks/gate.js";
+import type { RefusalRule } from "../checks/types.js";
+import type { RefusalPin } from "../storage/database.js";
+import { JobSoftRefusalRedo } from "../refusals/jobs.js";
 
 export interface SummarizationWorkerPoolOptions {
   storage: Storage;
@@ -44,7 +47,28 @@ export interface SummarizationWorkerPoolOptions {
    * path. Observe-only; absent = no checks.
    */
   outputChecks?: BackgroundChecks;
+  /**
+   * Refusal rules (spec REFUSAL-HANDLING §8.1): with `outputChecks`, a judged
+   * refusal of a summary or of a failed run reruns the job on a matching
+   * soft rule's model. Absent = observe-only checks.
+   */
+  refusals?: { rules: readonly RefusalRule[]; agentFor?: (timelineKey: string) => string | null };
   logger: Logger;
+}
+
+/** One run of a job (see `runAttempt`). */
+interface SummaryAttempt {
+  draft: SummaryDraft;
+  syntheticSession: AgentSessionRecord;
+  agentError: unknown;
+  refusalExhausted: boolean;
+  runMessages: readonly unknown[] | undefined;
+  /** Logical id of the member that served the run's last request. */
+  servedModel: string | undefined;
+}
+
+function servedField(model: string | undefined): { servedModel?: string } {
+  return model ? { servedModel: model } : {};
 }
 
 /** Material resolved from a job's input range, ready to persist as a summary. */
@@ -319,6 +343,200 @@ export class SummarizationWorkerPool {
       return;
     }
 
+    // A judged refusal of the summary (or of a run that produced none) reruns
+    // the job on a refusal rule's model instead (spec REFUSAL-HANDLING
+    // §5.2.3–4); every entry spent = no output.
+    const softRedo = this.jobSoftRefusal(job);
+    let attempt = await this.runAttempt(job, input, undefined);
+    // The final attempt's output was already judged (no fire-and-forget check below).
+    let judged = false;
+    while (softRedo && !(attempt.agentError instanceof WorkerDrainAbortError) && !attempt.refusalExhausted) {
+      const content = attempt.draft.getContent();
+      const produced = !attempt.agentError && attempt.draft.isCreated() && content.trim().length > 0;
+      const scope = { ...this.checkScope(job, attempt.syntheticSession, attempt.runMessages), ...servedField(attempt.servedModel) };
+      const kind = job.level === 1 ? "summary" : "condense";
+      const decision = produced
+        ? await softRedo.artifact({ ...scope, kind, text: content })
+        : attempt.runMessages && attempt.runMessages.length > 0
+          ? await softRedo.rollout({ ...scope, kind, messages: attempt.runMessages })
+          : ({ action: "accept" } as const);
+      judged = true;
+      if (decision.action === "accept") break;
+      await storage.updateAgentSessionStatus(attempt.syntheticSession.id, "discarded", {
+        completedAt: Date.now(),
+        error: `discarded: judged a refusal (${decision.checkCode})`,
+      });
+      if (decision.action === "exhausted") {
+        // Never a refusal written into a summary (spec §8.2): no output, no re-run.
+        logger.warn("summarization_refusal_exhausted", { jobId: job.id, summaryLevel: job.level, attempt: job.attempts, soft: true });
+        await storage.failSummarizationJob(job.id, `refused: every entry of refusal rule "${decision.rule}" refused`);
+        this.options.onError(job.id, new Error("refusal rule exhausted"));
+        this.emit(job, "failed", "failed");
+        return;
+      }
+      logger.info("summarization_refusal_redo", { jobId: job.id, summaryLevel: job.level, model: decision.pin.model });
+      attempt = await this.runAttempt(job, input, decision.pin);
+      judged = false;
+    }
+    const { draft, syntheticSession, agentError, refusalExhausted, runMessages } = attempt;
+
+    // Drain abort (spec LLM-FAILURE-HANDLING §7): the run was cancelled by the
+    // pool's own stop(), not judged. The job returns to 'pending' with its
+    // claim-time attempts increment compensated; a restart re-claims and
+    // re-runs from scratch. Any partial draft is discarded (it was produced by
+    // an aborted run); the session row records the interruption.
+    if (agentError instanceof WorkerDrainAbortError) {
+      await storage.updateAgentSessionStatus(syntheticSession.id, "interrupted", {
+        completedAt: Date.now(),
+        error: agentError.message,
+      });
+      await storage.returnSummarizationJobToPending(job.id);
+      logger.info("summarization_drain_requeued", {
+        jobId: job.id,
+        summaryLevel: job.level,
+        attempt: job.attempts,
+      });
+      this.emit(job, "retried", "pending");
+      return;
+    }
+
+    const content = draft.getContent();
+    const succeeded = !agentError && draft.isCreated() && content.trim().length > 0;
+
+    // Record the synthetic session's terminal status (spec §5). Content capture
+    // is handled by attachSessionCapture above; this only flips status/error.
+    if (succeeded) {
+      await storage.updateAgentSessionStatus(syntheticSession.id, "completed", {
+        completedAt: Date.now(),
+      });
+    } else {
+      const sessionErr = agentError instanceof Error
+        ? agentError.message
+        : agentError != null
+          ? String(agentError)
+          : "summary draft empty or not created";
+      await storage.updateAgentSessionStatus(syntheticSession.id, "discarded", {
+        completedAt: Date.now(),
+        error: sessionErr,
+      });
+    }
+
+    if (succeeded) {
+      const summaryId = `sum_${nanoid(10)}`;
+      const tokenCount = estimateTokens(content);
+      await storage.insertSummaryWithLineage({
+        id: summaryId,
+        timelineKey: job.timelineKey,
+        level: job.level,
+        content,
+        earliestTimestamp: input.earliestTimestamp,
+        latestTimestamp: input.latestTimestamp,
+        latestEventId: input.latestEventId,
+        eventCount: input.eventCount,
+        tokenCount,
+        modelId: input.modelId,
+        status: "complete",
+        generatedAt: Date.now(),
+        eventIds: input.eventIds,
+        parentIds: input.parentIds,
+        jobId: job.id,
+        absorbedParentId: job.absorbedParentId ?? undefined,
+      });
+      logger.info("summarization_complete", {
+        jobId: job.id,
+        summaryId,
+        summaryLevel: job.level,
+        tokenCount,
+        elapsed: Date.now() - started,
+      });
+      if (!judged) void this.options.outputChecks?.artifact({
+        ...this.checkScope(job, syntheticSession, runMessages),
+        kind: job.level === 1 ? "summary" : "condense",
+        text: content,
+      });
+      this.options.onComplete(job.id, summaryId);
+      this.emit(job, "completed", "complete");
+      await this.runCondensation(job.timelineKey, job.level);
+      return;
+    }
+
+    // Failure path. attempts was already incremented at claim time.
+    const errMsg = agentError instanceof Error
+      ? agentError.message
+      : agentError != null
+        ? String(agentError)
+        : "summary draft empty or not created";
+
+    if (content.trim().length > 0) {
+      const existing = job.bestEffortDraft;
+      if (!existing || estimateTokens(content) < estimateTokens(existing)) {
+        await storage.saveBestEffortDraft(job.id, content);
+      }
+    }
+
+    logger.error("summarization_failed", {
+      jobId: job.id,
+      summaryLevel: job.level,
+      attempt: job.attempts,
+      error: errMsg,
+    });
+    // A run that produced no summary is judged for a refusal before its re-run
+    // (spec REFUSAL-HANDLING §5.2.4); observe-only, the re-run is unchanged.
+    if (!judged && runMessages && runMessages.length > 0) {
+      void this.options.outputChecks?.rollout({
+        ...this.checkScope(job, syntheticSession, runMessages),
+        kind: job.level === 1 ? "summary" : "condense",
+        messages: runMessages,
+      });
+    }
+
+    try {
+      if (refusalExhausted) {
+        // Every entry of the matching refusal rule refused too (spec
+        // REFUSAL-HANDLING §8.2): no output, no salvaged draft, no re-run.
+        logger.warn("summarization_refusal_exhausted", { jobId: job.id, summaryLevel: job.level, attempt: job.attempts });
+        await storage.failSummarizationJob(job.id, errMsg);
+        this.options.onError(job.id, new Error(errMsg));
+        this.emit(job, "failed", "failed");
+      } else if (job.attempts <= job.maxRetries) {
+        await storage.retrySummarizationJob(job.id, errMsg);
+        this.emit(job, "retried", "pending");
+      } else {
+        await this.truncationFallback(
+          job,
+          input,
+          errMsg,
+          draft.isCreated() ? draft.getContent() : undefined,
+        );
+      }
+    } catch (writeErr) {
+      // Retry/truncation write failed — try to fail the job so it doesn't stay
+      // stuck in 'processing' forever.
+      const writeErrMsg = writeErr instanceof Error ? writeErr.message : String(writeErr);
+      logger.error("summarization_retry_write_failed", {
+        jobId: job.id,
+        originalError: errMsg,
+        writeError: writeErrMsg,
+      });
+      try {
+        await storage.failSummarizationJob(job.id, `retry/truncation write failed: ${writeErrMsg}`);
+      } catch (failErr) {
+        logger.error("summarization_fail_fallback_failed", {
+          jobId: job.id,
+          error: failErr instanceof Error ? failErr.message : String(failErr),
+        });
+      }
+      this.options.onError(job.id, new Error(errMsg));
+      this.emit(job, "failed", "failed");
+    }
+  }
+
+  /**
+   * One run of a job on a fresh synthetic session (pinned to a refusal rule's
+   * entry for a soft-refusal rerun, spec REFUSAL-HANDLING §5.2.4).
+   */
+  private async runAttempt(job: SummarizationJob, input: ResolvedInput, pin: RefusalPin | undefined): Promise<SummaryAttempt> {
+    const { storage, factory, config, logger } = this.options;
     const draft = new SummaryDraft();
     const summaryTool = createSummaryTool({
       draft,
@@ -371,6 +589,7 @@ export class SummarizationWorkerPool {
     });
 
     let agentError: unknown;
+    let servedModel: string | undefined;
     // Set when a refusal rule's entries were all exhausted (spec REFUSAL-HANDLING
     // §8.2): the job ends with no output and is not re-run on the refusing model.
     let refusalExhausted = false;
@@ -400,6 +619,7 @@ export class SummarizationWorkerPool {
           // attempt, so the job id is the only stable handle.
           priority: job.priority,
           escalationKey: `sumjob:${job.id}`,
+          ...(pin ? { refusalPin: pin } : {}),
         },
       );
 
@@ -505,160 +725,34 @@ export class SummarizationWorkerPool {
         this.activeAgents.delete(agent);
         capture.detach();
         runMessages = agent.state.messages;
+        servedModel = refusal?.servingModel();
       }
     } catch (err) {
       agentError = err;
     }
+    return { draft, syntheticSession, agentError, refusalExhausted, runMessages, servedModel };
+  }
 
-    // Drain abort (spec LLM-FAILURE-HANDLING §7): the run was cancelled by the
-    // pool's own stop(), not judged. The job returns to 'pending' with its
-    // claim-time attempts increment compensated; a restart re-claims and
-    // re-runs from scratch. Any partial draft is discarded (it was produced by
-    // an aborted run); the session row records the interruption.
-    if (agentError instanceof WorkerDrainAbortError) {
-      await storage.updateAgentSessionStatus(syntheticSession.id, "interrupted", {
-        completedAt: Date.now(),
-        error: agentError.message,
-      });
-      await storage.returnSummarizationJobToPending(job.id);
-      logger.info("summarization_drain_requeued", {
-        jobId: job.id,
-        summaryLevel: job.level,
-        attempt: job.attempts,
-      });
-      this.emit(job, "retried", "pending");
-      return;
-    }
-
-    const content = draft.getContent();
-    const succeeded = !agentError && draft.isCreated() && content.trim().length > 0;
-
-    // Record the synthetic session's terminal status (spec §5). Content capture
-    // is handled by attachSessionCapture above; this only flips status/error.
-    if (succeeded) {
-      await storage.updateAgentSessionStatus(syntheticSession.id, "completed", {
-        completedAt: Date.now(),
-      });
-    } else {
-      const sessionErr = agentError instanceof Error
-        ? agentError.message
-        : agentError != null
-          ? String(agentError)
-          : "summary draft empty or not created";
-      await storage.updateAgentSessionStatus(syntheticSession.id, "discarded", {
-        completedAt: Date.now(),
-        error: sessionErr,
-      });
-    }
-
-    if (succeeded) {
-      const summaryId = `sum_${nanoid(10)}`;
-      const tokenCount = estimateTokens(content);
-      await storage.insertSummaryWithLineage({
-        id: summaryId,
-        timelineKey: job.timelineKey,
-        level: job.level,
-        content,
-        earliestTimestamp: input.earliestTimestamp,
-        latestTimestamp: input.latestTimestamp,
-        latestEventId: input.latestEventId,
-        eventCount: input.eventCount,
-        tokenCount,
-        modelId: input.modelId,
-        status: "complete",
-        generatedAt: Date.now(),
-        eventIds: input.eventIds,
-        parentIds: input.parentIds,
-        jobId: job.id,
-        absorbedParentId: job.absorbedParentId ?? undefined,
-      });
-      logger.info("summarization_complete", {
-        jobId: job.id,
-        summaryId,
-        summaryLevel: job.level,
-        tokenCount,
-        elapsed: Date.now() - started,
-      });
-      void this.options.outputChecks?.artifact({
-        ...this.checkScope(job, syntheticSession, runMessages),
-        kind: job.level === 1 ? "summary" : "condense",
-        text: content,
-      });
-      this.options.onComplete(job.id, summaryId);
-      this.emit(job, "completed", "complete");
-      await this.runCondensation(job.timelineKey, job.level);
-      return;
-    }
-
-    // Failure path. attempts was already incremented at claim time.
-    const errMsg = agentError instanceof Error
-      ? agentError.message
-      : agentError != null
-        ? String(agentError)
-        : "summary draft empty or not created";
-
-    if (content.trim().length > 0) {
-      const existing = job.bestEffortDraft;
-      if (!existing || estimateTokens(content) < estimateTokens(existing)) {
-        await storage.saveBestEffortDraft(job.id, content);
-      }
-    }
-
-    logger.error("summarization_failed", {
-      jobId: job.id,
-      summaryLevel: job.level,
-      attempt: job.attempts,
-      error: errMsg,
+  /** The job's soft-refusal walk, when output checks are wired and a soft rule admits its site. */
+  private jobSoftRefusal(job: SummarizationJob): JobSoftRefusalRedo | undefined {
+    const { outputChecks, refusals, factory } = this.options;
+    if (!outputChecks || !refusals || refusals.rules.length === 0) return undefined;
+    const redo = new JobSoftRefusalRedo({
+      checks: outputChecks,
+      rules: refusals.rules,
+      site: job.level === 1 ? "summarize" : "condense",
+      agent: refusals.agentFor?.(job.timelineKey) ?? null,
+      usable: (model) => factory.refusalEntryViable(model),
+      chainOf: (model) => {
+        try {
+          return factory.resolveModelChainLogicalIdsForModel(model);
+        } catch {
+          return [model];
+        }
+      },
+      logger: this.options.logger,
     });
-    // A run that produced no summary is judged for a refusal before its re-run
-    // (spec REFUSAL-HANDLING §5.2.4); observe-only, the re-run is unchanged.
-    if (runMessages && runMessages.length > 0) {
-      void this.options.outputChecks?.rollout({
-        ...this.checkScope(job, syntheticSession, runMessages),
-        kind: job.level === 1 ? "summary" : "condense",
-        messages: runMessages,
-      });
-    }
-
-    try {
-      if (refusalExhausted) {
-        // Every entry of the matching refusal rule refused too (spec
-        // REFUSAL-HANDLING §8.2): no output, no salvaged draft, no re-run.
-        logger.warn("summarization_refusal_exhausted", { jobId: job.id, summaryLevel: job.level, attempt: job.attempts });
-        await storage.failSummarizationJob(job.id, errMsg);
-        this.options.onError(job.id, new Error(errMsg));
-        this.emit(job, "failed", "failed");
-      } else if (job.attempts <= job.maxRetries) {
-        await storage.retrySummarizationJob(job.id, errMsg);
-        this.emit(job, "retried", "pending");
-      } else {
-        await this.truncationFallback(
-          job,
-          input,
-          errMsg,
-          draft.isCreated() ? draft.getContent() : undefined,
-        );
-      }
-    } catch (writeErr) {
-      // Retry/truncation write failed — try to fail the job so it doesn't stay
-      // stuck in 'processing' forever.
-      const writeErrMsg = writeErr instanceof Error ? writeErr.message : String(writeErr);
-      logger.error("summarization_retry_write_failed", {
-        jobId: job.id,
-        originalError: errMsg,
-        writeError: writeErrMsg,
-      });
-      try {
-        await storage.failSummarizationJob(job.id, `retry/truncation write failed: ${writeErrMsg}`);
-      } catch (failErr) {
-        logger.error("summarization_fail_fallback_failed", {
-          jobId: job.id,
-          error: failErr instanceof Error ? failErr.message : String(failErr),
-        });
-      }
-      this.options.onError(job.id, new Error(errMsg));
-      this.emit(job, "failed", "failed");
-    }
+    return redo.active ? redo : undefined;
   }
 
   /** Where an output check of this job's run is attributed (spec REFUSAL-HANDLING §10.1). */

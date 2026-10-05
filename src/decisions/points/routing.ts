@@ -1,10 +1,12 @@
 /**
  * Routing (ARCHITECTURE.md §8h "Routing"): at the creation of a human-triggered
- * chat session, classify the request by task category (an operator-defined
- * `choice`), optionally by difficulty (a `score`), and optionally ask which
- * listed skill it needs. The verdict names a model preference cascade, a
- * thinking level, skills to preload, and extra tail files. The fallback is
- * today's behaviour: no routing at all.
+ * chat session, label the request with its tasks (one `noul` per
+ * operator-defined task, multi-label: DECISION-MODEL §5.1a), optionally score
+ * its difficulty (a `score`), and optionally ask which listed skills it needs
+ * (one `noul` per skill). The verdict names the selected tasks, a model
+ * preference cascade, a thinking level, skills to preload, and extra tail
+ * files, merged over the selected tasks. The fallback is today's behaviour: no
+ * routing at all (and no tasks).
  */
 
 import type { AppConfig } from "../../config/index.js";
@@ -21,6 +23,32 @@ type ThinkingLevel = NonNullable<AppConfig["models"]["default"]["thinking_level"
 
 export const ROUTING_OTHER = "other";
 export const ROUTING_NO_SKILL = "none";
+/**
+ * The built-in task of every proactive session (DECISION-MODEL §5.1a), assigned
+ * without a decision call. Reserved like `other`: config cannot define it.
+ */
+export const ROUTING_PROACTIVE = "proactive";
+/** Task keys config cannot define (`[decisions.routing.tasks.<key>]`). */
+export const RESERVED_ROUTING_TASKS: readonly string[] = [ROUTING_OTHER, ROUTING_PROACTIVE];
+
+/** The routing question id of a task's `noul`. */
+export function taskQuestionId(key: string): string {
+  return `task__${key}`;
+}
+
+/** The routing question id of a listed skill's `noul`. */
+export function skillQuestionId(name: string): string {
+  return `skill__${name}`;
+}
+
+const THINKING_ORDER: readonly string[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+
+/** The higher of two thinking levels (unknown levels rank lowest). */
+function higherThinking(a: ThinkingLevel | undefined, b: ThinkingLevel | undefined): ThinkingLevel | undefined {
+  if (a === undefined) return b;
+  if (b === undefined) return a;
+  return THINKING_ORDER.indexOf(b) > THINKING_ORDER.indexOf(a) ? b : a;
+}
 
 export interface RoutingInput {
   request: TranscriptMessage & { reply_to?: { from: string; text: string } };
@@ -35,8 +63,13 @@ export interface RoutingInput {
 }
 
 export interface RoutingVerdict {
-  /** The confident task category, or "other". */
+  /** The first selected task (authored order), or "other". */
   task: string;
+  /**
+   * Every selected task, in authored order (DECISION-MODEL §5.1a); `["other"]`
+   * when the model selected none. Empty only on the fallback verdict.
+   */
+  tasks: string[];
   /** Difficulty level index, when asked and confident. */
   difficulty?: number;
   /** Model preference cascade ([models.*] keys), tried before normal selection. */
@@ -54,7 +87,12 @@ export interface RoutingVerdict {
   decisionGroup?: string;
 }
 
-export const NO_ROUTING: RoutingVerdict = { task: ROUTING_OTHER, models: [], skills: [], tailFiles: [] };
+export const NO_ROUTING: RoutingVerdict = { task: ROUTING_OTHER, tasks: [], models: [], skills: [], tailFiles: [] };
+
+/** The task keys a routing verdict gives its session (a hand-built verdict without `tasks` keeps its `task`). */
+export function routingTasksOf(verdict: Pick<RoutingVerdict, "task" | "tasks">): string[] {
+  return verdict.tasks && verdict.tasks.length > 0 ? [...verdict.tasks] : [verdict.task];
+}
 
 /** Does routing have anything to ask for this session? */
 export function routingHasQuestions(input: Pick<RoutingInput, "tasks" | "difficulty" | "preloadSkills" | "skills">): boolean {
@@ -75,17 +113,19 @@ export const routingPoint: DecisionPoint<RoutingInput, RoutingVerdict> = {
 
   questions(input) {
     const questions: Record<string, DecisionQuestion> = {};
-    const taskKeys = Object.keys(input.tasks);
-    if (taskKeys.length > 0) {
-      const criteria: Record<string, string> = {};
-      for (const key of taskKeys) criteria[key] = input.tasks[key]!.description;
-      criteria[ROUTING_OTHER] = "None of the above; ordinary conversation or anything else.";
-      questions["task"] = {
-        type: "choice",
+    // Multi-label tasks (DECISION-MODEL §5.1a): one `noul` per task, so a
+    // request may select several; none selected = `other`.
+    for (const [key, task] of Object.entries(input.tasks)) {
+      questions[taskQuestionId(key)] = {
+        type: "noul",
         instructions:
           "`request` is the latest message sent to the assistant; `recent` is the conversation before it, " +
-          "for context only. Which kind of task does `request` ask the assistant to do?",
-        criteria,
+          "for context only. The request involves this kind of task: " +
+          task.description,
+        criteria: {
+          true: `\`request\` involves this: ${task.description}`,
+          false: "`request` does not involve this kind of task (ordinary conversation, or other kinds of work).",
+        },
       };
     }
     if (input.difficulty) {
@@ -95,17 +135,18 @@ export const routingPoint: DecisionPoint<RoutingInput, RoutingVerdict> = {
         criteria: input.difficulty.levels,
       };
     }
-    if (input.preloadSkills && input.skills.length > 0) {
-      const criteria: Record<string, string> = {};
-      for (const skill of input.skills) criteria[skill.name] = skill.description;
-      criteria[ROUTING_NO_SKILL] = "No skill is clearly needed: plain conversation, or the request needs none of these.";
-      questions["skill"] = {
-        type: "choice",
-        instructions:
-          "Which of these skills does the assistant need to load to handle `request`? " +
-          "Pick the one it would need first.",
-        criteria,
-      };
+    if (input.preloadSkills) {
+      // One `noul` per listed skill, so a request can preload several.
+      for (const skill of input.skills) {
+        questions[skillQuestionId(skill.name)] = {
+          type: "noul",
+          instructions: "Does the assistant need to load this skill to handle `request`? The skill: " + skill.description,
+          criteria: {
+            true: `Handling \`request\` needs this skill: ${skill.description}`,
+            false: "The skill is not needed: plain conversation, or the request needs other skills or none.",
+          },
+        };
+      }
     }
     return questions;
   },
@@ -125,44 +166,64 @@ export const routingPoint: DecisionPoint<RoutingInput, RoutingVerdict> = {
 
   resolve(answers, input, threshold, settings) {
     const minConfidence = threshold("min_confidence", settings.minConfidence);
-    let confidentAnswer = false;
-    let task = ROUTING_OTHER;
-    const taskAnswer = answers["task"];
-    if (taskAnswer?.type === "choice" && taskAnswer.confidence >= minConfidence) {
-      confidentAnswer = true;
-      task = taskAnswer.choice;
+    // Tasks (DECISION-MODEL §5.1a): every task at or above its own threshold
+    // (`tasks.<key>.threshold`, default the point's floor; calibration key
+    // `"routing.task.<key>"`) is selected, in authored order.
+    const taskKeys = Object.keys(input.tasks);
+    let tasksAnswered = false;
+    const selected: string[] = [];
+    for (const key of taskKeys) {
+      const answer = answers[taskQuestionId(key)];
+      if (answer?.type !== "noul") continue;
+      tasksAnswered = true;
+      const floor = threshold(`task.${key}`, input.tasks[key]!.threshold ?? minConfidence);
+      if (answer.noul >= floor) selected.push(key);
     }
     let difficulty: number | undefined;
     const difficultyAnswer = answers["difficulty"];
     if (difficultyAnswer?.type === "score" && difficultyAnswer.confidence >= minConfidence) {
-      confidentAnswer = true;
       difficulty = difficultyAnswer.score;
     }
-    let skillChoice: string | undefined;
-    const skillAnswer = answers["skill"];
-    if (skillAnswer?.type === "choice" && skillAnswer.confidence >= minConfidence) {
-      confidentAnswer = true;
-      if (skillAnswer.choice !== ROUTING_NO_SKILL) skillChoice = skillAnswer.choice;
+    const skillChoices: string[] = [];
+    for (const skill of input.skills) {
+      const answer = answers[skillQuestionId(skill.name)];
+      if (answer?.type !== "noul") continue;
+      if (answer.noul >= threshold(`skill.${skill.name}`, minConfidence)) skillChoices.push(skill.name);
     }
-    if (!confidentAnswer) return null;
+    // Nothing to apply and no task labels to give: fall back (no routing).
+    if (!tasksAnswered && difficulty === undefined && skillChoices.length === 0) return null;
 
-    const taskConfig = task === ROUTING_OTHER ? undefined : input.tasks[task];
-    let models = cascadeOf(taskConfig);
-    let thinkingLevel = taskConfig?.thinking_level as ThinkingLevel | undefined;
-    // The difficulty axis only routes requests no category covers.
-    if (task === ROUTING_OTHER && difficulty !== undefined && input.difficulty) {
-      models = input.difficulty.models?.[String(difficulty)] ?? [];
-      thinkingLevel = input.difficulty.thinking_levels?.[String(difficulty)] as ThinkingLevel | undefined;
+    const configs = selected.map((key) => input.tasks[key]!);
+    const models: string[] = [];
+    const skills: string[] = [];
+    const tailFiles: string[] = [];
+    let thinkingLevel: ThinkingLevel | undefined;
+    const add = (into: string[], items: readonly string[] | undefined) => {
+      for (const item of items ?? []) if (!into.includes(item)) into.push(item);
+    };
+    for (const config of configs) {
+      // Cascades concatenated in authored order: the first selected task with
+      // models heads the session, the others extend the cascade.
+      add(models, cascadeOf(config));
+      add(skills, config.skills);
+      add(tailFiles, config.tail_files);
+      thinkingLevel = higherThinking(thinkingLevel, config.thinking_level as ThinkingLevel | undefined);
     }
-    const skills = [...(taskConfig?.skills ?? [])];
-    if (skillChoice && !skills.includes(skillChoice)) skills.push(skillChoice);
+    // The difficulty axis applies when no selected task names models.
+    if (models.length === 0 && difficulty !== undefined && input.difficulty) {
+      add(models, input.difficulty.models?.[String(difficulty)]);
+      thinkingLevel ??= input.difficulty.thinking_levels?.[String(difficulty)] as ThinkingLevel | undefined;
+    }
+    add(skills, skillChoices);
+    const tasks = selected.length > 0 ? selected : [ROUTING_OTHER];
     return {
-      task,
+      task: tasks[0]!,
+      tasks,
       ...(difficulty !== undefined ? { difficulty } : {}),
       models,
       ...(thinkingLevel ? { thinkingLevel } : {}),
       skills,
-      tailFiles: [...(taskConfig?.tail_files ?? [])],
+      tailFiles,
     };
   },
 
@@ -170,6 +231,7 @@ export const routingPoint: DecisionPoint<RoutingInput, RoutingVerdict> = {
 
   describe: (verdict) => ({
     task: verdict.task,
+    ...(verdict.tasks.length > 0 ? { tasks: verdict.tasks } : {}),
     ...(verdict.difficulty !== undefined ? { difficulty: verdict.difficulty } : {}),
     ...(verdict.models.length > 0 ? { models: verdict.models } : {}),
     ...(verdict.thinkingLevel ? { thinkingLevel: verdict.thinkingLevel } : {}),

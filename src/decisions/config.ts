@@ -392,6 +392,9 @@ function validateEffective(
   };
   for (const [task, def] of Object.entries(routing.tasks ?? {})) {
     if (task === "other") throw new Error(`${where}.routing.tasks.other: "other" is the implicit no-match category`);
+    if (task === "proactive") {
+      throw new Error(`${where}.routing.tasks.proactive: "proactive" is the built-in task of proactive sessions`);
+    }
     if (def.model !== undefined && def.models !== undefined) {
       throw new Error(`${where}.routing.tasks.${task}: set model or models, not both`);
     }

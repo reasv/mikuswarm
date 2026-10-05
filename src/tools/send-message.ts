@@ -70,6 +70,61 @@ function resolveSelfSender(context: SendMessageToolContext): SenderInfo {
   return { id: "mikuswarm", displayName: "Miku", isSelf: true };
 }
 
+/**
+ * The cheap refusals `send_message` makes before sending anything: a reply
+ * without `reply_to_id`, a reply to a message another session is handling (the
+ * live claim guard), an empty send. Also the tool's `gatePrecheck`, so the
+ * output gate never holds or judges a call the tool would refuse anyway (spec
+ * REFUSAL-HANDLING §6.2: claim guard → evaluation → send). Undefined = go on.
+ */
+export function sendMessagePrecheck(
+  context: Pick<SendMessageToolContext, "isClaimedByOther">,
+  args: { message: string; html?: string; is_reply: boolean; reply_to_id?: string; media?: string | string[] },
+): { content: Array<{ type: "text"; text: string }>; details: null } | undefined {
+  if (args.is_reply && !args.reply_to_id?.trim()) {
+    return {
+      content: [{ type: "text", text: "error: reply_to_id is required when is_reply is true. Provide the event ID of the message you want to reply to." }],
+      details: null,
+    };
+  }
+
+  // Live reply guard (spec DUPLICATE-REPLY-MITIGATION §6): refuse to REPLY to a
+  // message another session is currently handling. Scoped to exactly this one
+  // mechanical signal (`reply_to_id`) so false positives are near-zero — inline
+  // addressing without a reply marker stays the marker/coordination line's job
+  // (§4). The error is a redirect (names the alternatives), not a refusal, and
+  // does NOT terminate — the agent gets another turn.
+  if (args.is_reply && args.reply_to_id?.trim() && context.isClaimedByOther) {
+    const claim = context.isClaimedByOther(args.reply_to_id.trim());
+    if (claim) {
+      // The owning session may not be attributed yet (a queued / just-accepted
+      // claim — review #4); name it when known, else describe it generically.
+      const who = claim.sessionId ? `another session (${claim.sessionId})` : "a session that's starting up";
+      return {
+        content: [{
+          type: "text",
+          text: `error: ${args.reply_to_id.trim()} is currently being handled by ${who}. Don't reply to it — that session has it. If you only meant to surface or quote it, send without is_reply. If it needs independent handling, that's already covered.`,
+        }],
+        details: null,
+      };
+    }
+  }
+
+  // A send with no text, no HTML, and no media has nothing to deliver — it would
+  // produce an empty event (or, historically, silently send nothing). If you
+  // have nothing to say, end the turn by calling no_reply instead.
+  const hasMedia = Array.isArray(args.media)
+    ? args.media.some((s) => s.trim())
+    : (args.media?.trim() ?? "").length > 0;
+  if (!args.message.trim() && !args.html?.trim() && !hasMedia) {
+    return {
+      content: [{ type: "text", text: "error: nothing to send — provide message text, html, or media. If you have nothing to say, call no_reply to end your turn silently." }],
+      details: null,
+    };
+  }
+  return undefined;
+}
+
 export function createSendMessageTool(context: SendMessageToolContext): AgentTool {
   const t = context.terminology ?? MATRIX_TERMINOLOGY;
   // Optional-chain safe: resume-exempt.ts constructs tools with a stub context at
@@ -100,7 +155,7 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
           ),
         )
       : Type.Optional(Type.String({ description: "Path to local file (relative to workspace) or URL to send as media attachment." }));
-  return {
+  const tool: AgentTool & { gatePrecheck?: (params: unknown) => ReturnType<typeof sendMessagePrecheck> } = {
     name: "send_message",
     label: "Send message",
     // Resume work gate (spec RESUMABLE-SESSIONS §7a): chat-surface — the effect IS
@@ -132,47 +187,8 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
       };
       const isFinal = args.final;
 
-      if (args.is_reply && !args.reply_to_id?.trim()) {
-        return {
-          content: [{ type: "text", text: "error: reply_to_id is required when is_reply is true. Provide the event ID of the message you want to reply to." }],
-          details: null,
-        };
-      }
-
-      // Live reply guard (spec DUPLICATE-REPLY-MITIGATION §6): refuse to REPLY to a
-      // message another session is currently handling. Scoped to exactly this one
-      // mechanical signal (`reply_to_id`) so false positives are near-zero — inline
-      // addressing without a reply marker stays the marker/coordination line's job
-      // (§4). The error is a redirect (names the alternatives), not a refusal, and
-      // does NOT terminate — the agent gets another turn.
-      if (args.is_reply && args.reply_to_id?.trim() && context.isClaimedByOther) {
-        const claim = context.isClaimedByOther(args.reply_to_id.trim());
-        if (claim) {
-          // The owning session may not be attributed yet (a queued / just-accepted
-          // claim — review #4); name it when known, else describe it generically.
-          const who = claim.sessionId ? `another session (${claim.sessionId})` : "a session that's starting up";
-          return {
-            content: [{
-              type: "text",
-              text: `error: ${args.reply_to_id.trim()} is currently being handled by ${who}. Don't reply to it — that session has it. If you only meant to surface or quote it, send without is_reply. If it needs independent handling, that's already covered.`,
-            }],
-            details: null,
-          };
-        }
-      }
-
-      // A send with no text, no HTML, and no media has nothing to deliver — it would
-      // produce an empty event (or, historically, silently send nothing). If you
-      // have nothing to say, end the turn by calling no_reply instead.
-      const hasMedia = Array.isArray(args.media)
-        ? args.media.some((s) => s.trim())
-        : (args.media?.trim() ?? "").length > 0;
-      if (!args.message.trim() && !args.html?.trim() && !hasMedia) {
-        return {
-          content: [{ type: "text", text: "error: nothing to send — provide message text, html, or media. If you have nothing to say, call no_reply to end your turn silently." }],
-          details: null,
-        };
-      }
+      const refused = sendMessagePrecheck(context, args);
+      if (refused) return refused;
 
       const effectiveTarget: OutboundTarget = { ...context.target };
       if (args.is_reply) {
@@ -321,6 +337,9 @@ export function createSendMessageTool(context: SendMessageToolContext): AgentToo
       }
     },
   };
+  // The output gate runs these first (spec REFUSAL-HANDLING §6.2).
+  tool.gatePrecheck = (params) => sendMessagePrecheck(context, params as Parameters<typeof sendMessagePrecheck>[1]);
+  return tool;
 }
 
 /**

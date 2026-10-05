@@ -56,6 +56,12 @@ export function isRefusalExhausted(error: unknown): boolean {
   return !!error && typeof error === "object" && (error as { [EXHAUSTED]?: boolean })[EXHAUSTED] === true;
 }
 
+/** Mark an error as "every entry of a matching refusal rule refused" (see {@link isRefusalExhausted}). */
+export function markRefusalExhausted<E extends object>(error: E): E {
+  (error as { [EXHAUSTED]?: boolean })[EXHAUSTED] = true;
+  return error;
+}
+
 export interface FetchRefusalRouting {
   /** The refusal site (`caption`). */
   site: string;
