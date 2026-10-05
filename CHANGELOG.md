@@ -59,14 +59,17 @@ Unreleased section; it is not part of any release's notes.
   view. Configured under `[decisions]`, with per-agent overrides in
   `[agents.<name>.decisions]`. See ARCHITECTURE.md §8h.
 - **Decision-model routing** (`[decisions.routing]`, off by default): when a human starts a
-  chat session, the decision model classifies the request into operator-defined task
-  categories (and optionally a difficulty level) and picks the listed skill it needs. A
+  chat session, the decision model labels the request with every operator-defined task
+  category it involves (one yes/no question per task, each with an optional own
+  `threshold`; optionally a difficulty level) and with the listed skills it needs. A
   category can name a model preference cascade (`models = [...]`, tried before normal
   selection, with per-user affordability and health checks; when every entry is exhausted
   selection is unchanged), a `thinking_level`, skills to preload, and extra `tail_files`.
   Preloaded skills are loaded by synthetic `load_skill` calls at the start of the session's
   transcript, so the cached prompt prefix is unchanged and a resume finds them already
-  loaded. Low confidence or any decision-model failure leaves the session exactly as before.
+  loaded. Several selected tasks join their cascades in config order and take the highest
+  thinking level. Proactive sessions carry the built-in `proactive` task (a reserved key).
+  Low confidence or any decision-model failure leaves the session exactly as before.
   Database schema v22 adds `agent_sessions.initial_preloads`.
 - **Model prompts** (off by default): a model can carry its own system-prompt preamble and
   tail, defined as named `[model_prompts.<name>]` profiles and assigned with
@@ -145,6 +148,57 @@ Unreleased section; it is not part of any release's notes.
   blocks to the exact request prefix, thinking produced before a session
   resume, or before a tool load that changed `tools`, is left out of the
   request so it is not rejected. Later thinking is still replayed.
+
+- **Refusal rules** (`[[refusal_fallback]]`, none by default). A refusal can be
+  sent to other models chosen by site, reason, refusing model, agent and routed
+  task: a matching rule replaces the chain fallover, tries its `models` in order
+  (`{ model, tries }` entries, `@same` retries the model that refused), keeps the
+  rest of the session on the model that succeeded (with that model's own model
+  prompts), and decides what happens when every entry refuses (`on_exhausted`:
+  `send_last`, `withhold`, `park`). Rules cover chat and proactive sessions, the
+  session record turn, summaries, diary entries and captions. Anthropic refusal
+  categories are recognized, a refused attempt's usage is billed to the model
+  that refused, and every refusal is recorded. Database schema v25 adds
+  `refusal_events`, `contract_attempts` and `agent_session_branches`, plus new
+  columns on `agent_sessions`, `decision_evaluations` and `usage_events`
+  (`system_prompt_hash`). See ARCHITECTURE.md §8j.
+
+- **Output checks** (`[checks]`, `[decisions.checks]`; judged checks off by
+  default). A check catalogue of refusal reasons, style issues and send-contract
+  diagnostics, detected by provider stop reasons, patterns and word lists, or
+  decision-model questions. Messages, `no_reply` and other endings, summaries,
+  diary entries, captions and session records can be judged; a message is held
+  only when a verdict could act (5 s deadline, then sent unjudged). A judged
+  refusal with a matching rule discards the turn and redoes it on the rule's
+  model; the discarded part is kept as a branch. Eleven starter style checks ship
+  disabled (em-dashes, "not X but Y", sycophantic openers, sign-offs, stock
+  vocabulary, AI disclaimers, emoji and more): when enabled, a flagged message is
+  returned to the agent to rewrite, within per-message and per-session bounds,
+  and the posting tools gain an `override_checks` argument for false positives.
+  Per-agent overrides in `[agents.<name>.checks]`.
+
+- **Send-contract records and redo.** Every forced-completion nudge is tagged
+  and every attempt is recorded per model (`contract_attempts`, with failure
+  types such as text-only replies and tool calls written as text), live and for
+  history. `[agent.sessions].forced_completion_redo` (default off) discards the
+  failed attempts and retries once on the same model before giving up.
+
+- **Model behaviour page** (`/models` in the console): per-model refusal rates,
+  send-contract failures and recoveries, style hits, revisions and redos, with
+  trends, a breakdown, an incident log linking into sessions, and markers for
+  config, code and prompt changes. `[models.<key>].family` groups entries by
+  underlying model. The session view shows redo branches with a switcher, check
+  cards on judged messages and endings, nudge cards and refusal markers, and the
+  session list shows refused, redone, nudged, revised and unjudged counts.
+  Database schema v26 adds the statistics tables, filled from history in the
+  background.
+
+- **Offline audit worker** (`[decisions.audit]`, off by default): diagnoses
+  send-contract failures and judges past sessions' messages after they finish,
+  so the statistics cover history too. Spend is recorded as usage class `audit`
+  (`[[limits]].classes` accepts `"audit"`). `scripts/calibrate-checks.ts`
+  calibrates check thresholds against model-made labels without anyone reading
+  the messages. Database schema v27 adds `session_audits`.
 
 ### Changed
 
