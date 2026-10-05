@@ -148,6 +148,7 @@ import {
   type RecordsCandidate,
 } from "./decisions/index.js";
 import { buildCheckCatalogue } from "./checks/catalogue.js";
+import { ModelBehaviourService } from "./behaviour/index.js";
 import { validateRefusalRules } from "./refusals/rules.js";
 import type { SyntheticCallSpec } from "./agent/synthetic-calls.js";
 import { SauceNaoRateLimiter } from "./saucenao/rate-limiter.js";
@@ -1832,6 +1833,23 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     if (!entry || entry.agentName === "__legacy__") return null;
     return entry.agentName;
   };
+  // Model behaviour statistics (spec REFUSAL-HANDLING §12.3, §12.4): the boot
+  // behaviour snapshot + its change events, observed prompt changes (fed from the
+  // ledger fan-in below) and the hourly rollups behind the console's /models page.
+  // Best-effort: a failure here never blocks startup.
+  const modelBehaviour = new ModelBehaviourService({
+    storage,
+    config,
+    catalogue: checkCatalogue,
+    agentForTimelineKey: (timelineKey) => (timelineKey ? agentNameForTimeline(timelineKey) : null),
+    logger: logger.child("model-behaviour"),
+  });
+  try {
+    await modelBehaviour.recordStartupSnapshot();
+    modelBehaviour.start();
+  } catch (error) {
+    logger.warn("model_behaviour_start_failed", { error: error instanceof Error ? error.message : String(error) });
+  }
   // Decision models (ARCHITECTURE.md §8h). Built only when some point can run, so a
   // deployment without decision points never constructs a client.
   const decisionEngine = anyDecisionPointEnabled(config)
@@ -2170,6 +2188,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           }
         }
       }
+      // Observed prompt changes (spec REFUSAL-HANDLING §12.4): in-memory compare, never throws.
+      modelBehaviour.observeUsage(event);
       void storage.insertUsageEvent(event).catch((error) => {
         logger.warn("usage_event_insert_failed", {
           class: event.class,
@@ -7691,6 +7711,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       budgetEngine: budgetHooks.engine,
       // Per-user limits meters for the Usage & Cost page (spec PER-USER-LIMITS §14).
       userLimitEngine,
+      // Model behaviour page (spec REFUSAL-HANDLING §12.3).
+      modelBehaviour,
       logger: logger.child("console"),
     });
     await consoleServer.start();
@@ -7828,6 +7850,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         proactiveScheduler.stop();
         // Stop the per-user limits reconcile tick (spec PER-USER-LIMITS §8.2).
         userLimitEngine?.stop();
+        // Stop the model behaviour rollup drain (spec REFUSAL-HANDLING §12.3).
+        modelBehaviour.stop();
         // Stop the console first: it stops accepting requests and tears down any
         // open SSE streams before the live state it reads begins shutting down.
         if (consoleServer) await consoleServer.stop();

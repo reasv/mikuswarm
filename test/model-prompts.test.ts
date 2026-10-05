@@ -13,6 +13,7 @@ import {
   renderModelTail,
   resolveModelPromptProfile,
   spliceModelTail,
+  systemPromptHashOf,
 } from "../src/agent/model-prompts.js";
 import type { AgentSessionRecord } from "../src/agent/session-manager.js";
 import { loadConfig, type AppConfig } from "../src/config/index.js";
@@ -420,6 +421,8 @@ test("e2e: after failover the fallback member sends ITS text; a member without a
     assert.equal(row?.logicalModelId, "second");
     assert.equal(row?.modelPrompt, "pb", "the ledger names the served member's profile");
     assert.match(row?.modelPromptHash ?? "", /^[0-9a-f]{12}$/);
+    // The frozen, model-neutral system prompt's hash (spec REFUSAL-HANDLING §12.4).
+    assert.equal(row?.systemPromptHash, systemPromptHashOf(agent.state.systemPrompt));
     assert.ok(served, `fallback served: ${stub.bodies.map((b) => b.path)}`);
     assert.ok(String(systemOf(served!.body)).startsWith("PREAMBLE B\n\n"));
     assert.ok(!String(systemOf(served!.body)).includes("PREAMBLE A"));
