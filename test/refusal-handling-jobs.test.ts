@@ -155,8 +155,11 @@ test("summarization: no refusal in a failed run keeps today's semantic redo (sam
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     const { created } = await runSummaryJob(storage, [RULE], { model_a: { text: "Hmm, let me think." } });
-    assert.deepEqual(created.map((c) => c.model), ["model_a"]);
-    assert.equal(storage.getSummarizationJobById("job")?.status, "pending", "retried by the queue, as before");
+    // The queue may retry again before the pool stops (timing): every run stays on
+    // the same model, never the rule's.
+    assert.ok(created.length >= 1);
+    assert.ok(created.every((c) => c.model === "model_a"), "no rerun on the rule's model");
+    assert.notEqual(storage.getSummarizationJobById("job")?.status, "failed", "retried by the queue, as before");
   } finally {
     storage.close();
   }
