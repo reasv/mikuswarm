@@ -1,12 +1,20 @@
 <script lang="ts">
+	import { page } from '$app/state';
 	import { selection } from '$lib/stores/selection.svelte';
+	import { conversationsHref } from '$lib/nav';
+	import {
+		decisionElementId,
+		fallbackReasonsLabel,
+		groupDecisions,
+		summarizeDecisionGroup
+	} from '$lib/decisions';
 	import { sessionQuery } from '$lib/query/sessions';
 	import { sessionRecordQuery, sessionDecisionsQuery } from '$lib/query/session-record';
 	import { agentsQuery } from '$lib/query/agents';
 	import { formatTokens, formatUsd } from '$lib/format';
 	import { cn } from '$lib/utils';
 	import { buildAgentLookup, agentFor, agentAccent } from '$lib/agents';
-	import { extractRecordsGiven } from '$lib/rollout';
+	import { extractRecordsGiven, injectedByDecisionGroup } from '$lib/rollout';
 
 	// Col 3 — the session inspector (ARCHITECTURE.md §11). Driven by the same
 	// `?session=` selection as Col 2, it surfaces the raw record behind the rendered
@@ -27,17 +35,38 @@
 	//   from the transcript by extractRecordsGiven)
 	const sessionRecord = sessionRecordQuery(() => activeId);
 	const decisionsQ = sessionDecisionsQuery(() => activeId);
-	const decisionGroups = $derived.by(() => {
-		const evs = decisionsQ.data?.evaluations ?? [];
-		const map = new Map<string, (typeof evs)[number][]>();
-		for (const ev of evs) {
-			map.set(ev.decisionGroup, [...(map.get(ev.decisionGroup) ?? []), ev]);
-		}
-		return map;
+	// One entry per decision group with its collapsed summary (verdict, top
+	// confidence, fallback reasons). Records groups name what the transcript shows
+	// was injected; before the transcript has any message that is unknown, and the
+	// summary falls back to the rows' own verdicts.
+	const decisionSummaries = $derived.by(() => {
+		const transcript = session.data?.transcript ?? [];
+		const injected = injectedByDecisionGroup(transcript);
+		return [...groupDecisions(decisionsQ.data?.evaluations ?? [])].map(([dg, evs]) => ({
+			dg,
+			summary: summarizeDecisionGroup(evs, transcript.length > 0 ? (injected.get(dg) ?? []) : undefined)
+		}));
 	});
 	const recordsGiven = $derived(
 		session.data?.transcript ? extractRecordsGiven(session.data.transcript) : []
 	);
+
+	/** A link to another session of this room, keeping the room and agent selection. */
+	function sessionHref(id: string): string {
+		return conversationsHref({
+			agent: page.url.searchParams.get('agent'),
+			room: selection.roomKey ?? meta?.timelineKey,
+			session: id
+		});
+	}
+
+	/** Scroll the session view to a decision's inline card. */
+	function jumpToDecision(event: MouseEvent, dg: string) {
+		const card = document.getElementById(decisionElementId(dg));
+		if (!card) return;
+		event.preventDefault();
+		card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+	}
 
 	let rawOpen = $state(false);
 
@@ -225,27 +254,37 @@
 				</div>
 			{/if}
 
-			<!-- Decisions (spec SESSION-RECORDS §8): one row per decision group with a
-			     scroll-jump link to the inline card in the rollout. -->
-			{#if decisionsQ.data && decisionsQ.data.evaluations.length > 0}
-				{@const groups = decisionGroups}
+			<!-- Decisions (spec SESSION-RECORDS §8): one entry per decision group with
+			     its collapsed summary and a jump to the inline card in the rollout. -->
+			{#if decisionSummaries.length > 0}
 				<div>
-					<div class="mb-1 text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">Decisions ({groups.size})</div>
-					<div class="space-y-1">
-						{#each [...groups.entries()] as [dg, evs] (dg)}
-							{@const first = evs[0]}
-							<div class="flex items-center justify-between gap-2 font-mono text-[11px]">
-								<div class="min-w-0 flex-1">
-									<span class="text-muted-foreground">{first?.point ?? '?'}</span>
-									{#if first?.source === 'heuristic'}
-										<span class="ml-1 rounded bg-amber-500/20 px-1 text-[10px] text-amber-300">heuristic</span>
+					<div class="mb-1 text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">Decisions ({decisionSummaries.length})</div>
+					<div class="space-y-1.5">
+						{#each decisionSummaries as { dg, summary } (dg)}
+							{@const reasons = fallbackReasonsLabel(summary)}
+							<div class="rounded border bg-card px-2 py-1.5 font-mono text-[11px]">
+								<div class="flex items-center justify-between gap-2">
+									<span class="font-semibold">{summary.point}</span>
+									<a
+										href={'#' + decisionElementId(dg)}
+										onclick={(e) => jumpToDecision(e, dg)}
+										class="shrink-0 text-[10px] text-violet-400 hover:text-violet-300"
+										title={dg}
+									>↗ rollout</a>
+								</div>
+								<div class="mt-0.5 break-all text-foreground">{summary.verdict}</div>
+								<div class="mt-0.5 flex flex-wrap gap-x-2 text-[10px] text-muted-foreground">
+									{#if summary.topConfidence != null}
+										<span>top {(summary.topConfidence * 100).toFixed(0)}%</span>
+									{/if}
+									{#if summary.sources.heuristic > 0}
+										<span class="text-amber-400"
+											>{summary.sources.heuristic} of {summary.sources.model + summary.sources.heuristic} fell back{reasons
+												? `: ${reasons}`
+												: ''}</span
+										>
 									{/if}
 								</div>
-								<a
-									href={'#decision-' + dg}
-									class="shrink-0 text-[10px] text-violet-400 hover:text-violet-300"
-									title={dg}
-								>↗ rollout</a>
 							</div>
 						{/each}
 					</div>
@@ -267,7 +306,7 @@
 								<div class="flex flex-col items-end gap-0.5">
 									{#each rec.buildsOn as bid (bid)}
 										<a
-											href={'?session=' + encodeURIComponent(bid)}
+											href={sessionHref(bid)}
 											class="break-all text-right text-violet-400 hover:text-violet-300"
 										>{bid}</a>
 									{/each}
@@ -290,10 +329,13 @@
 					<div class="space-y-1">
 						{#each recordsGiven as r (r.sessionId)}
 							<div class="font-mono text-[11px]">
-								<a
-									href={'?session=' + encodeURIComponent(r.sessionId)}
-									class="text-violet-400 hover:text-violet-300"
-								>{r.sessionId}</a>
+								<a href={sessionHref(r.sessionId)} class="text-violet-400 hover:text-violet-300"
+									>{r.sessionId}</a
+								>
+								<details class="mt-0.5">
+									<summary class="cursor-pointer text-[10px] text-muted-foreground hover:text-foreground">record as given</summary>
+									<pre class="mt-1 max-h-48 overflow-auto whitespace-pre-wrap rounded bg-muted p-2 text-[10px] leading-relaxed">{r.text}</pre>
+								</details>
 							</div>
 						{/each}
 					</div>

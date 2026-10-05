@@ -11,14 +11,27 @@ import { sessionPollInterval } from './session-poll';
  * status-driven `refetchInterval` (see {@link sessionPollInterval}) keeps the
  * view honest across resume / follow-up-fold transitions without a refresh.
  */
-export function sessionQuery(id: () => string | null) {
+export function sessionQuery(
+	id: () => string | null,
+	opts: {
+		/** True while the record turn may still append to the transcript (SESSION-RECORDS §3.2). */
+		recordPending?: () => boolean;
+	} = {}
+) {
 	return createQuery(() => {
 		const sid = id();
 		return {
 			queryKey: sid ? keys.session(sid) : ['sessions', '∅'],
 			queryFn: () => fresh(getSession(sid as string)),
 			enabled: sid != null,
-			refetchInterval: (query) => sessionPollInterval(query.state.data)
+			refetchInterval: (query) => {
+				const base = sessionPollInterval(query.state.data);
+				if (base !== false) return base;
+				return opts.recordPending?.() ? RECORD_PENDING_POLL_MS : false;
+			}
 		};
 	});
 }
+
+/** Session re-poll while its record turn may still be running. */
+const RECORD_PENDING_POLL_MS = 8000;

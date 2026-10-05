@@ -9,7 +9,8 @@ import {
 	getHarness,
 	isHarnessMessage,
 	buildRolloutPlan,
-	extractRecordsGiven
+	extractRecordsGiven,
+	hasRecordTurn
 } from './rollout';
 import type { DecisionEvaluation } from '$lib/schemas';
 
@@ -236,6 +237,30 @@ describe('buildRolloutPlan', () => {
 		expect(plan[2]).toMatchObject({ type: 'message', index: 0 });
 	});
 
+	it('names the record sessions the rollout injected for a records group', () => {
+		const messages = [
+			{
+				role: 'assistant',
+				content: [{ type: 'toolCall', id: 'r1', name: 'read_session_record', arguments: { session_id: 'ses_A' } }],
+				harness: { kind: 'injection', decisionGroup: 'grp-R' }
+			},
+			{ role: 'toolResult', toolCallId: 'r1', content: 'rec A', harness: { kind: 'injection', decisionGroup: 'grp-R' } },
+			{ role: 'assistant', content: [{ type: 'text', text: 'OK' }] }
+		];
+		const plan = buildRolloutPlan(messages, [ev('grp-R', 1), ev('grp-N', 2)]);
+		expect(plan.find((p) => p.type === 'decision' && p.decisionGroup === 'grp-R')).toMatchObject({
+			injected: ['ses_A']
+		});
+		// A group that injected nothing says so (empty list, not unknown).
+		expect(plan.find((p) => p.type === 'decision' && p.decisionGroup === 'grp-N')).toMatchObject({
+			injected: []
+		});
+		// With no messages yet, what was injected is unknown.
+		const empty = buildRolloutPlan([], [ev('grp-R')]);
+		expect(empty[0]).toMatchObject({ type: 'decision', decisionGroup: 'grp-R' });
+		expect((empty[0] as { injected?: string[] }).injected).toBeUndefined();
+	});
+
 	it('returns all messages unchanged when there are no evaluations', () => {
 		const messages = [
 			{ role: 'assistant', content: [{ type: 'text', text: 'Hello' }] },
@@ -293,10 +318,35 @@ describe('extractRecordsGiven', () => {
 		expect(records[0].text).toBe('Record text here.');
 	});
 
+	it('leaves out injections whose result was an error', () => {
+		const transcript = [
+			{
+				role: 'assistant',
+				content: [{ type: 'toolCall', id: 'tc1', name: 'read_session_record', arguments: { session_id: 'ses_GONE' } }],
+				harness: { kind: 'injection' }
+			},
+			{
+				role: 'toolResult',
+				toolCallId: 'tc1',
+				content: [{ type: 'text', text: 'No record for ses_GONE.' }],
+				isError: true,
+				harness: { kind: 'injection' }
+			}
+		];
+		expect(extractRecordsGiven(transcript)).toHaveLength(0);
+	});
+
 	it('returns empty array when there are no harness injections', () => {
 		const transcript = [
 			{ role: 'assistant', content: [{ type: 'text', text: 'Hello' }] }
 		];
 		expect(extractRecordsGiven(transcript)).toHaveLength(0);
+	});
+});
+
+describe('hasRecordTurn', () => {
+	it('detects the record-turn harness prompt', () => {
+		expect(hasRecordTurn([{ role: 'user', content: 'x', harness: { kind: 'record_turn' } }])).toBe(true);
+		expect(hasRecordTurn([{ role: 'user', content: 'x' }])).toBe(false);
 	});
 });

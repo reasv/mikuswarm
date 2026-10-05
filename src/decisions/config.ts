@@ -233,6 +233,48 @@ export function validateDecisionsConfig(config: AppConfig, opts: DecisionValidat
   }
 }
 
+/**
+ * The scheduler's per-group `max_in_flight` when a group sets none (mirrors
+ * `DEFAULT_MAX_IN_FLIGHT` in src/agent/scheduler.ts). Decision models get an
+ * implicit `decision:<key>` group with no settings, so this is their real cap.
+ */
+const SCHEDULER_DEFAULT_MAX_IN_FLIGHT = 2;
+
+/**
+ * One trigger can send up to `candidates + 1` records requests (the reply
+ * target plus `candidates` bot-message sessions) and one routing request, all
+ * at once (spec SESSION-RECORDS §6.2 "Capacity"). Sum that demand per
+ * rate-limit group of the chain heads and warn where a group's effective
+ * `max_in_flight` is below it.
+ */
+function warnRecordsCapacity(
+  config: AppConfig,
+  decisions: DecisionsRawConfig,
+  where: string,
+  opts: DecisionValidationOptions,
+): void {
+  const demand = new Map<string, number>();
+  const add = (head: string | undefined, requests: number) => {
+    if (!head || !config.models[head]) return;
+    const group = config.models[head]!.rate_limit_group ?? `decision:${head}`;
+    demand.set(group, (demand.get(group) ?? 0) + requests);
+  };
+  const candidates = decisions.records?.candidates ?? 3;
+  add(decisions.records?.model ?? decisions.model, candidates + 1);
+  if (decisions.routing?.enabled === true) add(decisions.routing.model ?? decisions.model, 1);
+  for (const [group, needed] of demand) {
+    const maxInFlight = config.rate_limits?.llm?.[group]?.max_in_flight ?? SCHEDULER_DEFAULT_MAX_IN_FLIGHT;
+    if (maxInFlight >= needed) continue;
+    opts.warn?.("decisions_records_capacity_low", {
+      where,
+      group,
+      maxInFlight,
+      needed,
+      hint: `raise [rate_limits.llm.${group}].max_in_flight to at least ${needed}`,
+    });
+  }
+}
+
 function requireDecisionModel(
   config: AppConfig,
   decisionKeys: Set<string>,
@@ -279,32 +321,23 @@ function validateEffective(
     }
   }
 
-  // Records point: validate ranges and emit a capacity warning when the decision
-  // chain's rate-limit group is too narrow for the expected parallel load.
+  // Records point: validate ranges and emit a capacity warning when a decision
+  // chain's rate-limit group is too narrow for the parallel load of one trigger.
   const records = decisions.records;
+  if (records?.min_confidence !== undefined) {
+    // The records point asks one `noul` question, whose answer is a probability
+    // with no separate confidence: `inject_threshold` already gates it, so a
+    // confidence floor would be a second knob for the same number.
+    throw new Error(
+      `${where}.records.min_confidence is not used by the records point; set ${where}.records.inject_threshold instead`,
+    );
+  }
   if (records?.enabled === true) {
     const inject = records.inject_threshold ?? 0.6;
     if (inject < 0 || inject > 1) {
       throw new Error(`${where}.records.inject_threshold must be in 0..1`);
     }
-    const candidates = records.candidates ?? 3;
-    const maxInflightNeeded = candidates + 2; // records candidates + routing
-    const recordsModel = records.model ?? decisions.model;
-    if (recordsModel && config.models[recordsModel]) {
-      const group =
-        config.models[recordsModel]!.rate_limit_group ??
-        `decision:${recordsModel}`;
-      const maxInFlight = config.rate_limits?.llm?.[group]?.max_in_flight;
-      if (maxInFlight !== undefined && maxInFlight < maxInflightNeeded) {
-        opts.warn?.("decisions_records_capacity_low", {
-          where,
-          group,
-          maxInFlight,
-          needed: maxInflightNeeded,
-          hint: `raise [rate_limits.llm.${group}].max_in_flight to at least ${maxInflightNeeded}`,
-        });
-      }
-    }
+    warnRecordsCapacity(config, decisions, where, opts);
   }
 
   const routing = decisions.routing;

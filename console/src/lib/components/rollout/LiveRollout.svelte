@@ -3,17 +3,26 @@
 	import { contextSummary } from '$lib/stores/context-summary.svelte';
 	import { isDuplicateInjectedTurn, isInjectedUserTurn, type RolloutMsg } from '$lib/rollout';
 	import Rollout from './Rollout.svelte';
+	import type { DecisionEvaluation } from '$lib/schemas';
 
 	// `onHead` surfaces the seed's sliced-off leading final-turn messages (the
 	// trigger turn) to the parent. They belong to the verbatim input view, not the
 	// rollout, but the persisted transcript head isn't flushed until the first
 	// turn_end and the session query isn't refetched mid-run — so without this the
 	// trigger turn is missing from the verbatim view until the run completes.
+	// `decisionEvaluations` are the session's decision rows (spec SESSION-RECORDS
+	// §8), fetched by the parent; their cards interleave with the live messages.
 	let {
 		sessionId,
 		onEnd,
-		onHead
-	}: { sessionId: string; onEnd?: () => void; onHead?: (head: RolloutMsg[]) => void } = $props();
+		onHead,
+		decisionEvaluations
+	}: {
+		sessionId: string;
+		onEnd?: () => void;
+		onHead?: (head: RolloutMsg[]) => void;
+		decisionEvaluations?: DecisionEvaluation[];
+	} = $props();
 
 	let messages = $state<RolloutMsg[]>([]);
 	let streaming = $state<RolloutMsg | null>(null);
@@ -185,7 +194,7 @@
 	const rows = $derived(streaming ? [...messages, streaming] : messages);
 </script>
 
-<Rollout messages={rows} />
+<Rollout messages={rows} {decisionEvaluations} />
 {#if !streaming && tentative}
 	<div class="px-3 opacity-60" title="Tentative — this attempt has not committed yet">
 		<div

@@ -12,6 +12,7 @@
 		type RolloutMsg
 	} from '$lib/rollout';
 	import { isCollapsible as collapsibleFor, defaultOpen } from '$lib/tiers';
+	import { decisionElementId } from '$lib/decisions';
 	import { formatTokens, formatUsd } from '$lib/format';
 	import AssistantTextCard from './AssistantTextCard.svelte';
 	import ThinkingCard from './ThinkingCard.svelte';
@@ -49,18 +50,18 @@
 	{#each plan as item (item.type === 'decision' ? 'decision:' + item.decisionGroup : item.index)}
 		{#if item.type === 'decision'}
 			<DecisionCard
-				decisionGroup={item.decisionGroup}
 				evaluations={item.evaluations}
-				elementId={'decision-' + item.decisionGroup}
+				injected={item.injected}
+				elementId={decisionElementId(item.decisionGroup)}
 			/>
 		{:else}
 			{@const msg = item.msg}
 			{@const harness = getHarness(msg)}
 
 			{#if harness?.kind === 'record_turn'}
-				<!-- The harness record-turn user prompt: show the section header and suppress
-				     the raw user-prompt text (the prompt is harness-internal). -->
-				<RecordTurnSection />
+				<!-- The harness record-turn user prompt: a section header, with the prompt
+				     itself collapsed and marked harness-made. -->
+				<RecordTurnSection prompt={contentText(msg.content)} />
 			{:else if msg.role === 'assistant' && harness?.kind === 'injection'}
 				<!-- Harness injection: assistant side — render each toolCall as a harness card. -->
 				{#each assistantBlocks(msg.content) as block, b (b)}

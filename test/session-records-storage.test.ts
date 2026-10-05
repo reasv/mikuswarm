@@ -74,7 +74,7 @@ test("upsertSessionRecord: insert then retrieve", async () => {
       text: "Looked into the question. Found the answer: 42.",
       token_count: 12,
       builds_on: [],
-      model_id: "sol6_aws",
+      model_id: "chat-model",
       created_at: now,
     });
 
@@ -86,7 +86,7 @@ test("upsertSessionRecord: insert then retrieve", async () => {
     assert.equal(row.text, "Looked into the question. Found the answer: 42.");
     assert.equal(row.token_count, 12);
     assert.equal(row.builds_on, "[]");
-    assert.equal(row.model_id, "sol6_aws");
+    assert.equal(row.model_id, "chat-model");
     assert.equal(row.created_at, now);
   });
 });
@@ -244,7 +244,7 @@ test("insertDecisionEvaluation: full row stored correctly", async () => {
       answers_json: JSON.stringify({ q1: "yes" }),
       state_json: JSON.stringify({ state: 1 }),
       questions_json: JSON.stringify(["q1"]),
-      served_model: "sol6_aws",
+      served_model: "chat-model",
       served_version: "v1",
       latency_ms: 450,
       input_tokens: 1234,
@@ -264,7 +264,7 @@ test("insertDecisionEvaluation: full row stored correctly", async () => {
     assert.equal(r.candidate_session_id, "cand-sess-1");
     assert.equal(r.source, "model");
     assert.equal(r.reason, "user asked follow-up");
-    assert.equal(r.served_model, "sol6_aws");
+    assert.equal(r.served_model, "chat-model");
     assert.equal(r.latency_ms, 450);
     assert.equal(r.input_tokens, 1234);
     assert.ok(Math.abs((r.cost_usd ?? 0) - 0.0012) < 1e-8);

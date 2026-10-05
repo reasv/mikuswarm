@@ -15,6 +15,8 @@
  * wire shape fails exactly like a real backend drift would.
  */
 
+import demoDecisionRows from './decision-evaluations.json';
+
 const MIN = 60_000;
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
@@ -863,7 +865,7 @@ function sessionDetailFixture(id: string, now: number): unknown {
 			isError: false,
 			harness: { kind: 'injection', decisionGroup: DEMO_DG_RECORDS }
 		},
-		// harness injection: load_skill for routing preload (no decisionGroup)
+		// harness injection: load_skill for the routing decision's skill preload
 		{
 			role: 'assistant',
 			content: [
@@ -875,7 +877,7 @@ function sessionDetailFixture(id: string, now: number): unknown {
 				}
 			],
 			stopReason: 'toolUse',
-			harness: { kind: 'injection' }
+			harness: { kind: 'injection', decisionGroup: DEMO_DG_ROUTING }
 		},
 		{
 			role: 'toolResult',
@@ -883,7 +885,7 @@ function sessionDetailFixture(id: string, now: number): unknown {
 			toolName: 'load_skill',
 			content: [{ type: 'text', text: 'Loaded skill: image-generation. Tools added: image_generate.' }],
 			isError: false,
-			harness: { kind: 'injection' }
+			harness: { kind: 'injection', decisionGroup: DEMO_DG_ROUTING }
 		},
 		// first real model turn
 		{
@@ -1300,110 +1302,30 @@ function sessionRecordFixture(id: string, now: number): unknown {
 	};
 }
 
-/** Invented decision group UUIDs used in demo evaluations. */
-const DEMO_DG_ROUTING = 'dg-00000000-routing-demo';
-const DEMO_DG_RECORDS = 'dg-11111111-records-demo';
+/**
+ * Demo decision rows. `decision-evaluations.json` is written by the real engine
+ * (test/decision-evaluation-fixture.test.ts runs DecisionEngine + the routing
+ * and records points against a mocked decision endpoint), so these are exactly
+ * the shapes the agent stores. Only the per-deployment columns (ids, times,
+ * session, room) are filled in here.
+ */
+const DEMO_DG_ROUTING = 'dg-routing-demo';
+const DEMO_DG_RECORDS = 'dg-records-demo';
+const DEMO_DECISION_LATENCY_MS = [312, 181, 2950, 194];
 
 /** Demo fixture for GET /api/sessions/:id/decisions */
 function sessionDecisionsFixture(id: string, now: number): unknown {
 	if (id !== FEATURED_ID) return { evaluations: [] };
 	const ts = now - 6 * MIN;
 	return {
-		evaluations: [
-			// Routing decision: model selected opus55_aws
-			{
-				id: 1,
-				ts,
-				decisionGroup: DEMO_DG_ROUTING,
-				point: 'routing',
-				agent: 'aria',
-				timelineKey: ROOMS[0].key,
-				agentSessionId: id,
-				triggerEventId: '$trigger:example.org',
-				candidateSessionId: null,
-				source: 'model',
-				reason: null,
-				verdictJson: JSON.stringify({ model: 'anthropic/claude-sonnet-4', cascade: false }),
-				answersJson: JSON.stringify([
-					{ label: 'opus55_aws', probability: 0.78 },
-					{ label: 'sol61_aws', probability: 0.22 }
-				]),
-				stateJson: JSON.stringify({
-					request: { from: '@ada:example.org', text: 'Hey Miku, can you find the summer meetup and make a poster?' },
-					recent_chat: [
-						{ from: '@grace:example.org', text: 'Ada, did you ask miku about the poster yet?' }
-					]
-				}),
-				questionsJson: JSON.stringify([
-					{ key: 'heavy', label: 'This task needs image generation and search — pick the capable model.' }
-				]),
-				servedModel: 'anthropic/claude-sonnet-4',
-				servedVersion: '20250219',
-				latencyMs: 312,
-				inputTokens: 1840,
-				costUsd: 0.0024
-			},
-			// Records decision: candidate ses_v8n2ke above threshold → injected
-			{
-				id: 2,
-				ts: ts + 50,
-				decisionGroup: DEMO_DG_RECORDS,
-				point: 'records',
-				agent: 'aria',
-				timelineKey: ROOMS[0].key,
-				agentSessionId: id,
-				triggerEventId: '$trigger:example.org',
-				candidateSessionId: DEMO_RECORD_SESSION_B,
-				source: 'model',
-				reason: null,
-				verdictJson: JSON.stringify({ inject: true }),
-				answersJson: JSON.stringify([{ label: 'relevant', probability: 0.83 }]),
-				stateJson: JSON.stringify({
-					request: { from: '@ada:example.org', text: 'Hey Miku, can you find the summer meetup and make a poster?' },
-					reply_to: { from: '<bot>', text: 'remind me what we decided about the color palette' },
-					record: 'Searched for color palette decisions in #general. Found: warm earth tones (Ada) vs. cool pastels (Grace); no final vote taken. Sent a summary with both options.'
-				}),
-				questionsJson: JSON.stringify([
-					{ key: 'relevant', label: 'Does the request refer to or continue the work in this record?' }
-				]),
-				servedModel: 'anthropic/claude-haiku-4',
-				servedVersion: '20250307',
-				latencyMs: 194,
-				inputTokens: 920,
-				costUsd: 0.00081
-			},
-			// Records decision: another candidate below threshold → not injected
-			{
-				id: 3,
-				ts: ts + 55,
-				decisionGroup: DEMO_DG_RECORDS,
-				point: 'records',
-				agent: 'aria',
-				timelineKey: ROOMS[0].key,
-				agentSessionId: id,
-				triggerEventId: '$trigger:example.org',
-				candidateSessionId: 'ses_k2f8ra',
-				source: 'model',
-				reason: null,
-				verdictJson: JSON.stringify({ inject: false }),
-				answersJson: JSON.stringify([{ label: 'relevant', probability: 0.18 }]),
-				stateJson: JSON.stringify({
-					request: { from: '@ada:example.org', text: 'Hey Miku, can you find the summer meetup and make a poster?' },
-					recent_chat: [
-						{ from: '@linus:example.org', text: 'lol did you see the game last night' }
-					],
-					record: 'Linus asked about last night\'s game. Replied with the score and highlights.'
-				}),
-				questionsJson: JSON.stringify([
-					{ key: 'relevant', label: 'Does the request refer to or continue the work in this record?' }
-				]),
-				servedModel: 'anthropic/claude-haiku-4',
-				servedVersion: '20250307',
-				latencyMs: 181,
-				inputTokens: 860,
-				costUsd: 0.00076
-			}
-		]
+		evaluations: demoDecisionRows.map((row, i) => ({
+			...row,
+			id: i + 1,
+			ts: ts + i * 5,
+			timelineKey: ROOMS[0].key,
+			agentSessionId: id,
+			latencyMs: DEMO_DECISION_LATENCY_MS[i] ?? 200
+		}))
 	};
 }
 
