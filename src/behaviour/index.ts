@@ -27,7 +27,6 @@ export { BEHAVIOUR_GROUP_BYS, BEHAVIOUR_WINDOWS, type ModelBehaviourQuery } from
 export { resolveCodeVersion } from "./version.js";
 
 /** Rollup hours a read recomputes before answering (the background drain does the rest). */
-export const READ_FLUSH_MAX_HOURS = 48;
 
 /** What the console server needs. */
 export interface ModelBehaviourApi {
@@ -125,7 +124,9 @@ export class ModelBehaviourService implements ModelBehaviourApi {
   }
 
   async read(query: ModelBehaviourQuery): Promise<ModelBehaviourResponse> {
-    await this.rollups.flush(READ_FLUSH_MAX_HOURS);
+    // Never recompute on the read path: a recompute holds the main thread, and a
+    // backfill keeps old hours dirty. Reads serve the rollups as they are; the
+    // background drain catches up (the response reports `pendingHours`).
     return readModelBehaviour(this.readContext(), query);
   }
 

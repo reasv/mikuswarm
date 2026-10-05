@@ -509,7 +509,7 @@ function writeHour(db: Database.Database, hour: number, result: { rows: RollupRo
 export interface ModelBehaviourRollupsOptions extends RollupContext {
   storage: Storage;
   logger?: Logger;
-  /** Hours recomputed per write job (each job holds the writer once). Default 24. */
+  /** Hours recomputed per write job (each job holds the writer and the main thread once). Default 1. */
   hoursPerJob?: number;
   /** Background drain interval. Default 30 s. */
   intervalMs?: number;
@@ -520,6 +520,9 @@ export interface ModelBehaviourRollupsOptions extends RollupContext {
  * (newest hour first, so the current period is fresh before history), on a timer and
  * before every read of the API.
  */
+/** Hours one background tick recomputes at most (one hour per job, yielding between). */
+const DRAIN_HOURS_PER_TICK = 24;
+
 export class ModelBehaviourRollups {
   private readonly hoursPerJob: number;
   private readonly intervalMs: number;
@@ -527,7 +530,7 @@ export class ModelBehaviourRollups {
   private draining: Promise<number> | undefined;
 
   constructor(private readonly options: ModelBehaviourRollupsOptions) {
-    this.hoursPerJob = Math.max(1, options.hoursPerJob ?? 24);
+    this.hoursPerJob = Math.max(1, options.hoursPerJob ?? 1);
     this.intervalMs = options.intervalMs ?? 30_000;
   }
 
@@ -557,6 +560,8 @@ export class ModelBehaviourRollups {
       );
       done += n;
       if (n < limit) break;
+      // Yield between jobs so a long drain never starves the event loop.
+      await new Promise<void>((resolve) => setImmediate(resolve));
     }
     return done;
   }
@@ -586,7 +591,7 @@ export class ModelBehaviourRollups {
 
   private drainOnce(): Promise<number> {
     if (this.draining) return this.draining;
-    const run = this.flush(this.hoursPerJob * 4)
+    const run = this.flush(DRAIN_HOURS_PER_TICK)
       .catch((error: unknown) => {
         this.options.logger?.warn("model_behaviour_rollup_failed", {
           error: error instanceof Error ? error.message : String(error),

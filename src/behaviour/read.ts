@@ -35,7 +35,7 @@ const WEEK_MS = 7 * DAY_MS;
 /** Change events this close to the previous one collapse into one marker (one deploy). */
 export const MARKER_COLLAPSE_MS = 5 * 60_000;
 /** Sessions examined per incident-log request before returning a partial page. */
-export const INCIDENT_SCAN_CAP = 2000;
+export const INCIDENT_SCAN_CAP = 400;
 const INCIDENT_BATCH = 200;
 export const INCIDENT_PAGE_DEFAULT = 25;
 export const INCIDENT_PAGE_MAX = 100;

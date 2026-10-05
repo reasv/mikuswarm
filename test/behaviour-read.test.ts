@@ -296,7 +296,7 @@ test("HTTP: GET /api/models/behaviour and /incidents; 503 when not wired", async
   });
 });
 
-test("reads flush pending rollup hours first", async () => {
+test("reads never recompute: pending hours are served later by the drain", async () => {
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {
     await addRequest(storage, null, Date.now() - 1_000, "cap_model", { key: KEY_A, cls: "caption" });
@@ -307,6 +307,10 @@ test("reads flush pending rollup hours first", async () => {
       catalogue: { all: () => [], get: () => undefined, enabledFor: () => [] },
       agentForTimelineKey: agentFor,
     });
+    const before = await service.read(q({ now: Date.now() }));
+    assert.deepEqual(before.scorecard, []);
+    assert.equal(before.pendingHours, 1);
+    await service.rollups.flush();
     const r = await service.read(q({ now: Date.now() }));
     assert.deepEqual(r.scorecard.map((row) => [row.group, row.volume.requests]), [["cap_model", 1]]);
     assert.equal(r.pendingHours, 0);
