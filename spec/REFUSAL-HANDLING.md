@@ -1,6 +1,6 @@
 # Refusal handling, output checks and session redo
 
-**Status**: PROPOSAL, revision 2 (2026-10-05). Revision 1 was the owner's direction of the same day; revision 2 folds in a review pass, the owner's answers to it, and the send-contract diagnostics and console design added by the owner. Remaining open questions are in §15.
+**Status**: PROPOSAL, revision 3 (2026-10-05), ready for implementation. Revision 1 was the owner's direction of the same day; revision 2 folded in a review pass, the owner's answers to it, and the send-contract diagnostics and console design added by the owner; revision 3 settles the pre-implementation questions (§3 decisions 21–26, §16). What remains in §15 is calibration done during implementation.
 **Builds on**: the shipped `refusal` error class (ARCHITECTURE.md §8a "Refusals"): hard refusals are recognized from the provider's stop reason, are never a health strike, are never retried on the member that refused, fall over to the next chain member, and log `llm_refusal`. The session-record turn opts out of that implicit fallover.
 **Supersedes**:
 - the "Refusal handling" direction in spec/SESSION-RECORDS.md §9, which this document expands;
@@ -12,6 +12,17 @@
 - constraint 5 ("no de-escalation of normal chat") and §8 ("no model switching mid-session"): a refusal redo switches the session to the rule's model for the rest of the session (§8.3). Style checks never switch models.
 
 **Related**: SESSION-RECORDS (record turn §3.2, the redo concept of §9), DECISION-MODEL (decision points, judge-shaped state §3.8, audit worker §5.8, dedup §5.4), MODEL-FALLBACK, LLM-FAILURE-HANDLING, OPENAI-PREFILL (the `analysis` argument), MODEL-PROMPTS.
+
+### What changed in revision 3
+
+- **Deadlines are timeouts, not targets** (§6.3, §13): 5 s for an outgoing message, 15 s for an ending without a send. The design minimizes the actual delay; the deadline only decides when to stop waiting.
+- Style checks skip messages under **40** characters (§6.3).
+- **Sibling tool calls on a redo** (§8.4): the redo forks into a branch where the gated call is removed and the sibling calls stay with their results; the new model continues from those results.
+- **One decision call per message by default** (§6.2): split only when a member's fits require it.
+- **Starter style catalogue** (§4.5), drawn from the workspace template's style rules and common LLM-isms.
+- **Phasing** (§16.1): deployed phase by phase; the unbuilt DECISION-MODEL and SESSION-RECORDS pieces are built inside the phase that first needs them.
+- `on_exhausted = "withhold"` settles as `NO_REPLY` with no notice (§8.2).
+- Defaults for the remaining implementer choices (§16.2).
 
 ### What changed in revision 2
 
@@ -70,6 +81,12 @@ Today the code cannot tell refusal reasons apart, cannot see soft refusals, keep
 18. **The page is passive**: no alerts or notifications for now.
 19. **Tasks are multi-label** (DECISION-MODEL §5.1a): a request may select several tasks, and some tasks exist only as labels.
 20. **Proactive sessions always carry a built-in `proactive` task** (DECISION-MODEL §5.1a), so rules and statistics can select them by task as well as by site.
+21. **Deadlines are timeouts, not targets**: 5 s for an outgoing message. The LLM itself is allowed far longer, so a strict judge timeout buys nothing; the design goal is the smallest *actual* added delay, and when to stop waiting and send unjudged is a separate question (§6.3, §13).
+22. **Style checks skip messages under 40 characters** (§6.3).
+23. **A redo keeps sibling tool calls**: when the gated call shares its assistant message with other tool calls, the redo forks into a branch where the gated call is removed and the other calls remain with their results. A tool result is a natural continuation point for any model (§8.4).
+24. **Phases are deployed as they land**, each in a working state (§16).
+25. **Prerequisites are built inside the phase that first needs them**, not as separate work first: the tool side-effect list in phase 1, judge-shaped state in phase 3, multi-label tasks before the rules' `tasks` condition is enabled, the audit worker in phase 6 (§16).
+26. **The starter style catalogue** starts from the not-X-but-Y contrast, em-dashes, "I hope this helps" sign-offs, sycophantic openers and "delve"-style vocabulary, plus the workspace template's existing style rules (§4.5).
 
 ## 4. Checks
 
@@ -133,6 +150,35 @@ patterns = []
   threshold = 0.85
 ```
 
+### 4.5 Starter style catalogue
+
+Upstream ships these as built-in style checks, **all disabled** (§11): an operator enables the ones that match their persona and may override any field. Two sources, so each check enforces something the prompt already asks for or a well-known LLM-ism:
+
+- the style rules the workspace template already gives the agent (`templates/workspace/AGENTS.md` and `TAIL.md`: no assistant filler, no "I'm just an AI" disclaimers, custom emoji or kaomoji over standard emoji, short messages unless length is warranted);
+- common LLM-isms (owner decision 26).
+
+| code | catches | detection | agent-facing explanation (shown with the code) |
+|---|---|---|---|
+| `style_em_dash` | an em-dash (`—`) | pattern only | Contains an em-dash. Use a comma, period, colon or parentheses instead. |
+| `style_not_x_but_y` | rhetorical contrast: "it's not X, it's Y", "not just X, but Y", "less X, more Y", litotes used for effect | question | Uses a rhetorical "not X, but Y" contrast. State the point directly. |
+| `style_parallel_construction` | rhetorical parallelism: triads for rhythm, anaphora, mirrored clauses | question | Uses a rhetorical parallel construction (a rhythmic triad or repeated sentence frame). Say it plainly, once. |
+| `style_sycophantic_opener` | praise or agreement as an opener: "Great question!", "You're absolutely right", "What a fascinating idea" | patterns (common phrasings) + question (paraphrases) | Opens by praising or agreeing with the user. Start with the substance. |
+| `style_assistant_sign_off` | service sign-offs and offers: "I hope this helps", "Let me know if you need anything else", "Feel free to ask", "How can I help?", "I'd be happy to" | patterns + question | Ends with (or contains) an assistant-style offer or sign-off. Drop it. |
+| `style_llm_vocabulary` | overused LLM vocabulary: delve, tapestry, testament to, multifaceted, navigate the complexities, in the realm of, it's worth noting, underscores, boasts | patterns over a configurable word list (word boundaries, case-insensitive) | Uses stock LLM vocabulary ("{matched}"). Use a plain word. |
+| `style_ai_disclaimer` | "as an AI", "I'm just a language model", disclaimers about being an AI | patterns + question | Contains an AI disclaimer. Stay in character and drop it. |
+| `style_essay_formatting` | headings, section labels, bulleted or numbered structure in a conversational message that did not call for it | pattern (markdown headings) + question | Formats a chat message like an essay (headings, bullet structure). Write it as a normal chat message unless a list was asked for. |
+| `style_moralizing` | unprompted ethical commentary, warnings or caveats the user did not ask for | question | Adds moral commentary or caveats nobody asked for. Remove them. |
+| `style_unicode_emoji` | standard Unicode emoji in the message body | pattern (emoji code-point ranges) | Contains standard Unicode emoji. Use a custom `:shortcode:` emoji or a kaomoji instead. |
+| `style_wall_of_text` | far longer than the exchange calls for, when nobody asked for research, an explanation or exact quoted material | question | Much longer than this exchange calls for. Cut it to what matters. |
+
+Notes:
+
+- A pattern hit decides its check without a model call (§4.2), so the pattern-only checks cost nothing and work without a decision model. A check with both decides on a pattern hit and otherwise asks its question, which catches paraphrases.
+- `{matched}` is filled with the matched text so the agent knows exactly what to change.
+- Deliberate uses (quoting someone, explaining what an em-dash is) are what the override is for (§6.4); the error text says so.
+- Each question carries explicit `false` criteria naming the near-misses (a factual correction is not a rhetorical contrast; a list the user asked for is not essay formatting), because decision models read instructions literally.
+- `style_moralizing` and `style_wall_of_text` are persona-dependent by nature; they ship like the others (disabled) and are the most likely candidates for operator-tuned questions.
+
 ## 5. Detection and checkpoints
 
 ### 5.1 Hard refusals (structured)
@@ -167,7 +213,7 @@ Artifact and rollout checks judge **declining and deflecting only**. "Did less t
 - a `no_reply` call, or a literal `NO_REPLY` text ending;
 - forced-completion exhaustion (the model wrote text and never called a send tool, §7).
 
-`no_reply` is judged **every time** in every session type (rare enough, owner decision 8), **proactive sessions included** (owner decision 11): not replying is a normal proactive outcome, but proactive sessions are also where agents most often reason "I should say this" and then end with `NO_REPLY`, so their endings are exactly the ones worth judging. Holding it costs no visible latency (no message is coming), so its deadline is looser than a send's.
+`no_reply` is judged **every time** in every session type (rare enough, owner decision 8), **proactive sessions included** (owner decision 11): not replying is a normal proactive outcome, but proactive sessions are also where agents most often reason "I should say this" and then end with `NO_REPLY`, so their endings are exactly the ones worth judging. Holding it costs no visible latency (no message is coming), so its deadline is looser than a send's (default 15 s).
 
 **Sources.** Three texts around the action, each its own state field so a question can point at one:
 
@@ -211,20 +257,21 @@ Every outgoing message written by the model is **held** and sent only after its 
 
 ### 6.2 One evaluation, possibly several calls
 
-The gate is one logical evaluation per message, carrying every enabled check: refusal reasons, style, operator conditions, and the duplicate guard (DECISION-MODEL §5.4) when its mechanical precondition holds. It may be split into **parallel calls grouped by state shape**:
+The gate is one logical evaluation per message, carrying every enabled check: refusal reasons, style, operator conditions, and the duplicate guard (DECISION-MODEL §5.4) when its mechanical precondition holds.
 
-- style checks: the message alone (style is a property of the message; short state suits judge routes that degrade above ~0.5–2k tokens);
-- refusal and operator checks: request, recent chat, message, `analysis`, `text`;
-- dedup: its own state, only when triggered.
+**One call by default.** All questions go in one request over one state (request, recent chat, message, `analysis`, `text`). A member that bills the state once per request answers every question for the price of one, and one call has one latency. Style questions point at the `message` field.
 
-The wait is the slowest call. On per-request-billed members the cost is about the same as one call; per-question-billed members are accounted for by the fits (DECISION-MODEL §3.6). Ordering inside the tool: claim guard → evaluation → send.
+**Split only when the fits require it.** When the serving member cannot take the whole evaluation in one request (its `max_questions`, a `state_budget_tokens` below the full state, a judge-only `{input, output}` shape, or per-question billing that makes a large shared state expensive), the evaluation is split into parallel calls grouped by state shape: style over the message alone, refusal and operator checks over the full state, dedup over its own state when triggered. The wait is then the slowest call. The fits (DECISION-MODEL §3.6) make this choice per member, so it follows the chain: a fallback member with tighter limits gets the split form.
+
+Ordering inside the tool: claim guard → evaluation → send.
 
 ### 6.3 Latency
 
 - The evaluation **starts when the tool call's arguments are complete** (`toolcall_end` in the stream), before the tool executes, concurrently with the claim guard.
 - **Observe-only checks never hold the send**: when no check in a message's evaluation has a `redo` or `revise` remedy, the evaluation runs alongside the send and only records (owner decision 5).
-- **Deadline**: past it, the message is sent unjudged and the miss is counted. The evaluation still completes and is recorded.
-- Style checks skip messages shorter than `min_chars` (default 80: one-liners rarely carry these constructions, and that is where added latency is most visible). Refusal checks have no length floor ("nah, can't do that" is short).
+- **Deadline** (default 5 s, owner decision 21): past it, the message is sent unjudged and the miss is counted. The evaluation still completes and is recorded. The deadline is a **timeout, not a target**: the LLM that wrote the message is allowed far longer, so a tight judge timeout only trades judged messages for nothing. What keeps the gate fast is the design (early start, one call, observe-only checks never holding, fast members), and the statistics measure the actual added delay per checkpoint (§13); the deadline only bounds the rare slow evaluation.
+- **Hold only when a verdict could act**: a message is held only when some check in its evaluation could block it in this session: a `revise` check, or a `redo` check for which a rule can match this session's site, agent, tasks and serving model. Otherwise the evaluation runs alongside the send as observe-only.
+- Style checks skip messages shorter than `min_chars` (default 40, owner decision 22). Refusal checks have no length floor ("nah, can't do that" is short). Pattern-only checks are free and synchronous, so they ignore `min_chars`.
 
 ### 6.4 Verdicts
 
@@ -234,8 +281,8 @@ The wait is the slowest call. On per-request-billed members the cost is about th
 
 **Bounds on revise** (an unnoticed, unbounded token spend is worse than a style issue):
 
-- a limit on consecutive rejections of one message (rejected sends since the last delivered message), after which the message goes through regardless of revisable checks;
-- a per-session limit on total rejections, after which revisable checks stop blocking for the rest of the session (they keep recording);
+- a limit on consecutive rejections of one message (rejected sends since the last delivered message; default 2), after which the message goes through regardless of revisable checks;
+- a per-session limit on total rejections (default 6), after which revisable checks stop blocking for the rest of the session (they keep recording);
 - the counters persist across a refusal redo.
 
 **Override.** The posting tools take an optional argument naming check codes to skip for this call. Only codes fired in the immediately preceding rejection are honoured; refusal checks can never be overridden. The tool error tells the agent to use it when a flag is a clear false positive or the message deliberately shows the pattern (a quotation, an example). Overrides are recorded.
@@ -328,7 +375,7 @@ on_exhausted = "send_last"        # chat sites: "send_last" (default) | "withhol
 
 When every entry of the rule has refused:
 
-- **chat sites**: `on_exhausted` (owner decision 3): `send_last` (default: send the last attempt; withholding makes the bot look dead), `withhold` (send nothing), `park` (today's hard-refusal outcome, `failed-resumable`). For a hard refusal there is no text to send, so `send_last` parks as today;
+- **chat sites**: `on_exhausted` (owner decision 3): `send_last` (default: send the last attempt; withholding makes the bot look dead), `withhold` (send nothing), `park` (today's hard-refusal outcome, `failed-resumable`). For a hard refusal there is no text to send, so `send_last` parks as today. `withhold` settles the session as `NO_REPLY` with no failure notice, for hard and soft refusals alike;
 - **mechanical jobs**: no output (never a refusal written into a summary, caption or diary), no repeated tool nudges against a refusing model.
 
 ### 8.3 Stickiness
@@ -341,7 +388,13 @@ After a redo the session stays on the redo model for the rest of the session (ow
 - **Discard and fork** (a soft refusal caught at the gate, a refusal at an ending without a send, send-contract exhaustion):
   - **Fork point**: the later of the last delivered message and the last irreversible tool effect (owner decision 2). Everything after it is discarded from the live context; read-only work in that span is redone by the new run.
   - **Tool side effects**: each tool declares whether it is redo-safe (read-only or idempotent) or irreversible. This is the same list as the redo whitelist of SESSION-RECORDS §9 (edits), defined once.
-  - **Mechanism**: a tool cannot rewind from inside the agent loop. The gating tool returns a redo sentinel and aborts the run; the runner truncates `agent.state.messages` to the fork point, applies the model pin, and continues. Sibling tool calls in the same assistant message that already ran irreversibly move the fork point after them.
+  - **Mechanism**: a tool cannot rewind from inside the agent loop. The gating tool returns a redo sentinel and aborts the run; the runner truncates `agent.state.messages` to the fork point, applies the model pin, and continues.
+  - **Sibling tool calls** (owner decision 23). Tool calls of one assistant message execute in parallel by default, so a held send can share its message with calls that run while it is judged. When a sibling had an irreversible effect, the fork point is that assistant message itself, and the new branch keeps it in edited form:
+    - the gated call and its tool result are removed;
+    - every sibling call stays, with its tool result;
+    - the message's text and thinking blocks are dropped: they belong to the judged output (a soft refusal is often stated in the text), and thinking is dropped on a model switch anyway (§8.4 Thinking);
+    - the new model continues from the sibling tool results. A tool result is a natural continuation point for any model, and the new model sees what was done without the refused message.
+    The runner waits for siblings still executing to settle before forking, because their results belong to the kept message. Several sends in one message are siblings like any other: a send that passed its own gate and was delivered is irreversible and stays; the refused one is removed. When every sibling is redo-safe, the whole message is part of the discarded span and is redone, as for any read-only work after the fork point (owner decision 2).
   - **Interjections** delivered inside the discarded span are redelivered into the new branch (the `steer_unread_redelivered` path).
   - **Forced completion**: the nudge counter resets on a refusal redo; a send-contract redo starts its own budget (§7.5).
   - **Thinking** blocks of the old model are dropped on replay to a different model, as today.
@@ -379,7 +432,7 @@ Refused attempts' spend is recorded: the pi-ai patch keeps `usage` on the refusa
 
 ## 11. Upstream vs deployment
 
-- **Upstream** (generic, default-off): checks and the built-in catalogue, detection, the gate, send-contract diagnostics, rules, redo and branches, statistics, console. No rule and no blocking check ships enabled. Mechanical statistics are on by default; judged statistics need a configured decision model.
+- **Upstream** (generic, default-off): checks and the built-in catalogue, detection, the gate, send-contract diagnostics, rules, redo and branches, statistics, console. No rule and no blocking check ships enabled. Mechanical statistics are on by default. Judged checks need a configured decision model **and** an explicit enable: configuring a decision model for another point (routing, records) never starts paying for a call on every message.
 - **Deployment**: which rules exist and which models they name, which checks block. A deployment may begin with distillation rules only, and observe everything else.
 
 ## 12. Console
@@ -464,7 +517,7 @@ Every checkpoint adds work to a task's path. **End-to-end task latency must not 
 
 - measured per checkpoint and site, with its share of the task's end-to-end time;
 - overlapped where possible: evaluation starts at `toolcall_end` (§6.3), runs parallel calls (§6.2), observe-only checks never hold, internal artifacts are judged off the interactive path when nothing waits on them;
-- bounded: every checkpoint has a deadline, past it the output proceeds unjudged and the miss is counted;
+- bounded: every checkpoint has a deadline, past it the output proceeds unjudged and the miss is counted. A deadline is a timeout, not a target (owner decision 21): the quantity to minimize is the actual added delay, measured above, and the deadline only bounds the slow tail;
 - decision models and state sizes chosen for latency as well as quality (DECISION-MODEL §3.6–§3.7);
 - a redo is slower than a success by construction; the rules decide when it is worth it and the statistics show what it costs.
 
@@ -475,7 +528,38 @@ Every checkpoint adds work to a task's path. **End-to-end task latency must not 
 
 ## 15. Open questions
 
-1. Default thresholds, deadlines and `min_chars` per checkpoint, and the decision chains for each (judge route for style, general route for refusal); calibration against the head decision member.
-2. The starter catalogue: built-in refusal questions per reason and source, starter style checks, the textual-tool-call patterns.
-3. Latency budgets per checkpoint and how end-to-end latency is measured (§13).
-4. Phasing: proposed order is (1) hard-refusal categories, statistics, rules and redo for hard refusals and mechanical jobs; (2) send-contract mechanics, backfill and the nudge redo; (3) the gate with observe-only checks; (4) blocking refusal checks, chat redo and branches in the console; (5) style revise; (6) offline diagnosis.
+None that block implementation. Calibrated during implementation:
+
+1. Per-question thresholds, calibrated against the head decision member on labelled examples (DECISION-MODEL §3.6), and the default decision chain per checkpoint.
+2. The built-in refusal questions per reason and source, and the textual-tool-call and context-mimicry patterns (§7.2), written in phase 1–3 and checked against history by the backfill (§10.2).
+3. The owner reviews the starter style catalogue (§4.5) before phase 5 ships it.
+
+## 16. Implementation plan
+
+### 16.1 Phasing
+
+Each phase is deployed as it lands, in a working state (owner decision 24). Pieces of other specs that are not built yet are built inside the phase that first needs them (owner decision 25).
+
+1. **Hard refusals end to end.** Provider categories (the pi-ai patch: `category` and `usage` on the refusal, §5.1), the built-in API-signal catalogue and custom mappings, `refusal_events`, `[[refusal_fallback]]` rules without the `tasks` condition, hard-refusal redo (re-issue on the rule's model), stickiness, `on_exhausted`, mechanical-job redo, the refused-attempt ledger rows. Builds the **tool side-effect list** (redo-safe vs irreversible, shared with SESSION-RECORDS §9).
+2. **Send-contract mechanics.** Tagged corrective prompts, `deriveContractEvents`, `contract_attempts`, the history backfill, the nudge redo (§7.5). Builds the model-free part of DECISION-MODEL §5.8 (contract counters).
+3. **The gate, observe-only.** Judged checks at every checkpoint, recording only; endings without a send; statistics. Builds **judge-shaped state** (DECISION-MODEL §3.8) with the reasoning sources (§5.5).
+4. **Blocking refusal checks.** Soft-refusal redo with discard and fork, sibling handling (§8.4), branches, and the console's branch switcher and gate cards. Builds **multi-label tasks** and the built-in `proactive` task (DECISION-MODEL §5.1a) and enables the rules' `tasks` condition.
+5. **Style revise.** The starter catalogue (§4.5), revise verdicts, bounds and override.
+6. **Offline diagnosis.** The audit worker (DECISION-MODEL §5.8) for §7.2–§7.3 and the history backfill of judged checks; the model behaviour page (§12.3) with change markers (§12.4).
+
+Until phase 4, a rule with `tasks` is a startup error naming the phase that adds it.
+
+### 16.2 Defaults settled for implementation
+
+| item | default |
+|---|---|
+| Deadline, outgoing message | 5 s (owner decision 21) |
+| Deadline, ending without a send | 15 s |
+| Deadline, artifacts and failed rollouts | 30 s (background; nothing user-visible waits) |
+| `min_chars` for style checks | 40 (owner decision 22) |
+| Revise bounds | 2 consecutive rejections per message, 6 per session |
+| Judged checks | off unless a deployment enables them, even with a decision model configured (§11) |
+| Holding a send | only when a verdict could act in this session (§6.3) |
+| Record turn after a sticky redo | runs on the redo model, like the rest of the session (§8.3) |
+| Gate call over the payee's budget | not made; the message is sent unjudged and the miss is counted, never refused for budget |
+| Irreversible tools | every message-posting and editing tool, reactions, deletes and pins, workspace and memory writes, sandbox `bash`, browser actions; reads, searches and fetches are redo-safe |
