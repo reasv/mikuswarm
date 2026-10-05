@@ -79,14 +79,29 @@ Unreleased section; it is not part of any release's notes.
   Usage rows record the profile and a hash of the text sent, and the console session panel
   lists them. Database schema v23 adds `usage_events.model_prompt` and `model_prompt_hash`.
   See ARCHITECTURE.md §8 "Model prompts".
-- **Decision-model continuation** (`[decisions.continuation]`, off by default): when a running or
-  recently completed session is open in the room, the decision model decides whether a new
-  message (a trigger, an explicit reply, or optionally an untriggered message from a recent human
-  participant) continues one of them, is a new request, or is not for the bot. A continuation
-  of a running session is steered in; a completed one is resumed with the message as its next
-  turn, by any participant (billed to the resuming sender), within `window_ms`. The work gate
-  still applies to every resume. Low confidence or any failure leaves today's reply-resume
-  rules in place.
+- **Session records**: every chat-lane or proactive session that did tool work writes a
+  compact record of its work in one extra turn immediately after it completes, while the
+  prompt cache is warm. The record is written with `session_record_tool` (a `summary_tool`
+  variant, always deferred) at interactive priority, bounded by `[session_records].timeout_ms`
+  (default 60 s) and `max_turns` (default 4). A reply to a bot message automatically injects
+  that message's session record into the new session's context via a synthetic
+  `read_session_record` tool call. The agent can fetch any record on demand with
+  `read_session_record(session_id)` (immediate tool, in every session) and drill into the raw
+  rollout with `read_session_transcript(session_id)` (deferred, behind the `sessions` skill).
+  Database schema v24 adds `session_records` and `decision_evaluations`. The observability
+  console shows the record and decision evaluations in the session detail panel.
+  Reply-to-continue (`[agent.sessions.resume]`) is now off by default; the code stays for
+  deployments that opt in.
+- **Decision-model records point** (`[decisions.records]`, off by default): when a decision
+  model is configured, the reply-injects rule is replaced with a judgement over the last
+  `candidates` bot-message sessions (default 3). Records with `relevant` score above
+  `inject_threshold` (default 0.6) are injected, highest-confidence first, up to
+  `max_injected` (default 2).
+- **Routing preloads via synthetic calls**: decision-model routing now injects preloaded skills
+  as synthetic `load_skill` calls at the start of the transcript rather than rendering them
+  into a satellite block. Resumes re-derive the loaded set from the transcript without a
+  separate preload step. Database schema v22 (`initial_preloads`) is unchanged; the `tools`
+  field written by older versions is loaded on resume for compatibility and never written again.
 - **OpenAI Responses API prefill**: `[models.<name>.prefill]` forces a required `analysis` argument on every tool call via strict JSON schema `pattern`, anchoring persona adherence on GPT-6 Sol/Luna. Includes `no_reply` tool, `drop_reasoning` option, and per-serving-member gating via `onPayload`. See spec/OPENAI-PREFILL.md.
 - **Captioning via OpenAI Responses API**: `[models.*]` with `api = "openai-responses"` can now serve as a caption model for images. Incomplete, refused, and unsupported-modality results are classified as content failures. (Port of MR !1 captioning code by contributor nopm.)
 
