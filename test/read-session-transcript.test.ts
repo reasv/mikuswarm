@@ -161,3 +161,30 @@ test("read_session_transcript: range filter works with real shapes", async () =>
     assert.ok(!text.includes("(not found)"), `result showed (not found): ${text}`);
   });
 });
+
+// ── T4: a huge argument is clipped, so one call cannot blow the output budget ──
+
+test("read_session_transcript: huge tool arguments are clipped", async () => {
+  await withStorage(async (storage) => {
+    const now = Date.now();
+    const sessionId = "s-t4-test";
+    await storage.insertAgentSession({
+      id: sessionId,
+      timelineKey: "!room:example.com",
+      sessionType: "default",
+      status: "completed",
+      createdAt: now,
+      updatedAt: now,
+    });
+    const bigFile = "lorem ipsum dolor sit amet ".repeat(4000);
+    const transcript = buildTranscript("file", { command: "create", path: "a.txt", file_text: bigFile }, "Created.");
+    await storage.saveAgentSessionTranscript(sessionId, JSON.stringify(transcript));
+
+    const tool = createReadSessionTranscriptTool({ storage });
+    const result = await tool.execute("call-1", { session_id: sessionId });
+    const text = (result.content as Array<{ type: string; text?: string }>).map((b) => b.text ?? "").join("");
+    assert.ok(text.length < bigFile.length / 4, `output not clipped: ${text.length} chars`);
+    assert.match(text, /TOOL CALL: file/);
+    assert.match(text, /Created\./);
+  });
+});

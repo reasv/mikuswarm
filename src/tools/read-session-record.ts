@@ -177,6 +177,8 @@ export function createReadSessionRecordTool(context: ReadSessionRecordToolContex
 
 /** Max token budget per individual tool-result when rendering the transcript. */
 const TRANSCRIPT_RESULT_MAX_TOKENS = 512;
+/** Max token budget for one call's arguments (a file write or a heredoc can be huge). */
+const TRANSCRIPT_ARGS_MAX_TOKENS = 256;
 /** Max total output tokens for a transcript response. */
 const TRANSCRIPT_MAX_OUTPUT_TOKENS = 4000;
 
@@ -203,7 +205,7 @@ function renderToolPair(
   resultAllowance: number,
 ): string {
   const name = call.name ?? "(unknown)";
-  const argsText = call.arguments !== undefined ? JSON.stringify(call.arguments, null, 2) : "";
+  const argsText = call.arguments !== undefined ? clipText(JSON.stringify(call.arguments), Math.min(TRANSCRIPT_ARGS_MAX_TOKENS, resultAllowance)) : "";
   let out = `TOOL CALL: ${name}\n`;
   if (argsText) out += `ARGS: ${argsText}\n`;
 
@@ -223,15 +225,14 @@ function renderToolPair(
     return out;
   }
 
-  const shaped = shapeContentBlocks(
-    [{ type: "text", text: rawText }],
-    resultAllowance,
-    "per-result",
-    false,
-  );
-  const shapedText = shaped.content.filter((b) => b.type === "text").map((b) => (b as { text: string }).text).join("");
-  out += `RESULT:\n${shapedText}\n`;
+  out += `RESULT:\n${clipText(rawText, resultAllowance)}\n`;
   return out;
+}
+
+/** Clip text to a token allowance with the tool-result budget's truncation marker. */
+function clipText(text: string, allowance: number): string {
+  const shaped = shapeContentBlocks([{ type: "text", text }], allowance, "per-result", false);
+  return shaped.content.filter((b) => b.type === "text").map((b) => (b as { text: string }).text).join("");
 }
 
 export function createReadSessionTranscriptTool(context: ReadSessionRecordToolContext): AgentTool {
