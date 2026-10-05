@@ -57,6 +57,12 @@ test("triggers mark the session's hour dirty for every raw write; sessionless ro
     // A sessionless caption row marks its own hour.
     await addRequest(storage, null, H + 5 * HOUR, "cap_model", { key: KEY_A, cls: "caption" });
     assert.deepEqual(dirtyHours(storage), [H, H + 5 * HOUR]);
+    await rollups(storage).flush();
+    // A running session's status/usage updates leave its rollups alone; the contract outcome does not.
+    await storage.write((db) => db.exec(`update agent_sessions set status = 'running', updated_at = 9, usage_cost = 1 where id = 's1'`));
+    assert.deepEqual(dirtyHours(storage), []);
+    await storage.setAgentSessionContract("s1", { outcome: "clean", nudges: 0, version: 1 });
+    assert.deepEqual(dirtyHours(storage), [H]);
     // Upserting contract attempts (ON CONFLICT DO UPDATE) through the trigger works.
     await storage.insertContractAttempts([
       { agentSessionId: "s1", attemptNo: 1, ts: H + 6_500, servedModel: "model_b", variant: "not_sent", failureTypes: [] },

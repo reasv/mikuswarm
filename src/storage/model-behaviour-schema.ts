@@ -21,9 +21,10 @@
  * their own `ts`. So a trigger on a session child table marks the session's hour,
  * falling back to the row's own time when the session row is missing.
  *
- * The triggers name only columns that predate the refusal-handling migration (or
- * live in tables created with it), so an older-shape test fixture can still drop
- * the v25 columns.
+ * Trigger bodies name only columns that predate the refusal-handling migration (or
+ * live in tables created with it): SQLite refuses to drop a column a trigger body
+ * reads, and older-shape test fixtures drop the v25 columns. An `update of` column
+ * list does not block a drop.
  */
 
 export const MODEL_BEHAVIOUR_HOUR_MS = 3_600_000;
@@ -114,7 +115,11 @@ end;`,
   },
   {
     table: "agent_sessions",
-    sql: `create trigger if not exists mbr_as_au after update on agent_sessions begin
+    // Only the columns the rollups read: the per-request usage aggregate updates
+    // of a running session never touch its rollups (usage_events has its own trigger).
+    sql: `create trigger if not exists mbr_as_au
+  after update of contract_outcome, contract_nudges, initial_preloads, timeline_key, session_type, created_at
+  on agent_sessions begin
   ${markDirty(hourOf("new.created_at"))}
 end;`,
   },
