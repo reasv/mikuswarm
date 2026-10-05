@@ -42,7 +42,7 @@ This is a false-positive vs false-negative trade-off:
 
 A decision-model point (DECISION-MODEL machinery; Jev) judges outputs for refusal (declined, deflected, did less than asked) and its reason. It runs at three kinds of checkpoint:
 
-1. **Every outgoing chat message** (§4): before a `send_message` (or any message-posting tool) executes.
+1. **Every outgoing chat message** (§4): a gate in the send path; the reply is held until judged, before `send_message` (or any message-posting tool) takes effect.
 2. **Internal tasks' artifacts**: the task's output judged against its instruction. The simplest case is a caption (the caption text itself); it applies equally to outputs built over several tool calls, such as a summary or a diary entry (the finished draft at finalize), and to the session record.
 3. **Internal tasks' rollouts, when they appear to fail**: today a summarization run that produces no summary takes the semantic path and is re-run from scratch as a new attempt, up to `max_retries` (ARCHITECTURE.md §9b). That redo becomes gated by a refusal check over the failed rollout: a judged refusal goes to the refusal rules (another model, §5) instead of re-running the same model; no refusal keeps today's redo.
 
@@ -54,12 +54,13 @@ A decision-model point (DECISION-MODEL machinery; Jev) judges outputs for refusa
 
 ## 4. The outgoing-message checkpoint
 
-Every outgoing chat message is judged before it is sent. This is the checkpoint that makes chat-session refusals recoverable: a refused reply is caught before it reaches the chat, so a redo has no irreversible effect to undo (§6.2).
+Every outgoing reply is **gated** on the decision model: it is held and sent only after Jev has evaluated it (or the checkpoint deadline has passed, below). This is a hard gate in the send path, not a check running beside it. This is the checkpoint that makes chat-session refusals recoverable: a refused reply is caught before it reaches the chat, so a redo has no irreversible effect to undo (§6.2).
 
 - **One evaluation, many questions.** The refusal questions ride along with every other per-message question: desired formatting and style (LLM-isms, length, markup), other potential issues, and arbitrary operator- or user-defined conditions on messages. Jev bills once per request (per context), not per question, and the context is the same for all of them, so adding questions costs little. Members billed per question (`billing = "per_question"`) change that arithmetic and must be accounted for.
 - **What the context is**: the outgoing message, the request it answers, and enough recent chat to judge it; designed once and shared by all the per-message questions.
 - **What happens on a verdict** is per question: a refusal goes to the refusal rules (§6); a style or condition violation could ask the model to revise, or only be recorded; to be designed per question family.
-- Open: whether every message is judged or only some (proactive, DMs, bot-to-bot); fail-open behaviour when the decision model is slow or down (the message must still go out).
+- Scope: every reply. Open only for message-posting paths that are not replies (proactive posts, cross-channel sends, bot-to-bot), which likely take the same gate.
+- Fail-open: when the decision model is slow or down, the message goes out at the checkpoint deadline, unjudged, and the miss is counted (§9). The gate never blocks a reply indefinitely.
 
 ## 5. Statistics
 
