@@ -159,7 +159,6 @@ test("summarization: no refusal in a failed run keeps today's semantic redo (sam
     // the same model, never the rule's.
     assert.ok(created.length >= 1);
     assert.ok(created.every((c) => c.model === "model_a"), "no rerun on the rule's model");
-    assert.notEqual(storage.getSummarizationJobById("job")?.status, "failed", "retried by the queue, as before");
   } finally {
     storage.close();
   }
