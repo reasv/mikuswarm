@@ -1318,7 +1318,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       refusals: {
         site: "caption",
         agent: agentName,
-        rules: normalizeRefusalRules(config),
+        rules: refusalRules,
         catalogue: checkCatalogue,
         models: config.models,
         insertEvent: (row: Parameters<typeof storage.insertRefusalEvent>[0]) => storage.insertRefusalEvent(row),
