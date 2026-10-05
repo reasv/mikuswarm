@@ -287,15 +287,24 @@ export class OutputGate implements SessionEndingHook {
         latencyMs: result.latencyMs,
       };
       if (evaluation.canceled) return base;
-      const consequence = this.policy.consequence(entry.info, base, { held: opts.held, late });
-      const ids = await this.evaluator.record(evaluation, {
-        consequence,
-        late,
-        heldMs: opts.heldMs,
-        refusalOutcome: (fired) => this.policy.refusalOutcome(entry.info, fired),
-      });
       this.entries.delete(key);
-      return { ...base, evaluationIds: ids };
+      try {
+        const consequence = this.policy.consequence(entry.info, base, { held: opts.held, late });
+        const ids = await this.evaluator.record(evaluation, {
+          consequence,
+          late,
+          heldMs: opts.heldMs,
+          refusalOutcome: (fired) => this.policy.refusalOutcome(entry.info, fired),
+        });
+        return { ...base, evaluationIds: ids };
+      } catch (error) {
+        this.options.logger?.warn("check_gate_record_failed", {
+          sessionId: this.scope.sessionId,
+          key,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return base;
+      }
     })();
     return entry.recording;
   }

@@ -183,6 +183,12 @@ async function until(cond: () => boolean, label = "condition"): Promise<void> {
 
 const rows = (storage: Storage) => storage.getDecisionEvaluationsForSession(SESSION);
 
+/** The `check_gate_evaluated` line, logged once the rows and events are written. */
+async function gateLog(lines: Array<[string, any]>): Promise<any> {
+  await until(() => lines.some(([e]) => e === "check_gate_evaluated"), "check_gate_evaluated");
+  return lines.find(([e]) => e === "check_gate_evaluated")![1];
+}
+
 function sendTool(log: string[]): any {
   return {
     name: "send_message",
@@ -237,7 +243,7 @@ test("send, observe-only: the send runs at once, the verdict is recorded beside 
   assert.equal(event!.site, "default");
   assert.equal(event!.served_model, "model_a");
   assert.equal(event!.decision_evaluation_id, row!.id);
-  const logged = t.lines.find(([e]) => e === "check_gate_evaluated")![1];
+  const logged = await gateLog(t.lines);
   assert.deepEqual(logged.fired, ["op_refusal"]);
   assert.equal(logged.heldMs, 0);
   assert.equal(logged.unjudged, false);
@@ -350,7 +356,7 @@ test("payee over budget: no gate call, the output proceeds unjudged and the miss
   assert.equal(row!.source, "heuristic");
   assert.equal(row!.reason, "payee_budget");
   assert.equal(row!.consequence, "sent_unjudged");
-  assert.equal(t.lines.find(([e]) => e === "check_gate_evaluated")![1].unjudged, true);
+  assert.equal((await gateLog(t.lines)).unjudged, true);
   t.storage.close();
 });
 
@@ -377,7 +383,7 @@ test("deadline (fake timers): a held output proceeds unjudged; the late completi
     await until(() => rows(t.storage).length === 1);
     const [row] = rows(t.storage);
     assert.equal(row!.consequence, "sent_unjudged");
-    const logged = t.lines.find(([e]) => e === "check_gate_evaluated")![1];
+    const logged = await gateLog(t.lines);
     assert.equal(logged.late, true);
     assert.equal(logged.unjudged, true);
     assert.equal(logged.heldMs, 5000, "the actual added delay");
@@ -601,6 +607,7 @@ test("one evaluation, several calls: they share a decisionGroup", async () => {
   assert.equal(t.server.calls.length, 2);
   const groups = new Set(rows(t.storage).map((r) => r.decision_group));
   assert.equal(groups.size, 1);
+  await gateLog(t.lines);
   assert.equal(t.lines.filter(([e]) => e === "check_gate_evaluated").length, 1, "one logical evaluation");
   t.storage.close();
 });

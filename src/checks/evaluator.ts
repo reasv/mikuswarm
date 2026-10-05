@@ -279,7 +279,15 @@ export class CheckEvaluator {
       if (took) evaluation.checks.push(check);
     }
     const items = assignItemIds(raw);
-    evaluation.done = this.judge(evaluation, items).then((partial) => {
+    const judged = this.judge(evaluation, items).catch((error): { fired: FiredCheck[]; unjudgedReason?: string } => {
+      this.options.logger?.warn("check_gate_call_failed", {
+        sessionId: scope.sessionId,
+        checkpoint,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { fired: [], unjudgedReason: "error" };
+    });
+    evaluation.done = judged.then((partial) => {
       const completedAt = this.now();
       evaluation.completedAt = completedAt;
       const result: CheckEvaluationResult = {
