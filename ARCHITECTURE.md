@@ -2775,7 +2775,7 @@ The records point is `[decisions.records]` (§8h). `StrictObject` schema: unknow
 
 `session_record_written`, `session_record_skipped {reason: empty | tool_unavailable}`, `session_record_failed {reason: refusal | budget_blocked | llm_error | timeout | max_turns | shutdown | not_finalized}`, `session_record_queue_cleared`, `steer_unread_redelivered`, `reply_resume_record_unsettled`, `records_injection_plan_failed`, `records_injection_select_failed`, `synthetic_injections_failed`, `synthetic_call_tool_error`, `synthetic_call_tool_not_found`, `follow_up_fold_after_settle {ownerSessionId, eventId, timelineKey, form, action}`, `follow_up_fold_launch_failed`, `follow_up_fold_after_settle_failed`, `follow_up_fold_after_settle_threw`, plus the decision rows and `decision_evaluated` of §8h.
 
-**Known limitation.** A provider refusal that surfaces as an error stop is classified `environmental` by Layer-0 (`classifyLlmError`) and retried until the turn's `timeout_ms`, so a refused record turn usually ends as `timeout` rather than `refusal` (no row either way). Refusal handling across request sites is not implemented.
+**Known limitation.** A provider refusal that surfaces as an error stop is classified `environmental` by Layer-0 (`classifyLlmError`) and retried until the turn's `timeout_ms`, so a refused record turn usually ends as `timeout` rather than `refusal` (no row either way). Refusal handling across request sites is not implemented. A **fresh-mode** console resume (a run that crashed before its first `turn_end`, rebuilt from the durable trigger row) builds the session without record injections or routing; only the continue-mode resume keeps them, from the transcript.
 
 ---
 
