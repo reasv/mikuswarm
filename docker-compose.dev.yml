@@ -161,6 +161,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # Code version on the model behaviour page's change markers, e.g.
+      # MIKUSWARM_BUILD_REVISION=$(git rev-parse --short HEAD) docker compose ... build
+      args:
+        MIKUSWARM_BUILD_REVISION: ${MIKUSWARM_BUILD_REVISION:-unknown}
     image: mikuswarm-agent:latest
     container_name: mikuswarm-agent
     restart: unless-stopped
