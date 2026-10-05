@@ -1,6 +1,6 @@
 # Refusal handling: detection, statistics, rule-driven fallback and redo
 
-**Status**: PROPOSAL (2026-10-05). Direction from the owner; most mechanisms below are still open design questions (§10), to be settled in a planning pass before implementation.
+**Status**: PROPOSAL (2026-10-05). Direction from the owner; most mechanisms below are still open design questions (§11), to be settled in a planning pass before implementation.
 **Builds on**: the shipped `refusal` error class (ARCHITECTURE.md §8a "Refusals"): hard refusals are recognized from the provider's stop reason, are never a health strike, are never retried on the member that refused, fall over to the next chain member, and log `llm_refusal`. The session-record turn opts out of fallover.
 **Supersedes**: the "Refusal handling" direction recorded in spec/SESSION-RECORDS.md §9, which this document expands.
 **Related**: style / LLM-ism enforcement (designed jointly, §4), SESSION-RECORDS (record turn, §3.2), DECISION-MODEL (decision points, Jev), MODEL-FALLBACK, LLM-FAILURE-HANDLING, the "redo" concept of SESSION-RECORDS §9.
@@ -21,7 +21,7 @@ Today the code cannot tell reasons apart, cannot see soft refusals, keeps no sta
 1. **Detection of many refusal types**, hard and soft, each classified by reason, with the reason taxonomy designed to be extended (new provider signals, new operator-defined reasons) without code changes where possible.
 2. **Statistics, always.** Every detected refusal is recorded per model, reason, task/session type and detection method, whether or not any fallback is configured, so the data exists before it is acted on and so false positives can be judged.
 3. **Rule-driven fallback across the board.** Refusal fallback rules apply to every request site: chat-lane reply sessions, proactive sessions, the session-record turn, summarization/condense, diary, captioning, decision-adjacent calls. A rule matches on the task/session type and the refusal reason, and names what to do (which models to try, how many times).
-4. **A correct "redo".** Recovering from a refusal that produced output means discarding that output and re-running the task from just before it, on another model (§6).
+4. **A correct "redo".** Recovering from a refusal that produced output means discarding that output and re-running the task from just before it, on another model (§7).
 5. **No rule matches → today's behaviour** (the shipped class: next member of the ordinary chain for hard refusals; nothing for soft ones beyond the statistic).
 
 ## 3. Detection
@@ -44,7 +44,7 @@ A decision-model point (DECISION-MODEL machinery; Jev) judges outputs for refusa
 
 1. **Every outgoing message** (§4): a gate in the send path; the message is held until judged, before `send_message` (or any message-posting tool) takes effect.
 2. **Internal tasks' artifacts**: the task's output judged against its instruction. The simplest case is a caption (the caption text itself); it applies equally to outputs built over several tool calls, such as a summary or a diary entry (the finished draft at finalize), and to the session record.
-3. **Internal tasks' rollouts, when they appear to fail**: today a summarization run that produces no summary takes the semantic path and is re-run from scratch as a new attempt, up to `max_retries` (ARCHITECTURE.md §9b). That redo becomes gated by a refusal check over the failed rollout: a judged refusal goes to the refusal rules (another model, §5) instead of re-running the same model; no refusal keeps today's redo.
+3. **Internal tasks' rollouts, when they appear to fail**: today a summarization run that produces no summary takes the semantic path and is re-run from scratch as a new attempt, up to `max_retries` (ARCHITECTURE.md §9b). That redo becomes gated by a refusal check over the failed rollout: a judged refusal goes to the refusal rules (another model, §7) instead of re-running the same model; no refusal keeps today's redo.
 
 ### 3.4 Reasons
 
@@ -54,36 +54,54 @@ A decision-model point (DECISION-MODEL machinery; Jev) judges outputs for refusa
 
 ## 4. The outgoing-message gate (shared with style enforcement)
 
-Every outgoing message is **gated** on the decision model: it is held and sent only after Jev has evaluated it (or the gate's deadline has passed, below). This is a hard gate in the send path, not a check running beside it. Replies are not special: proactive posts, cross-channel sends and bot-to-bot messages take the same gate. The gate is what makes chat-session refusals recoverable: a refused message is caught before it reaches the chat, so a redo has no irreversible effect to undo (§6.2).
+Every outgoing message is **gated** on the decision model: it is held and sent only after Jev has evaluated it (or the gate's deadline has passed, below). This is a hard gate in the send path, not a check running beside it. Replies are not special: proactive posts, cross-channel sends and bot-to-bot messages take the same gate. The gate is what makes chat-session refusals recoverable: a refused message is caught before it reaches the chat, so a redo has no irreversible effect to undo (§7.2).
 
 **Designed together with style enforcement.** The gate is the same feature as LLM-ism / style enforcement: one Jev call per outgoing message carries every per-message question (refusal and its reason, formatting and style, LLM-isms, other potential issues, arbitrary operator- or user-defined conditions on messages). Jev bills once per request (per context), not per question, and the context is the same for all of them, so adding questions costs little. Members billed per question (`billing = "per_question"`) change that arithmetic and must be accounted for. The two are specified and built as one gate; this document owns its refusal side.
 
 - **Context**: the outgoing message, the request it answers, and enough recent chat to judge it; designed once and shared by all questions.
 - **Two kinds of verdict, two recoveries:**
-  - **Redo on another model** (refusal fallback, and any other check whose remedy is a different model): the message is not sent; the turn is discarded and redone on the rule's model (§6.2). Bounded by its fallback chain, explicit or implicit, so it needs no further limit.
+  - **Redo on another model** (refusal fallback, and any other check whose remedy is a different model): the message is not sent; the turn is discarded and redone on the rule's model (§7.2). Bounded by its fallback chain, explicit or implicit, so it needs no further limit.
   - **Revise in place** (style and similar checks, where a different, less preferred model would likely do worse): the send is stopped and the `send_message` call returns a tool error listing each flagged check with its unique identifier and an explanation for the agent; the agent revises and calls `send_message` again. The same agent and model continue; nothing is discarded.
 - **Bounds on revise-in-place** (better a style issue than an unbounded, unnoticed token spend):
   - a limit on consecutive triggers for one message, after which the message goes through regardless of style flags;
   - a per-session limit on total style rejections, after which style checks stop blocking for the rest of the session;
   - both counted in the statistics.
 - **Per-check override.** `send_message` takes an argument naming check identifiers to skip for this send. The tool error tells the agent to use it whenever a flagged check is a clear false positive, or the message deliberately shows the flagged pattern (an example, a quotation). Every check therefore has a stable unique identifier. An override is recorded with the statistics.
-- **Fail-open**: when the decision model is slow or down, the message goes out at the gate's deadline, unjudged, and the miss is counted (§9). The gate never blocks a message indefinitely.
+- **Fail-open**: when the decision model is slow or down, the message goes out at the gate's deadline, unjudged, and the miss is counted (§10). The gate never blocks a message indefinitely.
 
-## 5. Statistics
+## 5. Check definitions (config)
+
+Refusal types and style issues are both **checks**, defined in config and judged by the same gate (§4) and checkpoints (§3.3). Each check has:
+
+- a **unique code** (stable identifier): recorded in the statistics, matched by rules, and, for style checks, shown to the agent as the override value;
+- a **user-facing description** (operators, console);
+- its **kind**: refusal (remedy: rules, redo on another model, §7) or style (remedy: revise in place, §4);
+- for style checks, an **agent-facing explanation**: the text shown to the agent in the `send_message` tool error, next to the code it can pass to override the check;
+- its **detection metadata**:
+  - **API signals** (hard refusals): which provider stop reasons / categories map to this code;
+  - **Jev questions** (soft detection): one or more questions for the decision model.
+
+**Several questions per check.** One check can carry multiple Jev questions that describe the same issue in different ways, to raise accuracy. All of them map to the same code and, for style, the same agent-facing explanation. The check's verdict is taken from whichever of its questions answers with the highest confidence. (How "confidence" is read for each question type, e.g. a `noul` probability, is part of the gate design.)
+
+**API-mediated hard refusals.** Every refusal signal the supported providers document is defined in advance, from their documentation, as built-in checks with built-in codes (stop reasons, filter results, guardrail outcomes, refusal categories). Open: whether config may also define custom API-signal mappings (a provider or gateway the built-in catalog does not know), or only Jev-question checks.
+
+**Built-in vs operator checks.** Upstream ships the built-in refusal catalog and possibly a starter set of style checks; operators add their own checks (refusal reasons and style issues alike) with their own codes, descriptions, explanations and questions, and may disable built-in ones. Per-agent overrides follow the existing `[agents.<name>.…]` pattern.
+
+## 6. Statistics
 
 - A durable record per detected refusal (a table such as `refusal_events`: time, session, request site / session type, model and served member, reason, detection method, confidence, provider explanation, whether a rule fired and its outcome). Written through the single-writer queue.
 - Console: per-model refusal rates by reason and site, and the refusals inline in a session's rollout (like decision cards), so a false positive can be seen and judged.
 - Collected whether or not any fallback rule is configured or enabled.
 
-## 6. Recovery: rules and redo
+## 7. Recovery: rules and redo
 
-### 6.1 Rules
+### 7.1 Rules
 
 - `[[refusal_fallback]]`-style rules (shape to be designed): match on site / session type (chat rollout, record turn, summarize, condense, diary, caption…), on reason (built-in or operator-defined), optionally on agent; name the models to try (a preference list, like routing cascades), a maximum number of redos, and whether a soft refusal of that reason triggers a redo or only a statistic.
 - A model named by a rule still goes through the usual gates (health, budget, per-user limits, context fits, capability).
 - If the fallback model also refuses, the next rule entry applies; when all are exhausted the task ends as it would today (no output for mechanical jobs; park for chat sessions on a hard refusal; the soft-refused output stands for chat, or is withheld; to decide).
 
-### 6.2 Redo semantics (the hard part)
+### 7.2 Redo semantics (the hard part)
 
 How to "redo" depends on where the refusal surfaced:
 
@@ -95,22 +113,22 @@ How to "redo" depends on where the refusal surfaced:
 - **Irreversible effects.** A refused turn may already have acted: sent a chat message, posted, edited a file. Options to decide between: judge before irreversible tools run (the outgoing-message gate of §4, the default for chat messages), only redo when the refused turn had no irreversible effects, or redo and then correct (edit/delete the sent message). Mechanical jobs (summary, caption) have no external effects, so for them a redo is always just "discard and rerun".
 - **What a redo is billed to** and how it appears in the usage ledger (the refused attempt and the redo are separate requests; refused attempts' spend must be recorded, which today's terminal-error path does not do).
 
-### 6.3 Per-site notes
+### 7.3 Per-site notes
 
 - **Chat-lane reply sessions**: the main new case. The outgoing-message gate (§4) catches the refused message before it is sent; the fork/redo machinery in the session runner then continues on the rule's model. Interacts with steering, interjections and the forced-completion loop.
 - **Session-record turn**: a refused record turn can be redone on another model (spec SESSION-RECORDS §3.2 anticipated this). The other model reads the whole rollout uncached; the record turn's own budget and timeout apply.
 - **Summarization / condense / diary / captioning**: the artifact check (§3.3) catches a refused output; a failed rollout is checked before today's redo-from-scratch (§3.3). Discard and rerun on the rule's model; never write a refusal into a summary, caption or diary; no repeated tool nudges against a refusing model.
 
-## 7. Upstream vs deployment
+## 8. Upstream vs deployment
 
 - Upstream (generic, default-off): detection, the reason taxonomy and operator-defined reasons, statistics, the rule engine, the redo machinery, console views. No rule ships enabled; statistics collection is on by default.
 - Deployment: which rules exist and which models they name. The first deployment intends to configure rules only for the distillation/reasoning-extraction reason, across every site, and nothing else at first.
 
-## 8. Non-goals
+## 9. Non-goals
 
 - Bypassing safety systems. Recovery only ever means asking another model that is permitted to do the task; nothing rewrites or disguises a request to get past a refusal.
 
-## 9. Latency
+## 10. Latency
 
 Every change here adds work to the path of a task: a judgement before each outgoing message, artifact checks, rollout checks, redos on another model. **End-to-end task latency must not suffer**, and that is a design requirement for each piece, not an afterthought:
 
@@ -120,7 +138,7 @@ Every change here adds work to the path of a task: a judgement before each outgo
 - Choose decision models and state sizes for latency as well as quality (DECISION-MODEL fits; state budgets).
 - A redo is slower than a success by construction; the rules decide when it is worth it, and the statistics show what it costs.
 
-## 10. Open questions (to settle before implementation)
+## 11. Open questions (to settle before implementation)
 
 1. Exact provider fields for refusal categories (Anthropic `stop_details`, others), and the pi-ai patch to carry them.
 2. Judged checks: the decision points' state and questions per checkpoint (§3.3); thresholds and calibration per model; precision/recall targets now that API signals are trusted positives only.
@@ -130,4 +148,5 @@ Every change here adds work to the path of a task: a judgement before each outgo
 6. Ledger: recording refused attempts' spend.
 7. The outgoing-message gate, designed jointly with style enforcement: shared context, the question families (refusal, style/LLM-isms, other issues, operator/user conditions), check identifiers, which checks redo vs revise, the consecutive and per-session limits, and the override argument.
 8. Which internal tasks get artifact checks and rollout checks first, and where in each worker the check sits.
-9. Latency budgets per checkpoint, fail-open deadlines, and how latency is measured end to end (§9).
+9. Latency budgets per checkpoint, fail-open deadlines, and how latency is measured end to end (§10).
+10. The check-definition schema (§5): codes, descriptions, agent-facing explanations, API-signal mappings, multiple questions per check and how their confidences compare; the built-in refusal catalog from provider documentation; whether custom API-signal mappings are allowed; built-in vs operator checks and per-agent overrides.
