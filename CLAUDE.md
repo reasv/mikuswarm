@@ -76,7 +76,7 @@ src/
   agent/            Session factory, runner, manager; LLM request scheduler + retry/resume recovery (ARCHITECTURE.md §8/§8a)
   context/          Context builder, renderer, compaction
   matrix/           Matrix provider, inbound normalization, native client
-  tools/            Agent tool implementations (52 tools: the 50 default-session tools of §10 plus the background-session summary_tool and diary_tool; session_record_tool is harness-only and not agent-visible)
+  tools/            Agent tool implementations (53 tools: the 50 default-session tools of §10, the background-session summary_tool and diary_tool, and the harness-only session_record_tool used only by the end-of-session record turn, §8i)
   sandbox/          Docker sandbox: ExecBackend + SandboxManager (bash & search_files run in-container; see ARCHITECTURE.md §11a)
   browser/          Browser-use control layer: Manager REST client + BrowserSession (connectOverCDP) + snapshot/act over one persistent stealth identity (see ARCHITECTURE.md §11b)
   storage/          SQLite persistence (single-writer queue) + MemoryFileWriter (memory/*.md single-writer)
