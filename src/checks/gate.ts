@@ -32,6 +32,12 @@ import type { Logger } from "../observability/logger.js";
 import type { RefusalOutcome } from "../storage/database.js";
 import { isPostingTool } from "../tools/side-effects.js";
 import {
+  addOverrideArgumentToSchema,
+  overrideArgumentCodes,
+  readOverrideChecks,
+  withoutOverrideArgument,
+} from "./revise.js";
+import {
   CheckEvaluation,
   type CheckConsequence,
   type CheckEvaluator,
@@ -75,6 +81,8 @@ export interface GateCallInfo {
   toolCallId?: string;
   attemptNo?: number;
   scope: CheckScope;
+  /** Codes the call's `override_checks` argument names (spec §6.4); honoured by the revise part only. */
+  overrideChecks?: string[];
 }
 
 /**
@@ -95,6 +103,12 @@ export interface GatePolicy {
   refusalOutcome(info: GateCallInfo, fired: FiredCheck): { outcome: RefusalOutcome; ruleName?: string; toModel?: string } | null;
   /** Act on a held verdict (after it is recorded). */
   act(info: GateCallInfo, verdict: GateVerdict): GateAction | Promise<GateAction>;
+  /**
+   * A gated call went through and its tool succeeded (a delivered message, an
+   * accepted `no_reply`): per-message counters restart (the revise part's
+   * consecutive bound, §6.4).
+   */
+  onDelivered?(info: GateCallInfo): void;
 }
 
 /** Observe-only (phase 3, and every check with remedy `observe`): record, never hold. */
@@ -148,6 +162,8 @@ export class OutputGate implements SessionEndingHook {
   private readonly attemptStarts = new Map<number, Set<string>>();
   private disposed = false;
   private artifactSeq = 0;
+  /** Per checkpoint: the revisable codes that put `override_checks` on its tools. */
+  private readonly overrideCodes = new Map<Checkpoint, string[]>();
 
   constructor(private readonly options: OutputGateOptions) {
     this.policy = options.policy ?? OBSERVE_POLICY;
@@ -220,6 +236,7 @@ export class OutputGate implements SessionEndingHook {
       ...(subject.toolCallId ? { toolCallId: subject.toolCallId } : {}),
       ...(subject.attemptNo !== undefined ? { attemptNo: subject.attemptNo } : {}),
       scope,
+      ...(subject.overrideChecks?.length ? { overrideChecks: subject.overrideChecks } : {}),
     };
     this.entries.set(key, { evaluation, info, claimed: false });
     return evaluation;
@@ -368,6 +385,8 @@ export class OutputGate implements SessionEndingHook {
       sources.thinking = reasoning.thinking;
     }
     const subject: GateSubject = { action: toolName, sources, toolCallId };
+    const overrideChecks = readOverrideChecks(args);
+    if (overrideChecks.length > 0) subject.overrideChecks = overrideChecks;
     if (checkpoint === "ending") {
       const history = nudgeHistory(messages);
       subject.nudges = history.nudges;
@@ -471,6 +490,37 @@ export class OutputGate implements SessionEndingHook {
     return this.recordEntry(key, entry, { held: false, heldMs: 0 });
   }
 
+  /**
+   * Whether the gated tool carries the `override_checks` argument: some
+   * revisable check can fire at its checkpoint for the session's agent (spec
+   * §6.4). Fixed for the session, so the tool schema is wire-stable.
+   */
+  overrideArgumentFor(toolName: string): boolean {
+    const checkpoint = gatedCheckpoint(toolName);
+    if (!checkpoint) return false;
+    let codes = this.overrideCodes.get(checkpoint);
+    if (!codes) {
+      codes = overrideArgumentCodes(this.evaluator, checkpoint, this.scope.agent);
+      this.overrideCodes.set(checkpoint, codes);
+    }
+    return codes.length > 0;
+  }
+
+  /** A gated call went through and its tool succeeded: tell the policy (never throws). */
+  delivered(toolName: string, toolCallId: string): void {
+    const checkpoint = gatedCheckpoint(toolName);
+    if (!checkpoint || !this.policy.onDelivered) return;
+    try {
+      this.policy.onDelivered({ checkpoint, action: toolName, toolCallId, scope: this.scope });
+    } catch (error) {
+      this.options.logger?.warn("check_gate_delivered_failed", {
+        sessionId: this.scope.sessionId,
+        toolCallId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   /** Drop pending, never-claimed evaluations (session end). Claimed ones still record. */
   dispose(): void {
     this.disposed = true;
@@ -493,6 +543,8 @@ export interface GateSubject {
   firstAttempt?: string;
   servedModel?: string;
   wireModel?: string;
+  /** The call's `override_checks` codes. */
+  overrideChecks?: string[];
 }
 
 /** One-line task descriptions for artifact checks (the `request` they are judged against). */
@@ -525,7 +577,13 @@ function emptyVerdict(): GateVerdict {
  * Wrap the gated tools (spec §6.1) so each call passes the gate before it
  * executes. In observe mode the call runs at once; a blocking policy may hold
  * it and throw (a thrown error is the tool error the agent sees). Other tools
- * are returned unchanged; definitions are untouched (wire-stable).
+ * are returned unchanged.
+ *
+ * When a revisable check can fire at the tool's checkpoint
+ * ({@link OutputGate.overrideArgumentFor}), the definition gains the optional
+ * `override_checks` argument (spec §6.4), fixed for the session (wire-stable);
+ * the gate reads it and the tool never receives it. A call that went through
+ * and succeeded is reported to the policy ({@link OutputGate.delivered}).
  */
 export function wrapToolsWithOutputGate(tools: readonly AgentTool[], gate: OutputGate): AgentTool[] {
   return tools.map((tool) => {
@@ -539,10 +597,21 @@ export function wrapToolsWithOutputGate(tools: readonly AgentTool[], gate: Outpu
         // The gate never stops a send by failing (fail-open).
       }
       if (action.kind === "block") throw new Error(action.message);
-      return original.call(tool, toolCallId, params, signal, onUpdate);
+      const result = await original.call(tool, toolCallId, withoutOverrideArgument(params), signal, onUpdate);
+      if (!isErrorResult(result)) gate.delivered(tool.name, toolCallId);
+      return result;
     };
-    return { ...tool, execute };
+    if (!gate.overrideArgumentFor(tool.name)) return { ...tool, execute };
+    return { ...tool, parameters: addOverrideArgumentToSchema(tool.parameters) as typeof tool.parameters, execute };
   });
+}
+
+/** A tool result reporting a failure as text (the tools' `error: …` convention), not a delivery. */
+function isErrorResult(result: unknown): boolean {
+  const content = (result as { content?: unknown } | undefined)?.content;
+  if (!Array.isArray(content)) return false;
+  const first = content[0] as { type?: unknown; text?: unknown } | undefined;
+  return first?.type === "text" && typeof first.text === "string" && /^error\b/i.test(first.text.trimStart());
 }
 
 /** Judging internal tasks' outputs (spec §5.2.3–4), off the interactive path. */
