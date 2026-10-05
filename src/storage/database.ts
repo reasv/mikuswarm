@@ -1192,13 +1192,23 @@ export interface ToolInvocationInput {
  *
  * `tools` was removed in W5: tool loading now happens via synthetic `load_skill`
  * calls in the live transcript, derived on resume by `seedFromTranscript`.
- * Old rows that still carry a `tools` array parse fine; the field is ignored.
+ * Old rows that still carry a `tools` array are read-only legacy compat: the
+ * field is exposed in `legacyTools` for the resume branch to load into the
+ * registry (I3), but is never written again.
  */
 export interface SessionRoutingState {
   skills: string[];
   model?: string;
   cascade?: string[];
   thinkingLevel?: string;
+  /**
+   * Legacy compat read-only (I3): present only when the persisted row was written
+   * before W5 replaced explicit tool preloads with synthetic load_skill calls.
+   * The resume branch loads these into the registry before `seedFromTranscript`
+   * so tools are in the right state before transcript-derived additions layer on.
+   * Never written; callers must not persist this field.
+   */
+  legacyTools?: string[];
 }
 
 /** Consumer class of a {@link UsageEventRow} (spec USAGE-COST-LIMITS §3). */
@@ -8075,13 +8085,17 @@ export class Storage {
     try {
       const parsed = JSON.parse(row.initial_preloads) as Record<string, unknown>;
       const strings = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
-      // `tools` was stored by sessions created before W5; it is ignored now
-      // (tool loading is derived from transcript `addedToolNames` instead).
+      // `tools` was stored by sessions created before W5 (tool loading now happens
+      // via synthetic load_skill calls in the transcript).  Exposed as `legacyTools`
+      // so the resume branch can load them into the registry before seedFromTranscript
+      // (I3 compat, read-only — never written back).
+      const legacyTools = strings(parsed["tools"]);
       return {
         skills: strings(parsed["skills"]),
         ...(typeof parsed["model"] === "string" ? { model: parsed["model"] } : {}),
         ...(Array.isArray(parsed["cascade"]) ? { cascade: strings(parsed["cascade"]) } : {}),
         ...(typeof parsed["thinkingLevel"] === "string" ? { thinkingLevel: parsed["thinkingLevel"] } : {}),
+        ...(legacyTools.length > 0 ? { legacyTools } : {}),
       };
     } catch {
       return undefined;

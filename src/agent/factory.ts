@@ -1611,6 +1611,13 @@ export class AgentSessionFactory {
       registry = new DynamicToolRegistry(wrappedTools, immediate);
       dynRef.registry = registry;
       declaredRef.set = { catalog: registry.catalogTools, immediate: registry.immediateNames };
+      // I3 legacy compat: old rows written before W5 stored the preloaded tool names
+      // directly in initial_preloads.tools.  Load them before seedFromTranscript so
+      // the transcript-derived addedToolNames layer on top of, not instead of, the
+      // tools the session was originally created with.  Read-only — never persisted.
+      if (opts?.resume && persistedRouting?.legacyTools?.length) {
+        registry.load(persistedRouting.legacyTools);
+      }
       if (opts?.resume?.transcript?.length) {
         registry.seedFromTranscript(opts.resume.transcript);
       }

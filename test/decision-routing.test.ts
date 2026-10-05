@@ -517,7 +517,7 @@ test("storage: v21→v22 adds agent_sessions.initial_preloads; set/get round-tri
           .run(JSON.stringify({ skills: ["shell"], tools: ["bash"], model: "mid" }), "s1"),
       );
       await storage.waitForIdle();
-      assert.deepEqual(storage.getSessionInitialPreloads("s1"), { skills: ["shell"], model: "mid" }, "old 'tools' field is ignored");
+      assert.deepEqual(storage.getSessionInitialPreloads("s1"), { skills: ["shell"], model: "mid", legacyTools: ["bash"] }, "old 'tools' field is exposed as legacyTools for resume compat");
     } finally {
       await storage.waitForIdle();
       storage.close();
