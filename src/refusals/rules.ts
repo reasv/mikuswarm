@@ -13,7 +13,8 @@ import {
   type RefusalRule,
   type RefusalRuleEntry,
 } from "../checks/types.js";
-import { isDecisionModel } from "../decisions/config.js";
+import { decisionsFor, isDecisionModel } from "../decisions/config.js";
+import { RESERVED_ROUTING_TASKS } from "../decisions/points/routing.js";
 
 /** The rules in authored order (precedence: first match wins). */
 export function normalizeRefusalRules(config: Pick<AppConfig, "refusal_fallback">): RefusalRule[] {
@@ -137,11 +138,7 @@ export function validateRefusalRules(config: AppConfig, catalogue: CheckCatalogu
         throw new Error(`${where}.${field}: must not be empty (omit it to match any)`);
       }
     }
-    if (rule.tasks && rule.tasks.length > 0) {
-      throw new Error(
-        `${where}.tasks: the tasks condition is not available yet (it arrives with multi-label tasks, phase 4 of refusal handling); remove it`,
-      );
-    }
+    if (rule.tasks && rule.tasks.length > 0) validateRuleTasks(config, rule.tasks, rule.agents, agentNames, where);
     for (const key of rule.from_models ?? []) {
       if (!config.models[key]) throw new Error(`${where}.from_models: "${key}" does not name a [models.*] block`);
     }
@@ -167,6 +164,33 @@ export function validateRefusalRules(config: AppConfig, catalogue: CheckCatalogu
       }
     }
   });
+}
+
+/**
+ * A rule's `tasks` (spec §8.1): every key must be a routing task of each agent
+ * the rule applies to (its `agents`, else every agent; the global
+ * `[decisions.routing]` in legacy mode), or a reserved key (`other`, the
+ * built-in `proactive`). Agents may replace their task list.
+ */
+function validateRuleTasks(
+  config: AppConfig,
+  tasks: readonly string[],
+  ruleAgents: readonly string[] | undefined,
+  agentNames: readonly string[],
+  where: string,
+): void {
+  const agents: Array<string | null> = ruleAgents ? [...ruleAgents] : agentNames.length > 0 ? [...agentNames] : [null];
+  for (const agent of agents) {
+    const known = new Set<string>([
+      ...Object.keys(decisionsFor(config, agent).routing?.tasks ?? {}),
+      ...RESERVED_ROUTING_TASKS,
+    ]);
+    for (const task of tasks) {
+      if (known.has(task)) continue;
+      const owner = agent ? `agent "${agent}"'s routing tasks` : "[decisions.routing.tasks]";
+      throw new Error(`${where}.tasks: "${task}" is not one of ${owner} (known: ${[...known].join(", ")})`);
+    }
+  }
 }
 
 /**

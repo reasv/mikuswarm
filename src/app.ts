@@ -75,6 +75,8 @@ import {
 } from "./decisions/index.js";
 import { attachSessionCapture, type SessionCaptureHandle } from "./agent/session-capture.js";
 import { createRedoHandler } from "./agent/redo.js";
+import { createSoftRefusalRedoHandler } from "./refusals/soft-redo.js";
+import { createActingPolicy } from "./checks/acting-policy.js";
 import { ContractReconciler, persistSessionContract } from "./agent/contract-store.js";
 import type { CreatedAgent } from "./agent/factory.js";
 import type { SessionRunnerOptions } from "./agent/runner.js";
@@ -2039,7 +2041,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // runs at runtime it is fully populated).
     mcpToolServerMap,
     // The output gate of every chat-lane session (spec REFUSAL-HANDLING §6).
-    outputChecks: { evaluator: checkEvaluator, chat: checkChatState, logger: logger.child("checks") },
+    outputChecks: {
+      evaluator: checkEvaluator,
+      chat: checkChatState,
+      // Blocking refusal checks (spec REFUSAL-HANDLING §6.3–§6.4): holds only
+      // when a soft rule could act; the revise half (style) plugs in here.
+      actingPolicy: (_session, handles) => createActingPolicy({ ...handles, logger: logger.child("checks") }),
+      logger: logger.child("checks"),
+    },
   });
 
   // ---------------------------------------------------------------------------
@@ -5635,12 +5644,19 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
    * the `[agent.sessions].forced_completion_redo` switch.
    */
   function sessionRedoOptions(
-    created: Pick<CreatedAgent, "redoControl" | "forkContext">,
+    created: Pick<CreatedAgent, "redoControl" | "forkContext" | "gate">,
     capture: SessionCaptureHandle,
   ): Pick<SessionRunnerOptions, "redo" | "contractRedo" | "logger"> {
     const fork = created.forkContext({ storage, flushTranscript: () => capture.flushNow(), logger });
+    // Soft-refusal redo (spec REFUSAL-HANDLING §6.4, §8.4): the acting gate
+    // policy files it; this forks, re-anchors the discarded span, continues.
+    const onRefusal = createSoftRefusalRedoHandler({
+      storage,
+      ...(created.gate ? { gate: created.gate } : {}),
+      logger,
+    });
     return {
-      redo: { control: created.redoControl, onRedo: createRedoHandler({ fork, logger }) },
+      redo: { control: created.redoControl, onRedo: createRedoHandler({ fork, logger, onRefusal }) },
       contractRedo: config.agent.sessions.forced_completion_redo === true,
       logger,
     };
@@ -6076,6 +6092,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       return { outcome, error: message };
     } finally {
       captureHandle.detach();
+      // The session is over: unclaimed gate evaluations are dropped (claimed ones still record).
+      created?.gate?.dispose();
       costWarnUnsub();
     }
   }
@@ -6881,6 +6899,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       })
       .finally(() => {
         captureHandle.detach();
+        // The session is over: unclaimed gate evaluations are dropped (claimed ones still record).
+        created?.gate?.dispose();
         costWarnUnsub();
         activeRuns.delete(run);
         // Per-session browser close (§10a): close this session's tab(s). Use the
@@ -7389,6 +7409,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       })
       .finally(() => {
         captureHandle.detach();
+        // The session is over: unclaimed gate evaluations are dropped (claimed ones still record).
+        created?.gate?.dispose();
         costWarnUnsub();
         activeRuns.delete(run);
         // Close this session's browser tab(s) when the run settles (the idle

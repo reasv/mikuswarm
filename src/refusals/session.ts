@@ -30,7 +30,7 @@ export interface SessionRefusalHandle {
   /** The current site: the session type, or `record_turn` while the record turn runs. */
   readonly site: string;
   readonly agent: string | null;
-  /** The session's task keys; null = taskless (multi-label tasks arrive in phase 4). */
+  /** The session's task keys (multi-label, DECISION-MODEL §5.1a); null = taskless. */
   tasks(): string[] | null;
   /** Logical id of the member that served (or is serving) the last request. */
   servingModel(): string | undefined;
@@ -85,6 +85,8 @@ export interface SessionRefusalDeps {
   /** The session type name (the default site). */
   sessionType: string;
   agent: string | null;
+  /** The session's task keys (routing, or the built-in `proactive`); null/absent = taskless. */
+  tasks?: readonly string[] | null;
   sessionId?: string;
   timelineKey?: string;
   rules: readonly RefusalRule[];
@@ -161,6 +163,7 @@ export function exhaustedOutcome(rule: RefusalRule, site: string): RefusalOutcom
 
 export function createSessionRefusalController(deps: SessionRefusalDeps): SessionRefusalController {
   const now = deps.now ?? Date.now;
+  const tasks: string[] | null = deps.tasks && deps.tasks.length > 0 ? [...deps.tasks] : null;
   let site = deps.sessionType;
   let serving: string | undefined;
   let lastOutcome: RefusalOutcome | undefined;
@@ -176,7 +179,7 @@ export function createSessionRefusalController(deps: SessionRefusalDeps): Sessio
   const scoped = (): RefusalRule[] => {
     let list = scopedBySite.get(site);
     if (!list) {
-      list = refusalRulesForSession(deps.rules, { site, agent: deps.agent, tasks: null });
+      list = refusalRulesForSession(deps.rules, { site, agent: deps.agent, tasks });
       scopedBySite.set(site, list);
     }
     return list;
@@ -203,7 +206,7 @@ export function createSessionRefusalController(deps: SessionRefusalDeps): Sessio
     model !== undefined && refused !== undefined && (model === refused || deps.chainOf(model).includes(refused));
 
   const matchRule: SessionRefusalHandle["matchRule"] = (input) => {
-    const scope = { site, agent: deps.agent, tasks: null, reason: input.reason, kind: input.kind };
+    const scope = { site, agent: deps.agent, tasks, reason: input.reason, kind: input.kind };
     // The model a running walk handed out refused: the same rule continues, when
     // it admits this refusal apart from `from_models` (they named the model that
     // refused first). Likewise for the rule the session is pinned by, when its
@@ -265,7 +268,7 @@ export function createSessionRefusalController(deps: SessionRefusalDeps): Sessio
         site,
         agent: deps.agent,
         timelineKey: deps.timelineKey ?? null,
-        tasks: event.tasks ?? null,
+        tasks: event.tasks !== undefined ? event.tasks : tasks,
       });
     } catch (error) {
       return Promise.reject(error);
@@ -349,7 +352,7 @@ export function createSessionRefusalController(deps: SessionRefusalDeps): Sessio
       return site;
     },
     agent: deps.agent,
-    tasks: () => null,
+    tasks: () => (tasks ? [...tasks] : null),
     servingModel: () => serving ?? pin?.model ?? deps.headModel,
     pinnedModel: () => pin?.model,
     pin: () => (pin ? { ...pin } : undefined),
@@ -395,15 +398,15 @@ export function createSessionRefusalController(deps: SessionRefusalDeps): Sessio
 /**
  * Logical ids of every model a session's refusal rules can switch it to, for
  * model-prompt resolution (spec §8.3): the rules whose scope admits any of the
- * session's sites.
+ * session's sites (and its tasks).
  */
 export function refusalRuleModels(
   rules: readonly RefusalRule[],
-  scope: { sites: readonly string[]; agent: string | null },
+  scope: { sites: readonly string[]; agent: string | null; tasks?: readonly string[] | null },
 ): string[] {
   const models = new Set<string>();
   for (const site of scope.sites) {
-    for (const rule of refusalRulesForSession(rules, { site, agent: scope.agent, tasks: null })) {
+    for (const rule of refusalRulesForSession(rules, { site, agent: scope.agent, tasks: scope.tasks ?? null })) {
       for (const model of ruleModelKeys(rule)) models.add(model);
     }
   }

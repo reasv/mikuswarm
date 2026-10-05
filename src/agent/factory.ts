@@ -32,7 +32,7 @@ import {
 } from "./model-fallback.js";
 import { loadWorkspace, renderSystemPrompt } from "../workspace/index.js";
 import type { WorkspaceContent, SessionTypeConfig, SkillMeta, RoutedSatellite } from "../workspace/types.js";
-import type { RoutingVerdict } from "../decisions/points/routing.js";
+import { ROUTING_PROACTIVE, routingTasksOf, type RoutingVerdict } from "../decisions/points/routing.js";
 import { resolveWorkspacePath } from "../tools/workspace.js";
 import { loadModelPrompts, systemPromptHashOf, withModelPrompt, type ResolvedModelPrompt } from "./model-prompts.js";
 import { SessionRedoControl } from "./redo-signal.js";
@@ -631,6 +631,43 @@ export class AgentSessionFactory {
    * falls back to `resolveSessionType(sessionType)?.model ?? "default"` directly.
    */
   /**
+   * A session's task keys (DECISION-MODEL §5.1a, spec REFUSAL-HANDLING §8.1):
+   * a fresh routed session's selected tasks, a resumed session's persisted ones,
+   * the built-in `proactive` task for a proactive session (no decision call),
+   * else null (taskless: unrouted, routing fell back, bot-triggered, internal
+   * jobs).
+   */
+  private sessionTasksFor(
+    session: AgentSessionRecord,
+    routing: RoutingVerdict | undefined,
+    persisted: SessionRoutingState | undefined,
+    opts: CreateAgentOptions | undefined,
+  ): string[] | null {
+    if (opts?.summarizationCutoff || opts?.condenseInputs || opts?.diaryRange) return null;
+    if (routing) return routingTasksOf(routing);
+    if (persisted?.tasks && persisted.tasks.length > 0) return [...persisted.tasks];
+    const proactiveType = this.options.config.proactive?.session_type ?? "proactive";
+    if (opts?.proactive || session.sessionType === proactiveType) return [ROUTING_PROACTIVE];
+    return null;
+  }
+
+  /**
+   * Can a refusal-rule entry serve a mechanical job's re-run now (spec
+   * REFUSAL-HANDLING §8.1 "Gates"): the model exists and some member of its
+   * chain is healthy (or probe-due) and in budget. Workers use it to walk a
+   * rule's entries outside a session.
+   */
+  refusalEntryViable(logicalId: string): boolean {
+    if (!this.options.config.models[logicalId]) return false;
+    const engine = this.options.budget?.engine;
+    return this.chainViable(
+      logicalId,
+      this.options.scheduler,
+      engine ? (id: string) => engine.isModelAvailable(id) : undefined,
+    );
+  }
+
+  /**
    * Can `logicalId`'s chain serve a request right now — some member healthy (or
    * probe-due) and in budget? The routed-cascade check (ARCHITECTURE.md §8h); the
    * same `chooseChainMember` predicate the per-attempt resolver applies.
@@ -732,6 +769,10 @@ export class AgentSessionFactory {
     // A resumed routed session keeps what routing chose when it was created (its
     // model, effort and preloads): the rollout was built for them (§8h).
     const persistedRouting = opts?.resume ? this.options.storage?.getSessionInitialPreloads(session.id) : undefined;
+    // The session's tasks (DECISION-MODEL §5.1a; spec REFUSAL-HANDLING §8.1):
+    // the routed labels (kept on resume), the built-in `proactive` task of a
+    // proactive session, else none (bot-triggered, unrouted, internal jobs).
+    const sessionTasks = this.sessionTasksFor(session, routing, persistedRouting, opts);
     const scheduler = this.options.scheduler;
     const budgetEngine = this.options.budget?.engine;
     const isModelAvailableFn = budgetEngine ? (id: string) => budgetEngine.isModelAvailable(id) : undefined;
@@ -833,6 +874,7 @@ export class AgentSessionFactory {
       internalJob: Boolean(opts?.summarizationCutoff || opts?.condenseInputs || opts?.diaryRange),
       getMessages: () => agentRef.agent?.state.messages ?? [],
       servingModel: () => resolvedMember.logicalId,
+      tasks: sessionTasks,
     });
     // Per-attempt served-model tracker for the request ring (served-model
     // attribution). Starts undefined; set by onResolve when the fallback fn
@@ -896,6 +938,7 @@ export class AgentSessionFactory {
         // A chat session may end in a record turn (site `record_turn`); a job never does.
         sites: isInternalSite(session.sessionType) ? [session.sessionType] : [session.sessionType, "record_turn"],
         agent: refusalAgent,
+        tasks: sessionTasks,
       }),
       ...(resumedPin && this.options.config.models[resumedPin.model] ? [resumedPin.model] : []),
     ];
@@ -1255,9 +1298,14 @@ export class AgentSessionFactory {
     // needs), health + budget + context fits over its own chain, and the user's
     // per-user limits. A model that refused is not excluded: explicit entries may
     // retry it (§8.1 tries).
+    // The session's redo control (spec REFUSAL-HANDLING §8.4): the gate files a
+    // redo, the run stops after the current tool batch (`shouldStopAfterTurn`
+    // below), and the runner takes it.
+    const redoControl = opts?.redoControl ?? new SessionRedoControl();
     const refusal = createSessionRefusalController({
       sessionType: session.sessionType,
       agent: refusalAgent,
+      tasks: sessionTasks,
       sessionId: session.id,
       timelineKey: session.timelineKey,
       rules: refusalRules,
@@ -1294,6 +1342,12 @@ export class AgentSessionFactory {
         : undefined,
       logger: this.options.logger,
     });
+    // The acting gate policy (spec REFUSAL-HANDLING §6.3–§6.4): built once the
+    // refusal handle and the redo control exist; observe-only without it.
+    if (outputGate && this.options.outputChecks?.actingPolicy) {
+      const acting = this.options.outputChecks.actingPolicy(session, { refusal, redoControl });
+      if (acting) outputGate.policy = acting;
+    }
     // Sticky refusal redo (spec REFUSAL-HANDLING §8.3): once a rule pinned the
     // session to an entry, every later request (the record turn included) goes to
     // that entry with its own fallback chain, over the routed cascade and the
@@ -1934,8 +1988,9 @@ export class AgentSessionFactory {
         ...(routedHead ? { model: routedHead } : {}),
         ...(userSelection && routedCascade.length > 0 ? { cascade: routedCascade } : {}),
         ...(routedThinking ? { thinkingLevel: routedThinking } : {}),
+        ...(sessionTasks && sessionTasks.length > 0 ? { tasks: sessionTasks } : {}),
       };
-      if (state.skills.length > 0 || state.model || state.cascade || state.thinkingLevel) {
+      if (state.skills.length > 0 || state.model || state.cascade || state.thinkingLevel || state.tasks) {
         void this.options.storage
           ?.setSessionInitialPreloads(session.id, state)
           .catch((error) =>
@@ -1948,6 +2003,7 @@ export class AgentSessionFactory {
       logger?.info("routing_applied", {
         sessionId: session.id,
         task: routing.task,
+        tasks: sessionTasks,
         skills: routing.skills,
         tailFiles: routing.tailFiles,
         thinkingLevel: routedThinking,
@@ -2180,6 +2236,11 @@ export class AgentSessionFactory {
       })(),
       steeringMode: "one-at-a-time",
       sessionId: session.timelineKey,
+      // A pending redo (spec REFUSAL-HANDLING §8.4) stops the run once the
+      // current tool batch settled: sibling calls finish (their results belong
+      // to the message a sibling-edit fork keeps), and no further request is
+      // made on the output about to be discarded. The runner then takes it.
+      shouldStopAfterTurn: () => redoControl.peek() !== undefined,
       // Dynamic tool loading (spec DYNAMIC-TOOL-LOADING §7): a load event mid-run
       // must reach the CURRENT run's next provider request — the loop snapshots
       // tools at run start, so this hook swaps in the registry's current array.
@@ -2200,6 +2261,7 @@ export class AgentSessionFactory {
     agent.subscribe((event) => {
       if (event.type === "tool_execution_end" && !event.isError && isPostingTool(event.toolName)) {
         refusal.noteDelivered();
+        outputGate?.policy.onDelivered?.();
       }
     });
     if (registry) {
@@ -2329,7 +2391,7 @@ export class AgentSessionFactory {
       setRefusalSite: (site: string | undefined) => {
         refusal.setSite(site);
       },
-      redoControl: opts?.redoControl ?? new SessionRedoControl(),
+      redoControl,
       forkContext: (deps: ForkContextDeps): ForkContext => ({
         sessionId: session.id,
         agent,
