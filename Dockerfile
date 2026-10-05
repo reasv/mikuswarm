@@ -86,6 +86,8 @@ COPY test ./test
 # the same tree the standalone CI checkout had.
 COPY config ./config
 COPY docker/95-docker.toml ./docker/95-docker.toml
+# The workspace templates: skill-template tests parse the shipped SKILL.md files.
+COPY templates ./templates
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ripgrep \
   && rm -rf /var/lib/apt/lists/* \

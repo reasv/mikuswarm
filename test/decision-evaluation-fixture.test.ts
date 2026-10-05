@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -175,7 +175,8 @@ async function generateRows(): Promise<Omit<DecisionEvaluationRow, "ts" | "laten
     );
 }
 
-test("console demo decision rows match what the real engine writes", async () => {
+// The console is a separate app: the agent image's test stage has no console tree.
+test("console demo decision rows match what the real engine writes", { skip: !existsSync(FIXTURE) && process.env["UPDATE_DECISION_FIXTURE"] !== "1" }, async () => {
   const rows = await generateRows();
   if (process.env["UPDATE_DECISION_FIXTURE"] === "1") {
     writeFileSync(FIXTURE, `${JSON.stringify(rows, null, "\t")}\n`);
