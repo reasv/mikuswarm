@@ -192,10 +192,10 @@ Unreleased section; it is not part of any release's notes.
   by any column and names models by config key, wire model id or both. The
   family toggle groups entries by `[models.<key>].family`, else by the wire model
   id they serve. The session view shows redo branches with a switcher, check
-  cards on judged messages and endings, nudge cards and refusal markers, and the
-  session list shows refused, redone, nudged, revised and unjudged counts.
-  Database schema v26 adds the statistics tables, filled from history in the
-  background.
+  cards on judged messages and endings, nudge cards, refusal markers and what
+  the offline audit found, and the session list shows refused, redone, nudged,
+  revised and unjudged counts. Database schema v26 adds the statistics tables,
+  filled from history in the background.
 
 - **Offline audit worker** (`[decisions.audit]`, off by default): diagnoses
   send-contract failures and judges past sessions' messages after they finish,
