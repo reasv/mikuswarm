@@ -140,7 +140,10 @@ test("routingInputFrom: reply target, captions, self flag, recent limit", () => 
 
 // --- satellite ---------------------------------------------------------------
 
-test("satellite: preloaded skills render right before <tail_instructions>, task tail files after", () => {
+test("satellite: task tail files render after <tail_instructions>; no <preloaded_skill> in W5", () => {
+  // W5: skill preloads moved to synthetic load_skill calls; the satellite only
+  // carries extra tail files now.  preloadedSkills is always []; the
+  // <preloaded_skill> block is never emitted.
   const out = renderSatelliteBlock(
     {
       timelineKey: "k",
@@ -148,17 +151,16 @@ test("satellite: preloaded skills render right before <tail_instructions>, task 
       activeSessions: [],
       suppressRuntimeState: true,
       routedSatellite: {
-        preloadedSkills: [{ name: "shell", body: "Use bash.", tools: ["bash"] }],
+        preloadedSkills: [],
         tailFiles: [{ source: "tail/code.md", content: "Code carefully." }],
       },
     },
     { tailContent: "Be brief." } as any,
   );
-  const skill = out.indexOf('<preloaded_skill name="shell">');
   const tail = out.indexOf('<tail_instructions source="TAIL.md">');
   const extra = out.indexOf('<tail_instructions source="tail/code.md">');
-  assert.ok(skill >= 0 && skill < tail && tail < extra, out);
-  assert.match(out, /Tools enabled by this skill \(already loaded, directly callable\): bash\./);
+  assert.ok(tail >= 0 && tail < extra, "base tail before extra tail");
+  assert.ok(!out.includes("<preloaded_skill"), "no preloaded_skill block in W5 satellite");
   // Without routing the satellite is unchanged.
   const plain = renderSatelliteBlock(
     { timelineKey: "k", trigger: { id: "e", timestamp: 1 } as any, activeSessions: [], suppressRuntimeState: true },
@@ -167,15 +169,21 @@ test("satellite: preloaded skills render right before <tail_instructions>, task 
   assert.equal(plain, '<tail_instructions source="TAIL.md">\nBe brief.\n</tail_instructions>');
 });
 
-test("DynamicToolRegistry.loadInitial: loads silently, not immediate", () => {
+test("DynamicToolRegistry.seedFromTranscript: loads from addedToolNames silently, no onChange", () => {
+  // W5: loadInitial() removed; resume derives the loaded set from transcript
+  // addedToolNames instead.  seedFromTranscript must be silent (no onChange).
   const tool = (name: string) => ({ name, description: name, parameters: {} }) as any;
   const reg = new DynamicToolRegistry([tool("a"), tool("b"), tool("c")], ["a"]);
   let changes = 0;
   reg.onChange = () => (changes += 1);
-  assert.deepEqual(reg.loadInitial(["b", "zzz", "a"]), ["b"]);
+  const added = reg.seedFromTranscript([
+    { role: "toolResult", toolCallId: "x", toolName: "load_skill", content: [], details: {}, isError: false, timestamp: 1, addedToolNames: ["b", "zzz"] } as any,
+    { role: "toolResult", toolCallId: "y", toolName: "load_skill", content: [], details: {}, isError: false, timestamp: 2, addedToolNames: ["a"] } as any,
+  ]);
+  assert.deepEqual(added, ["b"], "only newly-added names returned");
   assert.deepEqual(reg.current.map((t) => t.name), ["a", "b"]);
-  assert.equal(changes, 0);
-  assert.equal(reg.immediateNames.has("b"), false);
+  assert.equal(changes, 0, "onChange NOT fired by seedFromTranscript");
+  assert.equal(reg.immediateNames.has("b"), false, "b not immediate");
 });
 
 // --- factory -----------------------------------------------------------------
@@ -335,10 +343,14 @@ test("factory: a routed thinking level applies to a reasoning head, is ignored o
   });
 });
 
-test("factory: skill preloads load tools before turn 1, render in the satellite, persist, and re-apply on resume", async () => {
+test("factory: routing skill preloads inject synthetic load_skill calls; satellite has tail files only; resume derives tools from transcript", async () => {
+  // W5: skill preloads no longer use satellite text or loadInitial().
+  // Each routing skill → a synthetic load_skill call in the kickoff array.
+  // The satellite only carries tail files.  On resume, seedFromTranscript
+  // picks up addedToolNames from the synthetic toolResult messages.
   await withWorkspace(async (root) => {
     const { builder, calls } = capturingBuilder();
-    const persisted = new Map<string, { skills: string[]; tools: string[] }>();
+    const persisted = new Map<string, any>();
     const storage: any = {
       setSessionInitialPreloads: async (id: string, p: any) => void persisted.set(id, p),
       getSessionInitialPreloads: (id: string) => persisted.get(id),
@@ -353,40 +365,76 @@ test("factory: skill preloads load tools before turn 1, render in the satellite,
     const fresh = await factory.create(session(), tools, {
       route: async ({ listedSkills }) => {
         assert.deepEqual(listedSkills.map((s) => s.name), ["shell"]);
+        // "ghost" not in workspace → synthetic call produces an error toolResult.
         return verdict({ skills: ["shell", "ghost"], tailFiles: ["tail/code.md", "tail/missing.md"] });
       },
     });
+    // Bash loaded via synthetic load_skill (not satellite text or loadInitial).
     const names = fresh.agent.state.tools.map((t) => t.name);
-    assert.ok(names.includes("bash"), `bash preloaded: ${names}`);
-    assert.ok(!names.includes("web_fetch"));
-    const sat = calls[0].routedSatellite;
-    assert.deepEqual(sat.preloadedSkills.map((s: any) => [s.name, s.body, s.tools]), [["shell", "Use bash carefully.", ["bash"]]]);
-    assert.deepEqual(sat.tailFiles, [{ source: "tail/code.md", content: "Code tail." }]);
-    await new Promise((r) => setImmediate(r));
-    assert.deepEqual(persisted.get("s-route"), { skills: ["shell"], tools: ["bash"] });
+    assert.ok(names.includes("bash"), `bash loaded via synthetic call: ${names}`);
+    assert.ok(!names.includes("web_fetch"), "web_fetch stays deferred");
 
-    // Resume: no routing call, the persisted preloads are re-applied.
+    // Satellite: preloadedSkills always empty in W5; tail files still there.
+    const sat = calls[0].routedSatellite;
+    assert.deepEqual(sat.preloadedSkills, [], "no skill bodies in satellite (W5)");
+    assert.deepEqual(sat.tailFiles, [{ source: "tail/code.md", content: "Code tail." }]);
+
+    // kickoff = [finalTurn, synth_assistant_shell, synth_toolResult_shell,
+    //            synth_assistant_ghost, synth_toolResult_ghost]
+    assert.ok(Array.isArray(fresh.kickoff), "kickoff is an array");
+    assert.equal(fresh.kickoff.length, 5, "finalTurn + 2 messages per skill spec");
+    assert.equal(fresh.kickoff[1].role, "assistant");
+    assert.equal(fresh.kickoff[2].role, "toolResult");
+    assert.equal(fresh.kickoff[2].addedToolNames?.includes("bash"), true, "shell toolResult carries addedToolNames");
+    assert.equal(fresh.kickoff[2].harness?.kind, "injection");
+
+    // Persisted state has skills, no tools (W5: transcript is the tool source of truth).
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(persisted.get("s-route"), { skills: ["shell", "ghost"] });
+
+    // Resume: routing callback NOT called; tools derived from transcript addedToolNames.
     let routedOnResume = false;
+    // Provide the shell synthetic toolResult in the transcript so bash is re-loaded.
+    const synthResult = {
+      role: "toolResult", toolCallId: "synth_abc", toolName: "load_skill",
+      content: [{ type: "text", text: "ok" }], details: {}, isError: false, timestamp: 10,
+      addedToolNames: ["bash"],
+    };
     const resumed = await factory.create(session(), tools, {
-      resume: { snapshot: [{ type: "chatEvent", role: "user", content: "x", timestamp: 1 } as any], transcript: [] },
+      resume: {
+        snapshot: [{ type: "chatEvent", role: "user", content: "x", timestamp: 1 } as any],
+        transcript: [synthResult as any],
+      },
       route: async () => ((routedOnResume = true), verdict({ models: ["big"] })),
     });
-    assert.equal(routedOnResume, false);
-    assert.ok(resumed.agent.state.tools.some((t) => t.name === "bash"));
+    assert.equal(routedOnResume, false, "routing not called on resume");
+    assert.ok(resumed.agent.state.tools.some((t) => t.name === "bash"), "bash re-loaded from transcript addedToolNames");
     assert.equal(resumed.agent.state.model.id, "def-wire");
   });
 });
 
-test("factory: a declared-deferred head gets the preloaded tool definitions as text", async () => {
+test("factory: declared-deferred head receives routing skill tools via synthetic load_skill kickoff", async () => {
+  // W5: preloaded tool definitions no longer go into the satellite.
+  // For a declared-deferred head the synthetic load_skill toolResult carries
+  // addedToolNames; the declared-deferred transport injects the definitions
+  // at the next wire turn, exactly like a model-initiated load_skill.
   await withWorkspace(async (root) => {
     const { builder, calls } = capturingBuilder();
     const config = factoryConfig(root);
     config.models.default.compat = { declare_deferred_tools: true };
     const factory = new AgentSessionFactory({ config, contextBuilder: builder, getActiveSessions: () => [] });
-    await factory.create(session(), [fakeTool("send_message"), fakeTool("bash")], {
+    const fresh = await factory.create(session(), [fakeTool("send_message"), fakeTool("bash")], {
       route: async () => verdict({ skills: ["shell"] }),
     });
-    assert.match(calls[0].routedSatellite.preloadedSkills[0].toolDefinitions, /^Tool definitions now loaded/);
+    // Satellite no longer carries preloaded skills in W5.
+    assert.deepEqual(calls[0].routedSatellite.preloadedSkills, [], "preloadedSkills empty in W5");
+    // bash IS loaded via the synthetic call (registry load fires onChange).
+    const names = fresh.agent.state.tools.map((t: any) => t.name);
+    assert.ok(names.includes("bash"), `bash loaded via synthetic load_skill: ${names}`);
+    // The synthetic toolResult carries addedToolNames so declared-deferred works.
+    const synthResult = fresh.kickoff?.find((m: any) => m.role === "toolResult" && m.toolName === "load_skill");
+    assert.ok(synthResult, "synthetic load_skill toolResult in kickoff");
+    assert.ok((synthResult as any).addedToolNames?.includes("bash"), "addedToolNames carries bash");
   });
 });
 
@@ -458,9 +506,18 @@ test("storage: v21→v22 adds agent_sessions.initial_preloads; set/get round-tri
     try {
       assert.equal(storage.read((db) => Number(db.pragma("user_version", { simple: true }))), LATEST_SCHEMA_VERSION);
       assert.equal(storage.getSessionInitialPreloads("s1"), undefined, "existing rows stay unrouted");
-      await storage.setSessionInitialPreloads("s1", { skills: ["shell"], tools: ["bash"] });
+      // W5: SessionRoutingState no longer has 'tools'; the field is silently dropped.
+      await storage.setSessionInitialPreloads("s1", { skills: ["shell"] } as any);
       await storage.waitForIdle();
-      assert.deepEqual(storage.getSessionInitialPreloads("s1"), { skills: ["shell"], tools: ["bash"] });
+      assert.deepEqual(storage.getSessionInitialPreloads("s1"), { skills: ["shell"] });
+      // Backward compat: old JSON with 'tools' stored before W5 is parsed without
+      // the 'tools' field (it is ignored / stripped).
+      await storage.write((db: any) =>
+        db.prepare("update agent_sessions set initial_preloads = ? where id = ?")
+          .run(JSON.stringify({ skills: ["shell"], tools: ["bash"], model: "mid" }), "s1"),
+      );
+      await storage.waitForIdle();
+      assert.deepEqual(storage.getSessionInitialPreloads("s1"), { skills: ["shell"], model: "mid" }, "old 'tools' field is ignored");
     } finally {
       await storage.waitForIdle();
       storage.close();
@@ -484,7 +541,7 @@ test("factory: a resumed routed session keeps its routed model and effort", asyn
     });
     assert.equal(fresh.agent.state.model.id, "mid-wire");
     await new Promise((r) => setImmediate(r));
-    assert.deepEqual(persisted.get("s-route"), { skills: [], tools: [], model: "mid", thinkingLevel: "high" });
+    assert.deepEqual(persisted.get("s-route"), { skills: [], model: "mid", thinkingLevel: "high" });
     const resumed = await factory.create(session(), [fakeTool("send_message")], {
       resume: { snapshot: [{ type: "chatEvent", role: "user", content: "x", timestamp: 1 } as any], transcript: [] },
     });
