@@ -89,6 +89,7 @@ Today the code cannot tell refusal reasons apart, cannot see soft refusals, keep
 25. **Prerequisites are built inside the phase that first needs them**, not as separate work first: the tool side-effect list in phase 1, judge-shaped state in phase 3, multi-label tasks before the rules' `tasks` condition is enabled, the audit worker in phase 6 (§16).
 26. **The starter style catalogue** starts from the not-X-but-Y contrast, em-dashes, "I hope this helps" sign-offs, sycophantic openers and "delve"-style vocabulary, plus the workspace template's existing style rules (§4.5).
 27. **Every model switch uses the serving model's own model prompts**: a refusal redo, a later rule entry, the sticky pin and its fallback get the preamble and tail configured for that model, exactly like chain fallover (§8.3).
+28. **Same-model retries for refusals**: a refusal can be a random over-refusal, so a rule can retry the model that refused, and any rule entry can be tried several times (`tries`). The same model may also appear several times in a rule's list (§8.1).
 
 ## 4. Checks
 
@@ -360,7 +361,8 @@ reasons = ["distillation"]        # omitted = any reason (a generic refusal fall
 from_models = ["model_a"]         # optional: only refusals by these models
 agents = ["agent_a"]              # optional
 tasks = ["coding", "other"]       # optional: the session's routed task (DECISION-MODEL §5.1 routing keys, plus "other")
-models = ["open_model_x", "open_model_y"]   # tried in order
+models = ["open_model_x", "open_model_y"]   # tried in order; an entry may be a table:
+# models = [ { model = "@same", tries = 2 }, { model = "open_model_x", tries = 3 }, "open_model_y" ]
 soft = "redo"                     # "redo" | "observe": whether a judged (soft) refusal of this reason triggers a redo
 on_exhausted = "send_last"        # chat sites: "send_last" (default) | "withhold" | "park"
 ```
@@ -372,10 +374,11 @@ on_exhausted = "send_last"        # chat sites: "send_last" (default) | "withhol
 - **Gates**: a rule's model passes the usual gates (health, budget, per-user limits, context fits, capability). An entry that fails them is skipped. The redo is billed to the session's payee and counts on the redo model's caps.
 - **Record turn**: its opt-out disables only the implicit chain fallover. A rule naming `record_turn` applies (SESSION-RECORDS §3.2 anticipated this). The redo model reads the whole rollout uncached; the record turn's own budget and timeout apply.
 - If a rule's model also refuses, the next entry applies.
+- **Tries and same-model retries** (owner decision 28). An entry is a model key or a table `{ model, tries }`; `tries` (default 1) is how many times that entry is attempted before the next entry applies. The reserved key `@same` means **the model that refused** (the member that served the refused request, so a session already moved by an earlier redo retries its current model); a rule may start with it to absorb random over-refusals before switching models. The same model key may appear in several entries. Every try is a full redo of its kind: a hard refusal re-issues the same request, a soft refusal discards and forks again (§8.4); the retried request gets a fresh sample. Explicit entries override the "never re-sent to the member that refused" rule of the implicit chain fallover, which still holds when no rule matches. Tries count per refusal point (the span since the last delivered message, like the send-contract redo budget, §7.5): a later refused message starts the rule from its first entry again, on the model the session is pinned to. `@same` and repeated entries change nothing about stickiness: the session stays on whatever entry last succeeded.
 
 ### 8.2 Exhaustion
 
-When every entry of the rule has refused:
+When every entry of the rule has refused, every try included:
 
 - **chat sites**: `on_exhausted` (owner decision 3): `send_last` (default: send the last attempt; withholding makes the bot look dead), `withhold` (send nothing), `park` (today's hard-refusal outcome, `failed-resumable`). For a hard refusal there is no text to send, so `send_last` parks as today. `withhold` settles the session as `NO_REPLY` with no failure notice, for hard and soft refusals alike;
 - **mechanical jobs**: no output (never a refusal written into a summary, caption or diary), no repeated tool nudges against a refusing model.
