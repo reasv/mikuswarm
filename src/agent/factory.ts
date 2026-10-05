@@ -33,6 +33,9 @@ import type { WorkspaceContent, SessionTypeConfig, SkillMeta, RoutedSatellite } 
 import type { RoutingVerdict } from "../decisions/points/routing.js";
 import { resolveWorkspacePath } from "../tools/workspace.js";
 import { loadModelPrompts, withModelPrompt, type ResolvedModelPrompt } from "./model-prompts.js";
+import { SessionRedoControl } from "./redo-signal.js";
+import { stampServedModel } from "./contract.js";
+import type { ForkChange, ForkContext } from "./fork.js";
 import { readFile } from "node:fs/promises";
 import type { Storage, Summary } from "../storage/index.js";
 import type { SessionRoutingState } from "../storage/database.js";
@@ -400,6 +403,12 @@ export interface CreateAgentOptions {
    */
   abortSignal?: AbortSignal;
   /**
+   * The session's redo control (spec REFUSAL-HANDLING §8.4), when the caller
+   * created it before the agent (e.g. to hand it to tools built earlier).
+   * Absent = the factory creates one; either way it is `CreatedAgent.redoControl`.
+   */
+  redoControl?: SessionRedoControl;
+  /**
    * Per-user limits selection input (spec PER-USER-LIMITS §6). Supplied ONLY for a
    * human-triggered agent-loop session whose trigger ctx resolved to an ACTIVE
    * per-user rule (the app builds it at Gate A). When present + active, the factory
@@ -492,6 +501,23 @@ export interface CreatedAgent {
    * SESSION-RECORDS §3.2).
    */
   setRefusalFallover: (enabled: boolean) => void;
+  /** The session's redo control: the gate requests redos, the runner takes them (spec §8.4). */
+  redoControl: SessionRedoControl;
+  /**
+   * The fork core's view of this session (spec REFUSAL-HANDLING §8.4): the
+   * caller supplies storage and the session capture's flush; the factory adds
+   * the agent and resets what it derived from the append-only transcript (the
+   * running context counter, the loaded dynamic tools) after each fork.
+   */
+  forkContext: (deps: ForkContextDeps) => ForkContext;
+}
+
+/** What the caller adds to {@link CreatedAgent.forkContext}. */
+export interface ForkContextDeps {
+  storage: ForkContext["storage"];
+  /** The session capture's `flushNow`. */
+  flushTranscript: () => Promise<void>;
+  logger?: Logger;
 }
 
 export class AgentSessionFactory {
@@ -1214,6 +1240,9 @@ export class AgentSessionFactory {
           // agree with the ledger under fallback / per-user model selection,
           // instead of freezing the session type's configured model.
           usage.record(message.usage, message.model ?? model.id);
+          // Served-member attribution on the transcript (spec REFUSAL-HANDLING
+          // §7.1): the committed message is the object the agent stores.
+          stampServedModel(message, resolvedMember.logicalId);
           // Tool-result budget reset (spec TOOL-RESULT-BUDGET §4): each committed
           // LLM request starts a fresh tool-result turn; the accumulator resets so
           // the next batch of tool calls gets the full per-turn budget again.
@@ -2090,6 +2119,29 @@ export class AgentSessionFactory {
       setRefusalFallover: (enabled: boolean) => {
         refusalFallover.enabled = enabled;
       },
+      redoControl: opts?.redoControl ?? new SessionRedoControl(),
+      forkContext: (deps: ForkContextDeps): ForkContext => ({
+        sessionId: session.id,
+        agent,
+        storage: deps.storage,
+        flushTranscript: deps.flushTranscript,
+        liveEvents: this.options.liveEvents,
+        logger: deps.logger ?? logger,
+        onForked: (change: ForkChange) => {
+          // Dynamic tools (spec DYNAMIC-TOOL-LOADING §7): loads that rode only a
+          // discarded message are undone, so the next request's tools match the
+          // live transcript; their definition charge leaves the counter too.
+          let removedToolTokens = 0;
+          if (registry) {
+            const removed = registry.unloadDiscarded(change.discarded, change.kept);
+            if (removed.length > 0) {
+              agent.state.tools = registry.current;
+              removedToolTokens = renderToolBlock(removed).tokenEstimate;
+            }
+          }
+          rewindRunningContext(ctxCounter, change, removedToolTokens);
+        },
+      }),
     };
   }
 
@@ -2728,6 +2780,36 @@ export function mapBuiltMessages(built: BuiltContext): AgentMessage[] {
     }
     return [];
   });
+}
+
+/**
+ * Rewind the exact running input-token counter (spec PER-USER-LIMITS §5.3)
+ * after a fork (spec REFUSAL-HANDLING §8.4). The counter only ever added new
+ * live messages, so the discarded span's counted share (the messages before
+ * `seenMsgs`) and the definitions of tools the fork unloaded are taken back
+ * out; `seenMsgs` moves back to the fork index, so the kept tail past it (an
+ * edited message, redelivered interjections) is tokenized by the next refresh.
+ * The cached prefix can be no longer than what is left. No-op before the
+ * counter's first observation.
+ */
+export function rewindRunningContext(
+  counter: { running: number; seenMsgs: number; cachedAtLast: number },
+  change: Pick<ForkChange, "forkIndex" | "discarded">,
+  removedToolTokens = 0,
+  estimate: (slice: AgentMessage[]) => number = estimateLiveSliceTokens,
+): void {
+  if (counter.seenMsgs < 0) return;
+  const counted = change.discarded
+    .slice(0, Math.max(0, counter.seenMsgs - change.forkIndex))
+    .filter(isLiveRuntimeMessage);
+  try {
+    if (counted.length > 0) counter.running -= estimate(counted);
+  } catch {
+    /* best-effort, like the refresh itself */
+  }
+  counter.running = Math.max(0, counter.running - removedToolTokens);
+  counter.seenMsgs = Math.min(counter.seenMsgs, change.forkIndex);
+  counter.cachedAtLast = Math.min(counter.cachedAtLast, counter.running);
 }
 
 /**

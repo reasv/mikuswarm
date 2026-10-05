@@ -334,6 +334,15 @@ function serialize(value: unknown): string {
 }
 
 /**
+ * The transcript sanitizer (image base64 externalized, secrets redacted) for
+ * other persisted message lists, e.g. a fork's discarded branch (spec
+ * REFUSAL-HANDLING §9).
+ */
+export function serializeForPersistence(value: unknown): string {
+  return serialize(value);
+}
+
+/**
  * Attach snapshot + transcript capture to an agent.
  *
  * 1. Snapshot is written once, immediately. The snapshot write is *enqueued*

@@ -26,6 +26,20 @@ export type SessionLiveEvent =
       type: "attempt_discarded";
       attempt: number;
       reason: string;
+    }
+  | {
+      /**
+       * A redo forked the session (spec REFUSAL-HANDLING §9): the live transcript
+       * was cut at `forkIndex` and the discarded span stored as branch `branchNo`,
+       * so a live rollout view re-seeds onto the new branch.
+       */
+      type: "branch_forked";
+      branchNo: number;
+      forkIndex: number;
+      reason: "refusal_redo" | "contract_redo";
+      checkCode?: string;
+      fromModel?: string;
+      toModel?: string;
     };
 
 type Listener = (event: SessionLiveEvent) => void;

@@ -74,6 +74,10 @@ import {
   validateDecisionsConfig,
 } from "./decisions/index.js";
 import { attachSessionCapture, type SessionCaptureHandle } from "./agent/session-capture.js";
+import { createRedoHandler } from "./agent/redo.js";
+import { ContractReconciler, persistSessionContract } from "./agent/contract-store.js";
+import type { CreatedAgent } from "./agent/factory.js";
+import type { SessionRunnerOptions } from "./agent/runner.js";
 import { buildAgentModelOverrides } from "./agent/agent-model-overrides.js";
 import { emptyUsageTotals } from "./agent/usage.js";
 import { SessionUsageTracker, type CostRates, type SessionUsageTotals } from "./agent/usage.js";
@@ -840,6 +844,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     storage,
     logger: logger.child("chat-search"),
   });
+  // Send-contract history pass (spec REFUSAL-HANDLING §7.1, DECISION-MODEL §5.8):
+  // derives contract_attempts for every session not yet at the current
+  // derivation version. Started in the background with the other startup sweeps.
+  const contractReconciler = new ContractReconciler({ storage, logger });
   // Resolved defaults for the search_messages / recap tools (§9e). Sourced from
   // [search] config with fail-fast fallbacks to the shared constants; set explicitly
   // in deployment config per project convention.
@@ -5511,6 +5519,24 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   }
 
   /**
+   * The runner's redo wiring for a chat-lane session (spec REFUSAL-HANDLING
+   * §7.5, §8.4): the session's redo control, a handler that forks through the
+   * fork core (persisting branches, flushing through the session capture), and
+   * the `[agent.sessions].forced_completion_redo` switch.
+   */
+  function sessionRedoOptions(
+    created: Pick<CreatedAgent, "redoControl" | "forkContext">,
+    capture: SessionCaptureHandle,
+  ): Pick<SessionRunnerOptions, "redo" | "contractRedo" | "logger"> {
+    const fork = created.forkContext({ storage, flushTranscript: () => capture.flushNow(), logger });
+    return {
+      redo: { control: created.redoControl, onRedo: createRedoHandler({ fork, logger }) },
+      contractRedo: config.agent.sessions.forced_completion_redo === true,
+      logger,
+    };
+  }
+
+  /**
    * Wire the soft cost-budget interjection (spec SESSION-COST-LIMITS §2.1). When
    * the session's combined (agent-loop + tool) spend first crosses
    * `cost_warn_fraction × ceiling`, steer ONE agent-visible `<interjection>` so the
@@ -5882,6 +5908,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       provider: providers.get(target.provider),
       target,
       suppressTyping: record.sessionType === (config.proactive?.session_type ?? "proactive"),
+      ...sessionRedoOptions(created, captureHandle),
     });
     try {
       const result = await runner.run(
@@ -5896,6 +5923,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       );
       const interrupted = sessions.get(record.id)?.status === "interrupted";
       sessions.markCompleted(record.id, { noReply: result.noReply });
+      // Send-contract record (spec REFUSAL-HANDLING §7.1), before the record turn appends.
+      void persistSessionContract({ storage, sessionId: record.id, messages: agent.state.messages, interrupted, logger });
       logger.info("session_resumed_completed", {
         sessionId: record.id,
         attempt,
@@ -6660,7 +6689,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       logger,
     });
     const costWarnUnsub = wireCostBudgetWarner(record.id, record.sessionType, usage, costCeiling);
-    const runner = new SessionRunner({ provider: providers.get(target.provider), target, suppressTyping: false });
+    const runner = new SessionRunner({
+      provider: providers.get(target.provider),
+      target,
+      suppressTyping: false,
+      ...sessionRedoOptions(created, captureHandle),
+    });
     // The success path releases the slot itself, before the record turn (as in
     // launchSession); the .finally drains only on the error path.
     let resumeDrainCalled = false;
@@ -6669,6 +6703,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       .then(async (result) => {
         const interrupted = sessions.get(record.id)?.status === "interrupted";
         sessions.markCompleted(record.id, { noReply: result.noReply });
+        // Send-contract record (spec REFUSAL-HANDLING §7.1), before the record turn appends.
+        void persistSessionContract({ storage, sessionId: record.id, messages: agent.state.messages, interrupted, logger });
         logger.info("session_resumed_completed", {
           sessionId: record.id,
           generation,
@@ -7133,7 +7169,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // Soft cost-budget interjection (spec SESSION-COST-LIMITS §2.1); torn down in
     // the run's .finally alongside the capture handle.
     const costWarnUnsub = wireCostBudgetWarner(session.id, session.sessionType, usage, costCeiling);
-    const runner = new SessionRunner({ provider: providers.get(target.provider), target, suppressTyping: proactive });
+    const runner = new SessionRunner({
+      provider: providers.get(target.provider),
+      target,
+      suppressTyping: proactive,
+      ...sessionRedoOptions(created!, captureHandle),
+    });
 
     // drainCalled: the success path releases the timeline slot itself (before the
     // record turn), so the .finally drains only on the error path.
@@ -7145,6 +7186,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // `interrupted` status); such a run writes no record.
         const interrupted = sessions.get(session.id)?.status === "interrupted";
         sessions.markCompleted(session.id, { noReply: result.noReply });
+        // Send-contract record (spec REFUSAL-HANDLING §7.1), before the record turn appends.
+        void persistSessionContract({ storage, sessionId: session.id, messages: agent!.state.messages, interrupted, logger });
         logger.info("session_completed", {
           sessionId: session.id,
           noReply: result.noReply,
@@ -7408,6 +7451,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // Backfills existing events on first run after the v11 migration.
   void chatSearchIndexer.reconcileAll().catch((error) =>
     logger.warn("chat_index_sweep_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    }),
+  );
+
+  // Send-contract history pass: background, batched through the single-writer
+  // queue, resumable (each session is stamped as written); never blocks boot.
+  void contractReconciler.start().catch((error) =>
+    logger.warn("contract_reconcile_failed", {
       error: error instanceof Error ? error.message : String(error),
     }),
   );
@@ -7874,6 +7925,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // (§9e). Ordered after the pools whose onComplete hooks enqueue into it, so
         // no enqueue can arrive after the indexer has stopped accepting work.
         await chatSearchIndexer.stop();
+        await contractReconciler.stop();
         // Same drain contract for the eager-summarization indexer: ordered after
         // the summarization pool (whose onComplete enqueues into it), before
         // storage.close().

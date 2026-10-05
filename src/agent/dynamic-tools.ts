@@ -194,6 +194,36 @@ export class DynamicToolRegistry {
     if (added.length > 0) this.currentArr = this.computeCurrent();
     return added;
   }
+
+  /**
+   * Undo the loads a fork discarded (spec REFUSAL-HANDLING §8.4): a tool whose
+   * `addedToolNames` load rode only a discarded message is deferred again, so
+   * the wire tools match the new live transcript (the same rule as
+   * {@link seedFromTranscript}). Immediate tools and tools a kept message loaded
+   * stay; loads that never rode a transcript message are untouched. Silent (no
+   * {@link onChange}). Returns the tools unloaded.
+   */
+  unloadDiscarded(discarded: readonly AgentMessage[], kept: readonly AgentMessage[]): AgentTool[] {
+    const loadedBy = (messages: readonly AgentMessage[]): Set<string> => {
+      const names = new Set<string>();
+      for (const message of messages) {
+        const candidate = message as { role?: unknown; addedToolNames?: unknown };
+        if (candidate.role !== "toolResult" || !Array.isArray(candidate.addedToolNames)) continue;
+        for (const name of candidate.addedToolNames) if (typeof name === "string") names.add(name);
+      }
+      return names;
+    };
+    const keptLoads = loadedBy(kept);
+    const removed: AgentTool[] = [];
+    for (const name of loadedBy(discarded)) {
+      if (keptLoads.has(name) || this.immediateNames.has(name) || !this.loadedNames.has(name)) continue;
+      this.loadedNames.delete(name);
+      const tool = this.byName.get(name);
+      if (tool) removed.push(tool);
+    }
+    if (removed.length > 0) this.currentArr = this.computeCurrent();
+    return removed;
+  }
 }
 
 /** Minimal structural view of a deferred tool for index rendering. */
