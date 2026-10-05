@@ -159,7 +159,9 @@ export function messageText(message: { content?: unknown } | undefined): string 
 
 /** True when the request is a session-record turn (its record prompt is in the messages). */
 export function isRecordTurnRequest(req: FakeLlmRequest): boolean {
-  return req.body.messages.some((m) => m.role === "user" && messageText(m).includes("Write its session record"));
+  // The newest user turn: a resumed rollout carries an earlier record turn's prompt.
+  const lastUser = req.body.messages.filter((m) => m.role === "user").at(-1);
+  return messageText(lastUser).includes("Write its session record");
 }
 
 /** Names of the tools a request declared. */

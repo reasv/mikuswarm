@@ -253,6 +253,27 @@ test("SessionRecordService.waitFor: bounded by the entry's deadline", async () =
   await run;
 });
 
+test("SessionRecordService.waitFor: graceMs waits for the turn to settle past its deadline (Z3)", async () => {
+  const svc = new SessionRecordService();
+  const { logger } = quietLogger();
+  // The abort at the deadline takes a while to settle.
+  const slow = stubAgent(makeTranscriptWithTool("web_fetch"));
+  (slow.agent as unknown as { abort: () => void }).abort = () => setTimeout(slow.release, 150);
+  const run = svc.start(startParams({ agent: slow.agent, logger, config: { enabled: true, timeout_ms: 60 } }));
+  assert.equal(await svc.waitFor("s1", { graceMs: 2000 }), true, "settled within the grace");
+  assert.equal(svc.isInFlight("s1"), false);
+  await run;
+  // A turn that never settles: false once the grace elapsed.
+  const stuck = stubAgent(makeTranscriptWithTool("web_fetch"));
+  (stuck.agent as unknown as { abort: () => void }).abort = () => {};
+  const run2 = svc.start(startParams({ sessionId: "s2", agent: stuck.agent, logger, config: { enabled: true, timeout_ms: 60 } }));
+  assert.equal(await svc.waitFor("s2", { graceMs: 50 }), false);
+  assert.equal(svc.isInFlight("s2"), true);
+  stuck.release();
+  await run2;
+  assert.equal(await svc.waitFor("s2"), true, "nothing registered → true");
+});
+
 test("SessionRecordService.shutdown: aborts the running turn and refuses new ones", async () => {
   const svc = new SessionRecordService();
   const { logger, lines } = quietLogger();

@@ -5988,6 +5988,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     return tools.some((tool) => tool.name === name) && (!allow || allow.includes(name));
   }
 
+  /**
+   * How long a reply-resume waits past a record turn's deadline for the turn to
+   * settle (it aborts itself at the deadline) before giving up on resuming.
+   */
+  const RECORD_SETTLE_GRACE_MS = 10_000;
+
   /** Recent-chat window for the records point's non-reply state (§6.2). */
   const RECORDS_RECENT_CHAT_WINDOW = 40;
   /** Messages kept before a candidate's bot message in its recent_chat. */
@@ -6197,10 +6203,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     resumeClaims.add(sessionId);
     try {
       // Record wait (spec SESSION-RECORDS CONTRACT §7): a record turn still running
-      // extends this session's rollout; wait for it (bounded by its deadline) so the
-      // gate and the resume material see the finished transcript, and two agents
-      // never run on the same session at once.
-      await sessionRecordService.waitFor(sessionId);
+      // extends this session's rollout; wait until it is actually over (its deadline
+      // plus a grace for the abort to settle) so the gate and the resume material see
+      // the finished transcript, and two agents never run on the same session at
+      // once. A turn that still has not settled degrades this reply to FRESH.
+      if (!(await sessionRecordService.waitFor(sessionId, { graceMs: RECORD_SETTLE_GRACE_MS }))) {
+        logger.warn("reply_resume_record_unsettled", { sessionId, timelineKey: inbound.timelineKey });
+        return false;
+      }
       // ── Pre-CAS gate (§7 steps 2–8) ────────────────────────────────────────
       // Delegated to the throw-safe `evaluateResumeGate` (review issue #2): every
       // ineligible reply — and any UNEXPECTED throw inside the gate (DB read,

@@ -425,6 +425,34 @@ user_gap_ms = 7000
 wall_clock_ms = 15000
 `;
 
+test("app: a reply-resume waits until the timed-out record turn has settled (Z3)", async () => {
+  const h = await startHarness({
+    script: chatScript({ recordTurn: () => ({ ...finalize("late record"), delayMs: 2500 }) }),
+    toml: `
+[session_records]
+timeout_ms = 1000
+
+[agent.sessions.resume]
+enabled = { group = true }
+`,
+  });
+  try {
+    h.say("[work] first", { mention: true });
+    await h.until(() => h.llm.requests.some(isRecordTurnRequest), "record turn started");
+    h.say("and then?", { mention: true, replyTo: h.sends.at(-1)!.externalId });
+    await h.until(() => hasLog(h, "session_resume_started"), "reply resumed the session");
+    const idx = (m: string) => h.logs.findIndex((l) => l.message === m);
+    assert.ok(idx("session_record_failed") >= 0, "the record turn timed out");
+    assert.ok(
+      idx("session_record_failed") < idx("session_resume_started"),
+      "the resume started only after the record turn was over",
+    );
+    await settled(h, 1);
+  } finally {
+    await h.stop();
+  }
+});
+
 test("app: a follow-up after the owner settled starts a fresh session with the owner's record", async () => {
   const h = await startHarness({ script: chatScript({ recordTurn: () => finalize("owner record") }), toml: FOLLOWUP });
   try {

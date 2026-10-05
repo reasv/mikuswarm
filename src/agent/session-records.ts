@@ -195,22 +195,26 @@ export class SessionRecordService {
   }
 
   /**
-   * Wait for this session's in-flight record turn, at most until its deadline.
-   * Resolves at once when none is registered. Never rejects.
+   * Wait for this session's in-flight record turn, at most until its deadline
+   * (plus `graceMs`, for a caller that must see the turn actually over: the turn
+   * aborts itself at the deadline, and settling takes a moment). Resolves true
+   * when none is registered or the turn settled in time, false when the bound
+   * elapsed first. Never rejects.
    */
-  async waitFor(sessionId: string): Promise<void> {
+  async waitFor(sessionId: string, opts: { graceMs?: number } = {}): Promise<boolean> {
     const entry = this.inflight.get(sessionId);
-    if (!entry) return;
-    const remaining = entry.deadline - Date.now();
-    if (remaining <= 0) return;
+    if (!entry) return true;
+    const remaining = entry.deadline + (opts.graceMs ?? 0) - Date.now();
+    if (remaining <= 0) return false;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([
-      entry.done,
-      new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, remaining);
+    const settled = await Promise.race([
+      entry.done.then(() => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), remaining);
       }),
     ]);
     clearTimeout(timer);
+    return settled;
   }
 
   /**
