@@ -82,8 +82,8 @@ function downgradeToV24(storage: Storage): Promise<void> {
   });
 }
 
-test("schema: LATEST_SCHEMA_VERSION is 27 (v25 refusal handling, v26 behaviour, v27 audits)", () => {
-  assert.equal(LATEST_SCHEMA_VERSION, 27);
+test("schema: LATEST_SCHEMA_VERSION is 29 (v25 refusals, v26 behaviour, v27 audits, v28 metadata, v29 research)", () => {
+  assert.equal(LATEST_SCHEMA_VERSION, 29);
 });
 
 test("migration: a v24 database migrates to the fresh-DB shape, rows kept", async () => {

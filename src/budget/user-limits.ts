@@ -806,7 +806,10 @@ export class UserLimitEngine {
   }
 
   /** Authoritative periodic reconcile — rolling re-SUM + calendar roll-with-reseed. */
-  private tick(): void {
+  /** Refresh cached meters after a separately committed durable service charge. */
+  reconcileCommittedUsage(): void { this.tick(true); }
+
+  private tick(forceCalendar = false): void {
     const now = this.now();
     for (const state of this.meters.values()) {
       const w = resolveWindow(state.window, now);
@@ -814,7 +817,7 @@ export class UserLimitEngine {
         state.windowStart = w.start;
         state.resetsAt = w.resetsAt;
         state.spent = this.options.sumUsageCost({ since: w.start, ...state.seed });
-      } else if (w.start !== state.windowStart) {
+      } else if (forceCalendar || w.start !== state.windowStart) {
         state.windowStart = w.start;
         state.resetsAt = w.resetsAt;
         state.spent = this.options.sumUsageCost({ since: w.start, ...state.seed });

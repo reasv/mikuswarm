@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import type { ExaResearchRequest, ExaRun } from "../exa/types.js";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "../observability/index.js";
@@ -13,6 +14,46 @@ import {
   MODEL_BEHAVIOUR_TABLES_SCHEMA,
 } from "./model-behaviour-schema.js";
 import { SESSION_AUDITS_SCHEMA } from "./session-audits-schema.js";
+
+export interface ExaResearchOrigin {
+  agent: string | null;
+  timelineKey: string;
+  sessionId: string;
+  sessionType: string;
+  requesterId: string | null;
+  /** Raw provider user ID used by user-limit ledger seeds, distinct from auth identity. */
+  triggerSenderId?: string | null;
+  toolCallId: string;
+  budgetPartitions: string[];
+  spaceId: string | null;
+  accountId?: string | null;
+}
+export type ExaResearchJobState = "submitting" | "submission_unknown" | "queued" | "running" | "completed" | "failed" | "cancelled";
+export interface ExaResearchJob {
+  id: string;
+  origin: ExaResearchOrigin;
+  request: ExaResearchRequest;
+  previousJobId?: string;
+  remoteId: string | null;
+  state: ExaResearchJobState;
+  remote: ExaRun | null;
+  lastError: string | null;
+  createdAt: number;
+  updatedAt: number;
+  accounted: boolean;
+}
+export interface ExaResearchCost { usd: number; provenance: "reported" | "estimated"; estimateVersion?: string }
+interface ExaResearchRow {
+  id: string; origin_json: string; request_json: string; previous_job_id: string | null;
+  remote_id: string | null; state: ExaResearchJobState; remote_json: string | null;
+  last_error: string | null; created_at: number; updated_at: number; accounted: number;
+}
+function researchJob(row: ExaResearchRow): ExaResearchJob {
+  return { id: row.id, origin: JSON.parse(row.origin_json), request: JSON.parse(row.request_json),
+    ...(row.previous_job_id ? { previousJobId: row.previous_job_id } : {}), remoteId: row.remote_id,
+    state: row.state, remote: row.remote_json ? JSON.parse(row.remote_json) : null,
+    lastError: row.last_error, createdAt: row.created_at, updatedAt: row.updated_at, accounted: row.accounted === 1 };
+}
 
 /** Audit writes are valid only for the terminal snapshot that was judged. */
 interface AuditSnapshot { auditCompletedAt: number | null }
@@ -4486,6 +4527,89 @@ export class Storage {
       db.prepare(
         `update backfetch_jobs set ${sets.join(", ")}, updated_at = @updatedAt where id = @id`,
       ).run(params);
+    });
+  }
+
+  /** Persist before submitting; replay of a tool invocation returns its original intent. */
+  createExaResearchIntent(input: { origin: ExaResearchOrigin; request: ExaResearchRequest; previousJobId?: string }): Promise<{ job: ExaResearchJob; created: boolean }> {
+    if (!input.origin.sessionId || !input.origin.toolCallId) return Promise.reject(new Error("Research origin requires session and tool call IDs"));
+    const origin = { ...input.origin, budgetPartitions: [...new Set(input.origin.budgetPartitions)] };
+    const originJson = JSON.stringify(origin), requestJson = JSON.stringify(input.request);
+    return this.readAndWrite((db) => {
+      const existing = db.prepare("select * from exa_research_jobs where origin_session_id = ? and tool_call_id = ?")
+        .get(origin.sessionId, origin.toolCallId) as ExaResearchRow | undefined;
+      if (existing) return { job: researchJob(existing), created: false };
+      const id = `exa_job_${nanoid(12)}`, now = Date.now();
+      db.prepare(`insert into exa_research_jobs (id, origin_session_id, tool_call_id, origin_json, request_json,
+        previous_job_id, state, created_at, updated_at) values (?, ?, ?, ?, ?, ?, 'submitting', ?, ?)`)
+        .run(id, origin.sessionId, origin.toolCallId, originJson, requestJson, input.previousJobId ?? null, now, now);
+      return { job: researchJob(db.prepare("select * from exa_research_jobs where id = ?").get(id) as ExaResearchRow), created: true };
+    });
+  }
+
+  getExaResearchJob(id: string): ExaResearchJob | undefined {
+    return this.read((db) => {
+      const row = db.prepare("select * from exa_research_jobs where id = ?").get(id) as ExaResearchRow | undefined;
+      return row && researchJob(row);
+    });
+  }
+
+  /** Caller applies origin visibility before filtering, counting, or pagination. */
+  listExaResearchJobs(): ExaResearchJob[] {
+    return this.read((db) => (db.prepare("select * from exa_research_jobs order by created_at desc, id desc").all() as ExaResearchRow[]).map(researchJob));
+  }
+
+  updateExaResearchJob(id: string, patch: { remoteId?: string | null; state?: ExaResearchJobState; remote?: ExaRun | null; lastError?: string | null }): Promise<ExaResearchJob> {
+    return this.readAndWrite((db) => {
+      const row = db.prepare("select * from exa_research_jobs where id = ?").get(id) as ExaResearchRow | undefined;
+      if (!row) throw new Error("Unknown research job");
+      if (row.accounted) return researchJob(row); // stale polling cannot overwrite finalized output
+      if (row.remote_id && patch.remoteId !== undefined && patch.remoteId !== row.remote_id) throw new Error("Research remote ID is immutable");
+      if (patch.remote && patch.remote.id !== (patch.remoteId ?? row.remote_id)) throw new Error("Research response does not match remote ID");
+      const state = patch.state ?? row.state;
+      if (patch.remote && ["completed", "failed", "cancelled"].includes(patch.remote.status)) throw new Error("Terminal research responses require atomic finalization");
+      if (["completed", "cancelled"].includes(state) || (state === "failed" && (patch.remoteId ?? row.remote_id))) throw new Error("Remote terminal research states require atomic finalization");
+      db.prepare(`update exa_research_jobs set remote_id=?, state=?, remote_json=?, last_error=?, updated_at=? where id=?`)
+        .run(patch.remoteId === undefined ? row.remote_id : patch.remoteId, state,
+          patch.remote === undefined ? row.remote_json : patch.remote === null ? null : JSON.stringify(patch.remote),
+          patch.lastError === undefined ? row.last_error : patch.lastError?.slice(0, 2000) ?? null, Date.now(), id);
+      return researchJob(db.prepare("select * from exa_research_jobs where id=?").get(id) as ExaResearchRow);
+    });
+  }
+
+  /** Terminal output and its unique billable identity commit in one writer transaction. */
+  finalizeExaResearchJob(id: string, run: ExaRun, cost: ExaResearchCost): Promise<{ job: ExaResearchJob; newlyAccounted: boolean; event?: UsageEventInput }> {
+    if (!["completed", "failed", "cancelled"].includes(run.status)) return Promise.reject(new Error("Research run is not terminal"));
+    if (!Number.isFinite(cost.usd) || cost.usd < 0) return Promise.reject(new Error("Research cost must be finite and nonnegative"));
+    return this.readAndWrite((db) => {
+      const row = db.prepare("select * from exa_research_jobs where id=?").get(id) as ExaResearchRow | undefined;
+      if (!row) throw new Error("Unknown research job");
+      if (row.remote_id && row.remote_id !== run.id) throw new Error("Research response does not match remote ID");
+      if (row.accounted) return { job: researchJob(row), newlyAccounted: false };
+      const job = researchJob(row), origin = job.origin, now = Date.now();
+      const pools = [...new Set(origin.budgetPartitions)], roomId = roomIdFromTimelineKey(origin.timelineKey);
+      const event: UsageEventInput = { ts: now, class: "tool", agentSessionId: origin.sessionId,
+        sessionType: origin.sessionType, timelineKey: origin.timelineKey, triggerSenderId: origin.triggerSenderId ?? null,
+        toolName: "exa_research", modelId: "exa/research", logicalModelId: "exa/research", provider: "exa",
+        budgetPartitions: pools, spaceId: origin.spaceId, costUsd: cost.usd, ref: id };
+      db.prepare(`insert into tool_invocations (id, agent_session_id, tool_name, tool_call_id, model_id, provider, cost, ref, metadata_json, created_at)
+        values (?, ?, 'exa_research', ?, 'exa/research', 'exa', ?, ?, ?, ?)`)
+        .run(`exa_research_tool:${id}`, origin.sessionId, origin.toolCallId, cost.usd, id,
+          JSON.stringify({ jobId: id, remoteId: run.id, state: run.status, stopReason: run.stopReason ?? null,
+            costProvenance: cost.provenance, ...(cost.estimateVersion ? { estimateVersion: cost.estimateVersion } : {}),
+            reportedCost: run.costDollars?.total ?? null }), now);
+      const usageId = `exa_research_usage:${id}`;
+      db.prepare(`insert into usage_events (id, ts, class, agent_session_id, session_type, timeline_key,
+        trigger_sender_id, tool_name, model_id, logical_model_id, provider, budget_partition, room_id, space_id, cost_usd, ref, created_at)
+        values (?, ?, 'tool', ?, ?, ?, ?, 'exa_research', 'exa/research', 'exa/research', 'exa', ?, ?, ?, ?, ?, ?)`)
+        .run(usageId, now, origin.sessionId, origin.sessionType, origin.timelineKey, origin.triggerSenderId ?? null,
+          pools[0] ?? null, roomId, origin.spaceId, cost.usd, id, now);
+      const child = db.prepare(`insert into usage_event_partitions (event_id, partition_key, ts, cost_usd, requested_model_id, room_id, space_id, timeline_key)
+        values (?, ?, ?, ?, null, ?, ?, ?)`);
+      for (const pool of pools.slice(1)) child.run(usageId, pool, now, cost.usd, roomId, origin.spaceId, origin.timelineKey);
+      db.prepare(`update exa_research_jobs set remote_id=?, state=?, remote_json=?, last_error=null, accounted=1, updated_at=? where id=?`)
+        .run(run.id, run.status, JSON.stringify(run), now, id);
+      return { job: researchJob(db.prepare("select * from exa_research_jobs where id=?").get(id) as ExaResearchRow), newlyAccounted: true, event };
     });
   }
 
@@ -11795,6 +11919,26 @@ create table if not exists agent_session_branches (
   primary key (session_id, branch_no)
 );`;
 
+const EXA_RESEARCH_SCHEMA = `
+create table if not exists exa_research_jobs (
+  id text primary key,
+  origin_session_id text not null,
+  tool_call_id text not null,
+  origin_json text not null,
+  request_json text not null,
+  previous_job_id text,
+  remote_id text unique,
+  state text not null check(state in ('submitting','submission_unknown','queued','running','completed','failed','cancelled')),
+  remote_json text,
+  last_error text,
+  accounted integer not null default 0 check(accounted in (0,1)),
+  created_at integer not null,
+  updated_at integer not null,
+  unique(origin_session_id, tool_call_id)
+);
+create index if not exists idx_exa_research_recovery on exa_research_jobs(state, updated_at);
+`;
+
 const SCHEMA = `
 create table if not exists timeline_events (
   id text primary key,
@@ -12359,7 +12503,8 @@ create index if not exists idx_decision_evaluations_ts
   on decision_evaluations(ts);
 ${REFUSAL_HANDLING_SCHEMA}
 ${MODEL_BEHAVIOUR_SCHEMA}
-${SESSION_AUDITS_SCHEMA}`;
+${SESSION_AUDITS_SCHEMA}
+${EXA_RESEARCH_SCHEMA}`;
 
 // SCHEMA above defines the complete current shape with idempotent
 // `create … if not exists` DDL, so a fresh database is built directly at the
@@ -12367,7 +12512,7 @@ ${SESSION_AUDITS_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 28;
+export const LATEST_SCHEMA_VERSION = 29;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -13375,6 +13520,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
     const columns = db.prepare("PRAGMA table_info(tool_invocations)").all() as Array<{ name: string }>;
     if (columns.length && !columns.some((column) => column.name === "metadata_json")) db.exec("ALTER TABLE tool_invocations ADD COLUMN metadata_json TEXT");
   },                                   // v27→v28 paid service provenance
+  (db) => db.exec(EXA_RESEARCH_SCHEMA),  // v28→v29 durable Exa research
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write

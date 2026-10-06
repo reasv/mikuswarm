@@ -1551,3 +1551,18 @@ test("isEnforceableUser (Phase 0): a custom predicate changes enforceability out
   // "system" fails too.
   assert.ok(!partitions.has("system"), "non-numeric system sender is excluded");
 });
+
+
+test("durable research reconciliation refreshes cached calendar meters once after origin ends", () => {
+  let ledger = 0;
+  const engine = makeEngine([{ user: "*", max_usd: 1, window: { type: "calendar", period: "day", tz: "UTC" } }], { sumUsageCost: () => ledger, now: Date.UTC(2026, 0, 1, 12) });
+  const origin = engine.resolve({ userId: "@origin:example.org" });
+  assert.equal(engine.totalHeadroom(origin), 1);
+  ledger = 0.25; // Atomic service finalization is already in the ledger.
+  engine.reconcileCommittedUsage();
+  assert.equal(engine.totalHeadroom(origin), 0.75);
+  engine.reconcileCommittedUsage();
+  assert.equal(engine.totalHeadroom(origin), 0.75); // Never increment the committed charge twice.
+  const fresh = engine.resolve({ userId: "@origin:example.org" });
+  assert.equal(engine.totalHeadroom(fresh), 0.75);
+});

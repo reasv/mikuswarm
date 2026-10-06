@@ -1275,7 +1275,6 @@ allowed_data_sources = []
 max_in_flight = 2
 poll_interval_ms = 3000
 wait_timeout_ms = 900000
-retention_days = 90
 
 [exa.fallback]
 search = "native"

@@ -1905,7 +1905,6 @@ const ExaSchema = StrictObject({
     max_in_flight: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
     poll_interval_ms: Type.Optional(Type.Integer({ minimum: 1, maximum: 300000 })),
     wait_timeout_ms: Type.Optional(Type.Integer({ minimum: 1, maximum: 3600000 })),
-    retention_days: Type.Optional(Type.Integer({ minimum: 1, maximum: 3650 })),
   })),
   fallback: Type.Optional(StrictObject({
     search: Type.Optional(Type.Union([Type.Literal("native"), Type.Literal("none")])),

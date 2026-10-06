@@ -170,6 +170,34 @@ Paid API retrieval uses service identities `exa/search` and `exa/contents`, prov
 
 Direct native fallback now has bounded HTTP headers/body deadlines, caller AbortSignals, shared guarded transport, body cleanup and explicit bot-check/parser-failure errors; genuine empty results remain distinct.
 
+Native research (`src/exa/research.ts`, `src/tools/exa-research.ts`) is separately
+opt-in through `[exa.research].enabled`. `exa_research` submits a bounded fixed-effort
+job and blocks until completion or the caller's wait deadline. Result, list, and
+cancel tools remain available with native Exa enabled even when new research is
+disabled, so existing purchased work can be collected. Local cancellation of a
+wait leaves the remote run intact; only the cancellation tool requests remote
+cancellation. No completion sessions or unsolicited messages are launched.
+
+Schema v29 stores research intents, local/remote IDs, frozen originating agent,
+channel, requester, session type, shared budget partitions, and lifecycle/output.
+The originating session/tool-call identity prevents replay from submitting again.
+A submission whose acceptance cannot be determined remains `submission_unknown`;
+it consumes an active-job slot and is never automatically retried. Known remote
+runs reconcile at startup and periodically, with a single collector shared by
+independent caller waits. Finalization atomically commits terminal output and both
+cost ledgers with stable unique IDs, including charged failed/cancelled jobs.
+Repeated collection never charges again. Only newly committed events update the
+period engine and the live origin session tracker; user-limit caches refresh from
+the committed ledger, including after the origin session ends. Reported costs and
+versioned fixed-effort estimates remain distinguishable.
+
+Research visibility requires the owning agent plus channel visibility, and list
+filters authorization before pagination. Agent tools permit cancellation only by
+the originating requester; the service's trusted-operator flag is a host API and
+is never supplied by model arguments. Job identities and accounting records are
+retained; this version provides no research pruning policy. Full durable output
+and grounding can be read in bounded pages through `exa_research_result`.
+
 ### Schema shape
 
 ```

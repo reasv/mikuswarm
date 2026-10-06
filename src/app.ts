@@ -1,3 +1,5 @@
+import { ExaResearchService } from "./exa/research.js";
+import { createExaResearchTools } from "./tools/exa-research.js";
 import { ExaClient } from "./exa/client.js";
 import { resolveExaConfig } from "./exa/config.js";
 import { ExaContentStore } from "./exa/content-store.js";
@@ -2921,6 +2923,21 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   const exaConfig = resolveExaConfig(config.exa);
   const exaClient = exaConfig.enabled ? new ExaClient(exaConfig) : undefined;
   const exaContents = new ExaContentStore(exaConfig.fetch.content_store_max_bytes, exaConfig.fetch.content_ttl_hours * 3600000);
+  const liveExaUsage = new Map<string, SessionUsageTracker>();
+  const exaResearch = exaClient ? new ExaResearchService({
+    client: exaClient, storage, visibility: visibilityResolver,
+    onCommitted: (event) => {
+      // The service ledger transaction is already committed. Never insert it again.
+      budgetHooks.engine?.record(event);
+      const live = sessions.get(event.agentSessionId ?? "");
+      if (live && (live.status === "running" || live.status === "resuming")) {
+        liveExaUsage.get(event.agentSessionId!)?.recordToolCost(event.costUsd);
+      } else if (event.agentSessionId) liveExaUsage.delete(event.agentSessionId);
+      userLimitEngine?.reconcileCommittedUsage();
+      modelBehaviour.observeUsage(event);
+    },
+  }) : undefined;
+  await exaResearch?.start();
   const disabledTools = new Set(config.agent.disabled_tools ?? []);
   for (const tool of gatedOutFeatureTools(config.features)) {
     disabledTools.add(tool);
@@ -5122,6 +5139,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         "workspace unresolvable in agents mode",
       );
     }
+    for (const id of liveExaUsage.keys()) if (!sessions.get(id)) liveExaUsage.delete(id);
+    liveExaUsage.set(sessionId, usage);
     const sessionWsRoot = _sessionWsEntry?.workspaceRoot ?? workspaceRoot;
     const sessionMemWriter = _sessionWsEntry?.memoryWriter ?? memoryWriter;
     // Agents mode: the real agent name (not the "__legacy__" sentinel) for §7.1/§7.2.
@@ -5472,6 +5491,20 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           ...(!disabledTools.has("web_fetch") && exaConfig.fallback.fetch === "native" && (!factory.resolveSessionType(sessionType)?.tools || factory.resolveSessionType(sessionType)!.tools!.includes("web_fetch")) ? ["web_fetch"] : []),
         ],
         backgroundFallback: ["summarize", "condense", "diary"].includes(sessionType) && !disabledTools.has("web_fetch") && exaConfig.fallback.fetch === "native" && factory.resolveSessionType(sessionType)?.tools?.includes("web_fetch") ? createWebFetchTool() : undefined,
+      }) : []),
+      ...(exaResearch ? createExaResearchTools({
+        service: exaResearch,
+        caller: { agent: sessionAgentName, timeline: inbound.timelineKey, requesterId: (inbound.trigger?.triggeredBy.id ?? inbound.event.sender.id) ? `${inbound.provider}:${inbound.trigger?.triggeredBy.id ?? inbound.event.sender.id}` : null },
+        makeOrigin: (toolCallId) => {
+          const frozen = userLimitResolutions.get(sessionId);
+          return { agent: sessionAgentName, timelineKey: inbound.timelineKey, sessionId, sessionType,
+            requesterId: (inbound.trigger?.triggeredBy.id ?? inbound.event.sender.id) ? `${inbound.provider}:${inbound.trigger?.triggeredBy.id ?? inbound.event.sender.id}` : null,
+            triggerSenderId: frozen?.ctx.userId ?? inbound.trigger?.triggeredBy.id ?? inbound.event.sender.id ?? null,
+            toolCallId, accountId: target.accountId ?? null,
+            budgetPartitions: frozen && userLimitEngine ? userLimitEngine.sharedPoolKeys(frozen.resolution, undefined) : [],
+            spaceId: frozen?.ctx.spaceIds?.[0] ?? null };
+        },
+        checkBudget: () => usage.checkPaidServiceBudget() ?? makeToolBudgetGate({ engine: () => budgetHooks.engine, toolName: "exa_research", timelineKey: inbound.timelineKey, sessionType, formatResetsAt, paidService: true })("exa/research"),
       }) : []),
       // Per-session browser tool (§10a): use the per-agent session in agents mode
       // or the global legacy session. config.browser provides connection settings /
@@ -8174,6 +8207,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // factory.create as a clean AbortError → launchSession discards the
         // never-started session via its factory-failure path.
         drainAbort.abort();
+        await exaResearch?.stop();
+        liveExaUsage.clear();
         // Stop the proactive scheduler first: clear its per-channel timers so no
         // new proactive run is launched while the rest of the runtime tears down.
         proactiveScheduler.stop();
