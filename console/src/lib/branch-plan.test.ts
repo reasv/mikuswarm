@@ -150,3 +150,40 @@ describe('buildBranchPlan', () => {
 		expect(new Set(keys).size).toBe(keys.length);
 	});
 });
+
+it('hides continuation refusals when an older branch shares only the prefix', () => {
+ const event = { ...detail.refusalEvents![0]!, id: 999, branchNo: 0, ts: 3500, checkpoint: 'request' };
+ const build = (selection: Map<string, number>) => buildBranchPlan({ tree, selection, evaluations: [], gate: [], refusalEvents: [event] });
+ const current = build(new Map());
+ expect(current.findIndex((i) => i.type === 'hard_refusal')).toBeGreaterThan(current.findIndex((i) => i.type === 'fork'));
+ expect(build(new Map([[forkKey(0, 2), 1]])).filter((i) => i.type === 'hard_refusal')).toEqual([]);
+});
+
+it('anchors terminal refusal at the failed request, before a later record turn', () => {
+ const messages = [
+  { role: 'assistant', timestamp: 100, stopReason: 'error', rawStopReason: 'refusal', content: [] },
+  { role: 'user', timestamp: 300, harness: { kind: 'record_turn' }, content: [] },
+  { role: 'assistant', timestamp: 301, content: [] }
+ ];
+ const items = buildBranchPlan({ tree: buildBranchTree(messages, 0, []), selection: new Map(), evaluations: [], gate: [],
+  refusalEvents: [{ ...detail.refusalEvents![0]!, branchNo: 0, ts: 200, checkpoint: 'request', rawStopReason: 'refusal' }] });
+ expect(items.map((i) => i.type)).toEqual(['hard_refusal', 'message', 'message', 'message']);
+});
+
+it('offline ending uses the judged output timestamp, never the later audit clock', () => {
+ const ending: DecisionEvaluation = {
+  ...rows[0]!, id: 70, decisionGroup: 'audit:ending', ts: 999999, checkpoint: 'ending', toolCallId: null,
+  branchNo: 0, attemptNo: 0, verdictJson: JSON.stringify({ subjectTs: 4000, action: 'exhausted', results: [] })
+ };
+ const items = plan(new Map(), [...rows, ending]).map(describeItem);
+ expect(items.slice(items.indexOf('text'), items.indexOf('text') + 3)).toEqual(['text', 'ending', 'nudge 1']);
+ expect(gateEvaluations([ending])[0]).toMatchObject({ subjectTs: 4000, action: 'exhausted' });
+});
+
+it('legacy offline endings with no subject anchor are not guessed into the rollout', () => {
+ const ending: DecisionEvaluation = {
+  ...rows[0]!, id: 71, decisionGroup: 'audit:legacy', ts: 999999, checkpoint: 'ending', toolCallId: null,
+  branchNo: 0, attemptNo: 0, verdictJson: JSON.stringify({ results: [] })
+ };
+ expect(plan(new Map(), [...rows, ending]).some((i) => i.type === 'ending')).toBe(false);
+});

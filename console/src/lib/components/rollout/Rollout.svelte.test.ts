@@ -120,3 +120,13 @@ test('renders an in-rollout resume triggerGroup as a trigger turn, not raw JSON'
 	await expect.element(page.getByText('trigger', { exact: true })).toBeInTheDocument();
 	await expect.element(page.getByText('triggerGroup', { exact: true })).toBeInTheDocument();
 });
+
+test('aborted record response shows failure and an unexecuted tool instead of awaiting a result', async () => {
+ render(Rollout, { messages: [
+  { role: 'user', harness: { kind: 'record_turn', status: 'failed', reason: 'timeout' }, content: [] },
+  { role: 'assistant', stopReason: 'aborted', content: [{ type: 'toolCall', id: 'partial', name: 'session_record_tool', arguments: {} }] }
+ ] });
+ await expect.element(page.getByTestId('record-outcome')).toHaveTextContent('failed · timeout');
+ await expect.element(page.getByText('Not executed — request ended before completion.')).toBeVisible();
+ await expect.element(page.getByText('awaiting result…')).not.toBeInTheDocument();
+});

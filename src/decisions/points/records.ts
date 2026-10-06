@@ -9,6 +9,7 @@
  */
 
 import type { DecisionPoint } from "../registry.js";
+import { jsonTokens } from "../client.js";
 import { clipText, packNewest } from "../state.js";
 import type { PointSettings } from "../config.js";
 import type { DecisionAnswers, DecisionQuestion } from "../types.js";
@@ -18,6 +19,7 @@ export interface RecordsRequest {
   from: string;
   text: string;
   attachments?: string[];
+  reply_to?: { from: string; text: string };
 }
 
 /** One recent-chat message as seen by the point. */
@@ -25,11 +27,10 @@ export interface RecordsChatMessage {
   from: string;
   text: string;
   self?: true;
+  age?: string;
   /**
-   * Marks the record's own bot message (never sent: the state shows it only as
-   * a `self` message where it sat). Packing always keeps it and budgets the
-   * record around it, so a long chat never drops the one message the record
-   * belongs to.
+   * Marks the record's own bot message, emitted as record_message for the judge.
+   * A candidate is skipped if its continuous conversation suffix cannot fit.
    */
   ofRecord?: true;
 }
@@ -87,7 +88,9 @@ export const recordsPoint: DecisionPoint<RecordsInput, RecordsVerdict> = {
       relevant: {
         type: "noul",
         instructions:
-          "`request` asks about, refers to, or continues the work described in `record`.",
+          "`request` asks about, refers to, or continues the SAME specific work described in `record`. " +
+          "The message marked record_message (or reply_to) belongs to that record. " +
+          "A similar topic alone is not a match. If request.reply_to is present, the request refers to that message.",
       } satisfies DecisionQuestion,
     };
   },
@@ -96,6 +99,7 @@ export const recordsPoint: DecisionPoint<RecordsInput, RecordsVerdict> = {
     const clippedRequest: RecordsRequest = {
       from: input.request.from,
       text: clipText(input.request.text, REQUEST_TEXT_CLIP),
+      ...(input.request.reply_to ? { reply_to: { from: input.request.reply_to.from, text: clipText(input.request.reply_to.text, CHAT_TEXT_CLIP) } } : {}),
       ...(input.request.attachments?.length ? { attachments: input.request.attachments } : {}),
     };
 
@@ -107,7 +111,7 @@ export const recordsPoint: DecisionPoint<RecordsInput, RecordsVerdict> = {
       };
       // Try to fit the full record; clip it if the budget is tight.
       const full = buildReplyState(clippedRequest, replyTo, input.record);
-      const fullTokenEst = roughTokens(JSON.stringify(full));
+      const fullTokenEst = jsonTokens(full);
       if (fullTokenEst <= budgetTokens) return full;
       // Clip the record to fit.
       const record = clipRecord(input.record, budgetTokens, () =>
@@ -116,36 +120,30 @@ export const recordsPoint: DecisionPoint<RecordsInput, RecordsVerdict> = {
       return buildReplyState(clippedRequest, replyTo, record);
     }
 
-    // Non-reply framing: the record's bot message appears inline in recent_chat.
+    // Keep a continuous suffix. Never pin an old message across omitted chat.
     const recentChat = (input.recentChat ?? []).map((m) => ({
-      message: {
-        from: m.from,
-        text: clipText(m.text, CHAT_TEXT_CLIP),
-        ...(m.self ? { self: true as const } : {}),
-      },
-      pinned: m.ofRecord === true,
+      from: m.from,
+      text: clipText(m.text, CHAT_TEXT_CLIP),
+      ...(m.self ? { self: true as const } : {}),
+      ...(m.age ? { age: m.age } : {}),
+      ...(m.ofRecord ? { record_message: true as const } : {}),
     }));
-    type Entry = (typeof recentChat)[number];
-    const pinned = recentChat.filter((entry) => entry.pinned);
-    const others = recentChat.filter((entry) => !entry.pinned);
-    // Rebuild in timeline order so the pinned message sits where it actually was.
-    const build = (kept: Entry[], record: string) => {
-      const keep = new Set<Entry>([...pinned, ...kept]);
-      return {
-        request: clippedRequest,
-        recent_chat: recentChat.filter((entry) => keep.has(entry)).map((entry) => entry.message),
-        record,
-      };
-    };
-
-    // The fixed part (request + the record's own message) and the record come
-    // first; the record is clipped only when it cannot fit beside them. The rest
-    // of the chat is packed newest-first into what remains.
-    let record = input.record;
-    if (roughTokens(JSON.stringify(build([], record))) > budgetTokens) {
-      record = clipRecord(input.record, budgetTokens, () => build([], ""));
+    const candidateIndex = recentChat.findIndex((m) => m.record_message);
+    const required = candidateIndex < 0 ? [] : recentChat.slice(candidateIndex);
+    const build = (chat: typeof recentChat, record: string) => ({ request: clippedRequest, recent_chat: chat, record });
+    if (jsonTokens(build(required, "")) > budgetTokens) {
+      // The engine's non-reply fallback skips this candidate. It cannot be judged
+      // faithfully if the continuous conversation from its message will not fit.
+      throw new Error("record_candidate_outside_context_budget");
     }
-    const packed = packNewest(others, budgetTokens, (kept) => build(kept, record));
+    let record = input.record;
+    if (jsonTokens(build(required, record)) > budgetTokens) {
+      record = clipRecord(record, budgetTokens, () => build(required, ""));
+    }
+    const packed = packNewest(recentChat, budgetTokens, (chat) => build(chat, record));
+    if (candidateIndex >= 0 && !packed.some((m) => m.record_message)) {
+      throw new Error("record_candidate_outside_context_budget");
+    }
     return build(packed, record);
   },
 
@@ -197,23 +195,23 @@ function buildReplyState(
 }
 
 /**
- * Estimate tokens for a JSON string: 1 token ≈ 4 chars (rough but consistent
- * with how routing state is packed).
- */
-function roughTokens(s: string): number {
-  return Math.ceil(s.length / 4);
-}
-
-/**
  * Clip the record text so that `builder("") + clipped record` fits the budget.
  * Appends a truncation marker so the model knows it is cut.
  */
 function clipRecord(record: string, budgetTokens: number, baseBuilder: () => unknown): string {
-  const baseJson = JSON.stringify(baseBuilder());
-  const baseTokens = roughTokens(baseJson);
-  const recordBudgetChars = Math.max(0, (budgetTokens - baseTokens) * 4 - RECORD_CLIP_SUFFIX.length - 10);
-  if (recordBudgetChars <= 0) return RECORD_CLIP_SUFFIX;
+  const base = baseBuilder() as Record<string, unknown>;
   const chars = Array.from(record);
-  if (chars.length <= recordBudgetChars) return record;
-  return chars.slice(0, recordBudgetChars).join("") + RECORD_CLIP_SUFFIX;
+  let low = 0;
+  let high = chars.length;
+  let best = "";
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const text = chars.slice(0, mid).join("") + RECORD_CLIP_SUFFIX;
+    if (jsonTokens({ ...base, record: text }) <= budgetTokens) {
+      best = text;
+      low = mid + 1;
+    } else high = mid - 1;
+  }
+  if (!best || best === RECORD_CLIP_SUFFIX) throw new Error("record_candidate_outside_context_budget");
+  return best;
 }

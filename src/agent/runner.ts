@@ -352,6 +352,9 @@ async function reportEnding(
 ): Promise<void> {
   if (!hook || lifecycle?.isInterrupted() || wasAborted(agent.state.messages)) return;
   const messages = agent.state.messages;
+  // Harness-made endings are policy outcomes, not model output to judge again.
+  const terminal = findLastAssistantMessage(messages) as { harness?: unknown } | undefined;
+  if (terminal?.harness) return;
   let kind: SessionEnding["kind"];
   if (!isTerminallyValid(messages)) {
     kind = "exhausted";

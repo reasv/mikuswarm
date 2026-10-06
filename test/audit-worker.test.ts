@@ -99,8 +99,12 @@ async function setup(opts: {
   fail?: () => boolean;
   budgetAllowed?: () => boolean;
   shouldPause?: () => boolean;
+  endingText?: boolean;
 } = {}) {
   const config = makeConfig(opts.audit);
+  if (opts.endingText) config.checks.op_refusal = { ...opRefusal, questions: [
+    ...opRefusal.questions, { ...opRefusal.questions[0], source: "text" },
+  ] };
   const storage = await Storage.open({ databasePath: ":memory:" });
   const server = decisionServer(opts.answer ?? defaultAnswer, { fail: opts.fail });
   const usage: UsageEventInput[] = [];
@@ -535,4 +539,44 @@ test("backlog progress: counted in the background, per stage", async () => {
   await pool.runOnce(); // p1: refusal
   await counter.countOnce();
   assert.deepEqual(counter.snapshot()!.stages.map((s) => [s.id, s.done, s.remaining]), [["contract", 1, 0], ["priority_checks", 1, 0], ["rest", 0, 1]]);
+});
+
+test("continuation while the judge is in flight keeps usage but persists no obsolete verdict", async () => {
+  let storage: Storage;
+  let continuation: Promise<void> | undefined;
+  const h = await setup({ audit: { audits: ["refusal"] }, answer: (id, q, body) => {
+    continuation ??= storage.updateAgentSessionStatus("race", "running", { updatedAt: T0 });
+    return defaultAnswer(id, q, body);
+  } });
+  storage = h.storage;
+  try {
+    await addSession(storage, "race", { createdAt: 1000, transcript: [kick(), ...sent("c", "I cannot do that")] });
+    await h.pool.runOnce();
+    await continuation;
+    await storage.waitForIdle();
+    assert.ok(h.usage.length > 0, "the actual judge request remains billed");
+    assert.deepEqual(storage.getDecisionEvaluationsForSession("race"), []);
+    assert.deepEqual(storage.listRefusalEvents("race"), []);
+    assert.deepEqual(storage.listSessionAudits("race"), []);
+  } finally { storage.close(); }
+});
+
+test("live ending in one run does not suppress a later run with the same attempt number", async () => {
+  const { storage, pool } = await setup({ audit: { audits: ["refusal"] }, endingText: true });
+  try {
+    await addSession(storage, "runs", { createdAt: 1000, completedAt: 5000, transcript: [
+      kick(), asst([text("An unsent response")], { timestamp: 2000 }),
+      kick("next request"), asst([text("An unsent response")], { timestamp: 4000 }),
+    ] });
+    await storage.insertDecisionEvaluation({ ts: 2500, decision_group: "live", point: "checks",
+      agent_session_id: "runs", source: "model", checkpoint: "ending", attempt_no: 0,
+      verdict_json: JSON.stringify({ fired: [] }) });
+    await storage.insertDecisionEvaluation({ ts: 6000, decision_group: "audit:malformed", point: "checks",
+      agent_session_id: "runs", source: "model", checkpoint: "ending", attempt_no: 0,
+      verdict_json: "not-json" });
+    await pool.runOnce();
+    const judged = storage.getDecisionEvaluationsForSession("runs").filter((r) => r.decision_group.startsWith("audit:") && r.decision_group !== "audit:malformed");
+    assert.ok(judged.length > 0);
+    assert.ok(judged.every((r) => JSON.parse(r.verdict_json!).subjectTs === 4000));
+  } finally { storage.close(); }
 });

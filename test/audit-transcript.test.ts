@@ -235,3 +235,11 @@ test("audit knobs: defaults and seeded sampling", () => {
   assert.ok(share > 0.2 && share < 0.3, `share ${share}`);
   assert.equal(inSample("s-7", 0.25), inSample("s-7", 0.25), "seeded per session id");
 });
+
+test("checkItems: a paused tool-use response is not an exhausted ending", () => {
+  for (const completed of [false, true]) {
+    const messages = [kick(), asst([thinking("working"), call("lookup", "search", {})], { stopReason: "toolUse" }),
+      ...(completed ? [result("lookup", "search")] : [])];
+    assert.deepEqual(checkItems(messages), []);
+  }
+});

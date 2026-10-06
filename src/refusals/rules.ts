@@ -28,6 +28,7 @@ export function normalizeRefusalRules(config: Pick<AppConfig, "refusal_fallback"
     };
     if (raw.sites) rule.sites = [...raw.sites];
     if (raw.reasons) rule.reasons = [...raw.reasons];
+    if (raw.exclude_reasons) rule.excludeReasons = [...raw.exclude_reasons];
     if (raw.from_models) rule.fromModels = [...raw.from_models];
     if (raw.agents) rule.agents = [...raw.agents];
     // An empty task list is no condition.
@@ -59,6 +60,8 @@ export interface RefusalRuleMatchInput extends RefusalRuleScope {
   /** Logical id of the member that refused. */
   fromModel?: string;
   reason: string;
+  /** All fired refusal reasons for this output, including non-primary checks. */
+  detectedReasons?: readonly string[];
   kind: "hard" | "soft";
 }
 
@@ -80,6 +83,7 @@ export function matchRefusalRule(rules: readonly RefusalRule[], input: RefusalRu
     if (input.kind === "soft" && rule.soft !== "redo") return false;
     if (!scopeMatches(rule, input)) return false;
     if (rule.reasons && !rule.reasons.includes(input.reason)) return false;
+    if (rule.excludeReasons?.some((reason) => reason === input.reason || input.detectedReasons?.includes(reason))) return false;
     if (rule.fromModels && (!input.fromModel || !rule.fromModels.includes(input.fromModel))) return false;
     return true;
   });
@@ -133,7 +137,7 @@ export function validateRefusalRules(config: AppConfig, catalogue: CheckCatalogu
         throw new Error(`${where}.models: "${key}" is a system-one decision model; a rule needs chat models`);
       }
     }
-    for (const field of ["sites", "reasons", "from_models", "agents"] as const) {
+    for (const field of ["sites", "reasons", "exclude_reasons", "from_models", "agents"] as const) {
       if (rule[field] !== undefined && rule[field]!.length === 0) {
         throw new Error(`${where}.${field}: must not be empty (omit it to match any)`);
       }
@@ -156,11 +160,13 @@ export function validateRefusalRules(config: AppConfig, catalogue: CheckCatalogu
         throw new Error(`${where}.sites: unknown site "${site}" (known: ${[...sites].join(", ")})`);
       }
     }
-    for (const reason of rule.reasons ?? []) {
-      if (!reasons.has(reason)) {
-        throw new Error(
-          `${where}.reasons: unknown reason "${reason}" (known: ${[...reasons].join(", ")}; operator reasons come from [checks.<code>].reason)`,
-        );
+    for (const field of ["reasons", "exclude_reasons"] as const) {
+      for (const reason of rule[field] ?? []) {
+        if (!reasons.has(reason)) {
+          throw new Error(
+            `${where}.${field}: unknown reason "${reason}" (known: ${[...reasons].join(", ")}; operator reasons come from [checks.<code>].reason)`,
+          );
+        }
       }
     }
   });
@@ -212,6 +218,21 @@ export class RefusalRuleWalk {
     /** What `@same` means for this walk: the model that refused first. */
     readonly same: string,
   ) {}
+
+  /** Keep this exact entry (keys may repeat); the next failing request is try one. */
+  resetStreak(): void {
+    this.used = 1;
+  }
+
+  /** Start a fresh streak at the sticky entry; the request that refused used try one. */
+  resumeAt(model: string): void {
+    const index = this.rule.models.findIndex((e) => (e.model === SAME_MODEL_KEY ? this.same : e.model) === model);
+    if (index >= 0) {
+      this.index = index;
+      this.used = 1;
+      this.last = model;
+    }
+  }
 
   /** The next try's model, or undefined when every entry (every try) is spent. */
   next(usable: (model: string) => boolean, onSkip?: (model: string) => void): string | undefined {

@@ -36,7 +36,7 @@ const SessionRecordToolSchema = Type.Object({
     Type.Literal("insert"),
     Type.Literal("finalize"),
   ]),
-  file_text: Type.Optional(Type.String()),
+  file_text: Type.Optional(Type.String({ description: "Required for command=create: the complete session record text." })),
   view_range: Type.Optional(Type.Array(Type.Number(), { minItems: 2, maxItems: 2 })),
   old_str: Type.Optional(Type.String()),
   new_str: Type.Optional(Type.String()),
@@ -66,7 +66,8 @@ export function createSessionRecordTool(options: {
     description:
       "Write the session record: a compact account of what was done this session " +
       "so a later session can answer questions about it and continue it. " +
-      "Use `create` to start, then `str_replace` or `insert` to revise, and `view` to inspect. " +
+      "Use `create` with `file_text` containing the record and `finalize: true` to write and finish in one call. " +
+      "Use `str_replace` or `insert` to revise, and `view` to inspect. " +
       "To finish: set `finalize: true` on the final edit, or call `command: \"finalize\"` once done. " +
       "If there is nothing worth recording (the session did only conversation), " +
       "call `command: \"finalize\"` on the empty draft — this skips writing a record.",

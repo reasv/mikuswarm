@@ -127,6 +127,20 @@
 	const shown = $derived(plan.flatMap((item) => (item.type === 'message' ? [item.msg] : [])));
 	const toolResults = $derived(collectToolResults(shown));
 
+	function recordOutcome(msg: RolloutMsg): string | undefined {
+		const meta = msg.harness as { status?: string; reason?: string } | undefined;
+		if (meta?.status) return `${meta.status}${meta.reason ? ` · ${meta.reason.replaceAll('_', ' ')}` : ''}`;
+		// Older persisted sessions have no outcome marker. Their terminal response
+		// still establishes that the record turn ended without completing.
+		const index = shown.indexOf(msg);
+		for (const next of shown.slice(index + 1)) {
+			if (getHarness(next)?.kind === 'record_turn') break;
+			if (next.role === 'assistant' && (next.stopReason === 'aborted' || next.stopReason === 'error'))
+				return `failed · request ${next.stopReason}`;
+		}
+		return undefined;
+	}
+
 	function choose(key: string, option: number): void {
 		chosen = { ...chosen, [key]: option };
 	}
@@ -207,7 +221,7 @@
 			{:else if harness?.kind === 'record_turn'}
 				<!-- The harness record-turn user prompt: a section header, with the prompt
 				     itself collapsed and marked harness-made. -->
-				<RecordTurnSection prompt={contentText(msg.content)} />
+				<RecordTurnSection prompt={contentText(msg.content)} outcome={recordOutcome(msg)} />
 			{:else if msg.role === 'assistant' && harness?.kind === 'injection'}
 				<!-- Harness injection: assistant side — render each toolCall as a harness card. -->
 				{#each assistantBlocks(msg.content) as block, b (b)}
@@ -237,6 +251,9 @@
 			{:else if msg.role === 'toolResult' && harness?.kind === 'record_load'}
 				<!-- Already rendered inside HarnessCallRow above. -->
 			{:else if msg.role === 'assistant'}
+				{#if msg.stopReason === 'aborted' || msg.stopReason === 'error'}
+					<div class="my-1 rounded border border-red-500/30 p-2 text-xs text-red-500" data-testid="request-failed">Request {msg.stopReason === 'aborted' ? 'aborted' : 'failed'} · partial response; unfinished tool calls were not executed.</div>
+				{/if}
 				{#each assistantBlocks(msg.content) as block, b (b)}
 					{#if block.type === 'text'}
 						<AssistantTextCard text={block.text} />
@@ -252,6 +269,7 @@
 								args={block.arguments}
 								result={toolResults.get(block.id)}
 								usage={toolUsage?.get(block.id)}
+								requestFailed={msg.stopReason === 'aborted' || msg.stopReason === 'error'}
 							/>
 						</div>
 						<!-- The output gate's verdict on this call (spec REFUSAL-HANDLING §12.2). -->

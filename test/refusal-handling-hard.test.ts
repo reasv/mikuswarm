@@ -753,7 +753,7 @@ test("tries: exhaustion counts every try", async () => {
 });
 
 for (const [tool, delivered] of [["send_message", true], ["read_messages", false]] as const) {
-  test(`tries: a refusal point ${delivered ? "ends at a delivered message (the rule restarts at entry 1 on the pinned model)" : "spans non-posting tool work (the walk continues)"}`, async () => {
+  test(`tries: the pinned entry with one try fails on its next refusal after ${delivered ? "delivery" : "non-posting work"}`, async () => {
     await withEnv({ "/a/": "filter", "/r1/": ["toolcall", "filter", "ok"] }, async ({ stub, storage, root }) => {
       await addSessionRow(storage, `t4-${tool}`);
       const factory = makeFactory({
@@ -773,10 +773,10 @@ for (const [tool, delivered] of [["send_message", true], ["read_messages", false
       await runFirst(created);
       assert.deepEqual(
         prefixes(stub),
-        delivered ? ["a", "r1", "r1", "r1"] : ["a", "r1", "r1", "r2"],
-        "after a delivery the pinned model's refusal starts the rule over (entry 1 = redo1, a same-model retry)",
+        ["a", "r1", "r1", "r2"],
+        "a successful request resets the streak; one configured try means its next refusal advances",
       );
-      assert.equal(created.refusal.pinnedModel(), delivered ? "redo1" : "redo2");
+      assert.equal(created.refusal.pinnedModel(), "redo2");
     });
   });
 }

@@ -124,6 +124,8 @@ export interface RefusalRule {
   name: string;
   sites?: string[];
   reasons?: string[];
+  /** Veto this rule when any detected refusal reason is listed. */
+  excludeReasons?: string[];
   fromModels?: string[];
   agents?: string[];
   tasks?: string[];

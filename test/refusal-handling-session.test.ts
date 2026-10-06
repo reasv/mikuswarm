@@ -579,3 +579,62 @@ test("caption: @same retries the refusing caption model (tries), then the next e
     }
   });
 });
+
+test("hard refusal streak resets after success, retaining the sticky model and its full consecutive limit", () => {
+  const { c } = controller({ rules: rules([{ name: "r", models: ["open_z", { model: "open_x", tries: 3 }], on_exhausted: "withhold" }]) });
+  const rule = c.matchRule({ reason: "safety", kind: "soft", fromModel: "model_a" })!;
+  c.advance(rule, "model_a");
+  c.advance(rule, "open_z");
+  for (let point = 0; point < 4; point++) {
+    assert.equal(c.onHardRefusal(refusalInfo({ servedModel: "open_x" })).action, "redo");
+    c.noteCommitted();
+    assert.equal(c.dispatchModel(), "open_x", "success preserves the pin");
+  }
+  assert.equal(c.onHardRefusal(refusalInfo({ servedModel: "open_x" })).action, "redo");
+  assert.equal(c.onHardRefusal(refusalInfo({ servedModel: "open_x" })).action, "redo");
+  assert.equal(c.onHardRefusal(refusalInfo({ servedModel: "open_x" })).action, "withhold");
+});
+
+test("Layer 0 accounts provider usage on aborted and non-refusal error attempts exactly once", async () => {
+  for (const stopReason of ["aborted", "error"] as const) {
+    const committed: AssistantMessage[] = [];
+    const base: StreamFn = (model) => {
+      const stream = createAssistantMessageEventStream();
+      const error = { role: "assistant", content: [], api: model.api, provider: "p", model: "m", timestamp: 0,
+        stopReason, errorMessage: stopReason === "error" ? "400 bad request" : "aborted",
+        usage: { input: 5, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 7,
+          cost: { input: 0.01, output: 0.02, cacheRead: 0, cacheWrite: 0, total: 0.03 } },
+      } as AssistantMessage;
+      queueMicrotask(() => stream.push({ type: "error", reason: stopReason, error }));
+      return stream;
+    };
+    await drain(withRequestRetry(base, {}, { onRequestCommitted: (m) => committed.push(m) }));
+    assert.equal(committed.length, 1);
+    assert.equal(committed[0]!.usage.cost.total, 0.03);
+  }
+});
+
+test("Layer 0 stops a retry when the refused request consumes the remaining budget", async () => {
+ const calls: string[] = [];
+ let cost = 0;
+ const events = await drain(withRequestRetry(scripted(["refuse", "ok"], calls), {}, {
+   onRequestCommitted: (m) => { cost += m.usage.cost.total; },
+   checkCostBudget: () => cost >= 0.01 ? "budget exhausted" : undefined,
+   onRefusal: () => ({ action: "redo" }),
+ }));
+ assert.deepEqual(calls, ["refuse"]);
+ assert.equal(cost, 0.01);
+ assert.equal(events.at(-1).type, "error");
+});
+
+test("excluded overlapping reasons veto both an active walk and its sticky pin", () => {
+ const { c } = controller({ rules: rules([{ name: "r", from_models: ["model_a"], models: ["open_x"], exclude_reasons: ["capability"] }]) });
+ const input = { reason: "safety", kind: "soft" as const, fromModel: "model_a" };
+ const rule = c.matchRule(input)!;
+ c.advance(rule, "model_a");
+ for (const endWalk of [false, true]) {
+   if (endWalk) c.noteDelivered();
+   assert.equal(c.matchRule({ ...input, fromModel: "open_x", detectedReasons: ["safety", "capability"] }), undefined);
+   assert.equal(c.matchRule({ ...input, fromModel: "open_x", detectedReasons: ["safety"] })?.name, "r");
+ }
+});

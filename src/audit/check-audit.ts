@@ -75,9 +75,17 @@ export function judgedCodes(verdictJson: string | null): string[] {
  * Existing check rows at an output's anchor: judged live by a model, only pattern
  * hits, and the codes an earlier audit stage already judged there.
  */
+function subjectTimestamp(verdictJson: string | null): number | undefined {
+  try {
+    const value = JSON.parse(verdictJson ?? "{}").subjectTs;
+    return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  } catch { return undefined; }
+}
+
 function existingAt(
   rows: readonly DecisionEvaluationRow[],
   item: AuditCheckItem,
+  nextEndingTs = Infinity,
 ): { judged: boolean; patterns: boolean; auditCodes: Set<string> } {
   let judged = false;
   let patterns = false;
@@ -86,7 +94,10 @@ function existingAt(
     if (r.point !== "checks" || r.checkpoint !== item.checkpoint || (r.branch_no ?? 0) !== 0) continue;
     const same = item.toolCallId !== undefined
       ? r.tool_call_id === item.toolCallId
-      : r.tool_call_id === null && r.attempt_no === (item.attemptNo ?? null);
+      : r.tool_call_id === null && r.attempt_no === (item.attemptNo ?? null) &&
+        (r.decision_group.startsWith(AUDIT_GROUP_PREFIX)
+          ? item.ts !== undefined && subjectTimestamp(r.verdict_json) === item.ts
+          : item.ts === undefined || (r.ts >= item.ts && r.ts < nextEndingTs));
     if (!same) continue;
     if (r.source === "pattern") patterns = true;
     else if (r.source === "model") {
@@ -113,7 +124,10 @@ export async function auditSessionChecks(params: {
     costUsd: 0,
   };
   for (const item of items) {
-    const live = existingAt(existing, item);
+    const nextEndingTs = item.ts === undefined ? Infinity : Math.min(...items
+      .filter((other) => other.checkpoint === "ending" && other.ts !== undefined && other.ts > item.ts!)
+      .map((other) => other.ts!));
+    const live = existingAt(existing, item, nextEndingTs);
     if (live.judged) {
       result.verdict.skippedLive += 1;
       continue;
@@ -135,6 +149,7 @@ export async function auditSessionChecks(params: {
       },
       {
         checkpoint: item.checkpoint,
+        ...(item.ts !== undefined ? { subjectTs: item.ts } : {}),
         branchNo: 0,
         ...(item.toolCallId !== undefined ? { toolCallId: item.toolCallId } : {}),
         ...(item.attemptNo !== undefined ? { attemptNo: item.attemptNo } : {}),

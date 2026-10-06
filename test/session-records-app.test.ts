@@ -22,7 +22,7 @@ const finalize = (text: string): FakeLlmReply => ({
 
 /** The newest user-turn text that is not the record prompt. */
 function triggerText(req: FakeLlmRequest): string {
-  const users = req.body.messages.filter((m) => m.role === "user" && !messageText(m).includes("Write its session record"));
+  const users = req.body.messages.filter((m) => m.role === "user" && !messageText(m).includes("Write a record of the work you performed"));
   return messageText(users.at(-1));
 }
 
@@ -131,6 +131,8 @@ test("app: a session with tool work writes a record; pure chat writes none", asy
     const rows = await settled(h, 2);
     const rec = records(h);
     assert.equal(rec.length, 1, "only the working session writes a record");
+    assert.deepEqual(h.query("select status,reason from session_record_generation where session_id=?", rows[0]!.id), [{status:"skipped",reason:"no_work"}]);
+    assert.deepEqual(h.query("select status,reason from session_record_generation where session_id=?", rows[1]!.id), [{status:"written",reason:null}]);
     assert.equal(rec[0]!.session_id, rows[1]!.id);
     assert.equal(rec[0]!.text, "found X at memory/a.md");
     assert.equal(rec[0]!.model_id, "fake-model", "model_id is the member that served the record turn");
@@ -139,7 +141,7 @@ test("app: a session with tool work writes a record; pure chat writes none", asy
     const t = transcript(rows[1]!);
     const prompt = t.find((m) => m.harness?.kind === "record_turn");
     assert.ok(prompt, "record_turn prompt persisted");
-    assert.match(prompt.content[0].text, /^This session is over\. Write its session record/);
+    assert.match(prompt.content[0].text, /^This execution is over\. Write a record of the work you performed/);
     assert.ok(t.some((m) => m.role === "toolResult" && m.toolName === "session_record_tool"), "record tool result persisted");
   } finally {
     await h.stop();
@@ -170,6 +172,10 @@ context_window = 128000
     h.say("[work] go", { mention: true });
     await settled(h, 1);
     assert.equal(records(h)[0]?.model_id, "backup-model");
+    const req = h.llm.requests.find((r) => isRecordTurnRequest(r) && r.body.model === "backup-model")!;
+    const tool = req.body.tools?.find((t) => t.function.name === "session_record_tool")?.function as any;
+    assert.ok(tool.parameters.properties.file_text, "fallback receives the complete record schema");
+
   } finally {
     await h.stop();
   }
@@ -185,9 +191,14 @@ test("app: dynamic loading — record_load is a synthetic tool_search select cal
     assert.ok(mainTools.includes("read_session_record"), "read_session_record is immediate even when the list omits it");
     const recordReq = h.llm.requests.find(isRecordTurnRequest)!;
     assert.ok(requestToolNames(recordReq).includes("session_record_tool"), "loaded before the record-turn request");
+    const definition = recordReq.body.tools?.find((t) => t.function.name === "session_record_tool")?.function as any;
+    assert.ok(definition.parameters.properties.file_text, "full input schema reaches the provider");
+    assert.ok(definition.parameters.properties.command);
+    assert.ok(definition.parameters.properties.finalize);
+
     // The wire: record prompt, then the synthetic tool_search call + its result.
     const msgs = recordReq.body.messages;
-    const promptIdx = msgs.findIndex((m: Msg) => m.role === "user" && messageText(m).includes("Write its session record"));
+    const promptIdx = msgs.findIndex((m: Msg) => m.role === "user" && messageText(m).includes("Write a record of the work you performed"));
     const loadCall = msgs[promptIdx + 1]!;
     assert.equal(loadCall.role, "assistant");
     assert.equal(loadCall.tool_calls![0]!.function.name, "tool_search");
@@ -261,12 +272,6 @@ const failureCases: Array<{ name: string; toml?: string; recordTurn: () => FakeL
     recordTurn: () => ({ toolCalls: [{ name: "session_record_tool", args: { command: "create", file_text: "draft only" } }] }),
     reason: "max_turns",
   },
-  {
-    name: "timeout",
-    toml: "[session_records]\ntimeout_ms = 1000\n",
-    recordTurn: () => ({ ...finalize("too late"), delayMs: 3000 }),
-    reason: "timeout",
-  },
   { name: "ending without finalize", recordTurn: () => ({ text: "here is my record" }), reason: "not_finalized" },
   {
     name: "LLM error",
@@ -285,6 +290,7 @@ for (const c of failureCases) {
       assert.equal(records(h).length, 0);
       assert.ok(hasLog(h, "session_record_failed", { sessionId: row!.id, reason: c.reason }), `failed{${c.reason}}`);
       assert.equal(row!.status, "completed", "the session itself is unaffected");
+      assert.deepEqual(h.query("select status,reason from session_record_generation where session_id=?", row!.id), [{status:"failed",reason:c.reason}]);
     } finally {
       await h.stop();
     }
@@ -433,10 +439,10 @@ test("app: a reply that arrives while the record is being written waits for it",
   }
 });
 
-test("app: a reply proceeds without the record once its production times out", async () => {
+test("app: a reply wait expires but record production completes for a later reply", async () => {
   const h = await startHarness({
-    script: chatScript({ recordTurn: () => ({ ...finalize("never lands"), delayMs: 4000 }) }),
-    toml: "[session_records]\ntimeout_ms = 1000\n",
+    script: chatScript({ recordTurn: () => ({ ...finalize("late record"), delayMs: 4000 }) }),
+    toml: "[session_records]\nwait_timeout_ms = 1000\n",
   });
   try {
     h.say("[work] first", { mention: true });
@@ -447,7 +453,10 @@ test("app: a reply proceeds without the record once its production times out", a
     assert.ok(Date.now() - started < 3500, "did not wait past the record deadline");
     assert.equal(injectedCall(firstRequestFor(h, "and?")), undefined, "nothing injected");
     await settled(h, 2);
-    assert.equal(records(h).length, 0);
+    assert.equal(records(h).length, 1, "record finishes after the first reply stopped waiting");
+    h.say("what happened earlier?", { mention: true, replyTo: h.sends[0]!.externalId });
+    await settled(h, 3);
+    assert.ok(injectedCall(firstRequestFor(h, "what happened earlier?")), "later reply receives the completed record");
   } finally {
     await h.stop();
   }
@@ -462,7 +471,7 @@ user_gap_ms = 7000
 wall_clock_ms = 15000
 `;
 
-test("app: a reply-resume waits until the timed-out record turn has settled (Z3)", async () => {
+test("app: opt-in reply-resume waits for production past the reply wait deadline (Z3)", async () => {
   const h = await startHarness({
     script: chatScript({ recordTurn: () => ({ ...finalize("late record"), delayMs: 2500 }) }),
     toml: `
@@ -479,9 +488,9 @@ enabled = { group = true }
     h.say("and then?", { mention: true, replyTo: h.sends.at(-1)!.externalId });
     await h.until(() => hasLog(h, "session_resume_started"), "reply resumed the session");
     const idx = (m: string) => h.logs.findIndex((l) => l.message === m);
-    assert.ok(idx("session_record_failed") >= 0, "the record turn timed out");
+    assert.ok(idx("session_record_written") >= 0, "the record turn finished");
     assert.ok(
-      idx("session_record_failed") < idx("session_resume_started"),
+      idx("session_record_written") < idx("session_resume_started"),
       "the resume started only after the record turn was over",
     );
     await settled(h, 1);
@@ -765,4 +774,66 @@ test("app: shutdown aborts an in-flight record turn — no row, failed{shutdown}
   } finally {
     if (!stopped) await h.stop();
   }
+});
+
+test("app: record requests retain the user's billing partition after main-session completion", async () => {
+  const h = await startHarness({
+    script: chatScript({ recordTurn: () => finalize("test record") }),
+    toml: `
+[models.default.cost]
+input = 1
+output = 1
+cache_read = 0
+cache_write = 0
+[[user_limits]]
+user = "*"
+models = ["default"]
+limits = [{ max_usd = 10, window = { type = "rolling", duration = "24h" }, partition = "test-pool" }]
+`,
+  });
+  try {
+    h.say("[work] billing regression", { mention: true });
+    const [row] = await settled(h, 1);
+    assert.equal(records(h).length, 1);
+    const usage = h.query<{ cost_usd: number; budget_partition: string | null; requested_model_id: string | null }>(
+      "select cost_usd, budget_partition, requested_model_id from usage_events where agent_session_id = ? and class = 'agent_loop' order by ts", row!.id,
+    );
+    assert.equal(usage.length, 3, "work, reply, and record requests are each billed once");
+    assert.ok(usage.every((u) => u.cost_usd > 0));
+    assert.ok(usage.every((u) => u.budget_partition === "test-pool"), "record retains frozen shared-pool attribution");
+    assert.ok(usage.every((u) => u.requested_model_id === "default"));
+    const totals = h.query<{ usage_cost: number }>("select usage_cost from agent_sessions where id = ?", row!.id);
+    assert.ok(Math.abs(totals[0]!.usage_cost - usage.reduce((sum, u) => sum + u.cost_usd, 0)) < 1e-10);
+  } finally { await h.stop(); }
+});
+
+
+test("app: unsolicited records age out, but an explicit reply can still retrieve them", async () => {
+  const h = await startHarness({ script: chatScript({ recordTurn: () => finalize("old work") }), toml: DECISIONS.replace("[decisions.records]", "[decisions.records]\ncandidate_max_age_ms = 1"), decideNoul: () => 0.9 });
+  try {
+    h.say("[work] earlier", { mention: true });
+    const [old] = await settled(h, 1);
+    const replyId = h.sends[0]!.externalId;
+    h.say("unrelated new topic", { mention: true });
+    const rows = await settled(h, 2);
+    assert.equal(h.query("select id from decision_evaluations where point='records' and agent_session_id=?", rows[1]!.id).length, 0);
+    assert.equal(injectedCall(firstRequestFor(h, "unrelated new topic")), undefined);
+    h.say("continue that work", { mention: true, replyTo: replyId });
+    await settled(h, 3);
+    assert.ok(injectedCall(firstRequestFor(h, "continue that work")));
+  } finally { await h.stop(); }
+});
+
+test("app: many newer messages exclude an old record without filling from older history", async () => {
+  const h = await startHarness({ script: chatScript({ recordTurn: () => finalize("old work") }), toml: DECISIONS, decideNoul: () => 0.9 });
+  try {
+    h.say("[work] earlier", { mention: true });
+    await settled(h, 1);
+    for (let i=0;i<45;i++) h.say(`background conversation ${i}`);
+    await h.until(() => h.query<{n:number}>("select count(*) n from timeline_events where role='user'")[0]!.n >= 46, "background chat persisted");
+    h.say("a fresh topic", { mention: true });
+    const rows = await settled(h, 2);
+    assert.equal(h.query("select id from decision_evaluations where point='records' and agent_session_id=?", rows[1]!.id).length, 0);
+    assert.equal(injectedCall(firstRequestFor(h, "a fresh topic")), undefined);
+  } finally { await h.stop(); }
 });

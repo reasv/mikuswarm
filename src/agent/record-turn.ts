@@ -73,7 +73,7 @@ export function wrapToolsWithRecordTurnGate(
       if (!isRecordTool && gate.active) {
         throw new Error(
           "Only session_record_tool is available while writing the session record. " +
-            "Write it with session_record_tool (command \"create\", then \"finalize\"), or call " +
+            "Write it with session_record_tool (command \"create\", file_text: the record, finalize: true), or call " +
             "session_record_tool(command: \"finalize\") on the empty draft if nothing is worth recording.",
         );
       }

@@ -664,13 +664,13 @@ export class AgentSessionFactory {
    * chain is healthy (or probe-due) and in budget. Workers use it to walk a
    * rule's entries outside a session.
    */
-  refusalEntryViable(logicalId: string): boolean {
+  refusalEntryViable(logicalId: string, scope: { sessionType: string; timelineKey: string }): boolean {
     if (!this.options.config.models[logicalId]) return false;
     const engine = this.options.budget?.engine;
     return this.chainViable(
       logicalId,
       this.options.scheduler,
-      engine ? (id: string) => engine.isModelAvailable(id) : undefined,
+      engine ? (id: string) => engine.isModelAvailable(id, { class: "agent_loop", ...scope }) : undefined,
     );
   }
 
@@ -782,7 +782,7 @@ export class AgentSessionFactory {
     const sessionTasks = this.sessionTasksFor(session, routing, persistedRouting, opts);
     const scheduler = this.options.scheduler;
     const budgetEngine = this.options.budget?.engine;
-    const isModelAvailableFn = budgetEngine ? (id: string) => budgetEngine.isModelAvailable(id) : undefined;
+    const isModelAvailableFn = budgetEngine ? (id: string) => budgetEngine.isModelAvailable(id, { class: "agent_loop", sessionType: session.sessionType, timelineKey: session.timelineKey }) : undefined;
     const userLimit = opts?.userLimit;
     const userSelection = userLimit?.resolution.active === true;
 
@@ -1461,7 +1461,7 @@ export class AgentSessionFactory {
         onRequestCommitted: (message: AssistantMessage) => {
           // A clean commit ends the request: the models that refused it may serve
           // the next one (a refused attempt's usage arrives here too, §10.3).
-          if (message.stopReason !== "error") refusal.noteCommitted();
+          if (message.stopReason !== "error" && message.stopReason !== "aborted") refusal.noteCommitted();
           // Same billed-model expression the ledger row below uses (spec
           // MODEL-FALLBACK §2.2/§6.1): the committed message's own `model` when
           // the provider reports one, else this attempt's descriptor. Feeding it

@@ -146,13 +146,24 @@ export class AuditWorkerPool {
   private wake: (() => void) | undefined;
   private timer: ReturnType<typeof setTimeout> | undefined;
   readonly evaluator: CheckEvaluator;
+  private readonly auditSnapshots = new Map<string, { auditCompletedAt: number | null }>();
+  private reconciled?: Promise<void>;
 
   constructor(private readonly options: AuditWorkerPoolOptions) {
     this.evaluator = new CheckEvaluator({
       catalogue: options.catalogue,
       engine: options.engine,
       config: options.config,
-      storage: options.storage,
+      storage: {
+        insertDecisionEvaluation: (row) => {
+          const snapshot = row.agent_session_id ? this.auditSnapshots.get(row.agent_session_id) : undefined;
+          return snapshot ? options.storage.insertDecisionEvaluation(row, snapshot) : Promise.resolve(0);
+        },
+        insertRefusalEvent: (row) => {
+          const snapshot = row.agentSessionId ? this.auditSnapshots.get(row.agentSessionId) : undefined;
+          return snapshot ? options.storage.insertRefusalEvent(row, snapshot) : Promise.resolve(0);
+        },
+      },
       ...(options.logger ? { logger: options.logger } : {}),
       ...(options.now ? { now: options.now } : {}),
       judging: {
@@ -269,6 +280,7 @@ export class AuditWorkerPool {
    * and audit it. Exposed for tests and for a caller that drives the worker.
    */
   async runOnce(): Promise<AuditStep> {
+    await (this.reconciled ??= this.options.storage.reconcileOfflineAudits());
     if (this.startedAt === 0) this.startedAt = this.now();
     const now = this.now();
     if (now < this.pausedUntil || this.options.shouldPause?.()) {
@@ -279,10 +291,12 @@ export class AuditWorkerPool {
     if (claim.kind !== "claimed") return { kind: claim.kind };
     const { row, lane, stage, only } = claim;
     this.claimed.add(row.id);
+    this.auditSnapshots.set(row.id, { auditCompletedAt: row.completed_at });
     try {
       return await this.audit(row, lane, stage, only);
     } finally {
       this.claimed.delete(row.id);
+      this.auditSnapshots.delete(row.id);
       if (lane === "backlog") this.nextBacklogAt = this.now() + this.poolKnobs.backlogPaceMs;
     }
   }
@@ -393,7 +407,7 @@ export class AuditWorkerPool {
         version: AUDIT_VERSION,
         createdAt: now,
       }));
-      await storage.writeSessionAudits(rows);
+      await storage.writeSessionAudits(rows, { auditCompletedAt: row.completed_at });
       for (const audit of pending) statuses[audit] = "unauditable";
       this.deferred.delete(row.id);
       this.options.logger?.info("session_audited", { sessionId: row.id, lane, statuses });
@@ -477,6 +491,21 @@ export class AuditWorkerPool {
               timeoutMs: decisionsFor(config, agent).audit?.timeout_ms ?? DEFAULT_AUDIT_TIMEOUT_MS,
               usageClass: "audit",
               decisionGroup: `audit:${nanoid()}`,
+              onEvaluation: (evaluation) => {
+                void storage.insertDecisionEvaluation({
+                  ts: evaluation.ts, decision_group: evaluation.decisionGroup, point: evaluation.point,
+                  agent: evaluation.agent, agent_session_id: row.id, timeline_key: evaluation.timelineKey,
+                  source: evaluation.source, reason: evaluation.reason, verdict_json: evaluation.verdictJson,
+                  answers_json: evaluation.answersJson, state_json: evaluation.stateJson,
+                  questions_json: evaluation.questionsJson, served_model: evaluation.servedModel,
+                  served_version: evaluation.servedVersion, latency_ms: evaluation.latencyMs,
+                  input_tokens: evaluation.inputTokens, cost_usd: evaluation.costUsd,
+                }, { auditCompletedAt: row.completed_at }).catch((error) => {
+                  this.options.logger?.warn("decision_evaluation_persist_failed", {
+                    point: "audit", sessionId: row.id, error: error instanceof Error ? error.message : String(error),
+                  });
+                });
+              },
             });
             contractCost += outcome.costUsd;
             if (outcome.source === "model") {
@@ -571,7 +600,7 @@ export class AuditWorkerPool {
     } else {
       this.deferred.delete(row.id);
     }
-    await storage.writeSessionAudits(rows, attemptTypes ? { attemptTypes } : {});
+    await storage.writeSessionAudits(rows, { ...(attemptTypes ? { attemptTypes } : {}), auditCompletedAt: row.completed_at });
     this.options.logger?.info("session_audited", {
       sessionId: row.id,
       lane,

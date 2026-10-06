@@ -97,19 +97,15 @@ test("records state: record is clipped with marker when it cannot fit", () => {
   assert.match(s.record, /\[record truncated\]$/, "truncation marker present");
 });
 
-test("records state: the record's own bot message survives packing at its place", () => {
-  // The record's message is the oldest of 30; a tight budget drops the old chat
-  // but never that message, and it keeps its timeline position (first).
+test("records state: refuses to bridge omitted chat to preserve an old candidate", () => {
   const many: RecordsInput["recentChat"] = [
-    { from: "Miku", text: "Found X and Y.", self: true, ofRecord: true },
+    { from: "Bot", text: "Candidate.", self: true, ofRecord: true },
     ...Array.from({ length: 29 }, (_, i) => ({ from: "User", text: `message ${i} ${"pad ".repeat(10)}` })),
   ];
-  const s = recordsPoint.state(input({ recentChat: many }), 120) as any;
-  assert.ok(s.recent_chat.length < 30, "packed");
-  assert.deepEqual(s.recent_chat[0], { from: "Miku", text: "Found X and Y.", self: true });
-  assert.match(s.recent_chat.at(-1).text, /^message 28/, "newest kept");
-  assert.ok(!JSON.stringify(s).includes("ofRecord"), "the marker is never sent");
-  assert.equal(s.record, input().record, "record kept whole");
+  assert.throws(() => recordsPoint.state(input({ recentChat: many }), 120), /outside_context_budget/);
+  const s = recordsPoint.state(input({ recentChat: many }), 8000) as any;
+  assert.equal(s.recent_chat.length, 30);
+  assert.equal(s.recent_chat[0].record_message, true);
 });
 
 test("records state: a long record is clipped around the record's own message", () => {
@@ -118,7 +114,7 @@ test("records state: a long record is clipped around the record's own message", 
     { from: "User", text: "thanks" },
   ];
   const s = recordsPoint.state(input({ recentChat: chat, record: "r".repeat(20_000) }), 300) as any;
-  assert.deepEqual(s.recent_chat, [{ from: "Miku", text: "Done, see the file.", self: true }]);
+  assert.deepEqual(s.recent_chat, [{ from: "Miku", text: "Done, see the file.", self: true, record_message: true }, { from: "User", text: "thanks" }]);
   assert.match(s.record, /record truncated\]$/);
 });
 

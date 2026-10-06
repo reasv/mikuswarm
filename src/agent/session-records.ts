@@ -23,22 +23,27 @@ import { formatLoadedTools } from "../tools/tool-search.js";
 // ── Prompt (spec §3.2) ────────────────────────────────────────────────────────
 
 export const RECORD_TURN_PROMPT =
-  "This session is over. Write its session record: a later session will see only the chat and this record, and must be able to answer questions about this work and carry it on.\n" +
+  "This execution is over. Write a record of the work you performed during this execution, so a later execution can answer questions about that work and carry it on.\n" +
+  "Record your own tool calls and their useful results, artifacts you created or changed, and the messages you sent in this execution.\n" +
+  "The chat history, conversation summaries, and earlier session records supplied to you are background. They are not work you performed in this execution. Do not summarize that background or copy earlier records into this one. Include an earlier fact only when needed to explain your current work.\n" +
   "\n" +
   "What it needs depends on the work:\n" +
   "- a lookup: the sources behind what you said, including things you only mentioned in passing, and what you found but did not use;\n" +
   "- something made or changed: the artifacts (paths, message ids), their current state, and how to continue or check them;\n" +
-  "- anything left open.\n" +
+  "- work you attempted in this execution but did not finish: what remains and where to continue.\n" +
   "\n" +
-  "People reply to any of your messages, so tie each part to the message it belongs to by its message id.\n" +
+  "Tie each part to the message you sent in this execution, by its message id when available.\n" +
   "Keep it a handoff note: what and where, with a one-line why where it helps.\n" +
   "\n" +
-  "Write it with session_record_tool, then finalize. No other tool is available in this turn.";
+  'session_record_tool is already loaded: call it directly, without tool_search. ' +
+  'Write the record in one call: {"command":"create","file_text":"<the record>","finalize":true}. ' +
+  'The create command requires file_text. If nothing is worth recording, call {"command":"finalize"} on the empty draft. ' +
+  "No other tool is available in this turn.";
 
 // ── Config defaults (mirror config/00-defaults.toml) ─────────────────────────
 
 const DEFAULT_MAX_TURNS = 4;
-const DEFAULT_TIMEOUT_MS = 60_000;
+const DEFAULT_WAIT_TIMEOUT_MS = 60_000;
 
 const RECORD_TOOL = "session_record_tool";
 
@@ -60,10 +65,17 @@ export function isEligibleForRecord(
   transcript: AgentMessage[],
   exemptToolNames: Set<string>,
 ): boolean {
-  if (config?.enabled === false) return false;
-  if (SYNTHETIC_SESSION_TYPES.has(sessionType)) return false;
-  if (sessionType !== "default" && sessionType !== proactiveSessionType) return false;
-  return hasResumableWork(transcript, { scope: "any_in_history", exemptToolNames });
+  return recordSkipReason(sessionType, proactiveSessionType, config, transcript, exemptToolNames) === undefined;
+}
+
+function recordSkipReason(
+  sessionType: string, proactiveSessionType: string | undefined, config: SessionRecordsConfig | undefined,
+  transcript: AgentMessage[], exemptToolNames: Set<string>,
+): string | undefined {
+  if (config?.enabled === false) return "disabled";
+  if (SYNTHETIC_SESSION_TYPES.has(sessionType) || (sessionType !== "default" && sessionType !== proactiveSessionType)) return "session_type";
+  if (!hasResumableWork(transcript, { scope: "any_in_history", exemptToolNames })) return "no_work";
+  return undefined;
 }
 
 /**
@@ -105,7 +117,6 @@ export type RecordTurnFailure =
   | "refusal"
   | "budget_blocked"
   | "llm_error"
-  | "timeout"
   | "max_turns"
   | "shutdown"
   | "not_finalized";
@@ -121,7 +132,7 @@ export type RecordTurnFailure =
 export function classifyUnfinalizedRecordTurn(
   rawStopReason: string | undefined,
   errorMessage: string | undefined,
-): Exclude<RecordTurnFailure, "timeout" | "max_turns" | "shutdown"> {
+): Exclude<RecordTurnFailure, "max_turns" | "shutdown"> {
   if (extractLlmRequestClass(errorMessage) === "refusal" || isRefusalSignal(rawStopReason, errorMessage)) {
     return "refusal";
   }
@@ -130,11 +141,12 @@ export function classifyUnfinalizedRecordTurn(
   return "not_finalized";
 }
 
-type AbortReason = "timeout" | "max_turns" | "shutdown";
+type AbortReason = "max_turns" | "shutdown";
 
 interface InflightEntry {
+  outcome?: { status: string; reason?: string };
   done: Promise<void>;
-  deadline: number;
+  waitDeadline: number;
   /** Abort the running record turn. Set only while its prompt runs. */
   abort?: (reason: AbortReason) => void;
 }
@@ -177,9 +189,10 @@ export interface StartRecordTurnParams {
   flush?: () => Promise<void>;
   /**
    * Told of every written record (its text): the output gate judges it as an
-   * artifact off the turn's path (spec REFUSAL-HANDLING §5.2.3). Never awaited.
+   * artifact after writing (spec REFUSAL-HANDLING §5.2.3). Awaited before
+   * releasing the accounting settle barrier; failures remain observe-only.
    */
-  onRecordWritten?: (text: string) => void;
+  onRecordWritten?: (text: string) => void | Promise<void>;
   /**
    * Judge the finalized record before it is written (spec REFUSAL-HANDLING
    * §5.2.3), when a soft refusal rule could act on it: `rerun` = the record was
@@ -206,12 +219,12 @@ export interface StartRecordTurnParams {
  * entry), the caller calls {@link start}. It checks eligibility and registers the
  * entry synchronously, then runs the turn; the returned promise settles when
  * the turn is over and never rejects. Triggers that need the record
- * {@link waitFor} it, bounded by the entry's deadline (`timeout_ms`).
+ * {@link waitFor} it, bounded by the entry's wait deadline (`wait_timeout_ms`).
  *
  * Outcomes: a row only after `session_record_tool` finalized a non-empty draft
  * (`session_record_written`); a finalize on an empty draft is the legitimate
  * skip (`session_record_skipped`); anything else (refusal, LLM error, budget
- * block, timeout, `max_turns`, shutdown, a turn that ends without finalizing)
+ * block, `max_turns`, shutdown, a turn that ends without finalizing)
  * writes nothing and logs `session_record_failed` with the reason.
  */
 export class SessionRecordService {
@@ -228,17 +241,21 @@ export class SessionRecordService {
     return this.inflight.has(sessionId);
   }
 
+  /** Settle barrier for accounting cleanup; unlike trigger waits, it cannot time out. */
+  settled(sessionId: string): Promise<void> {
+    return this.inflight.get(sessionId)?.done ?? Promise.resolve();
+  }
+
   /**
-   * Wait for this session's in-flight record turn, at most until its deadline
-   * (plus `graceMs`, for a caller that must see the turn actually over: the turn
-   * aborts itself at the deadline, and settling takes a moment). Resolves true
+   * Wait for this session's in-flight record turn, at most until its wait deadline
+   * (plus optional `graceMs`). Expiring a wait never aborts record production. Resolves true
    * when none is registered or the turn settled in time, false when the bound
    * elapsed first. Never rejects.
    */
   async waitFor(sessionId: string, opts: { graceMs?: number } = {}): Promise<boolean> {
     const entry = this.inflight.get(sessionId);
     if (!entry) return true;
-    const remaining = entry.deadline + (opts.graceMs ?? 0) - Date.now();
+    const remaining = entry.waitDeadline + (opts.graceMs ?? 0) - Date.now();
     if (remaining <= 0) return false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const settled = await Promise.race([
@@ -271,7 +288,12 @@ export class SessionRecordService {
    */
   start(params: StartRecordTurnParams): Promise<void> | undefined {
     const { sessionId, sessionType, proactiveSessionType, config, agent, exemptToolNames } = params;
-    if (!isEligibleForRecord(sessionType, proactiveSessionType, config, agent.state.messages, exemptToolNames)) {
+    const persist = (status: string, reason?: string): Promise<void> =>
+      (params.storage.setSessionRecordGeneration?.(sessionId, status, reason ?? null) ?? Promise.resolve())
+        .catch(() => params.logger.warn("session_record_status_write_failed", { sessionId }));
+    const skip = recordSkipReason(sessionType, proactiveSessionType, config, agent.state.messages, exemptToolNames);
+    if (skip) {
+      void persist("skipped", skip);
       return undefined;
     }
     // A session-type tools allowlist or disabled_tools can take the record tool out
@@ -280,26 +302,30 @@ export class SessionRecordService {
       ? params.registry.inCatalog(RECORD_TOOL)
       : (agent.state.tools ?? []).some((tool) => tool.name === RECORD_TOOL);
     if (!inCatalog) {
+      void persist("skipped", "tool_unavailable");
       params.logger.info("session_record_skipped", { sessionId, reason: "tool_unavailable" });
       return undefined;
     }
-    const timeoutMs = config?.timeout_ms ?? DEFAULT_TIMEOUT_MS;
+    const waitTimeoutMs = config?.wait_timeout_ms ?? config?.timeout_ms ?? DEFAULT_WAIT_TIMEOUT_MS;
     let resolveDone!: () => void;
     const entry: InflightEntry = {
       done: new Promise<void>((resolve) => {
         resolveDone = resolve;
       }),
-      deadline: Date.now() + timeoutMs,
+      waitDeadline: Date.now() + waitTimeoutMs,
     };
     this.inflight.set(sessionId, entry);
-    return this.run(params, entry, timeoutMs)
+    void persist("writing");
+    return this.run(params, entry)
       .catch((error) => {
+        entry.outcome = { status: "failed", reason: "llm_error" };
         params.logger.warn("session_record_failed", {
           sessionId,
           reason: "llm_error" satisfies RecordTurnFailure,
           error: error instanceof Error ? error.message : String(error),
         });
       })
+      .then(() => persist(entry.outcome?.status ?? "failed", entry.outcome?.reason))
       .then(() => params.flush?.())
       .catch(() => undefined)
       .finally(() => {
@@ -308,9 +334,17 @@ export class SessionRecordService {
       });
   }
 
-  private async run(params: StartRecordTurnParams, entry: InflightEntry, timeoutMs: number): Promise<void> {
+  private async run(params: StartRecordTurnParams, entry: InflightEntry): Promise<void> {
     const { sessionId, agent, handles, registry, logger } = params;
+    const markOutcome = (status: string, reason?: string): void => {
+      entry.outcome = { status, reason };
+      const kickoff = [...agent.state.messages].reverse().find((m) =>
+        (m as { harness?: { kind?: string } }).harness?.kind === "record_turn",
+      ) as { harness?: Record<string, unknown> } | undefined;
+      if (kickoff?.harness) Object.assign(kickoff.harness, { status, ...(reason ? { reason } : {}) });
+    };
     const fail = (reason: RecordTurnFailure, extra?: Record<string, unknown>): void => {
+      markOutcome("failed", reason);
       logger.warn("session_record_failed", { sessionId, reason, ...extra });
     };
     if (this.stopping) {
@@ -392,7 +426,6 @@ export class SessionRecordService {
       turns += 1;
       if (turns >= maxTurns && !finalized) entry.abort?.("max_turns");
     });
-    const timer = setTimeout(() => entry.abort?.("timeout"), timeoutMs);
     handles.gate.active = true;
     // The record's soft-refusal verdict (spec REFUSAL-HANDLING §5.2.3), when judged.
     let judged: "accept" | "exhausted" | undefined;
@@ -418,8 +451,10 @@ export class SessionRecordService {
         turns = 0;
         logger.info("session_record_refusal_redo", { sessionId });
       }
+    } catch (error) {
+      markOutcome("failed", "llm_error");
+      throw error;
     } finally {
-      clearTimeout(timer);
       unsubscribe();
       handles.gate.active = false;
       entry.abort = undefined;
@@ -451,6 +486,7 @@ export class SessionRecordService {
     }
     const text = handles.draft.isCreated() ? handles.draft.getContent() : "";
     if (text.trim().length === 0) {
+      markOutcome("skipped", "empty");
       logger.info("session_record_skipped", { sessionId, reason: "empty" });
       return;
     }
@@ -475,6 +511,7 @@ export class SessionRecordService {
       model_id: served?.model ?? null,
       created_at: Date.now(),
     });
+    markOutcome("written");
     logger.info("session_record_written", {
       sessionId,
       timelineKey: params.timelineKey,
@@ -485,7 +522,7 @@ export class SessionRecordService {
     });
     if (judged === undefined) {
       try {
-        params.onRecordWritten?.(text);
+        await params.onRecordWritten?.(text);
       } catch {
         /* observe-only */
       }

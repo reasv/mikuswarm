@@ -82,6 +82,8 @@ export interface CheckScope {
 /** Where the judged output sits (spec §9 anchor). */
 export interface CheckAnchor {
   checkpoint: Checkpoint;
+  /** Exact timestamp of the judged assistant output, separate from decision execution time. */
+  subjectTs?: number;
   branchNo?: number;
   toolCallId?: string;
   attemptNo?: number;
@@ -511,7 +513,11 @@ export class CheckEvaluator {
     const insert = async (row: DecisionEvaluationInsert, codes: Iterable<string>): Promise<void> => {
       if (!storage) return;
       try {
+        if (anchor.subjectTs !== undefined) row.verdict_json = JSON.stringify({
+          ...JSON.parse(row.verdict_json ?? "{}"), subjectTs: anchor.subjectTs, action: subject.context.action,
+        });
         const id = await storage.insertDecisionEvaluation(row);
+        if (id === 0) return; // The offline audit's terminal snapshot changed.
         ids.push(id);
         for (const code of codes) if (!rowFor.has(code)) rowFor.set(code, id);
       } catch (error) {

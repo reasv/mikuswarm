@@ -12,8 +12,9 @@
 		// Auxiliary usage ledger row for this tool call (spec AUXILIARY-USAGE-TRACKING
 		// §10.3), matched by toolCallId — present for image_generate. A separate lane:
 		// these tokens are NOT context-bearing and never feed the §8b figures (§4).
-		usage
-	}: { name: string; args: unknown; result: RolloutMsg | undefined; usage?: ToolInvocation } =
+		usage,
+		requestFailed = false
+	}: { name: string; args: unknown; result: RolloutMsg | undefined; usage?: ToolInvocation; requestFailed?: boolean } =
 		$props();
 
 	const argsPretty = $derived.by(() => {
@@ -61,6 +62,8 @@
 		{#if resultText !== null}
 			<div class="mt-2 text-[10px] tracking-wide text-muted-foreground uppercase">result</div>
 			<pre class="overflow-x-auto text-xs whitespace-pre-wrap">{resultText}</pre>
+		{:else if requestFailed}
+			<div class="mt-2 text-xs text-muted-foreground italic">Not executed — request ended before completion.</div>
 		{:else}
 			<div class="mt-2 text-xs text-muted-foreground italic">awaiting result…</div>
 		{/if}

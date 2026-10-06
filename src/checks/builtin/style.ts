@@ -80,8 +80,8 @@ export const UNICODE_EMOJI_PATTERN =
 const MESSAGE_INTRO =
   "`message` is a chat message the assistant is about to send (`request`, when present, is what it replies to). ";
 
-function messageQuestion(instructions: string, criteria: { true: string; false: string }): CheckQuestion {
-  return { source: "message", instructions: MESSAGE_INTRO + instructions, criteria, threshold: STYLE_THRESHOLD };
+function messageQuestion(instructions: string, criteria: { true: string; false: string }, threshold = STYLE_THRESHOLD): CheckQuestion {
+  return { source: "message", instructions: MESSAGE_INTRO + instructions, criteria, threshold };
 }
 
 function styleCheck(
@@ -93,6 +93,7 @@ function styleCheck(
     words?: readonly string[];
     prefilter?: RegExp[];
     question?: CheckQuestion;
+    questions?: CheckQuestion[];
     minChars?: number;
   },
 ): CheckDefinition {
@@ -109,7 +110,7 @@ function styleCheck(
     words: [...(detection.words ?? [])],
     ...(detection.prefilter ? { prefilter: detection.prefilter } : {}),
     ...(detection.minChars !== undefined ? { minChars: detection.minChars } : {}),
-    questions: detection.question ? [detection.question] : [],
+    questions: detection.questions ?? (detection.question ? [detection.question] : []),
     builtin: true,
   };
 }
@@ -123,21 +124,30 @@ export const BUILTIN_STYLE_CHECKS: readonly CheckDefinition[] = [
   ),
   styleCheck(
     "style_not_x_but_y",
-    "Rhetorical 'not X, but Y' contrast",
-    'Uses a rhetorical "not X, but Y" contrast. State the point directly.',
+    "Rhetorical contrast: 'not X, but Y' or 'X, not Y'",
+    'Uses a contrast primarily for rhetorical impact ("not X, but Y" or "X, not Y"). State the point directly.',
     {
-      question: messageQuestion(
-        "`message` uses a rhetorical contrast for effect: \"it's not X, it's Y\", \"not just X, but Y\", \"less X, more Y\", " +
-          "\"this isn't about X, it's about Y\", or a litotes (\"not bad at all\", \"not unlike\") used for weight where " +
-          "saying Y plainly would carry the same information.",
-        {
-          true: "`message` sets up X only to knock it down and land on Y, for rhythm or emphasis rather than information.",
-          false:
-            "A factual correction is not a rhetorical contrast (\"the meeting is Tuesday, not Monday\"; \"no, that's a heron, " +
-            "not a crane\"). Comparing two real options someone asked about, or denying something someone actually said, " +
-            `is not one either. ${QUOTED}`,
-        },
-      ),
+      questions: [
+        messageQuestion(
+          "`message` uses \"not X, but Y\" or an equivalent (\"it's not X, it's Y\", \"not just X, but Y\", " +
+            "\"less X, more Y\", \"this isn't about X, it's about Y\") primarily to add rhetorical impact: " +
+            "making a characterization sound more emphatic, profound, dramatic, or validating.",
+          {
+            true: "The contrast mainly adds emphasis or rhetorical weight; stating Y directly would convey substantially the same information.",
+            false: "The contrast makes a concrete factual correction, explains a useful practical distinction, or is only quoted or discussed.",
+          },
+          0.70,
+        ),
+        messageQuestion(
+          "In `message`, the assistant uses \"X, not Y\" primarily to add rhetorical impact: " +
+            "making a characterization sound more emphatic, profound, dramatic, or validating.",
+          {
+            true: "The contrast mainly adds emphasis or rhetorical weight; stating X directly would convey substantially the same information.",
+            false: "The contrast makes a concrete factual correction, explains a useful practical distinction, or is only quoted or discussed.",
+          },
+          0.70,
+        ),
+      ],
     },
   ),
   styleCheck(

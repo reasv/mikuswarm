@@ -1,3 +1,5 @@
+import { recentRecordCandidates } from "./decisions/points/records-select.js";
+import { ageLabel } from "./decisions/state.js";
 import { EventEmitter } from "node:events";
 import { accessSync, constants as fsConstants } from "node:fs";
 import { mkdir, unlink, writeFile } from "node:fs/promises";
@@ -818,7 +820,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       embeddingChain: retrievalConfig.embedding.remote
         ? resolveModelChain(retrievalConfig.embedding.remote.model, config.models)
         : undefined,
-      isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
+      isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId, { class: "embedding" }) ?? true,
       // Per-agent workspaces (spec MULTI-AGENT-SUPPORT §7.1): in agents mode each
       // agent gets its own MemoryIndexer; in legacy mode this is empty and the
       // subsystem creates a single indexer with agentName=null.
@@ -1346,7 +1348,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         maxChars: imageConfig.max_chars ?? 500,
         maxTokens: imageConfig.max_tokens ?? 2048,
         scheduler: llmScheduler,
-        isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
+        isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId, { class: "caption" }) ?? true,
         imageProcessing: inferenceImageOptions,
         ...refusalOptions,
       });
@@ -1359,7 +1361,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         maxChars: videoConfig.max_chars ?? 500,
         maxTokens: videoConfig.max_tokens ?? 2048,
         scheduler: llmScheduler,
-        isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
+        isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId, { class: "caption" }) ?? true,
         timeoutMs: videoConfig.timeout_ms,
         videoProcessing: captionVideoProcessing,
         ...refusalOptions,
@@ -1373,7 +1375,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       maxChars: audioConfig.max_chars ?? 2000,
       maxTokens: audioConfig.max_tokens ?? 4096,
       scheduler: llmScheduler,
-      isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
+      isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId, { class: "caption" }) ?? true,
       timeoutMs: audioConfig.timeout_ms,
       audioProcessing: captionAudioProcessing,
       ...refusalOptions,
@@ -5567,7 +5569,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             recordToolUsage,
             // Period-budget gate (spec USAGE-COST-LIMITS §6.3).
             checkBudget: makeToolBudgetCheck("image_generate", inbound.timelineKey),
-            isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
+            isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId, { class: "tool", tool: "image_generate", sessionType, timelineKey: inbound.timelineKey }) ?? true,
             // Unified registry (spec MODEL-FALLBACK §2.3): each tier resolves to a
             // [models.*] chain (head + fallback members); pricing lives on the model.
             // Per-agent ladder (spec PER-AGENT-MODEL-OVERRIDES Phase 3): the ref is
@@ -5618,7 +5620,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             fastChain: resolveModelChain(agentModelOverrides.resolveXSearchRef(sessionAgentName, "fast"), config.models),
             deepChain: resolveModelChain(agentModelOverrides.resolveXSearchRef(sessionAgentName, "deep"), config.models),
             scheduler: llmScheduler,
-            isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId) ?? true,
+            isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId, { class: "tool", tool: "x_search", sessionType, timelineKey: inbound.timelineKey }) ?? true,
             workspaceRoot: sessionWsRoot,
             fxTwitterClient,
             statusHosts: fxTwitterConfig.statusHosts,
@@ -5886,8 +5888,15 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     }
     userLimitResolutions.set(sessionId, { resolution, ctx });
     sessions.onSettle(sessionId, () => {
-      userLimitResolutions.delete(sessionId);
       userLimitEngine?.clearSelection(sessionId); // drop the live console selection (§14)
+      // Completion releases the timeline before starting its record turn in the
+      // same synchronous continuation. Keep its payee until that turn has settled:
+      // the record requests and judges still spend this user's budget.
+      queueMicrotask(() => {
+        void sessionRecordService.settled(sessionId).then(() => {
+          userLimitResolutions.delete(sessionId);
+        });
+      });
     });
     // Dynamic §8d ceiling (§6.3): min(static, user total headroom-at-launch). An
     // exempt/uncapped user contributes ∞ → no change to the static ceiling.
@@ -6362,7 +6371,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       setRefusalSite: args.created.setRefusalSite,
       flush: args.flush,
       // The written record is judged as an artifact (spec REFUSAL-HANDLING §5.2.3).
-      onRecordWritten: (text) => void args.created.gate?.judgeArtifact("session_record", text, { site: "record_turn" }),
+      onRecordWritten: async (text) => {
+        await args.created.gate?.judgeArtifact("session_record", text, { site: "record_turn" });
+      },
       // A soft rule that could act on the record turn: the record is judged
       // before it is written, a judged refusal reruns the turn on the rule's
       // model, every entry spent = no record (spec REFUSAL-HANDLING §5.2.3).
@@ -6430,9 +6441,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
    *   - Reply target: the replied-to bot message's session, after waiting for an
    *     in-flight record (CONTRACT 7). Without the records point it is injected when
    *     `inject_on_reply` (6.1); with it, it is a candidate like the others.
-   *   - Records point on: the reply target plus the sessions behind the newest
-   *     `candidates` bot messages (one per session, only with a record, in-flight
-   *     ones skipped) are judged one request each (§6.2); a whole-selection failure
+   *   - Records point on: the reply target plus recorded sessions represented
+   *     in the continuous recent-chat window (age and message-count bounded,
+   *     in-flight ones skipped) are judged one request each; a whole-selection failure
    *     falls back to the 6.1 rule.
    */
   async function planRecordInjections(
@@ -6481,16 +6492,20 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       const rawDecisions = decisionsFor(config, agentName);
       const candidatesLimit = rawDecisions.records?.candidates ?? DEFAULT_RECORDS_CANDIDATES;
       const exclude = new Set([owner, replyTarget].filter((id): id is string => id !== undefined));
-      const recent = storage
-        .getRecentRecordedBotSessions(
-          session.timelineKey,
-          inbound.event.timestamp,
-          candidatesLimit + exclude.size + sessionRecordService.inFlightCount,
-          agentName,
-        )
-        .filter((row) => !exclude.has(row.sessionId) && !sessionRecordService.isInFlight(row.sessionId))
-        .filter((row) => ownRecord(row.sessionId) !== undefined)
-        .slice(0, candidatesLimit);
+      const triggerIds = new Set([inbound.event.id, ...(inbound.trigger?.groupedEventIds ?? [])]);
+      // Bound the conversation first; never walk farther back merely to fill the shortlist.
+      const maxAgeMs = rawDecisions.records?.candidate_max_age_ms ?? 60 * 60_000;
+      const window = timeline.query({
+        timelineKey: session.timelineKey,
+        fromTimestamp: inbound.event.timestamp - maxAgeMs,
+        toTimestamp: inbound.event.timestamp,
+        limit: RECORDS_RECENT_CHAT_WINDOW + triggerIds.size,
+      }).filter((e) => !triggerIds.has(e.id)).slice(-RECORDS_RECENT_CHAT_WINDOW);
+      const recent = recentRecordCandidates(window, {
+        limit: candidatesLimit, exclude,
+        hasRecord: (id) => ownRecord(id) !== undefined,
+        inFlight: (id) => sessionRecordService.isInFlight(id),
+      });
       if (!replyTarget && recent.length === 0) return ruleSpecs();
 
       const sender = inbound.trigger?.triggeredBy ?? inbound.event.sender;
@@ -6504,21 +6519,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         from: nameOf({ sender }),
         text: inbound.event.body ?? "",
         ...(attachments?.length ? { attachments } : {}),
+        ...(replyEvent ? { reply_to: { from: nameOf(replyEvent), text: replyEvent.body ?? "" } } : {}),
       };
-      const triggerIds = new Set([inbound.event.id, ...(inbound.trigger?.groupedEventIds ?? [])]);
-      const window =
-        recent.length > 0
-          ? timeline
-              .query({
-                timelineKey: session.timelineKey,
-                toTimestamp: inbound.event.timestamp,
-                limit: RECORDS_RECENT_CHAT_WINDOW + triggerIds.size,
-              })
-              .filter((e) => !triggerIds.has(e.id))
-          : [];
       const chat = window.map((e) => ({
         from: nameOf(e),
         text: e.body ?? "",
+        age: ageLabel(inbound.event.timestamp, e.timestamp),
         ...(e.role === "assistant" || e.sender?.isSelf ? { self: true as const } : {}),
       }));
       const candidates: RecordsCandidate[] = [];
@@ -6532,19 +6538,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         });
       }
       for (const row of recent) {
-        // The record's bot message where it actually sat, never as a reply target:
-        // the window from a few messages before it up to the trigger, the message
-        // itself marked `ofRecord` so the point's packing keeps it in place.
-        // A message older than the window is put first (it precedes all of it).
-        const at = window.findIndex((e) => e.id === row.eventId);
-        const older = at < 0 ? timeline.getById(row.eventId) : undefined;
-        const recentChat =
-          at >= 0
-            ? chat.slice(Math.max(0, at - RECORDS_RECENT_CHAT_LEAD)).map((m) => (m === chat[at] ? { ...m, ofRecord: true as const } : m))
-            : [...(older ? [{ from: nameOf(older), text: older.body ?? "", self: true as const, ofRecord: true as const }] : []), ...chat];
+        const at = window.findIndex((e) => e.id === row.id);
+        const recentChat = chat.slice(Math.max(0, at - RECORDS_RECENT_CHAT_LEAD))
+          .map((m) => m === chat[at] ? { ...m, ofRecord: true as const } : m);
         candidates.push({
-          sessionId: row.sessionId,
-          record: ownRecord(row.sessionId)!.text,
+          sessionId: row.agentSessionId!,
+          record: ownRecord(row.agentSessionId!)!.text,
           isReplyTarget: false,
           request,
           recentChat,
@@ -6631,8 +6630,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     resumeClaims.add(sessionId);
     try {
       // Record wait (spec SESSION-RECORDS CONTRACT §7): a record turn still running
-      // extends this session's rollout; wait until it is actually over (its deadline
-      // plus a grace for the abort to settle) so the gate and the resume material see
+      // extends this session's rollout; wait until it is actually over (bounded by
+      // the wait deadline plus grace) so the gate and the resume material see
       // the finished transcript, and two agents never run on the same session at
       // once. A turn that still has not settled degrades this reply to FRESH.
       if (!(await sessionRecordService.waitFor(sessionId, { graceMs: RECORD_SETTLE_GRACE_MS }))) {

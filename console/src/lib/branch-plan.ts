@@ -127,24 +127,41 @@ export function buildBranchPlan(input: BranchPlanInput): BranchPlanItem[] {
 	const ts = (i: number) => (typeof msgs[i]!.msg.timestamp === 'number' ? (msgs[i]!.msg.timestamp as number) : null);
 	const isAssistant = (i: number) => msgs[i]!.msg.role === 'assistant';
 
-	for (const event of input.refusalEvents) {
+	for (const event of [...input.refusalEvents].sort((a, b) => a.ts - b.ts || a.id - b.id)) {
 		if (event.checkpoint !== 'request') continue;
 		const node = nodeForTime(tree, event.ts, event.branchNo);
-		const idx = indicesOf(node);
-		if (idx.length === 0) continue;
+		// Resolve against the complete branch, BEFORE restricting to the selected
+		// path. A visible shared prefix does not make its hidden continuation visible.
+		const all = tree.nodes.get(node)?.messages ?? [];
+		if (all.length === 0) continue;
+		let offset = all.findIndex((m) => m.role === 'assistant' &&
+			(typeof m.timestamp === 'number' ? m.timestamp : Infinity) >= event.ts);
+		// Failed assistant timestamps are request-start times, while refusal events
+		// are recorded at completion. Keep a terminal refusal with that response,
+		// rather than attaching it to a subsequent record turn or resumed run.
+		const prior = all.findLastIndex((m) => typeof m.timestamp === 'number' && m.timestamp <= event.ts);
+		const failed = all[prior];
+		if (failed?.role === 'assistant' && failed.stopReason === 'error' &&
+			failed.rawStopReason === event.rawStopReason) offset = prior;
+		const anchor = offset < 0 ? all.length - 1 : offset;
+		const at = msgs.findIndex((m) => m.node === node && m.offset === anchor);
+		if (at < 0) continue;
 		const item: BranchPlanItem = { type: 'hard_refusal', key: `refusal:${event.id}`, event };
-		const at = idx.find((i) => isAssistant(i) && (ts(i) ?? Infinity) >= event.ts);
-		// No later request in its branch: the refusal ended it (terminal, or withheld).
-		if (at !== undefined) add(before, at, item);
-		else add(after, idx.at(-1)!, item);
+		if (offset < 0) add(after, at, item);
+		else add(before, at, item);
 	}
 	for (const evaluation of input.gate) {
 		if (evaluation.toolCallId || evaluation.checkpoint !== 'ending') continue;
-		const node = nodeForTime(tree, evaluation.ts, evaluation.branchNo);
+		// An old offline decision has no reliable subject anchor. Never guess from
+		// its execution time (which may be minutes or days after the output).
+		if (evaluation.decisionGroup.startsWith('audit:') && evaluation.subjectTs === undefined) continue;
+		const node = nodeForTime(tree, evaluation.subjectTs ?? evaluation.ts, evaluation.branchNo);
 		const idx = indicesOf(node);
 		if (idx.length === 0) continue;
 		const item: BranchPlanItem = { type: 'ending', key: `ending:${evaluation.decisionGroup}`, node, evaluation };
-		const ending = [...idx].reverse().find((i) => isAssistant(i) && (ts(i) ?? -Infinity) <= evaluation.ts);
+		const ending = [...idx].reverse().find((i) => isAssistant(i) &&
+			(evaluation.subjectTs !== undefined ? ts(i) === evaluation.subjectTs : (ts(i) ?? -Infinity) <= evaluation.ts));
+		if (evaluation.subjectTs !== undefined && ending === undefined) continue;
 		if (ending !== undefined) add(after, ending, item);
 		else add(before, idx[0]!, item);
 	}

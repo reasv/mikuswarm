@@ -50,6 +50,9 @@ export interface GateEvaluation {
 	attemptNo: number | null;
 	consequence: string | null;
 	ts: number;
+	/** Exact judged-output timestamp; absent on legacy rows. */
+	subjectTs?: number;
+	action?: string;
 	rows: DecisionEvaluation[];
 	/** Every check that took part, fired first. */
 	checks: CheckVerdict[];
@@ -188,6 +191,9 @@ export function gateEvaluations(
 		const fired = all.filter((c) => c.fired);
 		const first = group[0]!;
 		const consequence = group.find((r) => r.consequence)?.consequence ?? null;
+		const anchor = group.map((r) => parse(r.verdictJson)).find((v) => isObject(v) && num(v.subjectTs) !== null);
+		const subjectTs = isObject(anchor) ? num(anchor.subjectTs) : null;
+		const action = isObject(anchor) && typeof anchor.action === 'string' ? anchor.action : undefined;
 		out.push({
 			decisionGroup,
 			checkpoint: first.checkpoint ?? null,
@@ -196,6 +202,8 @@ export function gateEvaluations(
 			attemptNo: first.attemptNo ?? null,
 			consequence,
 			ts: Math.min(...group.map((r) => r.ts)),
+			...(subjectTs !== null ? { subjectTs } : {}),
+			...(action ? { action } : {}),
 			rows: group,
 			checks: all,
 			fired,

@@ -222,7 +222,7 @@ export function checkItems(messages: readonly unknown[]): AuditCheckItem[] {
         });
       }
     }
-    if (!runEnds.has(i) || isIncomplete(m)) continue;
+    if (!runEnds.has(i) || isIncomplete(m) || calls.length > 0 || m["stopReason"] === "toolUse") continue;
     // A run's last ending without a send: the NO_REPLY text, or exhaustion.
     const terminal = calls.some((c) => c.name === "send_message" || c.name === "no_reply");
     if (terminal) continue;

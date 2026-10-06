@@ -106,7 +106,11 @@ export class JobSoftRefusalRedo {
       verdict.fired.filter((f) => f.kind === "refusal" && f.remedy === "redo" && (!late || f.method === "pattern")),
     );
     if (!fired) return { decision: { action: "accept" } };
-    const scope = { site, agent, tasks: null, reason: fired.reason ?? "unclear", kind: "soft" as const };
+    const scope = {
+      site, agent, tasks: null, reason: fired.reason ?? "unclear",
+      detectedReasons: verdict.fired.filter((f) => f.kind === "refusal").map((f) => f.reason ?? "unclear"),
+      kind: "soft" as const,
+    };
     const chainOf = this.options.chainOf ?? ((model: string) => [model]);
     // The model the walk handed out refused again: the same rule continues.
     const continuing =
@@ -170,7 +174,11 @@ export function decideSessionArtifactRefusal(
   );
   if (!fired) return { decision: "accept" };
   const fromModel = handle.servingModel();
-  const rule = handle.matchRule({ reason: fired.reason ?? "unclear", kind: "soft", fromModel });
+  const rule = handle.matchRule({
+        reason: fired.reason ?? "unclear",
+        detectedReasons: verdict.fired.filter((f) => f.kind === "refusal").map((f) => f.reason ?? "unclear"),
+        kind: "soft", fromModel,
+      });
   if (!rule) return { decision: "accept" };
   const next = handle.advance(rule, fromModel ?? "");
   const base = { site: handle.site, checkCode: fired.code, rule: rule.name, fromModel };

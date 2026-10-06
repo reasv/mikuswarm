@@ -3,7 +3,7 @@
 	import BotIcon from '@lucide/svelte/icons/bot';
 
 	/** The record-turn prompt the harness sent (shown collapsed). */
-	let { prompt }: { prompt?: string } = $props();
+	let { prompt, outcome }: { prompt?: string; outcome?: string } = $props();
 </script>
 
 <!--
@@ -18,6 +18,7 @@
 		<span class="text-[10px] font-semibold tracking-wide text-muted-foreground/60 uppercase">
 			Session record
 		</span>
+		{#if outcome}<span class="text-xs text-muted-foreground" data-testid="record-outcome">{outcome}</span>{/if}
 	</div>
 	{#if prompt}
 		<details class="mt-1">

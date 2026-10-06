@@ -1236,4 +1236,5 @@ enabled = true          # write records for work-gated chat-lane and proactive s
 max_tokens = 1500       # session_record_tool draft budget
 max_turns = 4           # record-turn assistant turns before giving up (no record)
 inject_on_reply = true  # a reply to a bot message injects that message's session record
-timeout_ms = 60000      # give up producing a record; triggers waiting on it proceed without it
+# wait_timeout_ms = 60000 # waiting triggers proceed without it; record creation continues
+# timeout_ms is a legacy alias for wait_timeout_ms (waiting only).

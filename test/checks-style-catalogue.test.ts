@@ -80,7 +80,10 @@ test("questions read the message and name their near misses in the false criteri
       assert.ok(q.criteria.false.length > 40, `${c.code} names its near misses`);
     }
   }
-  assert.match(check("style_not_x_but_y").questions[0]!.criteria.false, /factual correction is not a rhetorical contrast/);
+  assert.deepEqual(check("style_not_x_but_y").questions.map((q) => q.threshold), [0.70, 0.70]);
+  for (const q of check("style_not_x_but_y").questions) {
+    assert.match(q.criteria.false, /concrete factual correction/);
+  }
   assert.match(check("style_essay_formatting").questions[0]!.criteria.false, /list the user asked for is not essay formatting/);
   assert.match(check("style_load_bearing").questions[0]!.criteria.false, /Quoting .* is not the assistant's own phrasing/);
   assert.match(check("style_ai_disclaimer").questions[0]!.criteria.false, /AI as a subject/);

@@ -37,8 +37,8 @@ export interface RecordsCandidate {
   replyTo?: RecordsInput["replyTo"];
   /**
    * Recent chat messages before the request, oldest first (non-reply framing).
-   * Mark this candidate's own bot message with `ofRecord: true`: packing always
-   * keeps it in place and budgets the record around it (spec §6.2).
+   * Mark this candidate's own bot message with `ofRecord: true`: packing keeps
+   * its continuous suffix, or skips the candidate if that suffix cannot fit.
    */
   recentChat?: RecordsInput["recentChat"];
 }
@@ -195,4 +195,23 @@ export async function selectRecordsToInject(
   const inject = injections.slice(0, maxInjected).map((i) => i.sessionId);
 
   return { inject, decisionGroup, outcomes };
+}
+
+
+/** Candidates must be represented in the caller's continuous recent-chat window. */
+export function recentRecordCandidates<T extends { id: string; role?: string; agentSessionId?: string }>(
+  window: readonly T[],
+  options: { limit: number; exclude: ReadonlySet<string>; hasRecord: (id: string) => boolean; inFlight: (id: string) => boolean },
+): T[] {
+  const seen = new Set(options.exclude);
+  const result: T[] = [];
+  for (const event of [...window].reverse()) {
+    if (result.length >= options.limit) break;
+    const id = event.agentSessionId;
+    if (event.role !== "assistant" || !id || seen.has(id)) continue;
+    seen.add(id);
+    if (options.inFlight(id) || !options.hasRecord(id)) continue;
+    result.push(event);
+  }
+  return result;
 }

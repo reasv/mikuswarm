@@ -413,34 +413,16 @@ export class BudgetEngine {
   }
 
   /**
-   * Is the named LOGICAL model currently within budget (spec MODEL-FALLBACK §3/§7
-   * — the per-attempt fallback resolver drops a member that fails this)?
-   *
-   * Scoped rules (non-empty `timelineKeyPrefixes`) are skipped here because this
-   * method has no `timelineKey` context — it is called by the per-attempt fallback
-   * resolver which knows only a logical model id, not which agent's session is
-   * requesting it. If a scoped rule were included, one agent's exhausted budget
-   * would make the model "unavailable" process-wide, silently degrading every other
-   * agent to a fallback model. Real enforcement of scoped rules stays at
-   * `check()`/`checkAdmissionChain`, which thread the session's `timelineKey`.
-   * A global rule (no `timelineKeyPrefixes`) still blocks correctly here.
+   * Per-attempt eligibility for a logical model in the caller's spend scope.
+   * Reuse admission's matcher: an exhausted audit/tool/session/agent budget
+   * must never exclude that model from an unrelated request's fallback chain.
+   * Requiring the scope prevents callers silently making process-wide decisions.
    */
-  isModelAvailable(modelId: string): boolean {
-    if (this.isZeroCost(modelId)) return true;
-    const now = this.now();
-    for (const state of this.states) {
-      this.rollIfNeeded(state, now);
-      // Skip agent/account-scoped rules — they have no timelineKey to match against
-      // here and must not influence process-wide model availability (see above).
-      if (state.rule.selector.timelineKeyPrefixes?.length) continue;
-      // A rule covers this model iff it either targets it explicitly OR has no
-      // `models` selector (wildcard) — symmetric with `selectorMatches`. Without
-      // the wildcard arm a global over-cap rule wrongly reports every model free,
-      // contradicting `check()`.
-      const s = state.rule.selector;
-      if ((!s.models || s.models.includes(modelId)) && state.spent >= state.rule.maxUsd) return false;
-    }
-    return true;
+  isModelAvailable(
+    modelId: string,
+    scope: Omit<SpendDescriptor, "modelId" | "logicalModelId">,
+  ): boolean {
+    return this.check({ ...scope, modelId, logicalModelId: modelId }).allowed;
   }
 
   /**

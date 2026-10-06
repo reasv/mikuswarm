@@ -171,7 +171,8 @@ function stubAgent(messages: AgentMessage[]) {
     hasQueuedMessages: () => false,
     clearAllQueues: () => {},
     subscribe: () => () => {},
-    prompt: async () => {
+    prompt: async (kickoff: AgentMessage[]) => {
+      agent.state.messages.push(...kickoff);
       await prompted;
     },
     waitForIdle: async () => {},
@@ -244,9 +245,11 @@ test("SessionRecordService.waitFor: bounded by the entry's deadline", async () =
   const svc = new SessionRecordService();
   const { logger } = quietLogger();
   const { agent, release } = stubAgent(makeTranscriptWithTool("web_fetch"));
-  const run = svc.start(startParams({ agent, logger, config: { enabled: true, timeout_ms: 60 } }));
+  const run = svc.start(startParams({ agent, logger, config: { enabled: true, wait_timeout_ms: 60, timeout_ms: 60_000 } }));
   const t0 = Date.now();
-  await svc.waitFor("s1");
+  assert.equal(await svc.waitFor("s1"), false);
+  assert.equal(svc.isInFlight("s1"), true);
+  assert.equal(agent.state.errorMessage, undefined, "waiting does not abort production");
   const waited = Date.now() - t0;
   assert.ok(waited < 1000, `waitFor returned at the deadline (${waited} ms)`);
   release();
@@ -256,9 +259,9 @@ test("SessionRecordService.waitFor: bounded by the entry's deadline", async () =
 test("SessionRecordService.waitFor: graceMs waits for the turn to settle past its deadline (Z3)", async () => {
   const svc = new SessionRecordService();
   const { logger } = quietLogger();
-  // The abort at the deadline takes a while to settle.
+  // Production can finish after the ordinary wait expires.
   const slow = stubAgent(makeTranscriptWithTool("web_fetch"));
-  (slow.agent as unknown as { abort: () => void }).abort = () => setTimeout(slow.release, 150);
+  setTimeout(slow.release, 150);
   const run = svc.start(startParams({ agent: slow.agent, logger, config: { enabled: true, timeout_ms: 60 } }));
   assert.equal(await svc.waitFor("s1", { graceMs: 2000 }), true, "settled within the grace");
   assert.equal(svc.isInFlight("s1"), false);
@@ -424,4 +427,51 @@ test("factory setPriority changes the admission class of the agent's later reque
   } finally {
     server.close();
   }
+});
+
+
+test("record shutdown persists its outcome on the harness marker before flushing", async () => {
+  const svc = new SessionRecordService();
+  const { logger } = quietLogger();
+  const { agent } = stubAgent(makeTranscriptWithTool("web_fetch"));
+  let flushed = false;
+  const run = svc.start(startParams({ agent, logger, config: { enabled: true, timeout_ms: 10 }, flush: async () => {
+    const marker = agent.state.messages.find((m) => (m as any).harness?.kind === "record_turn") as any;
+    assert.deepEqual(marker.harness, { kind: "record_turn", status: "failed", reason: "shutdown" });
+    flushed = true;
+  } }));
+  svc.shutdown();
+  await run;
+  assert.equal(flushed, true);
+});
+
+test("record settle barrier includes asynchronous post-write judging", async () => {
+ const svc = new SessionRecordService();
+ const { logger } = quietLogger();
+ const { agent } = stubAgent(makeTranscriptWithTool("web_fetch"));
+ const draft = new SummaryDraft();
+ draft.create("synthetic record");
+ let listener: (event: any) => void = () => {};
+ (agent as any).subscribe = (fn: typeof listener) => { listener = fn; return () => {}; };
+ (agent as any).prompt = async (messages: AgentMessage[]) => {
+   agent.state.messages.push(...messages);
+   listener({ type: "tool_execution_end", toolName: "session_record_tool", isError: false, result: { terminate: true } });
+ };
+ let finishJudge!: () => void;
+ let enteredJudge!: () => void;
+ const entered = new Promise<void>((resolve) => { enteredJudge = resolve; });
+ const judge = new Promise<void>((resolve) => { finishJudge = resolve; });
+ const run = svc.start(startParams({ agent, logger, handles: { gate: { active: false }, draft },
+   storage: { upsertSessionRecord: async () => {} } as any,
+   onRecordWritten: async () => { enteredJudge(); await judge; },
+ }));
+ await entered;
+ let settled = false;
+ const barrier = svc.settled("s1").then(() => { settled = true; });
+ await new Promise((resolve) => setImmediate(resolve));
+ assert.equal(settled, false);
+ finishJudge();
+ await run;
+ await barrier;
+ assert.equal(settled, true);
 });

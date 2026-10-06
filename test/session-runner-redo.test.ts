@@ -317,3 +317,13 @@ test("end to end: contract redo through the fork core, the refusal pin untouched
     storage.close();
   }
 });
+
+test("ending judge skips harness NO_REPLY but still judges model NO_REPLY", async () => {
+ for (const synthetic of [true, false]) {
+   let judged = 0;
+   const { agent } = scriptedAgent([(messages) => messages.push({ ...text("NO_REPLY"), ...(synthetic ? { harness: { kind: "refusal_withheld" } } : {}) })]);
+   const result = await new SessionRunner({ endings: { onEnding: async () => { judged++; } } }).run(agent, session, 0, kickoff);
+   assert.equal(result.noReply, true);
+   assert.equal(judged, synthetic ? 0 : 1);
+ }
+});

@@ -159,13 +159,11 @@ export interface RequestRetryContext {
    * Fired once per COMMITTED request (spec TOKEN-USAGE-TRACKING §3.1), with the
    * terminal `done` event's AssistantMessage (authoritative usage). Best-effort:
    * exceptions are swallowed; the hook can never affect the run. NOT fired for
-   * terminal errors (their usage is stub zeros) nor for discarded attempts —
+   * terminal errors with zero-usage stubs —
    * this is the single authoritative usage capture point, distinct from the
    * observe-only `onAttemptEvent` tap (which also fires for discarded attempts).
-   * The one exception is a REFUSED attempt that carries provider usage (spec
-   * REFUSAL-HANDLING §10.3): the provider billed it, so it is fired with the
-   * refusal's error message (`stopReason: "error"`) whether the request then
-   * falls over, is redone, or fails.
+   * Failed attempts with provider-reported usage (including refusals and aborts)
+   * also fire exactly once, before retry/fallover/termination.
    */
   onRequestCommitted?: (message: AssistantMessage) => void;
   /**
@@ -717,6 +715,17 @@ export function withRequestRetry(
           // prior attempt is never read at this attempt's settle (§ served-model
           // attribution). Safe: attempts within a session are sequential.
           ctx.resetServedModel?.();
+          // A billed failed attempt can exhaust the budget before its retry.
+          if (attempt > 0) {
+            let violation: string | undefined;
+            try { violation = ctx.checkCostBudget?.(); } catch { /* same best-effort policy as initial pre-flight */ }
+            if (violation !== undefined) {
+              const error = synthesizeErrorEvent(model, violation, "error");
+              recordAttempt(attempt + 1, Date.now(), "error", { cls: "content" });
+              surface(error, "content");
+              return;
+            }
+          }
           const attemptStart = Date.now();
           const buffered: AssistantMessageEvent[] = [];
           let errorEvent: Extract<AssistantMessageEvent, { type: "error" }> | undefined;
@@ -905,6 +914,28 @@ export function withRequestRetry(
             },
           );
 
+          // Preserve provider-reported usage for EVERY failed attempt, including
+          // aborted and retried streams. Zero-usage stubs are not estimates.
+          const billedUsage = failure?.usage;
+          if (billedUsage && [billedUsage.totalTokens, billedUsage.input, billedUsage.output,
+            billedUsage.cacheRead, billedUsage.cacheWrite, billedUsage.cost?.total ?? 0].some((n) => n > 0)) {
+            if (attemptRecord) {
+              attemptRecord.usage = {
+                input: failure.usage.input,
+                output: failure.usage.output,
+                cacheRead: failure.usage.cacheRead,
+                cacheWrite: failure.usage.cacheWrite,
+                totalTokens: failure.usage.totalTokens,
+                cost: failure.usage.cost?.total ?? 0,
+              };
+            }
+            try {
+              ctx.onRequestCommitted?.(failure);
+            } catch {
+              /* best-effort: the capture hook can never affect the run */
+            }
+          }
+
           if (verdict === "environmental") {
             // Every environmental failure is logged — including the first
             // attempt (spec §9.3 closes the audit gap where first-attempt
@@ -1015,25 +1046,6 @@ export function withRequestRetry(
             const canReissue = !budgetExpired && Date.now() < deadline;
             const fallover = refusalFallover && attemptState.refusalFalloverAvailable && canReissue;
             const servedModel = ctx.getServedModel?.();
-            // The provider billed the refused attempt: its usage reaches the
-            // ledger like a committed request's (spec REFUSAL-HANDLING §10.3).
-            if (failure?.usage && (failure.usage.totalTokens > 0 || (failure.usage.cost?.total ?? 0) > 0)) {
-              if (attemptRecord) {
-                attemptRecord.usage = {
-                  input: failure.usage.input,
-                  output: failure.usage.output,
-                  cacheRead: failure.usage.cacheRead,
-                  cacheWrite: failure.usage.cacheWrite,
-                  totalTokens: failure.usage.totalTokens,
-                  cost: failure.usage.cost?.total ?? 0,
-                };
-              }
-              try {
-                ctx.onRequestCommitted?.(failure);
-              } catch {
-                /* best-effort: the capture hook can never affect the run */
-              }
-            }
             // Refusal rules (spec REFUSAL-HANDLING §8.1): a matching rule
             // replaces the implicit fallover; no rule keeps it.
             let decision: RefusalDecision = { action: fallover ? "fallover" : "fail" };

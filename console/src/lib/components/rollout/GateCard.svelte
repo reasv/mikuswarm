@@ -90,6 +90,9 @@
 				>offline audit</span
 			>
 		{/if}
+		{#if variant === 'ending' && evaluation.action}
+			<span class="text-[10px] text-muted-foreground">{evaluation.action === 'exhausted' ? 'text ending without a send' : evaluation.action}</span>
+		{/if}
 		{#if evaluation.checkpoint && variant === 'ending'}
 			<span class="font-mono text-[10px] text-muted-foreground">attempt {evaluation.attemptNo ?? 0}</span>
 		{/if}

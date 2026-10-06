@@ -39,7 +39,7 @@ async function withStorage(fn: (s: Storage) => Promise<void>): Promise<void> {
 async function addSession(
   storage: Storage,
   id: string,
-  opts: { timelineKey?: string; status?: "completed" | "running"; transcript?: AgentMessage[] } = {},
+  opts: { timelineKey?: string; status?: "completed" | "running" | "interrupted" | "discarded"; transcript?: AgentMessage[] } = {},
 ): Promise<void> {
   const now = Date.now();
   await storage.insertAgentSession({
@@ -341,4 +341,42 @@ test("record-turn gate: a gate-blocked editor view activates no skill tools", as
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+
+test("read_session_record: durable generation outcomes have distinct actionable errors", async () => {
+  await withStorage(async (storage) => {
+    const cases = [
+      ["skipped", "no_work", /work gate found no non-exempt tool work/],
+      ["skipped", "empty", /explicitly chose not to save/],
+      ["failed", "refusal", /record writer refused/],
+      ["failed", "budget_blocked", /budget was exhausted/],
+      ["writing", null, /previous attempt was interrupted/],
+    ] as const;
+    for (const [status, reason, expected] of cases) {
+      if (!storage.getAgentSessionMeta("s-status")) await addSession(storage, "s-status");
+      await storage.setSessionRecordGeneration("s-status", status, reason);
+      const res = await runToolViaPi(recordTools({ storage }), "read_session_record", { session_id: "s-status" });
+      assert.equal(res.isError, true);
+      assert.match(resultText(res), expected);
+    }
+    for (const status of ["interrupted", "discarded"] as const) {
+      await addSession(storage, `s-${status}`, { status });
+      const result = await runToolViaPi(recordTools({ storage }), "read_session_record", { session_id: `s-${status}` });
+      assert.match(resultText(result), new RegExp(`session was ${status}`));
+    }
+    await addSession(storage, "s-running", { status: "running" });
+    const pending = await runToolViaPi(recordTools({ storage }), "read_session_record", { session_id: "s-running" });
+    assert.match(resultText(pending), /session has not finished/);
+  });
+});
+
+
+test("read_session_record: historical harness outcome is used without guessing a work-gate result", async () => {
+  await withStorage(async (storage) => {
+    await addSession(storage, "s-legacy", { transcript: [{ role: "user", content: "synthetic harness", timestamp: 1,
+      harness: { kind: "record_turn", status: "failed", reason: "not_finalized" } } as any] });
+    const result = await runToolViaPi(recordTools({ storage }), "read_session_record", { session_id: "s-legacy" });
+    assert.match(resultText(result), /did not finalize/);
+  });
 });

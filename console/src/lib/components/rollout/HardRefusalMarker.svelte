@@ -10,11 +10,17 @@
 	const what = $derived.by(() => {
 		switch (event.outcome) {
 			case 'fallover':
-				return 'chain fallover';
+				return 'retry on fallback model';
 			case 'redo':
-				return `rule ${event.ruleName ?? '?'} → ${event.toModel ?? '?'}`;
+				return event.toModel === event.servedModel
+					? `retry same request on ${event.toModel} (rule ${event.ruleName ?? '?'})`
+					: `retry request on ${event.toModel ?? '?'} (rule ${event.ruleName ?? '?'})`;
 			case 'failed':
-				return 'failed (no rule)';
+				return 'request failed';
+			case 'exhausted_withheld':
+				return 'retry limit exhausted · reply withheld';
+			case 'exhausted_no_output':
+				return 'retry limit exhausted · no output';
 			default:
 				return event.outcome.replaceAll('_', ' ') + (event.ruleName ? ` (rule ${event.ruleName})` : '');
 		}

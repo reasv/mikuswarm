@@ -711,7 +711,7 @@ export class DiaryWorkerPool {
       rules: refusals.rules,
       site: "diary",
       agent: refusals.agentFor?.(job.timelineKey) ?? null,
-      usable: (model) => factory.refusalEntryViable(model),
+      usable: (model) => factory.refusalEntryViable(model, { sessionType: "diary", timelineKey: job.timelineKey }),
       chainOf: (model) => {
         try {
           return factory.resolveModelChainLogicalIdsForModel(model);

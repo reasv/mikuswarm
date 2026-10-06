@@ -545,8 +545,8 @@ test("#13 selector matches the LOGICAL id, not the shared upstream wire id", () 
     "the shared-upstream image lane stays unblocked despite the same wire id",
   );
   // isModelAvailable keys on the logical id too: premium unavailable, image free.
-  assert.equal(engine.isModelAvailable("caption-premium"), false);
-  assert.equal(engine.isModelAvailable("image-flash"), true);
+  assert.equal(engine.isModelAvailable("caption-premium", { class: "caption" }), false);
+  assert.equal(engine.isModelAvailable("image-flash", { class: "agent_loop" }), true);
 });
 
 // ---------------------------------------------------------------------------
@@ -762,10 +762,10 @@ test("#1 isModelAvailable: global (no-models) rule over cap blocks every model",
   const rules: LimitRule[] = [{ name: "global", maxUsd: 1, window: dayWindow, selector: {} }];
   const engine = engineWith(rules, {}, { zero: new Set(["free-model"]) });
   engine.record({ class: "agent_loop", modelId: "paid", costUsd: 5 }); // global over cap
-  assert.equal(engine.isModelAvailable("paid"), false);
-  assert.equal(engine.isModelAvailable("some-other-model"), false); // wildcard covers it too
+  assert.equal(engine.isModelAvailable("paid", { class: "agent_loop" }), false);
+  assert.equal(engine.isModelAvailable("some-other-model", { class: "agent_loop" }), false); // wildcard covers it too
   // Zero-cost short-circuit preserved: a free model is never blocked.
-  assert.equal(engine.isModelAvailable("free-model"), true);
+  assert.equal(engine.isModelAvailable("free-model", { class: "agent_loop" }), true);
 });
 
 test("#1 isModelAvailable: models-scoped rule blocks only its listed models", () => {
@@ -774,8 +774,8 @@ test("#1 isModelAvailable: models-scoped rule blocks only its listed models", ()
   ];
   const engine = engineWith(rules);
   engine.record({ class: "agent_loop", modelId: "opus", costUsd: 5 });
-  assert.equal(engine.isModelAvailable("opus"), false);
-  assert.equal(engine.isModelAvailable("sonnet"), true); // not in the rule's models
+  assert.equal(engine.isModelAvailable("opus", { class: "agent_loop" }), false);
+  assert.equal(engine.isModelAvailable("sonnet", { class: "agent_loop" }), true); // not in the rule's models
 });
 
 test("#4 calendar roll: check()/ruleStatuses() report rolled-empty window WITHOUT tick(), no SUM on hot path", () => {
@@ -1535,7 +1535,7 @@ test("§8 isModelAvailable: scoped rule at cap does NOT block model process-wide
   // Push alice's scoped rule over cap.
   engine.record({ class: "agent_loop", modelId: "m1", costUsd: 5, timelineKey: "matrix:alice:t:!x:hs" });
   // isModelAvailable must still be true — scoped rules have no timelineKey context here.
-  assert.equal(engine.isModelAvailable("m1"), true, "scoped rule at cap must not block isModelAvailable");
+  assert.equal(engine.isModelAvailable("m1", { class: "agent_loop" }), true, "scoped rule at cap must not block isModelAvailable");
   // But check() with alice's timelineKey still blocks.
   const aliceCheck = engine.check({ class: "agent_loop", modelId: "m1", timelineKey: "matrix:alice:t:!x:hs" });
   assert.equal(aliceCheck.allowed, false, "check() with alice's timelineKey is still blocked");
@@ -1552,7 +1552,7 @@ test("§8 isModelAvailable: global rule at cap still blocks model", () => {
   ];
   const engine = engineWithScoped(rules);
   engine.record({ class: "agent_loop", modelId: "m1", costUsd: 5 });
-  assert.equal(engine.isModelAvailable("m1"), false, "global cap must still block isModelAvailable");
+  assert.equal(engine.isModelAvailable("m1", { class: "agent_loop" }), false, "global cap must still block isModelAvailable");
 });
 
 // ---------------------------------------------------------------------------
@@ -1697,4 +1697,37 @@ test("§8 makeToolBudgetGate: an agent-scoped tool cap blocks only that agent's 
     undefined,
     "no engine wired = no gate",
   );
+});
+
+
+test("fallback eligibility respects class, session, tool and agent scope", () => {
+  const cases: Array<{ selector: LimitRule["selector"]; scope: Omit<SpendDescriptor, "modelId"> }> = [
+    { selector: { classes: ["audit"] }, scope: { class: "audit" } },
+    { selector: { sessionTypes: ["summarize"] }, scope: { class: "agent_loop", sessionType: "summarize" } },
+    { selector: { tools: ["image_generate"] }, scope: { class: "tool", tool: "image_generate" } },
+    { selector: { timelineKeyPrefixes: ["matrix:other"] }, scope: { class: "agent_loop", timelineKey: "matrix:other:room" } },
+  ];
+  for (const { selector, scope } of cases) {
+    const engine = engineWith([{ name: "scoped", maxUsd: 2, window: dayWindow, selector }]);
+    engine.record({ class: scope.class, sessionType: scope.sessionType, toolName: scope.tool,
+      timelineKey: scope.timelineKey, modelId: "paid", costUsd: 2.01 });
+    assert.equal(engine.isModelAvailable("paid", scope), false, "matching consumer remains blocked");
+    assert.equal(engine.isModelAvailable("paid", { class: "agent_loop", sessionType: "default", timelineKey: "matrix:chat:room" }), true,
+      "unrelated chat keeps its paid model");
+  }
+});
+
+test("audit-only fallback block resets at midnight without affecting chat", () => {
+  let now = Date.UTC(2026, 0, 1, 23, 59);
+  const engine = new BudgetEngine({
+    rules: [{ name: "audit", maxUsd: 2, window: dayWindow, selector: { classes: ["audit"] } }],
+    sumUsageCost: () => 0, zeroCostModelIds: new Set(), dependencies: {},
+    resolveModelId: () => "paid", logger: noopLogger, now: () => now,
+  });
+  engine.record({ class: "audit", modelId: "paid", costUsd: 2.01 });
+  assert.equal(engine.isModelAvailable("paid", { class: "audit" }), false);
+  assert.equal(engine.isModelAvailable("paid", { class: "agent_loop" }), true);
+  now = Date.UTC(2026, 0, 2);
+  assert.equal(engine.isModelAvailable("paid", { class: "audit" }), true);
+  assert.equal(engine.isModelAvailable("paid", { class: "agent_loop" }), true);
 });

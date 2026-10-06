@@ -97,7 +97,7 @@ export function createReadSessionRecordTool(context: ReadSessionRecordToolContex
     }),
     execute: async (_toolCallId, params) => {
       const { session_id } = params as { session_id: string };
-      resolveReadableSession(session_id, context);
+      const session = resolveReadableSession(session_id, context);
 
       if (context.isRecordInFlight?.(session_id)) {
         throw new Error(
@@ -108,11 +108,34 @@ export function createReadSessionRecordTool(context: ReadSessionRecordToolContex
 
       const record = context.storage.getSessionRecord(session_id);
       if (!record) {
-        throw new Error(
-          `No record for session "${session_id}": it did no tool work worth recording (its messages ` +
-            "in the chat are all there is), or its record was not written. Its raw tool calls, if any: " +
-            `read_session_transcript(session_id: "${session_id}") (sessions skill).`,
-        );
+        const outcome = context.storage.getSessionRecordGeneration(session_id);
+        const raw = `read_session_transcript(session_id: "${session_id}") (sessions skill)`;
+        if (["created", "running", "resuming", "suspended", "failed-resumable"].includes(session.status)) {
+          throw new Error(`No record yet for session "${session_id}": the session has not finished. Record generation is considered after completion. Use ${raw} for work already performed.`);
+        }
+        if (session.status === "interrupted" || session.status === "discarded") {
+          throw new Error(`No record for session "${session_id}": the session was ${session.status} before normal completion, so record generation was not started. Use ${raw}.`);
+        }
+        if (outcome?.status === "skipped") {
+          const why: Record<string, string> = {
+            no_work: "the work gate found no non-exempt tool work to record; the chat messages are the available account",
+            empty: "the record writer finished and explicitly chose not to save a record",
+            disabled: "record generation was disabled",
+            session_type: "this session type does not produce session records",
+            tool_unavailable: "the record-writing tool was unavailable for this session",
+          };
+          throw new Error(`No record for session "${session_id}": ${why[outcome.reason ?? ""] ?? "record generation was skipped"}. This was not a relevance-gate rejection. Use ${raw} if you need its raw tool activity.`);
+        }
+        if (outcome?.status === "failed" || outcome?.status === "writing") {
+          const why: Record<string, string> = {
+            refusal: "the record writer refused", budget_blocked: "the applicable budget was exhausted",
+            llm_error: "the model request failed", max_turns: "the record writer reached its turn limit",
+            shutdown: "the service shut down before generation finished", not_finalized: "the writer did not finalize a record",
+          };
+          const reason = outcome.status === "writing" ? "the previous attempt was interrupted and no record writer is active" : why[outcome.reason ?? ""] ?? "record generation failed";
+          throw new Error(`Record generation failed for session "${session_id}": ${reason}. No record is being generated now. Use ${raw}.`);
+        }
+        throw new Error(`No record for session "${session_id}". Its generation outcome was not recorded, so the reason is unknown. Relevance selection does not control record creation. Use ${raw}.`);
       }
 
       const buildsOn = parseBuildsOn(record.builds_on);

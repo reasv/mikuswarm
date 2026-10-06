@@ -189,6 +189,13 @@ end;`,
 end;`,
   })),
   {
+    table: "decision_evaluations",
+    sql: `create trigger if not exists mbr_de_ad after delete on decision_evaluations
+  when old.point = 'checks' begin
+  ${markDirty(sessionHour("old.agent_session_id", "old.ts"))}
+end;`,
+  },
+  {
     table: "timeline_events",
     sql: `create trigger if not exists mbr_te_ai after insert on timeline_events
   when new.role = 'assistant' and new.agent_session_id is not null begin

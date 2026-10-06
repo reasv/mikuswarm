@@ -434,3 +434,23 @@ test("decideSessionArtifactRefusal: the session handle's rule and walk decide; n
   assert.equal(exhausted.decision, "exhausted");
   assert.equal(exhausted.act?.refusal?.outcome, "exhausted_no_output");
 });
+
+test("overlapping exclusions reach record artifacts and veto continuing job walks", async () => {
+ const rules = normalizeRefusalRules({ refusal_fallback: [{ name: "r", from_models: ["model_a"], models: [{ model: "model_b", tries: 3 }], exclude_reasons: ["capability"] }] });
+ const safety = { code: "refusal_safety", kind: "refusal", remedy: "redo", reason: "safety", method: "pattern", probability: 1 } as const;
+ const capability = { ...safety, code: "refusal_capability", reason: "capability", remedy: "observe", probability: 0.7 } as const;
+ let verdict: GateVerdict = { evaluationIds: [], fired: [safety], revise: [], unjudged: false, latencyMs: 1 };
+ const job = new JobSoftRefusalRedo({ rules, site: "summarize", agent: null, usable: () => true,
+   checks: { artifact: async (input: any) => { input.act(verdict, { late: false }); } } as any,
+ });
+ assert.equal((await job.artifact({ site: "summarize", kind: "summary", text: "synthetic", servedModel: "model_a" } as any)).action, "rerun");
+ verdict = { ...verdict, fired: [safety, capability] };
+ assert.equal((await job.artifact({ site: "summarize", kind: "summary", text: "synthetic", servedModel: "model_b" } as any)).action, "accept");
+ const { matchRefusalRule } = await import("../src/refusals/rules.js");
+ const handle: any = {
+   site: "record_turn", servingModel: () => "model_a",
+   matchRule: (input: any) => matchRefusalRule(rules, { ...input, site: "record_turn" }),
+   advance: () => assert.fail("excluded record must not consume a retry"),
+ };
+ assert.equal(decideSessionArtifactRefusal(handle, verdict, false).decision, "accept");
+});

@@ -234,3 +234,18 @@ test("validateRefusalRules: startup errors", () => {
     assert.throws(() => validateRefusalRules(cfg, buildCheckCatalogue(cfg)), re, JSON.stringify(rules));
   }
 });
+
+test("exclude_reasons vetoes any detected reason, not only the primary", () => {
+ const cfg = config({ refusal_fallback: [{ name: "r", models: ["open_model_x"], exclude_reasons: ["capability"] }] });
+ const rules = normalizeRefusalRules(cfg);
+ validateRefusalRules(cfg, buildCheckCatalogue(cfg));
+ assert.deepEqual(rules[0]!.excludeReasons, ["capability"]);
+ const input = { site: "default", kind: "soft" as const, reason: "safety" };
+ assert.equal(matchRefusalRule(rules, input)?.name, "r");
+ assert.equal(matchRefusalRule(rules, { ...input, detectedReasons: ["safety", "capability"] }), undefined);
+ assert.equal(matchRefusalRule(rules, { ...input, reason: "capability" }), undefined);
+ for (const excluded of [[], ["refusal_capability"]]) {
+   const bad = config({ refusal_fallback: [{ name: "r", models: ["open_model_x"], exclude_reasons: excluded }] });
+   assert.throws(() => validateRefusalRules(bad, buildCheckCatalogue(bad)), /exclude_reasons/);
+ }
+});

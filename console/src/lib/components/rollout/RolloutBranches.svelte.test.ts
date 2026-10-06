@@ -50,7 +50,7 @@ test('the latest branch by default; the switcher moves to the discarded branch a
 test('hard refusal marker, nudge card with failure types and the recovered diff', async () => {
 	render(Rollout, props);
 	await expect.element(page.getByTestId('hard-refusal')).toHaveTextContent(/stop refusal · cyber/);
-	await expect.element(page.getByTestId('hard-refusal')).toHaveTextContent(/chain fallover/);
+	await expect.element(page.getByTestId('hard-refusal')).toHaveTextContent(/retry on fallback model/);
 	const nudge = page.getByTestId('nudge-card');
 	await expect.element(nudge).toHaveTextContent(/nudge 1\/3/);
 	await expect.element(nudge).toHaveTextContent(/text_only/);

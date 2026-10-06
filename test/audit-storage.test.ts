@@ -297,3 +297,62 @@ test("DecisionEngine: usageClass audit bills and budgets the audit class, never 
   assert.deepEqual(engine.usableMembers("audit", null, {}, "audit").map((m) => m.logicalId), ["decider"]);
   assert.equal(checks[checks.length - 1].class, "audit");
 });
+
+test("audit eligibility excludes every resumable state in both queue and progress", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    for (const status of ["created", "running", "resuming", "suspended", "interrupted", "failed-resumable", "completed", "discarded"]) {
+      await addSession(storage, status, 1, { status, completedAt: 2 });
+    }
+    const rows = storage.listAuditCandidates({ audits: [{ name: "refusal" }], excludeSessionTypes: [], settledBefore: 100, limit: 100, order: "asc" });
+    assert.deepEqual(rows.map((r) => r.id).sort(), ["completed", "discarded"]);
+    const progress = storage.auditProgressChunk({ audits: ["refusal"], excludeSessionTypes: [], settledBefore: 100, limit: 100 });
+    assert.equal(progress.rows.filter((r) => r.eligible).length, 2);
+  } finally { storage.close(); }
+});
+
+test("continuation invalidates only offline verdicts and rejects writes from the old completion", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await addSession(storage, "s", 1, { completedAt: 10 });
+    const offline = { ts: 20, decision_group: "audit:old", point: "checks", agent_session_id: "s", source: "model" as const };
+    const auditId = await storage.insertDecisionEvaluation(offline, { auditCompletedAt: 10 });
+    const liveId = await storage.insertDecisionEvaluation({ ...offline, decision_group: "live" });
+    await storage.writeSessionAudits([{ sessionId: "s", audit: "refusal", status: "done", version: 1 }]);
+    await storage.updateAgentSessionStatus("s", "running", { updatedAt: 30 });
+    assert.deepEqual(storage.getDecisionEvaluationsForSession("s").map((r) => r.id), [liveId]);
+    assert.deepEqual(storage.listSessionAudits("s"), []);
+    assert.equal(await storage.insertDecisionEvaluation(offline, { auditCompletedAt: 10 }), 0);
+    await storage.updateAgentSessionStatus("s", "completed", { completedAt: 40 });
+    assert.equal(await storage.insertDecisionEvaluation(offline, { auditCompletedAt: 10 }), 0);
+    await storage.writeSessionAudits([{ sessionId: "s", audit: "refusal", status: "done", version: 1 }], { auditCompletedAt: 10 });
+    assert.deepEqual(storage.listSessionAudits("s"), []);
+    assert.ok(auditId > 0);
+    assert.ok(await storage.insertDecisionEvaluation({ ...offline, ts: 50 }, { auditCompletedAt: 40 }) > 0);
+  } finally { storage.close(); }
+});
+
+test("historical partial-run audit reconciliation preserves live verdicts and reopens the audit queue", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await addSession(storage, "s", 1, { completedAt: 40 });
+    const row = { ts: 20, decision_group: "audit:partial", point: "checks", agent_session_id: "s", source: "model" as const };
+    await storage.insertDecisionEvaluation(row);
+    const liveId = await storage.insertDecisionEvaluation({ ...row, decision_group: "live" });
+    await storage.writeSessionAudits([{ sessionId: "s", audit: "refusal", status: "done", version: 1, createdAt: 50 }]);
+    await storage.reconcileOfflineAudits();
+    assert.deepEqual(storage.getDecisionEvaluationsForSession("s").map((r) => r.id), [liveId]);
+    assert.deepEqual(storage.listSessionAudits("s"), []);
+  } finally { storage.close(); }
+});
+
+test("deleting an offline check invalidates its behaviour rollup", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    await addSession(storage, "s", 1, { completedAt: 10 });
+    const id = await storage.insertDecisionEvaluation({ ts: 20, decision_group: "audit:check", point: "checks", agent_session_id: "s", source: "model" });
+    await storage.write((db) => db.exec("delete from model_behaviour_dirty_hours"));
+    await storage.write((db) => db.prepare("delete from decision_evaluations where id = ?").run(id));
+    assert.equal(storage.read((db) => (db.prepare("select count(*) n from model_behaviour_dirty_hours").get() as { n: number }).n), 1);
+  } finally { storage.close(); }
+});

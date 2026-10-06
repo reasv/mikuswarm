@@ -1059,6 +1059,8 @@ const DecisionRecordsSchema = StrictObject({
   // Maximum bot-message sessions checked as candidates (besides the reply target).
   // Default 3.
   candidates: Type.Optional(Type.Integer({ minimum: 0, maximum: 20 })),
+  // Maximum age of unsolicited candidates; explicit replies/follow-ups are exempt. Default 1 hour.
+  candidate_max_age_ms: Type.Optional(Type.Integer({ minimum: 1 })),
   // Maximum records injected into a single session. Default 2.
   max_injected: Type.Optional(Type.Integer({ minimum: 0, maximum: 10 })),
 });
@@ -1181,6 +1183,7 @@ const RefusalRuleSchema = StrictObject({
   // tasks (or the built-in `proactive` / `other`) is listed; a taskless session never.
   sites: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
   reasons: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
+  exclude_reasons: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
   from_models: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
   agents: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
   tasks: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
@@ -2239,8 +2242,10 @@ const SessionRecordsSchema = StrictObject({
   // When true (default), a reply to a bot message injects that message's session
   // record into the new session (spec §6.1, the no-decision-model rule).
   inject_on_reply: Type.Optional(Type.Boolean()),
-  // Record production deadline in ms; past it the record is abandoned and waiting
-  // triggers proceed without it (§3.2). Default 60000.
+  // Waiting triggers proceed without the record after this interval from record start.
+  // Record production continues under normal LLM request handling. Default 60000.
+  wait_timeout_ms: Type.Optional(Type.Integer({ minimum: 1000 })),
+  // Legacy alias for wait_timeout_ms; no longer aborts record production.
   timeout_ms: Type.Optional(Type.Integer({ minimum: 1000 })),
 });
 

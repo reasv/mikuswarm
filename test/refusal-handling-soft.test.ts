@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { Type } from "@earendil-works/pi-ai";
+import { BudgetEngine } from "../src/budget/engine.js";
 import { AgentSessionFactory, type CreatedAgent } from "../src/agent/factory.js";
 import { createRedoHandler } from "../src/agent/redo.js";
 import { SessionRunner, SessionRunnerError } from "../src/agent/runner.js";
@@ -130,7 +131,7 @@ interface Env {
 }
 
 async function withEnv(
-  o: { script: Record<string, Step[]>; rules: Array<Record<string, unknown>>; checks?: Record<string, unknown> },
+  o: { script: Record<string, Step[]>; rules: Array<Record<string, unknown>>; checks?: Record<string, unknown>; budgetEngine?: BudgetEngine },
   fn: (env: Env) => Promise<void>,
 ): Promise<void> {
   const stub = await scriptedServer(o.script);
@@ -159,6 +160,11 @@ async function withEnv(
     checks: o.checks ?? { refusal_canned: { kind: "refusal", reason: "capability", patterns: [REFUSAL] } },
     refusal_fallback: o.rules,
   } as unknown as AppConfig;
+  if (o.budgetEngine) {
+    config.models.default!.fallback = ["model_c"];
+    config.models.model_b!.fallback = ["model_c"];
+    config.models.model_c!.cost = { input: 0, output: 0, cache_read: 0, cache_write: 0 };
+  }
   const catalogue = buildCheckCatalogue(config);
   const evaluator = new CheckEvaluator({ catalogue, config, storage, logger });
   const built = {
@@ -177,7 +183,7 @@ async function withEnv(
     getActiveSessions: () => [],
     storage,
     logger,
-    budget: { record: (event: unknown) => recorded.push(event) } as any,
+    budget: { engine: o.budgetEngine, record: (event: unknown) => recorded.push(event) } as any,
     liveEvents: { publish: (_id: string, event: SessionLiveEvent) => live.push(event) } as any,
     refusals: { catalogue, rules: normalizeRefusalRules(config) },
     outputChecks: {
@@ -624,5 +630,43 @@ test("factory: a session created with a refusal pin (a job's rerun) sends every 
     await run(created, "s-pin");
     assert.deepEqual(stub.served, ["b"]);
     assert.deepEqual(sent, ["From the pinned model."]);
+  });
+});
+
+test("overlapping capability and safety findings do not redo an excluded output", async () => {
+ await withEnv({ script: { a: [send(REFUSED)] }, rules: [rule({ reasons: undefined, exclude_reasons: ["capability"] })],
+   checks: {
+     refusal_a_safety: { kind: "refusal", reason: "safety", patterns: [REFUSAL] },
+     refusal_z_capability: { kind: "refusal", reason: "capability", remedy: "observe", patterns: [REFUSAL] },
+   },
+ }, async ({ stub, storage, sent, create, run }) => {
+   const created = await create("s-veto");
+   await run(created, "s-veto");
+   assert.deepEqual(stub.served, ["a"]);
+   assert.deepEqual(sent, [REFUSED]);
+   const result = await settled(storage, "s-veto");
+   assert.equal(result.branches.length, 0);
+   assert.equal(result.refusals.length, 2);
+   assert.ok(result.refusals.every((r) => r.outcome === "observed"));
+ });
+});
+
+
+test("exhausted audit budget cannot redirect the primary or refusal pin to a free fallback", async () => {
+  const engine = new BudgetEngine({
+    rules: [{ name: "audit-only", maxUsd: 2, window: { type: "calendar", period: "day", tz: "UTC" }, selector: { classes: ["audit"] } }],
+    sumUsageCost: () => 0, zeroCostModelIds: new Set(["model_c"]), dependencies: {},
+    resolveModelId: () => "default", logger: { debug() {}, info() {}, warn() {}, error() {} } as any,
+  });
+  engine.record({ class: "audit", modelId: "judge", costUsd: 2.01 });
+  await withEnv({
+    budgetEngine: engine,
+    script: { a: [send(REFUSED)], b: [send("Done properly.")], c: [send("Wrong free fallback.")] },
+    rules: [{ name: "r", reasons: ["capability"], models: [{ model: "model_b", tries: 2 }], soft: "redo" }],
+  }, async (e) => {
+    const created = await e.create("s-budget-scope");
+    await e.run(created, "s-budget-scope");
+    assert.deepEqual(e.stub.served, ["a", "b"], "both the primary and redo target actually serve");
+    assert.deepEqual(e.sent, ["Done properly."]);
   });
 });

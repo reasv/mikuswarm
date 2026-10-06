@@ -742,7 +742,7 @@ export class SummarizationWorkerPool {
       rules: refusals.rules,
       site: job.level === 1 ? "summarize" : "condense",
       agent: refusals.agentFor?.(job.timelineKey) ?? null,
-      usable: (model) => factory.refusalEntryViable(model),
+      usable: (model) => factory.refusalEntryViable(model, { sessionType: job.level === 1 ? "summarize" : "condense", timelineKey: job.timelineKey }),
       chainOf: (model) => {
         try {
           return factory.resolveModelChainLogicalIdsForModel(model);

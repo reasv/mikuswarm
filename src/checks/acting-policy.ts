@@ -84,7 +84,11 @@ export function createActingPolicy(deps: ActingPolicyDeps): ActingGatePolicy {
     const fired = strongestOf(candidates);
     if (fired) {
       const fromModel = refusal.servingModel();
-      const rule = refusal.matchRule({ reason: fired.reason ?? "unclear", kind: "soft", fromModel });
+      const rule = refusal.matchRule({
+        reason: fired.reason ?? "unclear",
+        detectedReasons: verdict.fired.filter((f) => f.kind === "refusal").map((f) => f.reason ?? "unclear"),
+        kind: "soft", fromModel,
+      });
       if (rule) {
         const toModel = refusal.advance(rule, fromModel ?? "");
         act =

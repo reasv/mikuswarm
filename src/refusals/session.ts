@@ -42,7 +42,7 @@ export interface SessionRefusalHandle {
    * session is pinned to a rule's entry and that entry refused, the same rule's
    * next entry applies (spec §8.1) whatever its `from_models` say.
    */
-  matchRule(input: { reason: string; kind: "hard" | "soft"; fromModel?: string }): RefusalRule | undefined;
+  matchRule(input: { reason: string; detectedReasons?: readonly string[]; kind: "hard" | "soft"; fromModel?: string }): RefusalRule | undefined;
   /** Some soft = "redo" rule could match this session now, for any reason. Cheap. */
   softRuleCouldMatch(): boolean;
   /**
@@ -52,7 +52,8 @@ export interface SessionRefusalHandle {
    * session's gates (health, budget, per-user limits, context fits, capability)
    * are skipped whole. A try on another model pins the session to it (persisted);
    * a try on `refusedModel` itself is a same-model retry and leaves the pin as it
-   * is. The walk lasts until a message is delivered (or the site changes); a
+   * is. Hard-refusal streaks reset on a clean request at the current entry.
+   * Soft walks last until a message is delivered (or the site changes); a
    * different rule starts a new walk. Undefined = every entry, every try, spent.
    * The returned model may equal `refusedModel`.
    */
@@ -73,7 +74,7 @@ export interface SessionRefusalController extends SessionRefusalHandle {
   setSite(site: string | undefined): void;
   /** The member the composite resolved for the current attempt. */
   noteServing(logicalId: string): void;
-  /** A request committed cleanly: a same-model retry target ends with it. */
+  /** A clean request ends a hard-refusal streak and clears its temporary retry target. */
   noteCommitted(): void;
   /** A message was delivered: the refusal point ends; the next refusal starts a rule from its first entry. */
   noteDelivered(): void;
@@ -174,6 +175,7 @@ export function createSessionRefusalController(deps: SessionRefusalDeps): Sessio
   // A same-model retry's target for the rest of the current request (the pin
   // does not move when a try re-sends to the model that refused).
   let retryTarget: string | undefined;
+  let hardRetryPending = false;
   // The rules whose scope admits the current site (cached per site).
   const scopedBySite = new Map<string, RefusalRule[]>();
   const scoped = (): RefusalRule[] => {
@@ -206,7 +208,7 @@ export function createSessionRefusalController(deps: SessionRefusalDeps): Sessio
     model !== undefined && refused !== undefined && (model === refused || deps.chainOf(model).includes(refused));
 
   const matchRule: SessionRefusalHandle["matchRule"] = (input) => {
-    const scope = { site, agent: deps.agent, tasks, reason: input.reason, kind: input.kind };
+    const scope = { site, agent: deps.agent, tasks, reason: input.reason, detectedReasons: input.detectedReasons, kind: input.kind };
     // The model a running walk handed out refused: the same rule continues, when
     // it admits this refusal apart from `from_models` (they named the model that
     // refused first). Likewise for the rule the session is pinned by, when its
@@ -234,6 +236,7 @@ export function createSessionRefusalController(deps: SessionRefusalDeps): Sessio
     // A new walk unless this refusal point is already walking this rule.
     if (!walk || walk.rule.name !== rule.name) {
       walk = new RefusalRuleWalk(rule, refusedModel ?? pin?.model ?? deps.headModel ?? "");
+      if (pin?.rule === rule.name) walk.resumeAt(pin.model);
     }
     const model = walk.next(
       (candidate) => {
@@ -276,6 +279,7 @@ export function createSessionRefusalController(deps: SessionRefusalDeps): Sessio
   };
 
   const onHardRefusal = (info: RefusalAttemptInfo): RefusalDecision => {
+    hardRetryPending = true;
     const message = info.message as
       | (RefusalAttemptInfo["message"] & { stopCategory?: string | null })
       | undefined;
@@ -379,6 +383,7 @@ export function createSessionRefusalController(deps: SessionRefusalDeps): Sessio
       if (nextSite !== site) {
         walk = undefined;
         retryTarget = undefined;
+        hardRetryPending = false;
       }
       site = nextSite;
     },
@@ -390,6 +395,13 @@ export function createSessionRefusalController(deps: SessionRefusalDeps): Sessio
       serving = logicalId;
     },
     noteCommitted: () => {
+      // A successful request ends a HARD-refusal streak. Soft redos are judged
+      // after commit and keep their separate walk until delivery/site change.
+      if (hardRetryPending) {
+        walk?.resetStreak();
+        hardRetryPending = false;
+        lastOutcome = undefined;
+      }
       retryTarget = undefined;
     },
   };
