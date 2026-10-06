@@ -214,6 +214,12 @@ export type SessionFacetsResponse = Schema.Schema.Type<typeof SessionFacetsRespo
  * block. Token/cost fields are nullable ("unknown", rendered "—").
  */
 export const ToolInvocation = Schema.Struct({
+  metadata: Schema.optional(Schema.Struct({
+    requestId: Schema.optional(Schema.String), mode: Schema.optional(Schema.String),
+    costProvenance: Schema.optional(Schema.String), estimateVersion: Schema.optional(Schema.String),
+    latencyMs: Schema.optional(Schema.Number), reportedCost: Schema.NullOr(Schema.Number),
+    jobId: Schema.optional(Schema.String), state: Schema.optional(Schema.String), stopReason: Schema.optional(Schema.String)
+  })),
 	id: Schema.String,
 	toolCallId: Schema.NullOr(Schema.String),
 	toolName: Schema.String,

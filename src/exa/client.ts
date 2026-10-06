@@ -13,7 +13,7 @@ function validateCost(value: Record<string, unknown>): boolean {
   return value.costDollars === undefined || (object(value.costDollars) && typeof value.costDollars.total === "number" && Number.isFinite(value.costDollars.total) && value.costDollars.total >= 0);
 }
 function retrieval(value: unknown): value is ExaRetrievalResponse {
-  return object(value) && Array.isArray(value.results) && value.results.every((item) => object(item) && typeof item.url === "string" && ["text", "title", "author", "publishedDate", "id"].every((key) => item[key] === undefined || typeof item[key] === "string") && (item.highlights === undefined || (Array.isArray(item.highlights) && item.highlights.every((h) => typeof h === "string")))) && validateCost(value) && (value.statuses === undefined || (Array.isArray(value.statuses) && value.statuses.every((s) => object(s) && typeof s.id === "string" && typeof s.status === "string")));
+  return object(value) && Array.isArray(value.results) && value.results.every((item) => object(item) && typeof item.url === "string" && ["text", "title", "author", "publishedDate", "id"].every((key) => item[key] === undefined || (["title", "author", "publishedDate"].includes(key) && item[key] === null) || typeof item[key] === "string") && (item.highlights === undefined || (Array.isArray(item.highlights) && item.highlights.every((h) => typeof h === "string")))) && validateCost(value) && (value.statuses === undefined || (Array.isArray(value.statuses) && value.statuses.every((s) => object(s) && typeof s.id === "string" && typeof s.status === "string")));
 }
 function run(value: unknown): value is ExaRun {
   return object(value) && typeof value.id === "string" && /^[A-Za-z0-9_.:-]{1,200}$/.test(value.id) && ["queued", "running", "completed", "failed", "cancelled"].includes(String(value.status)) && validateCost(value) && (value.output === undefined || (object(value.output) && (value.output.text === undefined || typeof value.output.text === "string")));
@@ -71,7 +71,8 @@ export class ExaClient {
             const retryMs = Number.isFinite(numeric) ? numeric * 1000 : retry ? Date.parse(retry) - this.now() : 30000;
             throw new ExaError(code, `Exa ${scope} returned HTTP ${response.status}.`, scope, response.status, code === "rate_limited" ? this.now() + Math.max(1000, Math.min(300000, Number.isFinite(retryMs) ? retryMs : 30000)) : undefined, requestId, scope === "research-create" && response.status >= 500);
           }
-          if (!validate(value)) throw new ExaError("invalid_response", "Exa returned an unsupported response shape.", scope, response.status, undefined, requestId, scope === "research-create");
+          if (!validate(value)) throw new ExaError("invalid_response", "Exa returned an unsupported response shape.", scope, response.status, undefined, requestId, scope === "research-create", object(value) && validateCost(value) ? (value.costDollars as { total: number } | undefined)?.total : undefined);
+          if (object(value) && Array.isArray(value.results)) for (const item of value.results) if (object(item)) for (const key of ["title", "author", "publishedDate"]) if (item[key] === null) delete item[key];
           admission.success(); return value;
         } catch (cause) {
           const error = cause instanceof ExaError ? cause : new ExaError(caller?.aborted ? "aborted" : controller.signal.aborted ? "timeout" : "transport_failed", caller?.aborted ? "Exa call aborted; remote work may still exist." : controller.signal.aborted ? "Exa request timed out." : "Exa transport failed.", scope, undefined, undefined, undefined, scope === "research-create" && sent);

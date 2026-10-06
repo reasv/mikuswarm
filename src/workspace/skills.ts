@@ -79,6 +79,8 @@ export async function scanSkills(
 
     const tools = frontmatterToolPatterns(frontmatter);
     if (tools) meta.tools = tools;
+    const requirements = frontmatterToolPatterns({ tools: frontmatter.requires_any_tools });
+    if (requirements) meta.requiresAnyTools = requirements;
 
     if (alwaysLoaded) {
       meta.content = body;
@@ -206,4 +208,14 @@ function unquote(value: string): string {
     return value.slice(1, -1);
   }
   return value;
+}
+
+
+/** Requirements inspect the permitted catalog, independent of transient health/loading. */
+export function skillRequirementsMet(patterns: string[] | undefined, catalogNames: readonly string[]): boolean {
+  return !patterns?.length || patterns.some(pattern => catalogNames.some(name => pattern.endsWith("*") ? name.startsWith(pattern.slice(0, -1)) : name === pattern));
+}
+export function eligibleSkillIndex(index: SkillIndex, catalogNames: readonly string[]): SkillIndex {
+  const eligible = (skill: SkillMeta) => skillRequirementsMet(skill.requiresAnyTools, catalogNames);
+  return { listed: index.listed.filter(eligible), inlined: index.inlined.filter(eligible) };
 }

@@ -1422,6 +1422,10 @@ export function resolveFixture(pathname: string, params: URLSearchParams): unkno
 	const agent = coerceAgent(params.get('agent'));
 
 	switch (pathname) {
+		case '/api/exa':
+      return {enabled:false,researchEnabled:false,health:null};
+    case '/api/exa/jobs':
+      return {jobs:[],total:0,nextCursor:null};
 		case '/api/agents':
 			return agentsFixture();
 		case '/api/usage/summary':

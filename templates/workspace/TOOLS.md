@@ -26,12 +26,11 @@ another channel goes through the **contacts skill**.
 
 ## Web
 
-The default deployment serves web access through the Exa tools (always loaded):
+Use the configured retrieval tools:
 
-- `mcp_exa_web_search_exa`: web search (title/URL/snippet results). `mcp_exa_web_fetch_exa`: fetch a URL's readable text. `mcp_exa_web_search_advanced_exa` (deferred — `tool_search` it) adds filters and more results when plain search isn't enough.
-- Deployments using the native tools instead have `web_search` / `web_fetch` in the same roles.
-- X/Twitter blocks generic fetchers — use the x-twitter skill for x.com content. For recent/breaking news, its `x_search` is usually fresher than web search.
-- JS-heavy, login-gated, or bot-checked pages need the browser skill.
+- Native Exa: `exa_search` for lookup, `exa_fetch` for source reading; load `web-research` for filters, structured extraction, verification and X coverage. Legacy deployments may expose `mcp_exa_web_search_exa` / `mcp_exa_web_fetch_exa` or permitted `web_search` / `web_fetch` instead.
+- Load `deep-research` for substantial delegated investigations or retrieving/continuing earlier research; small lookups use search/fetch.
+- X links need `x-twitter`; verify social claims against primary sources. Interactive, login-gated or JavaScript pages need `browser`.
 
 ## Files
 

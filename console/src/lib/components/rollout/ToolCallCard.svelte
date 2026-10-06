@@ -56,6 +56,15 @@
 			<Badge class="bg-red-500/15 text-[10px] text-red-600 dark:text-red-400">error</Badge>
 		{/if}
 	</div>
+  {#if usage?.metadata}
+    <div class="border-b px-3 py-2 text-xs text-muted-foreground" data-testid="tool-service-metadata">
+      {usage.metadata.mode ? `${usage.metadata.mode} · ` : ''}{usage.metadata.latencyMs !== undefined ? `${usage.metadata.latencyMs}ms · ` : ''}
+      provider cost {usage.metadata.reportedCost === null ? 'unknown' : formatUsd(usage.metadata.reportedCost)} · ledger {usage.cost === null ? 'unknown' : formatUsd(usage.cost)}{usage.metadata.costProvenance ? ` (${usage.metadata.costProvenance})` : ''}
+      {#if usage.metadata.requestId}<span class="ml-2 font-mono">request {usage.metadata.requestId}</span>{/if}
+      {#if usage.metadata.jobId}<span class="ml-2 font-mono">job {usage.metadata.jobId}</span>{/if}
+    </div>
+  {/if}
+
 	<div class="px-3 py-2">
 		<div class="text-[10px] tracking-wide text-muted-foreground uppercase">args</div>
 		<pre class="overflow-x-auto text-xs whitespace-pre-wrap">{argsPretty}</pre>

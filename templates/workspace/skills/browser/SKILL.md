@@ -1,6 +1,6 @@
 ---
 name: browser
-description: Drive a real stealth web browser (one persistent identity — shared cookies/logins) via the `browser` tool to read and interact with JS-heavy, login-gated, or bot-checked sites. Use when web_fetch is not enough — for clicking, typing, forms, multi-step flows, or pages that need a real browser to render.
+description: Drive a real stealth web browser (one persistent identity — shared cookies/logins) via the `browser` tool to read and interact with JS-heavy, login-gated, or bot-checked sites. Use when configured text fetch (exa_fetch, MCP fetch or web_fetch) is not enough — for clicking, typing, forms, multi-step flows, or pages that need a real browser to render.
 tools:
   - browser
 ---
@@ -9,12 +9,12 @@ tools:
 
 **Purpose:** Operate a single persistent, stealth Chromium identity to read and interact with the live web. Everything is driven through one tool, `browser`, whose behaviour is selected by the `action` field.
 
-## When to use this vs `web_fetch`
+## When to use this vs text fetch
 
-- **`web_fetch`** — first choice for *just reading* a page's text or markdown. Faster, cheaper, no session.
+- **Text fetch** — first choice for reading: `exa_fetch` when native Exa is available, otherwise the configured MCP fetch or permitted `web_fetch`. Load `web-research` for source verification and provider guidance.
 - **`browser`** — use when you actually need a browser: interactive or JS-heavy pages, login/cookie-gated content, bot-checked sites, multi-step flows (search → click → read), forms, file uploads, or anything that only renders after scripts run.
 
-If a plain read works, prefer `web_fetch`. Reach for `browser` when it doesn't.
+If a plain read works, prefer the available text-fetch tool. Reach for `browser` when it does not.
 
 ## The core loop
 
@@ -199,7 +199,7 @@ Failures come back as `browser:<code> — <message>`. Common ones and what to do
 - **`evaluate_disabled`** — `act:evaluate` is off in this deployment. Achieve the goal with click/type/etc. instead.
 - **`evaluate_failed`** — your JS threw on the page. Fix the expression.
 - **`pdf_failed`** — the `pdf` export couldn't be produced or written. Fall back to a full-page `screenshot` if you just need to save what the page looks like.
-- **`backend_unavailable`** — the browser backend is down. The browser is unavailable right now; fall back to `web_fetch` if you only need to read, and tell the user the browser isn't reachable.
+- **`backend_unavailable`** — the browser backend is down. The browser is unavailable right now; use `exa_fetch` if available, otherwise a permitted MCP fetch or `web_fetch`, when you only need to read, and tell the user the browser isn't reachable.
 - **`bad_request`** — malformed action/params (e.g. missing `url`, bad upload path, `wait` with no/too-many conditions). Re-read the action's required fields.
 
 ## Strategy notes

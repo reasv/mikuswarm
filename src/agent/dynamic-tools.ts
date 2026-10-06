@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import type { AgentMessage, AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Logger } from "../observability/logger.js";
 import type { SkillMeta } from "../workspace/types.js";
-import { frontmatterToolPatterns, parseFrontmatter } from "../workspace/skills.js";
+import { frontmatterToolPatterns, parseFrontmatter, skillRequirementsMet } from "../workspace/skills.js";
 import { resolveWorkspacePath } from "../tools/workspace.js";
 import { renderToolBlock } from "../context/tool-block.js";
 
@@ -376,6 +376,8 @@ export function wrapEditorWithSkillActivation(
       const raw = await readFile(absolute, "utf-8");
       const parsed = parseFrontmatter(raw);
       if (!parsed) return result;
+      const requirements = frontmatterToolPatterns({ tools: parsed.frontmatter.requires_any_tools });
+      if (!skillRequirementsMet(requirements, registry.catalogNames())) return result;
       const patterns = frontmatterToolPatterns(parsed.frontmatter);
       if (!patterns) return result;
       const { added } = registry.load(registry.matchCatalog(patterns));

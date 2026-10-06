@@ -1,3 +1,4 @@
+import { exaHealth, exaJobs } from "./exa-handlers.js";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
 import { isAuthorized } from "./auth.js";
@@ -89,6 +90,8 @@ export function createObservabilityServer(deps: ConsoleServerDeps): ConsoleServe
 
   const router = new Router()
     .add("GET", "/api/agents", agentsSnapshot)
+    .add("GET", "/api/exa", exaHealth)
+    .add("GET", "/api/exa/jobs", exaJobs)
     .add("GET", "/api/rooms", createCachedRoomsHandler(deps.storage))
     .add("GET", "/api/rooms/:key/context", roomContext)
     .add("GET", "/api/rooms/:key/sessions", roomSessions)

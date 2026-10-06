@@ -15,7 +15,9 @@
 
 	// Active area from the URL so deep-links + back/forward reflect the right view.
 	const area = $derived(
-		page.url.pathname.startsWith('/pipelines')
+		page.url.pathname.startsWith('/research')
+      ? 'research'
+      : page.url.pathname.startsWith('/pipelines')
 			? 'pipelines'
 			: page.url.pathname.startsWith('/scheduler')
 				? 'scheduler'
@@ -148,11 +150,14 @@
 		>
 			Models
 		</a>
+    <a href="/research" class={cn('rounded px-2 py-0.5 transition-colors', area === 'research' ? 'bg-background font-medium text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground')}>Research</a>
 	</nav>
 
 	<span class="text-muted-foreground">/</span>
 
-	{#if area === 'scheduler'}
+	{#if area === 'research'}
+    <span class="text-muted-foreground">Exa health &amp; jobs</span>
+  {:else if area === 'scheduler'}
 		<nav class="flex min-w-0 items-center gap-1 text-muted-foreground">
 			<span>llm scheduler</span>
 		</nav>

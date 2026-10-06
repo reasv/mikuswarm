@@ -113,6 +113,8 @@ export interface SkillMeta {
    * immediate set at session build. Absent = pure-instructions skill.
    */
   tools?: string[];
+  /** At least one configured catalog capability is required to advertise/load. */
+  requiresAnyTools?: string[];
 }
 
 export interface SkillIndex {

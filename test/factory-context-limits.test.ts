@@ -1204,3 +1204,32 @@ test("factory applies health-selected immediates and notices after real tool all
   assert.match(factory.toolBlockFor(perMemberSession().timelineKey, "default")!.segments.map((segment) => segment.text).join("\n"), /web_search/);
   assert.doesNotMatch(factory.toolBlockFor(perMemberSession().timelineKey, "default")!.segments.map((segment) => segment.text).join("\n"), /"name": "exa_search"/);
 });
+
+test("factory routing index and real synthetic skill preloads use eligible full catalog", async () => {
+  const { mkdtemp, mkdir, writeFile, rm } = await import("node:fs/promises");
+  const path = await import("node:path");
+  const os = await import("node:os");
+  const { Type } = await import("@earendil-works/pi-ai");
+  const root = await mkdtemp(path.join(os.tmpdir(), "factory-skill-requirements-"));
+  try {
+    for (const [name, required, toolName] of [["web", "exa_search", "exa_search"], ["deep", "exa_research", "exa_research"], ["unavailable", "forbidden", "forbidden"]]) {
+      await mkdir(path.join(root, "skills", name!), { recursive: true });
+      await writeFile(path.join(root, "skills", name!, "SKILL.md"), `---\nname: ${name}\ndescription: ${name} work\nrequires_any_tools: [${required}]\ntools: [${toolName}]\n---\n${name} instructions`);
+    }
+    const config = perMemberConfig(); config.workspace.root_dir = root;
+    config.agent.tools = { dynamic: { enabled: true, immediate: [] } };
+    config.agent.session_types = { default: { tools: ["exa_search", "exa_research"], tools_dynamic: true } };
+    const tools = ["exa_search", "exa_research", "forbidden"].map(name => ({ name, label: name, description: name, parameters: Type.Object({}), execute: async () => ({ content: [] }) }));
+    const factory = new AgentSessionFactory({ config, contextBuilder: stubCtxBuilder(minimalBuilt()), getActiveSessions: () => [] });
+    let observed: string[] = [];
+    const created = await factory.create(perMemberSession(), tools, { route: async ({ listedSkills }) => {
+      observed = listedSkills.map(skill => skill.name);
+      return { task: "deep", tasks: ["web", "deep"], models: [], skills: ["web", "deep", "unavailable"], tailFiles: [] };
+    } });
+    assert.deepEqual(observed, ["deep", "web"]);
+    assert.equal(created.agent.state.tools.some(tool => tool.name === "exa_search"), true);
+    assert.equal(created.agent.state.tools.some(tool => tool.name === "exa_research"), true);
+    assert.equal(created.agent.state.tools.some(tool => tool.name === "forbidden"), false);
+    assert.doesNotMatch(created.agent.state.systemPrompt, /unavailable work/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

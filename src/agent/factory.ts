@@ -1,3 +1,4 @@
+import { eligibleSkillIndex } from "../workspace/skills.js";
 import { Agent } from "@earendil-works/pi-agent-core";
 import type { AgentMessage, AgentTool, PrepareNextTurnContext, StreamFn } from "@earendil-works/pi-agent-core";
 import { createAssistantMessageEventStream, type Api, type Model, type AssistantMessage, type OpenRouterRouting } from "@earendil-works/pi-ai";
@@ -764,6 +765,11 @@ export class AgentSessionFactory {
     let earlyWorkspace: WorkspaceContent | undefined;
     if (opts?.route && !opts.resume) {
       earlyWorkspace = await loadWorkspace(workspaceRoot, sessionTypeConfig);
+      const routingAgent = this.options.resolveAgentName?.(session.timelineKey) ?? null;
+      const routingCatalog = filterTools(filterMcpToolsByAllowlist(tools,
+        routingAgent !== null ? this.options.config.agents?.[routingAgent]?.mcp_servers : undefined,
+        this.options.mcpToolServerMap ?? new Map()), sessionTypeConfig);
+      earlyWorkspace.skills = eligibleSkillIndex(earlyWorkspace.skills, routingCatalog.map(tool => tool.name));
       try {
         routing = await opts.route({ listedSkills: earlyWorkspace.skills.listed });
       } catch (error) {
@@ -1805,6 +1811,7 @@ export class AgentSessionFactory {
     const mcpToolServerMap = this.options.mcpToolServerMap ?? new Map<string, string>();
     const mcpFilteredTools = filterMcpToolsByAllowlist(tools, agentMcpServers, mcpToolServerMap);
     const filteredTools = filterTools(mcpFilteredTools, sessionTypeConfig);
+    workspace.skills = eligibleSkillIndex(workspace.skills, filteredTools.map(tool => tool.name));
     workspace.runtimeNotices = [...new Set(filteredTools.map((tool) => (tool as AgentTool & { availabilityNotice?: string }).availabilityNotice).filter((notice): notice is string => !!notice))];
     const logger = this.options.logger;
 
@@ -2011,7 +2018,7 @@ export class AgentSessionFactory {
           ? await this.buildRoutedSatellite(routing, { workspace, workspaceRoot, sessionId: session.id })
           : { preloadedSkills: [], tailFiles: [] };
       const state: SessionRoutingState = {
-        skills: routing.skills,
+        skills: routing.skills.filter(name => workspace.skills.listed.some(skill => skill.name === name)),
         ...(routedHead ? { model: routedHead } : {}),
         ...(userSelection && routedCascade.length > 0 ? { cascade: routedCascade } : {}),
         ...(routedThinking ? { thinkingLevel: routedThinking } : {}),
@@ -2038,7 +2045,7 @@ export class AgentSessionFactory {
       // One synthetic load_skill spec per preloaded skill.  They are executed
       // below (after agent + registry.onChange are both wired) so the registry
       // load, tool-definition charge, and harness marker all land correctly.
-      for (const name of routing.skills) {
+      for (const name of state.skills) {
         routingSkillSpecs.push({
           name: "load_skill",
           params: { name },
@@ -2669,6 +2676,7 @@ export class AgentSessionFactory {
     const previewDefs = this.options.buildToolDefs?.(timelineKey, "default");
     let previewTools = previewDefs;
     if (previewDefs) {
+      workspace.skills = eligibleSkillIndex(workspace.skills, previewDefs.map(definition => definition.name));
       workspace.runtimeNotices = [...new Set(previewDefs.map((definition) => definition.availabilityNotice).filter((notice): notice is string => !!notice))];
       const split = this.splitDefsForDynamic(previewDefs, sessionTypeConfig, workspace);
       if (split) {

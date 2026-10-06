@@ -8001,6 +8001,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   if (config.observability?.server?.enabled) {
     consoleServer = createObservabilityServer({
       config: config.observability.server,
+      ...(exaClient ? { exa: { enabled: true, researchEnabled: exaConfig.research.enabled, health: () => exaClient.health.snapshot() } } : {}),
       storage,
       factory,
       sessions,

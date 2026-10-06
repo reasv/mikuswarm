@@ -1049,7 +1049,22 @@ function sessionMeta(
  * (rendered "—", never 0).
  */
 function toolInvocationWire(row: ToolInvocationRow): Record<string, unknown> {
+  const metadata: Record<string, unknown> = {};
+  if (row.metadata_json) {
+    try {
+      const source = JSON.parse(row.metadata_json);
+      if (source && typeof source === "object") {
+        for (const key of ["requestId", "mode", "costProvenance", "estimateVersion", "jobId", "state", "stopReason"]) {
+          if (typeof source[key] === "string") metadata[key] = source[key].slice(0, 200);
+        }
+        if (Number.isFinite(source.latencyMs) && source.latencyMs >= 0) metadata.latencyMs = source.latencyMs;
+        const reported = typeof source.reportedCost === "number" ? source.reportedCost : source.reportedCost?.total;
+        metadata.reportedCost = Number.isFinite(reported) && reported >= 0 ? reported : null;
+      }
+    } catch { /* legacy invalid metadata is omitted */ }
+  }
   return {
+    ...(Object.keys(metadata).length ? { metadata } : {}),
     id: row.id,
     toolCallId: row.tool_call_id,
     toolName: row.tool_name,

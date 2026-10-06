@@ -113,3 +113,17 @@ test("freshness provider crawl timeout stays within 90 seconds independently of 
   assert.equal(f.calls[1].body.livecrawlTimeout, 90000);
   assert.equal(f.client.config.request_timeout_ms, 120000);
 });
+
+test("successful malformed paid retrieval records once while still failing", async () => {
+  for (const name of ["exa_search", "exa_search_advanced", "exa_fetch"]) {
+    for (const costDollars of [{ total: 0.02 }, undefined]) {
+      const f = fixture({ results: [{ url: 123 }], requestId: "req_paid", costDollars });
+      await assert.rejects(f.run(name, name === "exa_fetch" ? { urls: ["https://example.com"] } : { query: "facts" }), /unsupported response shape/);
+      assert.equal(f.records.length, 1);
+      assert.equal(f.records[0].metadata.requestId, "req_paid");
+      assert.equal(f.records[0].metadata.costProvenance, costDollars ? "reported" : "estimated");
+      assert.ok(f.records[0].cost > 0);
+      if (costDollars) assert.equal(f.records[0].cost, 0.02);
+    }
+  }
+});

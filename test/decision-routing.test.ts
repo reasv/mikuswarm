@@ -397,7 +397,7 @@ test("factory: routing skill preloads inject synthetic load_skill calls; satelli
     const fresh = await factory.create(session(), tools, {
       route: async ({ listedSkills }) => {
         assert.deepEqual(listedSkills.map((s) => s.name), ["shell"]);
-        // "ghost" not in workspace → synthetic call produces an error toolResult.
+        // "ghost" not in workspace → eligibility excludes it before injection.
         return verdict({ skills: ["shell", "ghost"], tailFiles: ["tail/code.md", "tail/missing.md"] });
       },
     });
@@ -411,10 +411,9 @@ test("factory: routing skill preloads inject synthetic load_skill calls; satelli
     assert.deepEqual(sat.preloadedSkills, [], "no skill bodies in satellite (W5)");
     assert.deepEqual(sat.tailFiles, [{ source: "tail/code.md", content: "Code tail." }]);
 
-    // kickoff = [finalTurn, synth_assistant_shell, synth_toolResult_shell,
-    //            synth_assistant_ghost, synth_toolResult_ghost]
+    // kickoff contains the final turn and the eligible shell skill messages.
     assert.ok(Array.isArray(fresh.kickoff), "kickoff is an array");
-    assert.equal(fresh.kickoff.length, 5, "finalTurn + 2 messages per skill spec");
+    assert.equal(fresh.kickoff.length, 3, "finalTurn + 2 messages for the eligible skill");
     assert.equal(fresh.kickoff[1].role, "assistant");
     assert.equal(fresh.kickoff[2].role, "toolResult");
     assert.equal(fresh.kickoff[2].addedToolNames?.includes("bash"), true, "shell toolResult carries addedToolNames");
@@ -422,7 +421,7 @@ test("factory: routing skill preloads inject synthetic load_skill calls; satelli
 
     // Persisted state has skills, no tools (W5: transcript is the tool source of truth).
     await new Promise((r) => setImmediate(r));
-    assert.deepEqual(persisted.get("s-route"), { skills: ["shell", "ghost"], tasks: ["coding"] });
+    assert.deepEqual(persisted.get("s-route"), { skills: ["shell"], tasks: ["coding"] });
 
     // Resume: routing callback NOT called; tools derived from transcript addedToolNames.
     let routedOnResume = false;

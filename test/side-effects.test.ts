@@ -23,6 +23,7 @@ async function declaredToolNames(): Promise<Set<string>> {
     if (!file.endsWith(".ts") || file === "side-effects.ts") continue;
     const source = await readFile(path.join(dir, file), "utf8");
     for (const m of source.matchAll(/\bname: "([a-z_]+)"/g)) names.add(m[1]!);
+    for (const m of source.matchAll(/\bname: \w+ \? "([a-z_]+)" : "([a-z_]+)"/g)) { names.add(m[1]!); names.add(m[2]!); }
     for (const m of source.matchAll(/\b[A-Z_]+_NAME = "([a-z_]+)"/g)) names.add(m[1]!);
   }
   return names;
@@ -71,4 +72,9 @@ test("isPostingTool: the gated message tools only", () => {
   assert.deepEqual([...POSTING_TOOL_NAMES].sort(), ["create_poll", "edit_message", "send_dm", "send_message", "send_to_channel"]);
   for (const name of POSTING_TOOL_NAMES) assert.equal(isPostingTool(name), true);
   for (const name of ["media", "react", "no_reply", "image_generate", "mcp_x_post"]) assert.equal(isPostingTool(name), false, name);
+});
+
+test("Exa paid reads follow existing redo-safe read policy; create/cancel do not", () => {
+  for (const name of ["exa_search", "exa_search_advanced", "exa_fetch", "exa_research_list", "exa_research_result"]) assert.equal(toolEffect(name), "redo_safe", name);
+  for (const name of ["exa_research", "exa_research_cancel"]) assert.equal(toolEffect(name), "irreversible", name);
 });

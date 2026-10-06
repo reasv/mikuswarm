@@ -195,7 +195,30 @@ Research visibility requires the owning agent plus channel visibility, and list
 filters authorization before pagination. Agent tools permit cancellation only by
 the originating requester; the service's trusted-operator flag is a host API and
 is never supplied by model arguments. Job identities and accounting records are
-retained; this version provides no research pruning policy. Full durable output
+retained; this version provides no research pruning policy.
+
+`web-research` activates retrieval, permitted direct/MCP fallbacks and Grok X
+search/fetch; `deep-research` activates research lifecycle plus evidence tools.
+These workflow skills are deferred; only native basic search/fetch are initially
+loaded when healthy. Skills are seeded only when absent, preserving operator
+edits. Optional `requires_any_tools` frontmatter accepts exact names/trailing-star
+patterns. Eligibility checks the permitted catalog before routing and prompt
+index construction, then again for final catalog, live `load_skill`, editor
+activation, synthetic routing preloads and console preview. Breaker changes do
+not remove configured capabilities or skills. No routing model questions changed:
+independent task labels union their skill preloads; topic-only labels can coexist.
+`config/examples/exa.toml` supplies opt-in configuration and task mappings.
+
+The authenticated operator API exposes `/api/exa` health and `/api/exa/jobs`
+bounded job summaries; the console Exa page presents these without API keys or
+full inputs/output. It starts no jobs and sends no completion messages.
+
+Prompt overhead measured against the shipped anonymous MCP's actual `tools/list`
+on 2026-10-06, with the default gpt-tokenizer: basic MCP search/fetch 484 tokens,
+all three MCP tools 1,359; native basic search/fetch 256, all retrieval tools 649,
+and four research tools 568. Advanced/research schemas are deferred until loaded;
+these tool-block figures exclude workflow bodies and other session tools.
+ Full durable output
 and grounding can be read in bounded pages through `exa_research_result`.
 
 ### Schema shape

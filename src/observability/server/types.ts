@@ -1,3 +1,4 @@
+import type { ExaHealth } from "../../exa/health.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ObservabilityServerConfig } from "../../config/index.js";
 import type { Storage } from "../../storage/index.js";
@@ -73,6 +74,7 @@ export interface ConsoleCheckInfo {
  * and every JSON response is redacted before it leaves the process.
  */
 export interface ConsoleServerDeps {
+  exa?: { enabled: boolean; researchEnabled: boolean; health: () => ReturnType<ExaHealth["snapshot"]> };
   config: ObservabilityServerConfig;
   storage: Storage;
   factory: AgentSessionFactory;

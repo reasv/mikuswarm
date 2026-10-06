@@ -4,5 +4,5 @@ export type ExaErrorCode = "invalid_request" | "auth_failed" | "credit_exhausted
 export class ExaError extends Error {
   constructor(readonly code: ExaErrorCode, message: string, readonly scope: ExaScope,
     readonly status?: number, readonly retryAt?: number, readonly requestId?: string,
-    readonly submissionUncertain = false) { super(message); this.name = "ExaError"; }
+    readonly submissionUncertain = false, readonly reportedCostUsd?: number) { super(message); this.name = "ExaError"; }
 }

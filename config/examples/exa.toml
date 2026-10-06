@@ -1,0 +1,28 @@
+# Optional native search. Inject EXA_API_KEY into the process/container environment.
+[exa]
+enabled = true
+api_key = "${EXA_API_KEY}"
+
+# Separately opt in to paid delegated research; retrieval needs no research gate.
+[exa.research]
+enabled = false
+default_effort = "low"
+max_effort = "medium"
+
+# Merge these labels into an existing operator routing configuration.
+# Independent questions can select several labels; these entries add no model routes.
+[decisions.routing.tasks.web_research]
+description = "Online lookup, source reading, current facts, verification or sourced comparison, including investigations needing web evidence"
+skills = ["web-research"]
+
+[decisions.routing.tasks.deep_research]
+description = "Substantial multi-source investigation or researched list-building/enrichment"
+skills = ["web-research", "deep-research"]
+
+[decisions.routing.tasks.research_followup]
+description = "Check, retrieve, extend or cancel previously delegated research"
+skills = ["deep-research"]
+
+[decisions.routing.tasks.news]
+description = "News or current events topic; can overlap with evidence gathering"
+# Topic-only label. web_research selects the workflow independently.

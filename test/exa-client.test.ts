@@ -55,3 +55,20 @@ test("invalid arguments make no requests", () => {
   assert.throws(() => client.createRun({ query: "q", effort: "high" }), /effort/);
   assert.equal(calls, 0);
 });
+
+test("contents normalizes nullable provider metadata without losing reported cost", async () => {
+  const fixture = { requestId: "sanitized_request", results: [{ id: "https://example.com/article", url: "https://example.com/article", title: "Public article", author: null, publishedDate: null, text: "Sanitized provider content" }], statuses: [{ id: "https://example.com/article", status: "success" }], costDollars: { total: 0.001 } };
+  const client = new ExaClient(cfg(), async () => json(fixture));
+  const result = await client.contents({ urls: ["https://example.com/article"] });
+  assert.equal(result.results[0]?.author, undefined);
+  assert.equal(result.results[0]?.publishedDate, undefined);
+  assert.equal(result.results[0]?.text, "Sanitized provider content");
+  assert.equal(result.costDollars?.total, 0.001);
+  const nullableTitle = new ExaClient(cfg(), async () => json({ results: [{ url: "https://example.com", title: null }] }));
+  assert.equal((await nullableTitle.search(search)).results[0]?.title, undefined);
+});
+
+test("malformed successful retrieval preserves only sanitized accounting fields", async () => {
+  const client = new ExaClient(cfg(), async () => json({ requestId: "req_paid", results: [{ url: 123, secret: "private-body" }], costDollars: { total: 0.02 } }));
+  await assert.rejects(client.search(search), (e: ExaError) => e.code === "invalid_response" && e.reportedCostUsd === 0.02 && e.requestId === "req_paid" && !JSON.stringify(e).includes("private-body"));
+});

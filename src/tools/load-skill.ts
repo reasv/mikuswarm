@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { resolveWorkspacePath } from "./workspace.js";
-import { frontmatterToolPatterns, parseFrontmatter } from "../workspace/skills.js";
+import { frontmatterToolPatterns, parseFrontmatter, skillRequirementsMet } from "../workspace/skills.js";
 import type { SkillIndex } from "../workspace/types.js";
 import type { DynamicToolRegistry } from "../agent/dynamic-tools.js";
 import type { Logger } from "../observability/logger.js";
@@ -69,16 +69,20 @@ export function createLoadSkillTool(context: LoadSkillContext): AgentTool {
         throw new Error(`Unknown skill "${name}". Available skills: ${available}.${inlinedNote}`);
       }
 
+      if (!skillRequirementsMet(meta.requiresAnyTools, registry.catalogNames())) throw new Error(`Skill "${name}" requires a capability unavailable in this session.`);
+
       // Body + tools list read LIVE from disk (freshest content; matches the
       // editor-hook's content-keyed behavior). Fall back to the scan-time
       // metadata when the live read/parse fails (file deleted mid-session).
       let body: string | undefined;
       let patterns = meta.tools ?? [];
+      let liveRequirements = meta.requiresAnyTools;
       try {
         const absolute = resolveWorkspacePath(context.workspaceRoot, meta.path);
         const raw = await readFile(absolute, "utf-8");
         const parsed = parseFrontmatter(raw);
         if (parsed) {
+          liveRequirements = frontmatterToolPatterns({ tools: parsed.frontmatter.requires_any_tools });
           body = parsed.body;
           patterns = frontmatterToolPatterns(parsed.frontmatter) ?? [];
         } else {
@@ -90,6 +94,8 @@ export function createLoadSkillTool(context: LoadSkillContext): AgentTool {
       if (body === undefined) {
         throw new Error(`Skill "${name}" could not be read from ${meta.path}.`);
       }
+
+      if (!skillRequirementsMet(liveRequirements, registry.catalogNames())) throw new Error(`Skill "${name}" requires a capability unavailable in this session.`);
 
       // matchCatalog already excludes harness-only tools (CONTRACT §2).
       const matchedNames = registry.matchCatalog(patterns);

@@ -1,6 +1,6 @@
 ---
 name: x-twitter
-description: X/Twitter access — fetch a specific post/thread by URL or id (`x_fetch`) or run a live cited search over X via Grok (`x_search`). The freshest source available for recent/breaking news and real-time happenings — for anything time-sensitive, load this before reaching for web search. Also for any x.com link the enrichment didn't cover (X blocks generic web fetchers).
+description: X/Twitter access — fetch a specific post/thread by URL or id (`x_fetch`) or run a live cited search over X via Grok (`x_search`). Useful for recent reports, reactions and real-time happenings; verify factual claims against primary web sources. Also for any x.com link the enrichment didn't cover (X blocks generic web fetchers).
 tools:
   - x_fetch
   - x_search
@@ -18,8 +18,8 @@ tools — never use a web fetcher for x.com content.
 Searches X via Grok, which acts like a sub-agent: it searches and reasons over
 X for you and returns a cited synthesis **plus the actual cited tweets**
 (verbatim text + media), top images already captioned. Grok can also pull in
-general web results. **This is your best source for recent / breaking news** —
-X is fresher than the web tools and far fresher than your training data.
+general web results. Use X for early reports and reactions; verify consequential claims against
+primary sources and publication dates. Web and X coverage complement each other.
 
 - `query`: the question in natural language ("what are people saying about the
   new patch", "find posts from @dev about the outage").

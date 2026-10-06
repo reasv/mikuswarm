@@ -38,7 +38,7 @@ export function createExaRetrievalTools(ctx: ExaRetrievalContext): AgentTool[] {
     if (!(cause instanceof ExaError)) throw cause;
     const permitted = ctx.fallbackNames?.filter((name) => name === (cause.scope === "contents" ? "web_fetch" : "web_search")) ?? [];
     const fallback = permitted.length ? ` Use tool_search to load ${permitted.join(" or ")} for basic fallback.` : "";
-    throw new ExaError(cause.code, `${cause.message}${cause.code === "invalid_request" ? " Correct request arguments; load web-research for permitted filters." : ""}${cause.retryAt ? ` Retry after ${new Date(cause.retryAt).toISOString()}.` : ""}${["exa_unavailable", "rate_limited", "transport_failed", "upstream_failed", "auth_failed", "credit_exhausted", "timeout"].includes(cause.code) ? fallback : ""}`, cause.scope, cause.status, cause.retryAt, cause.requestId, cause.submissionUncertain);
+    throw new ExaError(cause.code, `${cause.message}${cause.code === "invalid_request" ? " Correct request arguments; load web-research for permitted filters." : ""}${cause.retryAt ? ` Retry after ${new Date(cause.retryAt).toISOString()}.` : ""}${["exa_unavailable", "rate_limited", "transport_failed", "upstream_failed", "auth_failed", "credit_exhausted", "timeout"].includes(cause.code) ? fallback : ""}`, cause.scope, cause.status, cause.retryAt, cause.requestId, cause.submissionUncertain, cause.reportedCostUsd);
   };
   const budget = (tool: string, service: string) => { const reason = ctx.checkBudget?.(tool, service); if (reason) throw new Error(reason); };
   const record = (response: ExaRetrievalResponse, tool: string, call: string, started: number, kind: "search" | "contents", count: number, mode?: ExaSearchMode) => {
@@ -79,7 +79,10 @@ export function createExaRetrievalTools(ctx: ExaRetrievalContext): AgentTool[] {
       budget(advanced ? "exa_search_advanced" : "exa_search", "exa/search"); const started = Date.now();
       try { const response = await ctx.client.search(request, signal, advanced); const usage = record(response, advanced ? "exa_search_advanced" : "exa_search", call, started, "search", request.numResults!, request.type);
         return textResult(`${renderSearch(response, args.content_mode === "text")}${response.output ? `\n\nStructured output and grounding:\n${JSON.stringify(response.output)}` : ""}`, { ...response, usage });
-      } catch (cause) { return error(cause); }
+      } catch (cause) {
+        if (cause instanceof ExaError && cause.code === "invalid_response" && cause.status === 200) record({ results: [], requestId: cause.requestId, costDollars: cause.reportedCostUsd === undefined ? undefined : { total: cause.reportedCostUsd } }, advanced ? "exa_search_advanced" : "exa_search", call, started, "search", request.numResults!, request.type);
+        return error(cause);
+      }
     },
   });
   const fetch: AgentTool = {
@@ -111,6 +114,7 @@ export function createExaRetrievalTools(ctx: ExaRetrievalContext): AgentTool[] {
         });
         return textResult(outcomes.map((o) => o.status === "error" ? `${o.url}\n[fetch failed: ${JSON.stringify(o.error)}]` : `${o.title ?? o.url}\n${o.resolvedUrl}\n${o.text}${o.displayTruncated && o.contentId ? `\n[more: exa_fetch(content_id: "${o.contentId}", offset: ${max})]` : o.displayTruncated ? "\n[content could not be cached; refetch this URL with a larger max_chars]" : ""}`).join("\n\n"), { outcomes, usage });
       } catch (cause) {
+        if (cause instanceof ExaError && cause.code === "invalid_response" && cause.status === 200) record({ results: [], requestId: cause.requestId, costDollars: cause.reportedCostUsd === undefined ? undefined : { total: cause.reportedCostUsd } }, "exa_fetch", call, started, "contents", urls.length);
         if (ctx.backgroundFallback && cause instanceof ExaError && ["exa_unavailable", "auth_failed", "credit_exhausted", "rate_limited", "transport_failed", "upstream_failed", "timeout"].includes(cause.code) && args.max_age_hours === undefined && args.mode !== "highlights") {
           const results = []; for (const url of urls) { try { results.push(await ctx.backgroundFallback.execute(call, { url, max_chars: max }, signal)); } catch (err) { results.push(textResult(`[fetch failed: ${String(err)}]`, {})); } }
           return textResult(`[Fallback provider: direct web_fetch; Exa unavailable]\n${results.flatMap((r) => r.content.filter((c) => c.type === "text").map((c) => c.text)).join("\n\n")}`, { fallbackProvider: "web_fetch", urls });

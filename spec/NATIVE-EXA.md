@@ -1,6 +1,7 @@
 # Native Exa retrieval and research
 
-**Status:** PROPOSED — implementation plan; no runtime changes authorized by this document.
+**Status:** IMPLEMENTED — native retrieval, durable research, workflow discovery and operator monitoring.
+**Implementation adjustment:** research records are retained without an automatic pruning knob to preserve replay identity/accounting; no full-output console endpoint or model-controlled operator cancellation.
 **Baseline:** merged checkout `a13e914`, inspected 2026-10-05.
 **Target documentation on implementation:** ARCHITECTURE.md configuration, tool discovery, web tools, auxiliary/period/session cost accounting, persistence and console sections.
 

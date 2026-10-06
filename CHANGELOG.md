@@ -36,6 +36,13 @@ Unreleased section; it is not part of any release's notes.
 
 ### Added
 
+- Optional native Exa API search, batch page extraction and separately enabled
+  durable delegated research, with cost accounting, runtime fallback and recoverable
+  job results. New web/deep research skills combine web sources with Grok X evidence;
+  generic skill capability requirements prevent unavailable workflows being preloaded.
+- Operator console Exa health and saved research-job monitoring without exposing
+  API credentials or full research output.
+
 - **`cache_breakpoints = "explicit"` works on Anthropic models** (`api =
   "anthropic-messages"`, off by default). Two more `cache_control` markers go on
   the conversation summary and on the stable end of the room timeline, so a new
