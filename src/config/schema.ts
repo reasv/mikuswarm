@@ -1876,6 +1876,42 @@ const XSearchSchema = StrictObject({
 // block needn't ship a `${SAUCENAO_API_KEY}` template that would fail startup
 // when the env var is unset); the `enabled => api_key` invariant is enforced as
 // a cross-field check in app.ts (per the proactive-posting precedent).
+// Native Exa is opt-in; child defaults resolve in src/exa/config.ts.
+const ExaModeSchema = Type.Union((["auto", "fast", "instant", "deep", "deep-reasoning"] as const).map((value) => Type.Literal(value)));
+const ExaEffortSchema = Type.Union((["minimal", "low", "medium", "high", "xhigh"] as const).map((value) => Type.Literal(value)));
+const ExaSchema = StrictObject({
+  enabled: Type.Optional(Type.Boolean()), api_key: Type.Optional(Type.String()),
+  request_timeout_ms: Type.Optional(Type.Integer({ minimum: 1, maximum: 300000 })),
+  max_in_flight: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+  requests_per_second: Type.Optional(Type.Number({ minimum: 0.01, maximum: 100 })),
+  search: Type.Optional(StrictObject({
+    enabled: Type.Optional(Type.Boolean()), default_results: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+    max_results: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })), highlight_chars: Type.Optional(Type.Integer({ minimum: 1, maximum: 20000 })),
+    allowed_modes: Type.Optional(Type.Array(ExaModeSchema, { minItems: 1, uniqueItems: true })),
+    advanced_timeout_ms: Type.Optional(Type.Integer({ minimum: 1, maximum: 300000 })),
+  })),
+  fetch: Type.Optional(StrictObject({
+    enabled: Type.Optional(Type.Boolean()), max_urls: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+    display_chars: Type.Optional(Type.Integer({ minimum: 1, maximum: 200000 })),
+    extraction_chars: Type.Optional(Type.Integer({ minimum: 1, maximum: 200000 })),
+    max_extraction_chars: Type.Optional(Type.Integer({ minimum: 1, maximum: 200000 })),
+    content_ttl_hours: Type.Optional(Type.Number({ minimum: 0.01, maximum: 8760 })),
+    content_store_max_bytes: Type.Optional(Type.Integer({ minimum: 1 })),
+  })),
+  research: Type.Optional(StrictObject({
+    enabled: Type.Optional(Type.Boolean()), default_effort: Type.Optional(ExaEffortSchema), max_effort: Type.Optional(ExaEffortSchema),
+    allowed_data_sources: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 100, pattern: "^[a-z0-9_-]+$" }), { maxItems: 5, uniqueItems: true })),
+    max_in_flight: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+    poll_interval_ms: Type.Optional(Type.Integer({ minimum: 1, maximum: 300000 })),
+    wait_timeout_ms: Type.Optional(Type.Integer({ minimum: 1, maximum: 3600000 })),
+    retention_days: Type.Optional(Type.Integer({ minimum: 1, maximum: 3650 })),
+  })),
+  fallback: Type.Optional(StrictObject({
+    search: Type.Optional(Type.Union([Type.Literal("native"), Type.Literal("none")])),
+    fetch: Type.Optional(Type.Union([Type.Literal("native"), Type.Literal("none")])),
+  })),
+});
+
 const SauceNaoSchema = StrictObject({
   enabled: Type.Optional(Type.Boolean()),
   api_key: Type.Optional(Type.String({ minLength: 1 })),
@@ -2486,6 +2522,7 @@ export const AppConfigSchema = StrictObject({
   image_gen: Type.Optional(ImageGenSchema),
   x_search: Type.Optional(XSearchSchema),
   saucenao: Type.Optional(SauceNaoSchema),
+  exa: Type.Optional(ExaSchema),
   observability: Type.Optional(ObservabilitySchema),
   browser: Type.Optional(BrowserSchema),
   recovery: Type.Optional(RecoverySchema),

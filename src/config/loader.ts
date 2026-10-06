@@ -1,3 +1,4 @@
+import { resolveExaConfig } from "../exa/config.js";
 import { Value, ValueErrorType } from "@sinclair/typebox/value";
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
@@ -305,6 +306,7 @@ function validatePrefillSettings(config: AppConfig): void {
  * Runs after structural validation/decoding so all values are present and typed.
  */
 function validateConfig(config: AppConfig): void {
+  resolveExaConfig(config.exa);
   // Observability console auth (issue #5). The schema's `minLength: 1` already
   // rejects an empty `auth_token`, but a whitespace-only value (e.g.
   // `${MIKUSWARM_CONSOLE_TOKEN}` expanding to " ") would slip through and silently

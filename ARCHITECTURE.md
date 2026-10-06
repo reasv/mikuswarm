@@ -154,6 +154,14 @@ The merged config is validated against a TypeBox schema and decoded via `Value.D
 
 Validation is **strict**: every fixed-shape object in the schema is built with the `StrictObject` helper (`src/config/schema.ts`, `additionalProperties: false`), so an unknown key anywhere in the config tree — a typo, a stale knob, a removed alias — fails at load with an error naming the offending path (e.g. `enrichment.fetch_concurrency is not a recognized config key`; the loader rewrites TypeBox's unexpected-property errors into this dotted-path form). Dictionary-shaped sections (`[models.*]`, `[agent.session_types.*]`, `[rate_limits.llm.*]`, `[matrix.accounts.*]`, `[mcp.servers.*]`, `[rate_limits.http].per_host_max_in_flight`, `[sandbox].env`) accept arbitrary keys at the dictionary level — those keys are names — while their value objects are still strict. The one deliberate exception in the schema source is the `{ default: ModelSchema }` arm of the `models` intersect, which must stay permissive so other model names can pass; the record arm validates every model block strictly.
 
+### Native Exa foundation
+
+`[exa]` is an opt-in native API configuration (`enabled = false`); enabled requires a nonblank `api_key`, which the existing secret registry redacts. `src/exa/config.ts` resolves bounded search, fetch, fixed research-effort and fallback settings and validates cross-field limits during config load. Default research is independently disabled. Native tool registration is not yet wired by this foundation.
+
+`src/exa/client.ts` owns fixed-origin bearer-authenticated `/search`, `/contents`, and `/agent/runs` request contracts, explicit per-attempt timeouts/cancellation, bounded response decoding, sanitized error categories and uncertain-create indicators. It uses shared guarded HTTP transport with `rejectRedirects`, which rejects redirects whether the SSRF address guard is enabled or disabled. The abortable FIFO pacer bounds active requests and start rate; it never occupies a slot while a research job is remotely running between polls. There are no hidden request retries or paid startup probes.
+
+`src/exa/health.ts` provides app-scoped account authentication/credit health, shared Retry-After cooldowns (clamped to five minutes), and separate search/contents/research-create/research-collection circuits. Three transport/server failures within sixty seconds open the affected circuit for thirty seconds, increasing to five minutes; one demand-driven half-open request probes recovery. Caller aborts and invalid requests do not count as outages. Account failures permit a demand-driven probe after five minutes. Health starts unverified and does not itself launch traffic.
+
 ### Schema shape
 
 ```

@@ -1238,3 +1238,43 @@ max_turns = 4           # record-turn assistant turns before giving up (no recor
 inject_on_reply = true  # a reply to a bot message injects that message's session record
 # wait_timeout_ms = 60000 # waiting triggers proceed without it; record creation continues
 # timeout_ms is a legacy alias for wait_timeout_ms (waiting only).
+
+# Native Exa API. Opt-in; put api_key = "${EXA_API_KEY}" in an operator overlay.
+# No network/paid startup probe. Research additionally requires explicit enablement.
+[exa]
+enabled = false
+api_key = ""
+request_timeout_ms = 30000
+max_in_flight = 3
+requests_per_second = 3
+
+[exa.search]
+enabled = true
+default_results = 10
+max_results = 20
+highlight_chars = 1500
+allowed_modes = ["auto", "fast", "instant", "deep", "deep-reasoning"]
+advanced_timeout_ms = 90000
+
+[exa.fetch]
+enabled = true
+max_urls = 20
+display_chars = 8000
+extraction_chars = 50000
+max_extraction_chars = 200000
+content_ttl_hours = 24
+content_store_max_bytes = 104857600
+
+[exa.research]
+enabled = false
+default_effort = "low"
+max_effort = "medium"
+allowed_data_sources = []
+max_in_flight = 2
+poll_interval_ms = 3000
+wait_timeout_ms = 900000
+retention_days = 90
+
+[exa.fallback]
+search = "native"
+fetch = "native"

@@ -77,6 +77,8 @@ export async function assertPublicHttpUrl(value: string): Promise<void> {
 }
 
 export interface GuardedFetchOptions {
+  /** Reject every redirect, including when the address guard is disabled. */
+  rejectRedirects?: boolean;
   signal?: AbortSignal;
   /** HTTP method; defaults to GET. */
   method?: string;
@@ -145,8 +147,12 @@ export async function guardedFetch(url: string, options: GuardedFetchOptions = {
       await assertPublicHttpUrl(url);
       const response = await globalThis.fetch(
         url,
-        buildInit(options, "follow", options.method, options.body, withDefaultUserAgent(options.headers)),
+        buildInit(options, options.rejectRedirects ? "manual" : "follow", options.method, options.body, withDefaultUserAgent(options.headers)),
       );
+      if (options.rejectRedirects && response.status >= 300 && response.status < 400) {
+        await response.body?.cancel().catch(() => {});
+        throw new Error("HTTP redirects are forbidden for this request.");
+      }
       // Native "follow" lands on the final URL; attribute the status to the host
       // that actually produced it, not the original one.
       noteHttpResponse(response.url || url, response.status, response.headers.get("retry-after"));
@@ -174,6 +180,10 @@ export async function guardedFetch(url: string, options: GuardedFetchOptions = {
       await assertPublicHttpUrl(current);
       const response = await globalThis.fetch(current, buildInit(options, "manual", method, body, headers));
       noteHttpResponse(current, response.status, response.headers.get("retry-after"));
+      if (options.rejectRedirects && response.status >= 300 && response.status < 400) {
+        await response.body?.cancel().catch(() => {});
+        throw new Error("HTTP redirects are forbidden for this request.");
+      }
       if (!REDIRECT_FOLLOW_STATUSES.has(response.status)) {
         return tieReleaseToBodySettlement(response, release, options.signal);
       }
