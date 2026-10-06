@@ -5,7 +5,7 @@ log_level = "info"
 context_dump_dir = "./debug/context"
 
 [agent]
-disabled_tools = ["web_fetch", "web_search"]
+disabled_tools = []
 # IANA time zone the agent operates in. Every date the agent sees is rendered in
 # this zone (never the server's real zone), and it is exported as TZ to the
 # process and the Docker sandbox. Set explicitly in local config.
@@ -220,6 +220,8 @@ immediate = [
   "web_search",
   "mcp_exa_web_search_exa",
   "mcp_exa_web_fetch_exa",
+  "exa_search",
+  "exa_fetch",
   "str_replace_based_edit_tool",
   "search_files",
   "recall_memory",
@@ -616,8 +618,8 @@ ssrf_guard = true
 # block declares a remote MCP endpoint whose tools are exposed to the agent as
 # `mcp_<server>_<tool>`. Shipped by default: the KEYLESS Exa MCP, which provides the
 # live web tools (web_search_exa, web_search_advanced_exa, web_fetch_exa) — the
-# replacement for the built-in web_search / web_fetch, which are disabled by default
-# (see [agent].disabled_tools above). The Exa public endpoint needs no API key, so
+# replacement for basic native web access, which remains deferred while MCP is present.
+# Native [exa] suppresses this exact shipped server. The endpoint needs no API key, so
 # this default works out-of-box on a fresh deploy. The `?tools=...` query restricts
 # the server to the three web tools. Add credentialed MCP servers (with a `headers`
 # Authorization bearer) only in local config, where the secret lives in .env.
@@ -1084,9 +1086,9 @@ workspace_files = ["AGENTS.md", "SOUL.md"]
 # the rendered context is insufficient — recover a tweet behind a [truncated]
 # hint or an enrichment mosaic (x_fetch), caption/load an aged-out or
 # never-captioned asset (media/read_image), or fetch a referenced URL
-# (mcp_exa_web_fetch_exa — the Exa MCP replacement for the disabled web_fetch;
+# (the selected allowed Exa/native/MCP fetch capability;
 # inert where no Exa server is configured).
-tools = ["diary_tool", "x_fetch", "media", "read_image", "mcp_exa_web_fetch_exa"]
+tools = ["diary_tool", "x_fetch", "media", "read_image", "mcp_exa_web_fetch_exa", "exa_fetch", "web_fetch"]
 skills = "none"
 max_tool_calls = 30
 max_turns = 15
@@ -1116,10 +1118,10 @@ workspace_files = ["AGENTS.md", "SOUL.md"]
 tail_file = "SUMMARIZE_TAIL.md"
 # summary_tool writes the summary; the rest are read/enrich escape hatches for
 # content the rendered window cannot carry (truncated tweets, mosaic'd photos,
-# aged-out/never-captioned media, referenced URLs). mcp_exa_web_fetch_exa is the
+# aged-out/never-captioned media, referenced URLs). The selected web fetch is the
 # Exa MCP fetch (web_fetch is intentionally globally disabled); inert where no
 # Exa server is configured.
-tools = ["summary_tool", "x_fetch", "media", "read_image", "mcp_exa_web_fetch_exa"]
+tools = ["summary_tool", "x_fetch", "media", "read_image", "mcp_exa_web_fetch_exa", "exa_fetch", "web_fetch"]
 skills = "none"
 # Runaway loop-breakers (NOT a wall-clock timeout): high enough to never bite a
 # healthy run, low enough to break a degenerate loop. Hitting either aborts the
@@ -1153,7 +1155,7 @@ workspace_files = ["AGENTS.md", "SOUL.md"]
 tail_file = "SUMMARIZE_TAIL.md"
 # Condense operates over existing summary text (no raw media events in scope),
 # so it keeps only the URL-recovery hatches: x_fetch and the Exa MCP fetch.
-tools = ["summary_tool", "x_fetch", "mcp_exa_web_fetch_exa"]
+tools = ["summary_tool", "x_fetch", "mcp_exa_web_fetch_exa", "exa_fetch", "web_fetch"]
 skills = "none"
 max_tool_calls = 30
 max_turns = 15

@@ -80,6 +80,9 @@ export function renderSystemPromptWithSegments(
   // Inject AGENTS.md fallback when the file is missing or empty.
   // An empty AGENTS.md on disk is treated the same as a missing one — the
   // fallback prompt provides a minimal instruction set in either case.
+  for (const notice of workspace.runtimeNotices ?? []) {
+    blocks.push({ tag: "tool_availability", label: "Tool availability", source: null, text: `<tool_availability>${escapeXml(notice)}</tool_availability>` });
+  }
   let files = workspace.files;
   if (fallbackPrompt) {
     const existing = files.get("AGENTS.md");

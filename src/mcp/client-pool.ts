@@ -9,6 +9,7 @@ import { registerSecret } from "../config/redaction.js";
 import type { Logger } from "../observability/logger.js";
 
 export interface McpServerConfig {
+  enabled?: boolean;
   url: string;
   transport?: "streamable-http" | "sse";
   headers?: Record<string, string>;
@@ -119,6 +120,7 @@ export class McpClientPool {
   async start(): Promise<void> {
     const servers: Array<[string, McpServerConfig]> = [];
     for (const [name, config] of Object.entries(this.options.servers)) {
+      if (config.enabled === false) continue;
       if (!McpClientPool.VALID_KEY.test(name)) {
         this.logger.error("mcp_server_invalid_key", {
           server: name,

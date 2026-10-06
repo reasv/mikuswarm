@@ -1461,6 +1461,7 @@ export interface SessionCheckChips {
  * nullable ("unknown", never a misleading 0).
  */
 export interface ToolInvocationRow {
+  metadata_json?: string | null;
   id: string;
   agent_session_id: string | null;
   tool_name: string;
@@ -1486,6 +1487,7 @@ export interface ToolInvocationRow {
  * `id` (nanoid) and `created_at`; the caller supplies attribution + usage/cost.
  */
 export interface ToolInvocationInput {
+  metadata?: Record<string, unknown> | null;
   agentSessionId: string | null;
   toolName: string;
   toolCallId?: string | null;
@@ -4497,6 +4499,7 @@ export class Storage {
     const row: ToolInvocationRow = {
       id: `toolinv_${nanoid(12)}`,
       agent_session_id: input.agentSessionId,
+      metadata_json: input.metadata ? JSON.stringify(input.metadata) : null,
       tool_name: input.toolName,
       tool_call_id: input.toolCallId ?? null,
       model_id: input.modelId ?? null,
@@ -4515,11 +4518,11 @@ export class Storage {
         `insert into tool_invocations (
            id, agent_session_id, tool_name, tool_call_id, model_id, provider,
            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-           images, cost, ref, created_at
+           images, cost, ref, metadata_json, created_at
          ) values (
            @id, @agent_session_id, @tool_name, @tool_call_id, @model_id, @provider,
            @input_tokens, @output_tokens, @cache_read_tokens, @cache_write_tokens,
-           @images, @cost, @ref, @created_at
+           @images, @cost, @ref, @metadata_json, @created_at
          )`,
       ).run(row);
     });
@@ -11043,6 +11046,7 @@ create table if not exists tool_invocations (
   images integer,
   cost real,
   ref text,
+  metadata_json text,
   created_at integer not null
 );
 
@@ -12363,7 +12367,7 @@ ${SESSION_AUDITS_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 27;
+export const LATEST_SCHEMA_VERSION = 28;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -13367,6 +13371,10 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   addRefusalHandlingTables,             // v24→v25
   addModelBehaviourTables,              // v25→v26
   addSessionAuditsTable,                // v26→v27
+  (db) => {
+    const columns = db.prepare("PRAGMA table_info(tool_invocations)").all() as Array<{ name: string }>;
+    if (columns.length && !columns.some((column) => column.name === "metadata_json")) db.exec("ALTER TABLE tool_invocations ADD COLUMN metadata_json TEXT");
+  },                                   // v27→v28 paid service provenance
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write

@@ -25,6 +25,8 @@ export interface ToolDefinitionLike {
   parameters: unknown;
   /** Harness-only (spec SESSION-RECORDS §3.2): never immediate, never indexed. Not serialized. */
   harnessOnly?: boolean;
+  initialLoading?: "immediate" | "deferred";
+  availabilityNotice?: string;
 }
 
 /** One tool's contribution within the block, with its own definition. */

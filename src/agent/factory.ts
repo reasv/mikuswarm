@@ -1393,6 +1393,7 @@ export class AgentSessionFactory {
     // otherwise the factory constructs one from the seed (worker pools / tests,
     // which have no tool-cost lane).
     const usage = opts?.usage ?? new SessionUsageTracker(opts?.usageSeed);
+    usage.setPaidServiceCeiling(costCeiling);
     const streamFn = withRequestRetry(
       sessionStreamFn,
       {
@@ -1804,6 +1805,7 @@ export class AgentSessionFactory {
     const mcpToolServerMap = this.options.mcpToolServerMap ?? new Map<string, string>();
     const mcpFilteredTools = filterMcpToolsByAllowlist(tools, agentMcpServers, mcpToolServerMap);
     const filteredTools = filterTools(mcpFilteredTools, sessionTypeConfig);
+    workspace.runtimeNotices = [...new Set(filteredTools.map((tool) => (tool as AgentTool & { availabilityNotice?: string }).availabilityNotice).filter((notice): notice is string => !!notice))];
     const logger = this.options.logger;
 
     // Dynamic tool loading (spec DYNAMIC-TOOL-LOADING). Gate: the global config
@@ -1917,6 +1919,11 @@ export class AgentSessionFactory {
     if (dynamicEnabled) {
       const catalogNames = wrappedTools.map((t) => t.name);
       const immediate = new Set(matchToolPatterns(catalogNames, dynCfg?.immediate ?? []));
+      for (const tool of wrappedTools) {
+        const loading = (tool as AgentTool & { initialLoading?: string }).initialLoading;
+        if (loading === "immediate") immediate.add(tool.name);
+        if (loading === "deferred") immediate.delete(tool.name);
+      }
       // The prefill `no_reply` tool (spec OPENAI-PREFILL) exists so a session under
       // tool_choice = "required" can end a turn silently; deferred behind
       // tool_search it could not, so it is always in the initial wire set.
@@ -2662,6 +2669,7 @@ export class AgentSessionFactory {
     const previewDefs = this.options.buildToolDefs?.(timelineKey, "default");
     let previewTools = previewDefs;
     if (previewDefs) {
+      workspace.runtimeNotices = [...new Set(previewDefs.map((definition) => definition.availabilityNotice).filter((notice): notice is string => !!notice))];
       const split = this.splitDefsForDynamic(previewDefs, sessionTypeConfig, workspace);
       if (split) {
         previewTools = split.initial;
@@ -2733,6 +2741,10 @@ export class AgentSessionFactory {
     if (!enabled) return undefined;
     const names = defs.map((d) => d.name);
     const immediate = new Set(matchToolPatterns(names, dynCfg?.immediate ?? []));
+    for (const definition of defs) {
+      if (definition.initialLoading === "immediate") immediate.add(definition.name);
+      if (definition.initialLoading === "deferred") immediate.delete(definition.name);
+    }
     // The prefill `no_reply` tool (spec OPENAI-PREFILL) only exists so a session
     // under tool_choice = "required" can end a turn silently; deferring it behind
     // tool_search would defeat that, so it is always in the initial wire set.

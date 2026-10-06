@@ -1731,3 +1731,11 @@ test("audit-only fallback block resets at midnight without affecting chat", () =
   assert.equal(engine.isModelAvailable("paid", { class: "audit" }), true);
   assert.equal(engine.isModelAvailable("paid", { class: "agent_loop" }), true);
 });
+
+test("paid service gate never bypasses limits for colliding zero-cost model id", () => {
+  const engine = engineWith([{ name: "no-tools", maxUsd: 0, window: dayWindow, selector: { classes: ["tool"] } }], {}, { zero: new Set(["exa/search"]) });
+  assert.equal(engine.check({ class: "tool", modelId: "exa/search" }).allowed, true);
+  assert.equal(engine.check({ class: "tool", modelId: "exa/search", paidService: true }).allowed, false);
+  const gate = makeToolBudgetGate({ engine: () => engine, toolName: "exa_search", timelineKey: "matrix:account:room:!a", formatResetsAt: String, paidService: true });
+  assert.match(gate("exa/search")!, /Over budget/);
+});

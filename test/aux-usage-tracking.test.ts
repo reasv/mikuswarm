@@ -331,3 +331,12 @@ test("getCostOverview: three lanes summed independently (§10.4)", async () => {
     assert.ok(Math.abs(o.captioningCost - 0.5) < 1e-9);
   });
 });
+
+test("paid service invocation retains nullable tokens and cost provenance", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertToolInvocation({ agentSessionId: "service-s", toolName: "exa_search", toolCallId: "call", modelId: "exa/search", provider: "exa", cost: 0.007, metadata: { requestId: "r1", costProvenance: "reported" } });
+    const rows = storage.getToolInvocationsBySession("service-s");
+    assert.equal(rows[0].input_tokens, null); assert.equal(rows[0].output_tokens, null);
+    assert.deepEqual(JSON.parse(rows[0].metadata_json!), { requestId: "r1", costProvenance: "reported" });
+  });
+});

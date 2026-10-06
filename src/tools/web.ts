@@ -14,7 +14,12 @@ const WEB_FETCH_SECURITY_NOTE =
  */
 const WEB_FETCH_TIMEOUT_MS = 30_000;
 
-export interface WebFetchToolOptions {
+export interface WebRequestOptions {
+  /** Injectable guarded transport for deterministic tests. */
+  fetchImpl?: typeof guardedFetch;
+  timeoutMs?: number;
+}
+export interface WebFetchToolOptions extends WebRequestOptions {
   /** When true, append a hint for recognized 4chan URLs suggesting the yotsuba tool. */
   yotsubaEnabled?: boolean;
   /** Extra hostnames to treat as 4chan (passed to isYotsubaHost). */
@@ -30,35 +35,10 @@ export function createWebFetchTool(opts: WebFetchToolOptions = {}): AgentTool {
       url: Type.String(),
       max_chars: Type.Optional(Type.Number({ minimum: 1, maximum: 200_000 })),
     }),
-    execute: async (_toolCallId, params) => {
+    execute: async (_toolCallId, params, signal) => {
       const args = params as { url: string; max_chars?: number };
       const url = normalizeHttpUrl(args.url);
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), WEB_FETCH_TIMEOUT_MS);
-      let contentType: string;
-      let raw: string;
-      let status: number;
-      try {
-        const response = await guardedFetch(url, {
-          signal: controller.signal,
-          headers: { "user-agent": "mikuswarm/0.1" },
-        });
-        if (!response.ok) {
-          // Settle the body so the per-host limiter slot is freed promptly.
-          await response.body?.cancel().catch(() => {});
-          throw new Error(`Fetch failed with HTTP ${response.status}`);
-        }
-        contentType = response.headers.get("content-type") ?? "";
-        status = response.status;
-        raw = await response.text();
-      } catch (error) {
-        if ((error as { name?: string })?.name === "AbortError") {
-          throw new Error(`Fetch timed out after ${WEB_FETCH_TIMEOUT_MS}ms`);
-        }
-        throw error;
-      } finally {
-        clearTimeout(timeout);
-      }
+      const { raw, contentType, status } = await readWebResponse(url, opts, signal, "Fetch");
       const text = contentType.includes("html") ? htmlToText(raw) : raw;
       const maxChars = args.max_chars ?? 50_000;
       let outputText = text.length > maxChars ? `${text.slice(0, maxChars)}\n[truncated]` : text;
@@ -84,7 +64,7 @@ export function createWebFetchTool(opts: WebFetchToolOptions = {}): AgentTool {
   };
 }
 
-export function createWebSearchTool(): AgentTool {
+export function createWebSearchTool(opts: WebRequestOptions = {}): AgentTool {
   return {
     name: "web_search",
     label: "Search web",
@@ -93,41 +73,83 @@ export function createWebSearchTool(): AgentTool {
       query: Type.String(),
       limit: Type.Optional(Type.Number({ minimum: 1, maximum: 10 })),
     }),
-    execute: async (_toolCallId, params) => {
+    execute: async (_toolCallId, params, signal) => {
       const args = params as { query: string; limit?: number };
       const url = new URL("https://html.duckduckgo.com/html/");
       url.searchParams.set("q", args.query);
-      const response = await fetch(url, { headers: { "user-agent": "mikuswarm/0.1" } });
-      if (!response.ok) throw new Error(`Search failed with HTTP ${response.status}`);
-      const html = await response.text();
-      const results = parseDuckDuckGoResults(html).slice(0, args.limit ?? 5);
-      if (html.trim() && results.length === 0) {
-        console.warn(JSON.stringify({
-          level: "warn",
-          component: "mikuswarm.web_search",
-          message: "duckduckgo_parse_returned_no_results",
-          time: new Date().toISOString(),
-          query: args.query,
-          responseBytes: Buffer.byteLength(html),
-        }));
+      const { raw: html } = await readWebResponse(url.toString(), opts, signal, "Search");
+      if (/<(?:form|div|section)[^>]+(?:id|class)=["'][^"']*(?:anomaly-modal|challenge-form|captcha-container)[^"']*["']|<form[^>]+action=["'][^"']*\/(?:anomaly|challenge)\.js(?:\?[^"']*)?["']/i.test(html)) {
+        throw new Error("Search blocked by DuckDuckGo's bot check. Use another available search tool or browser.");
       }
+      const parsed = parseDuckDuckGoResults(html);
+      const noResults = /class=["'][^"']*(?:no-results|result--no-result)|No results found/i.test(html);
+      if (!parsed.length && !noResults) {
+        throw new Error("Search response could not be parsed as results. Use another available search tool or browser.");
+      }
+      const results = parsed.slice(0, args.limit ?? 5);
       return {
         content: [
           {
             type: "text",
             text: results.length
               ? results.map((result, index) => `${index + 1}. ${result.title}\n${result.url}\n${result.snippet}`).join("\n\n")
-              : "No search results parsed.",
+              : "No search results found.",
           },
         ],
         details: {
           query: args.query,
           results,
-          warning: html.trim() && results.length === 0 ? "DuckDuckGo HTML parsing returned no results." : undefined,
         },
       };
     },
   };
+}
+
+/** Bounds admission, headers, and body reading; always cancels unfinished bodies. */
+async function readWebResponse(url: string, opts: WebRequestOptions, caller: AbortSignal | undefined, operation: string) {
+  const timeoutMs = opts.timeoutMs ?? WEB_FETCH_TIMEOUT_MS;
+  const controller = new AbortController();
+  const onCallerAbort = () => controller.abort(caller?.reason);
+  caller?.addEventListener("abort", onCallerAbort, { once: true });
+  if (caller?.aborted) onCallerAbort();
+  const timer = setTimeout(() => controller.abort(new Error(`${operation} timed out after ${timeoutMs}ms`)), timeoutMs);
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let response: Response | undefined;
+  let complete = false;
+  const bounded = <T>(promise: Promise<T>): Promise<T> => new Promise((resolve, reject) => {
+    const abort = () => reject(controller.signal.reason);
+    controller.signal.addEventListener("abort", abort, { once: true });
+    if (controller.signal.aborted) abort();
+    void promise.then(resolve, reject).finally(() => controller.signal.removeEventListener("abort", abort));
+  });
+  try {
+    controller.signal.throwIfAborted();
+    const pending = (opts.fetchImpl ?? guardedFetch)(url, { signal: controller.signal, headers: { "user-agent": "mikuswarm/0.1" } });
+    // Even a transport that settles after cancellation must not abandon its body.
+    void pending.then((late) => { if (controller.signal.aborted) void late.body?.cancel().catch(() => {}); }, () => {});
+    response = await bounded(pending);
+    if (!response.ok) throw new Error(`${operation} failed with HTTP ${response.status}`);
+    reader = response.body?.getReader();
+    const chunks: Uint8Array[] = []; let bytes = 0;
+    if (reader) for (;;) {
+      const { done, value } = await bounded(reader.read());
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > 4 * 1024 * 1024) throw new Error(`${operation} response exceeds the 4 MiB size limit`);
+      chunks.push(value);
+    }
+    complete = true;
+    return { raw: Buffer.concat(chunks).toString("utf8"), contentType: response.headers.get("content-type") ?? "", status: response.status };
+  } finally {
+    clearTimeout(timer); caller?.removeEventListener("abort", onCallerAbort);
+    if (!complete) {
+      if (reader) void reader.cancel().catch(() => {});
+      else void response?.body?.cancel().catch(() => {});
+      // Release guarded transport's admission slot even if cancellation hangs.
+      controller.abort();
+    }
+    if (reader) reader.releaseLock();
+  }
 }
 
 function normalizeHttpUrl(value: string): string {

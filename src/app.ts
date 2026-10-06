@@ -1,3 +1,9 @@
+import { ExaClient } from "./exa/client.js";
+import { resolveExaConfig } from "./exa/config.js";
+import { ExaContentStore } from "./exa/content-store.js";
+import { selectExaMcpServers, selectExaRetrievalCatalog, type ToolAvailability } from "./exa/selection.js";
+import type { ExaUsageRecord } from "./exa/accounting.js";
+import { createExaRetrievalTools } from "./tools/exa.js";
 import { recentRecordCandidates } from "./decisions/points/records-select.js";
 import { ageLabel } from "./decisions/state.js";
 import { EventEmitter } from "node:events";
@@ -1849,7 +1855,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       agentName !== null ? config.agents?.[agentName]?.mcp_servers : undefined;
     // Memo key must include the agent name: two agents with different mcp_servers
     // but the same session type would otherwise share a wrong cached block.
-    const memoKey = `${agentName ?? ""}:${sessionType}`;
+    const memoKey = `${agentName ?? ""}:${sessionType}:${exaClient ? [exaClient.health.available("search"), exaClient.health.available("contents")].join(":") : ""}`;
     const cached = toolDefsByType.get(memoKey);
     if (cached) return cached;
     // Use the shared grammar parser (spec DISCORD-SUPPORT-DESIGN §4.2).
@@ -1906,6 +1912,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         description: t.description,
         parameters: t.parameters,
         ...(t.harnessOnly ? { harnessOnly: true } : {}),
+        initialLoading: (t as typeof t & ToolAvailability).initialLoading,
+        availabilityNotice: (t as typeof t & ToolAvailability).availabilityNotice,
       }));
       toolDefsByType.set(memoKey, defs);
       return defs;
@@ -2112,11 +2120,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     const knownTools = new Set<string>([
       "image_generate",
       "x_search",
+      "exa_search", "exa_search_advanced", "exa_fetch", "exa_research",
     ]);
     // Every configured model id (zero-cost ∪ paid), assembled before normalize so a
     // `models` selector naming an unknown id earns a soft validation warning,
     // symmetric with the unknown-tool / unknown-session-type warnings (review #11).
     const knownModelIds = collectKnownModelIds(config);
+    for (const service of ["exa/search", "exa/contents", "exa/research"]) knownModelIds.add(service);
     // All configured account prefixes ("provider:accountKey") for agent/account
     // matcher validation in normalizeLimits and normalizeUserLimits.
     const knownAccountPrefixes = new Set<string>([
@@ -2455,8 +2465,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
 
   // Per-tool period-budget gate (spec USAGE-COST-LIMITS §6.3), wired into the paid
   // LLM-calling tools (image_generate, x_search) with the calling session's timeline.
-  const makeToolBudgetCheck = (toolName: string, timelineKey: string) =>
-    makeToolBudgetGate({ engine: () => budgetHooks.engine, toolName, timelineKey, formatResetsAt });
+  const makeToolBudgetCheck = (toolName: string, timelineKey: string, sessionType: string) =>
+    makeToolBudgetGate({ engine: () => budgetHooks.engine, toolName, timelineKey, sessionType, formatResetsAt });
 
   // Fail-fast: a misconfigured summarizer must not silently fall back to the
   // default chat agent or model. Both this check and pool instantiation use
@@ -2908,6 +2918,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // Both feed the single tool-set filter in buildSessionTools, so one code path owns
   // exclusion for every session type. Feature gates default OFF: with no `[features]`
   // table (or an absent key) the feature's tools are excluded here.
+  const exaConfig = resolveExaConfig(config.exa);
+  const exaClient = exaConfig.enabled ? new ExaClient(exaConfig) : undefined;
+  const exaContents = new ExaContentStore(exaConfig.fetch.content_store_max_bytes, exaConfig.fetch.content_ttl_hours * 3600000);
   const disabledTools = new Set(config.agent.disabled_tools ?? []);
   for (const tool of gatedOutFeatureTools(config.features)) {
     disabledTools.add(tool);
@@ -2929,7 +2942,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     }
   };
   const mcpPool: McpClientPool = new McpClientPool({
-    servers: config.mcp?.servers ?? {},
+    servers: selectExaMcpServers(config.mcp?.servers ?? {}, exaConfig),
     retry: {
       maxAttempts: config.mcp?.startup_retry_max_attempts,
       initialDelayMs: config.mcp?.startup_retry_initial_delay_ms,
@@ -5158,7 +5171,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // (spec SESSION-COST-LIMITS §4) and appends one durable `tool_invocations` row
     // (spec AUXILIARY-USAGE-TRACKING §8.2). Both lanes are separate
     // from agent_sessions.usage_* (§8c §4); a sink failure never fails the tool.
-    const recordToolUsage = (record: ToolUsageRecord) => {
+    const recordToolUsage = (record: ToolUsageRecord | ExaUsageRecord) => {
+      const tokenUsage = "usage" in record ? record.usage : undefined;
       usage.recordToolCost(record.cost ?? 0);
       void storage
         .insertToolInvocation({
@@ -5167,13 +5181,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           toolCallId: record.toolCallId,
           modelId: record.modelId,
           provider: record.provider,
-          inputTokens: record.usage.input,
-          outputTokens: record.usage.output,
-          cacheReadTokens: record.usage.cacheRead,
-          cacheWriteTokens: record.usage.cacheWrite,
-          images: record.usage.images ?? null,
+          metadata: "metadata" in record ? record.metadata : null,
+          inputTokens: tokenUsage?.input ?? null,
+          outputTokens: tokenUsage?.output ?? null,
+          cacheReadTokens: tokenUsage?.cacheRead ?? null,
+          cacheWriteTokens: tokenUsage?.cacheWrite ?? null,
+          images: tokenUsage?.images ?? null,
           cost: record.cost,
-          ref: record.ref,
+          ref: "ref" in record ? record.ref : null,
         })
         .catch((error) => {
           logger.warn("tool_usage_ledger_insert_failed", {
@@ -5195,15 +5210,15 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         modelId: record.modelId,
         // Logical id for budget scoping / grouping (spec MODEL-FALLBACK §2.2),
         // defaulting to the wire id when the tool has no virtual model.
-        logicalModelId: record.logicalModelId ?? record.modelId,
+        logicalModelId: "logicalModelId" in record ? record.logicalModelId ?? record.modelId : record.modelId,
         provider: record.provider,
-        inputTokens: record.usage.input,
-        outputTokens: record.usage.output,
-        cacheReadTokens: record.usage.cacheRead,
-        cacheWriteTokens: record.usage.cacheWrite,
-        images: record.usage.images ?? null,
+        inputTokens: tokenUsage?.input ?? null,
+        outputTokens: tokenUsage?.output ?? null,
+        cacheReadTokens: tokenUsage?.cacheRead ?? null,
+        cacheWriteTokens: tokenUsage?.cacheWrite ?? null,
+        images: tokenUsage?.images ?? null,
         costUsd: record.cost ?? 0,
-        ref: record.ref,
+        ref: "ref" in record ? record.ref : null,
       });
     };
 
@@ -5448,6 +5463,16 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         yotsubaExtraHosts: yotsubaSubsystem?.config.extraHosts,
       }),
       createWebSearchTool(),
+      ...(exaClient ? createExaRetrievalTools({
+        client: exaClient, store: exaContents, owner: { agent: sessionAgentName, timeline: inbound.timelineKey },
+        visibility: visibilityResolver, sessionId, recordUsage: recordToolUsage,
+        checkBudget: (toolName, service) => usage.checkPaidServiceBudget() ?? makeToolBudgetGate({ engine: () => budgetHooks.engine, toolName, timelineKey: inbound.timelineKey, sessionType, formatResetsAt, paidService: true })(service),
+        fallbackNames: [
+          ...(!disabledTools.has("web_search") && exaConfig.fallback.search === "native" && (!factory.resolveSessionType(sessionType)?.tools || factory.resolveSessionType(sessionType)!.tools!.includes("web_search")) ? ["web_search"] : []),
+          ...(!disabledTools.has("web_fetch") && exaConfig.fallback.fetch === "native" && (!factory.resolveSessionType(sessionType)?.tools || factory.resolveSessionType(sessionType)!.tools!.includes("web_fetch")) ? ["web_fetch"] : []),
+        ],
+        backgroundFallback: ["summarize", "condense", "diary"].includes(sessionType) && !disabledTools.has("web_fetch") && exaConfig.fallback.fetch === "native" && factory.resolveSessionType(sessionType)?.tools?.includes("web_fetch") ? createWebFetchTool() : undefined,
+      }) : []),
       // Per-session browser tool (§10a): use the per-agent session in agents mode
       // or the global legacy session. config.browser provides connection settings /
       // timeouts; profile_name is already baked into the session from construction.
@@ -5568,7 +5593,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             agentSessionId: sessionId,
             recordToolUsage,
             // Period-budget gate (spec USAGE-COST-LIMITS §6.3).
-            checkBudget: makeToolBudgetCheck("image_generate", inbound.timelineKey),
+            checkBudget: makeToolBudgetCheck("image_generate", inbound.timelineKey, sessionType),
             isModelAvailable: (logicalId) => budgetHooks.engine?.isModelAvailable(logicalId, { class: "tool", tool: "image_generate", sessionType, timelineKey: inbound.timelineKey }) ?? true,
             // Unified registry (spec MODEL-FALLBACK §2.3): each tier resolves to a
             // [models.*] chain (head + fallback members); pricing lives on the model.
@@ -5634,7 +5659,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             agentSessionId: sessionId,
             recordToolUsage,
             // Period-budget gate (spec USAGE-COST-LIMITS §6.3).
-            checkBudget: makeToolBudgetCheck("x_search", inbound.timelineKey),
+            checkBudget: makeToolBudgetCheck("x_search", inbound.timelineKey, sessionType),
           })]
         : []),
       // youtube_fetch: YouTube metadata + transcript + workspace download tool
@@ -5721,7 +5746,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     ].filter((t) => !disabledTools.has(t.name));
     // The record-turn gate is applied by the factory to the final tool list
     // (`recordTurnGate` in create()), so it also covers load_skill/tool_search.
-    return allTools;
+    const selected = selectExaRetrievalCatalog(filterMcpToolsByAllowlist(allTools, sessionAgentName !== null ? config.agents?.[sessionAgentName]?.mcp_servers : undefined, mcpToolServerMap), exaConfig, exaClient?.health ?? new ExaClient(exaConfig).health, factory.resolveSessionType(sessionType)?.tools);
+    if (["summarize", "condense", "diary"].includes(sessionType)) {
+      const names = new Set(selected.map((tool) => tool.name));
+      if (names.has("exa_fetch")) return selected.filter((tool) => tool.name !== "web_fetch" && tool.name !== "mcp_exa_web_fetch_exa");
+      if (names.has("mcp_exa_web_fetch_exa")) return selected.filter((tool) => tool.name !== "web_fetch");
+    }
+    return selected;
   }
 
   /**

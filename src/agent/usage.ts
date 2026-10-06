@@ -70,6 +70,13 @@ export function emptyUsageTotals(): SessionUsageTotals {
  */
 export class SessionUsageTracker {
   private totals: SessionUsageTotals;
+  private paidServiceCeiling: number | undefined;
+  /** Set by factory from the exact effective session ceiling, including user overrides. */
+  setPaidServiceCeiling(ceiling: number | undefined): void { this.paidServiceCeiling = ceiling; }
+  checkPaidServiceBudget(): string | undefined {
+    return this.paidServiceCeiling !== undefined && this.combinedCost() >= this.paidServiceCeiling
+      ? `Session spending limit $${this.paidServiceCeiling.toFixed(4)} reached. Return already acquired evidence; no new paid service work is permitted.` : undefined;
+  }
   /**
    * Cumulative tool-use cost (USD) for this session run — the §8c lane. Kept
    * OUT of {@link SessionUsageTotals} (whose shape maps 1:1 to the agent-loop

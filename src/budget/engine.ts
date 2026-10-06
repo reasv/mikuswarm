@@ -60,6 +60,8 @@ export interface BudgetHooks {
 
 /** The prospective spend a gate is about to admit (spec §6.2). */
 export interface SpendDescriptor {
+  /** Non-LLM paid service; never bypass limits due to a zero-cost model id. */
+  paidService?: boolean;
   class: string;
   sessionType?: string;
   tool?: string;
@@ -381,7 +383,7 @@ export class BudgetEngine {
    * over the cap (cap 0 → always blocks any covered non-free spend).
    */
   check(descriptor: SpendDescriptor): CheckResult {
-    if (this.isZeroCost(descriptor.logicalModelId ?? descriptor.modelId)) {
+    if (!descriptor.paidService && this.isZeroCost(descriptor.logicalModelId ?? descriptor.modelId)) {
       return { allowed: true, blockingRules: [] };
     }
     const now = this.now();
@@ -715,9 +717,11 @@ export function makeRateLimitedClaimGate(opts: {
  * without it would let every per-agent tool cap through.
  */
 export function makeToolBudgetGate(opts: {
+  paidService?: boolean;
   engine: () => BudgetEngine | undefined;
   toolName: string;
   timelineKey: string;
+  sessionType?: string;
   formatResetsAt: (ms: number) => string;
 }): (modelId: string) => string | undefined {
   return (modelId) => {
@@ -726,8 +730,10 @@ export function makeToolBudgetGate(opts: {
     const descriptor: SpendDescriptor = {
       class: "tool",
       tool: opts.toolName,
+      paidService: opts.paidService,
       modelId,
       timelineKey: opts.timelineKey,
+      sessionType: opts.sessionType,
     };
     const result = engine.check(descriptor);
     if (result.allowed) return undefined;

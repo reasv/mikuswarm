@@ -72,6 +72,8 @@ export interface RoutedSatellite {
  * Workspace content loaded from disk at session creation time.
  */
 export interface WorkspaceContent {
+  /** Configuration/capability notices frozen for this session. */
+  runtimeNotices?: string[];
   /** Loaded workspace files keyed by filename (e.g. "AGENTS.md" → content). */
   files: Map<string, string>;
   /** Content of the tail instructions file, or null if not found. */

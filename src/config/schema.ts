@@ -1495,6 +1495,7 @@ const MediaSchema = StrictObject({
 });
 
 const McpServerSchema = StrictObject({
+  enabled: Type.Optional(Type.Boolean()),
   url: Type.String({ minLength: 1 }),
   transport: Type.Optional(Type.Union([
     Type.Literal("streamable-http"),

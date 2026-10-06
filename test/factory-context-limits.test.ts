@@ -1179,3 +1179,28 @@ test("createModelFromConfig: compat.declare_deferred_tools → descriptor flag; 
   const off = createModelFromConfig({ id: "m", ...base } as any);
   assert.equal((off.compat as any)?.declareDeferredTools, undefined);
 });
+
+test("factory applies exact user ceiling override to paid service gate", async () => {
+  const config = perMemberConfig(); config.agent.max_session_cost_usd = 10;
+  const tracker = new SessionUsageTracker(); tracker.recordToolCost(0.1);
+  const factory = new AgentSessionFactory({ config, contextBuilder: stubCtxBuilder(minimalBuilt()), getActiveSessions: () => [] });
+  await factory.create(perMemberSession(), [], { usage: tracker, costCeilingOverride: 0.05 });
+  assert.match(tracker.checkPaidServiceBudget()!, /Session spending limit/);
+  assert.equal(tracker.snapshot().cost, 0, "service costs remain outside agent-loop counters");
+});
+
+test("factory applies health-selected immediates and notices after real tool allowlist", async () => {
+  const { Type } = await import("@earendil-works/pi-ai");
+  const make = (name: string, loading: "immediate" | "deferred", notice?: string) => ({ name, label: name, description: name, parameters: Type.Object({}), initialLoading: loading, availabilityNotice: notice, execute: async () => ({ content: [] }) });
+  const config = perMemberConfig(); config.agent.tools = { dynamic: { enabled: true, immediate: ["exa_search", "web_search"] } };
+  config.agent.session_types = { default: { tools: ["exa_search", "web_search"], tools_dynamic: true } };
+  const definitions = [make("exa_search", "deferred", "Exa search unavailable; web_search is available."), make("web_search", "immediate"), make("forbidden", "immediate", "FORBIDDEN NOTICE")];
+  const factory = new AgentSessionFactory({ config, contextBuilder: stubCtxBuilder(minimalBuilt()), getActiveSessions: () => [], buildToolDefs: () => definitions.filter((d) => d.name !== "forbidden") });
+  const created = await factory.create(perMemberSession(), definitions);
+  assert.equal(created.agent.state.tools.some((t) => t.name === "exa_search"), false);
+  assert.equal(created.agent.state.tools.some((t) => t.name === "web_search"), true);
+  assert.equal(created.agent.state.tools.some((t) => t.name === "forbidden"), false);
+  assert.match(created.agent.state.systemPrompt, /Exa search unavailable/); assert.doesNotMatch(created.agent.state.systemPrompt, /FORBIDDEN NOTICE/);
+  assert.match(factory.toolBlockFor(perMemberSession().timelineKey, "default")!.segments.map((segment) => segment.text).join("\n"), /web_search/);
+  assert.doesNotMatch(factory.toolBlockFor(perMemberSession().timelineKey, "default")!.segments.map((segment) => segment.text).join("\n"), /"name": "exa_search"/);
+});
