@@ -389,7 +389,7 @@ export class SessionRecordService {
     // A steer that landed after the rollout's last turn would otherwise be fed
     // into the record turn's loop. The session is over: clear the queue. The app
     // already handed every unread timeline steer to a fresh session when the run
-    // settled (fold-after-settle), so nothing a user sent is lost here.
+    // settled (it revives the session, or the message takes its native fate), so nothing a user sent is lost here.
     if (agent.hasQueuedMessages()) {
       agent.clearAllQueues();
       logger.warn("session_record_queue_cleared", { sessionId });

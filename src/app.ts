@@ -544,10 +544,6 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // Drained into the session the moment it goes live (`launchSession`/resume
   // post-attachAgent), or reverted to native fate if the owner is abandoned.
   const pendingFollowUps = new Map<string, FollowUpDelivery[]>();
-  // Fold-after-settle owners (spec SESSION-RECORDS §7), keyed by the follow-up's
-  // trigger event id: whichever launch picks the trigger up (at once, or later from
-  // the timeline queue) injects that owner's record. Consumed by launchSession.
-  const foldOwners = new Map<string, string>();
   // ─── Workspace setup (spec MULTI-AGENT-SUPPORT §4.1/§4.2) ──────────────────
   //
   // Hard validation (§3 account key colons, §4.2 cross-field invariants) via the
@@ -3302,6 +3298,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       enrichmentPool.notifyNewEvent(inbound.event.id);
     }
 
+    // Late input (§8 "Late input"): a reply from the trigger's sender to a message
+    // of a running (or just settled) request belongs to it.
+    if (routeReplyToRequest(inbound)) return;
     if (steerReplyToActiveSession(inbound)) return;
 
     // Follow-up folding (spec FOLLOWUP-FOLDING §6): a quick same-sender follow-up —
@@ -3313,13 +3312,21 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // return + accept, so it catches BOTH a group's non-triggering bare follow-up and
     // a trigger-bearing one (re-`@` / DM message) whose parallel spawn it suppresses.
     // Fully synchronous, so the accept→claim serialization invariant below is intact.
+    // Late additions (§8 "Late input") come before the quick fold: a message from
+    // a request's sender is judged (or windowed) for membership in that request.
+    if (routeLateAddition(inbound)) return;
     if (foldFollowUp(inbound)) return;
 
     // A reply to one of the bot's own messages always triggers (spec SESSION-RECORDS
     // §6.1): resolved upstream in the provider's trigger hold (`resolveReplyTrigger`),
     // so it already carries `inbound.trigger` here with the hold's debounce applied.
     // The §7 fork in launchSession then resumes or starts fresh. Nothing to synthesize.
-    if (!inbound.trigger) return;
+    if (!inbound.trigger) {
+      // Implicit replies (§8 "Late input"): a bare group message right after a bot
+      // message may answer it without the reply function or a mention.
+      maybeImplicitReply(inbound);
+      return;
+    }
 
     // Bot-chain cap gate (spec MULTI-AGENT-SUPPORT §9, Phase 5b).
     // Applied after trigger confirmation but before accept/claim so capped-out
@@ -3476,6 +3483,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
    */
   async function applyEdit(inbound: InboundChatEvent): Promise<void> {
     const targetExternalId = inbound.edit!.targetExternalId;
+    // Late input (§8 "Late input"): the message before the edit, for the request
+    // correction (before/after text, the no-op filter, mention changes).
+    const prior = lateInputSettings.enabled
+      ? timeline.getByExternalId(inbound.provider, targetExternalId, inbound.timelineKey)
+      : undefined;
     const replacement = {
       body: inbound.event.body,
       attachments: inbound.event.attachments ?? [],
@@ -3531,6 +3543,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       enrichmentStatus: result.status,
       hasMedia,
     });
+    if (prior && prior.id === result.event.id) onRequestEdited(inbound, prior, result.event);
   }
 
   async function runInitialBackfill(inbound: InboundChatEvent): Promise<void> {
@@ -4550,7 +4563,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     gapMs: number;
   }
 
-  /** What foldAfterSettle takes: a follow-up, or a steered reply / co-reply never read. */
+  /** A fold's unit of work for a settled owner: a follow-up, or a steered reply / co-reply never read. */
   interface FoldDelivery {
     inbound: InboundChatEvent;
     form: FollowUpForm | "reply" | "co-reply" | "edit";
@@ -4645,8 +4658,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // single-writer queue. In that window a fold sees the record absent while the row
     // still reads `running`/`resuming` — the pure decision would demote a just-settled
     // session to native fate. `resolveFollowUpRoute` routes that case to the settled
-    // route; `foldAfterSettle` then `waitForIdle`s so the queued terminal write drains
-    // before it reads the row. Read the RAW row status once and pass it through.
+    // route, which revives the owner when it is revivable (§8 "Late input"). Read the
+    // RAW row status once and pass it through.
     const route = resolveFollowUpRoute({
       recordPresent: !!record,
       recordStatus: record?.status,
@@ -4658,6 +4671,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // own session, a bare group one goes inert via the `!inbound.trigger` return — no
       // explicit revert here.
       return false;
+    }
+    // A settled owner (§8 "Late input"): revived when the follow-up was sent before
+    // its run ended, otherwise the follow-up takes its native fate. Folding never
+    // starts a fresh session.
+    if (route !== "steer" && route !== "park") {
+      const entry = lateInputEntries.get(watch.sessionId);
+      if (!entry || !sentBeforeRunEnd(entry.ctl, inbound.event.timestamp)) return false;
     }
     // Past the route decision the event is consumed exactly once (§6): mark it so the
     // trigger-hold twin (DM / re-`@`) is suppressed, then dispatch the chosen delivery.
@@ -4674,10 +4694,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // created / running-but-pre-attachAgent → park; drained when it goes live.
       parkFollowUp(watch.sessionId, delivery);
     } else {
-      // settled `completed` → fold-after-settle: fresh session injecting the owner's
-      // session record at kickoff (spec SESSION-RECORDS §6, fold-after-settle).
-      void foldAfterSettle(delivery, watch.sessionId).catch((error) => {
-        logger.error("follow_up_fold_after_settle_threw", {
+      // settled `completed`, sent before its run ended → revival (§8 "Late input").
+      void reviveWithFollowUp(watch.sessionId, delivery).catch((error) => {
+        logger.error("follow_up_revival_threw", {
           sessionId: watch.sessionId,
           eventId: inbound.event.id,
           error: error instanceof Error ? error.message : String(error),
@@ -4765,10 +4784,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     );
     if (!steered) {
       // The owner settled between the fold decision and here (it completed during the
-      // download wait above). Folding never resumes (spec SESSION-RECORDS §7): take the
-      // settled branch, a fresh session with the owner's record. `foldAfterSettle`
-      // reverts to native fate itself when the owner did not complete.
-      await foldAfterSettle(delivery, sessionId);
+      // download wait above): revive it when the follow-up was sent before its run
+      // ended (§8 "Late input"), else the follow-up takes its native fate.
+      if (!(await tryReviveWithSteer(sessionId, message, inbound))) revertFollowUpToNativeFate(inbound, "owner-settled");
       return;
     }
     trackSteer(sessionId, message, delivery);
@@ -4890,76 +4908,15 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   }
 
   /**
-   * Fold-after-settle (spec SESSION-RECORDS §7): a follow-up whose owning session
-   * has already completed starts a FRESH session with the owner's record injected
-   * (it waits for an in-flight one), like any message that arrives after a rollout
-   * ended. Folding never resumes.
-   *
-   * The follow-up was consumed by `foldFollowUp` (its trigger-hold twin is
-   * suppressed), so it must never be dropped: it goes through the normal trigger
-   * path — accept (spawn, or queue behind a busy slot), claim, launch — with the
-   * owner id carried in `foldOwners` to whichever launch picks it up. A bare group
-   * follow-up gets a synthesized `mention` trigger (same idiom as
-   * `retainFollowUpForSpawn`). An owner that did not complete (discarded, parked),
-   * or a setup failure, reverts the follow-up to native fate.
+   * Revive a settled owner with a folded follow-up (§8 "Late input"): the fold's
+   * interjection, marked as sent before the reply reached the sender. Falls back
+   * to the follow-up's native fate when the owner is not revivable any more.
    */
-  async function foldAfterSettle(delivery: FoldDelivery, ownerSessionId: string): Promise<void> {
-    const { inbound } = delivery;
-    // Settle window (review issue #3): the owner's record is evicted synchronously
-    // but its terminal status persists through the write queue. Drain it so the
-    // read below sees the settled status.
-    await storage.waitForIdle();
-    if (storage.getAgentSession(ownerSessionId)?.status !== "completed" || !inbound.outboundTarget) {
-      revertFollowUpToNativeFate(inbound, "fold-owner-not-completed");
-      return;
-    }
-    const spawnInbound: InboundChatEvent = inbound.trigger
-      ? inbound
-      : (() => {
-          const trigger: TriggerInfo = {
-            type: "mention",
-            reason: "same-sender follow-up after the session it followed had completed",
-            triggeredBy: inbound.event.sender,
-            groupedEventIds: [inbound.event.id],
-          };
-          return { ...inbound, trigger, event: { ...inbound.event, trigger } };
-        })();
-    foldOwners.set(spawnInbound.event.id, ownerSessionId);
-    try {
-      await resolveTriggerGroup(spawnInbound);
-      captionPool.notifyNewWork();
-      const decision = triggerCoordinator.accept(spawnInbound);
-      if (decision.action === "spawn" || decision.action === "queued") addClaim(spawnInbound);
-      logger.info("follow_up_fold_after_settle", {
-        ownerSessionId,
-        eventId: inbound.event.id,
-        timelineKey: inbound.timelineKey,
-        form: delivery.form,
-        action: decision.action,
-      });
-      if (decision.action === "queued") return; // launched by the slot's drain
-      if (decision.action !== "spawn") {
-        // Queue full: the native fate of this trigger is the same refusal.
-        foldOwners.delete(spawnInbound.event.id);
-        return;
-      }
-      void launchSession(spawnInbound, false).catch((error) => {
-        releaseClaimFor(spawnInbound);
-        logger.error("follow_up_fold_launch_failed", {
-          timelineKey: inbound.timelineKey,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        drainNextQueuedTrigger(inbound.timelineKey);
-      });
-    } catch (error) {
-      foldOwners.delete(spawnInbound.event.id);
-      releaseClaimFor(spawnInbound);
-      logger.error("follow_up_fold_after_settle_failed", {
-        ownerSessionId,
-        eventId: inbound.event.id,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      revertFollowUpToNativeFate(inbound, "fold-after-settle-failed");
+  async function reviveWithFollowUp(ownerSessionId: string, delivery: FollowUpDelivery): Promise<void> {
+    const { inbound, form, gapMs } = delivery;
+    const message = await buildAdditionInterjection(ownerSessionId, inbound, form, gapMs);
+    if (!(await tryReviveWithSteer(ownerSessionId, message, inbound))) {
+      revertFollowUpToNativeFate(inbound, "fold-owner-not-revivable");
     }
   }
 
@@ -4970,8 +4927,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // settles) is never read, and the record turn clears the agent's queues. Each
   // timeline-originated steer (follow-up, reply, co-reply) is tracked here per
   // session; when the session settles `completed`, every one whose message is not
-  // in the transcript is handed to foldAfterSettle with that session as owner
-  // (a fresh session with its record), exactly once. Non-timeline steers (cost
+  // in the transcript revives that session (ARCHITECTURE.md §8 "Late input"), or
+  // takes its native fate when it cannot be revived, exactly once. Non-timeline steers (cost
   // warning, delegate_to_session) are not tracked: the session they addressed is
   // over. Other terminal states keep their fates (an operator interrupt drops the
   // queue on purpose).
@@ -5075,7 +5032,15 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         timelineKey: entry.delivery.inbound.timelineKey,
         form: entry.delivery.form,
       });
-      void foldAfterSettle(entry.delivery, sessionId);
+      // Sent while the session ran, so before its run ended: it revives the
+      // session (§8 "Late input"); a session that cannot be revived gives the
+      // message its native fate.
+      const inbound = entry.delivery.inbound;
+      void tryReviveWithSteer(sessionId, entry.message, inbound)
+        .then((revived) => {
+          if (!revived) revertFollowUpToNativeFate(inbound, "steer-unread");
+        })
+        .catch(() => revertFollowUpToNativeFate(inbound, "steer-unread"));
     }
   }
 
@@ -5176,8 +5141,15 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     });
   }
 
-  function registerLateInputEntry(entry: Pick<LateInputEntry, "sessionId" | "timelineKey" | "inbound" | "ctl" | "revive">): void {
-    lateInputEntries.set(entry.sessionId, { ...entry, judged: 0, folded: 0, parked: [] });
+  function registerLateInputEntry(entry: Pick<LateInputEntry, "sessionId" | "timelineKey" | "inbound" | "ctl">): LateInputEntry {
+    const registered: LateInputEntry = { ...entry, revive: async () => false, judged: 0, folded: 0, parked: [] };
+    lateInputEntries.set(entry.sessionId, registered);
+    // A session that ends any other way than completed (discarded before it ran,
+    // parked, interrupted) is not correctable any more.
+    sessions.onSettle(entry.sessionId, (status) => {
+      if (status !== "completed") unregisterLateInputEntry(entry.sessionId);
+    });
+    return registered;
   }
 
   function unregisterLateInputEntry(sessionId: string): void {
@@ -5722,6 +5694,106 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       logger.error("late_input_reply_trigger_failed", { error: error instanceof Error ? error.message : String(error) });
     });
     return true;
+  }
+
+  /**
+   * Implicit replies (§8 "Late input", decision point `implicit_reply`): a bare
+   * group message from a human, sent within a few messages and seconds of one of
+   * this agent's messages M, may answer M without the reply function or a
+   * mention. The mechanical pre-gate keeps the decision call rare; a yes records
+   * M as the message's reply context and dispatches it exactly as an explicit
+   * reply to M (a reply trigger, a fresh session, M's record by the reply rule).
+   */
+  function maybeImplicitReply(inbound: InboundChatEvent): void {
+    if (!decisionEngine || inbound.event.sender.isSelf || !inbound.outboundTarget || !inbound.event.externalId) return;
+    const agentName = agentNameForTimeline(inbound.timelineKey);
+    if (!decisionEngine.isEnabled("implicit_reply", agentName)) return;
+    const knobs = implicitReplyKnobs(decisionsFor(config, agentName));
+    const accountId = parseTimelineKey(inbound.timelineKey)?.accountId;
+    const selfId = accountId ? providers.get(inbound.provider)?.getSelf(accountId)?.id : undefined;
+    const ids = {
+      ...(selfId ? { selfIds: new Set([selfId]) } : {}),
+      otherBotIds: new Set([...botSelfIdsForLimits].filter((id) => id !== selfId)),
+    };
+    const preceding = timeline
+      .query({ timelineKey: inbound.timelineKey, toTimestamp: inbound.event.timestamp, limit: knobs.maxMessagesAfter + 2 })
+      .filter((e) => e.id !== inbound.event.id);
+    const candidateGate = implicitReplyGateEventOf(inbound.event, ids);
+    const gate = implicitReplyPreGate({
+      isGroup: channelTypeOf(inbound) !== "dm",
+      candidate: {
+        ...candidateGate,
+        author: isHumanSender(inbound.event.sender) ? candidateGate.author : "bot",
+        hasReply: Boolean(inbound.event.replyTo?.externalId),
+        mentionsBot: inbound.event.mentions?.mentionedSelf ?? false,
+        hasTrigger: inbound.trigger !== undefined,
+        consumed: steeredEventIds.has(inbound.event.id),
+      },
+      preceding: preceding.map((e) => implicitReplyGateEventOf(e, ids)),
+      maxMessagesAfter: knobs.maxMessagesAfter,
+      maxAgeMs: knobs.maxAgeMs,
+    });
+    if (!gate.eligible) return;
+    void evaluateImplicitReply(inbound, gate.botMessageIds, agentName, ids.selfIds, knobs.recentMessages).catch((error) => {
+      logger.warn("implicit_reply_failed", { eventId: inbound.event.id, error: error instanceof Error ? error.message : String(error) });
+    });
+  }
+
+  async function evaluateImplicitReply(
+    inbound: InboundChatEvent,
+    botMessageIds: readonly string[],
+    agentName: string | null,
+    selfIds: ReadonlySet<string> | undefined,
+    recentMessages: number,
+  ): Promise<void> {
+    if (!decisionEngine) return;
+    const recent = hydrateEvents(
+      storage,
+      timeline.query({ timelineKey: inbound.timelineKey, toTimestamp: inbound.event.timestamp, limit: recentMessages + 8 }),
+    );
+    const [candidate] = hydrateEvents(storage, [timeline.getById(inbound.event.id) ?? inbound.event]);
+    for (const botMessageId of botMessageIds) {
+      const botMessage = recent.find((e) => e.id === botMessageId) ?? timeline.getById(botMessageId);
+      if (!botMessage?.externalId || !candidate) continue;
+      const input = implicitReplyInputFrom({ recent, botMessage, candidate, ...(selfIds ? { selfIds } : {}), recentMessages });
+      const outcome = await decisionEngine.evaluate(implicitReplyPoint, input, {
+        agentName,
+        attribution: { timelineKey: inbound.timelineKey, sessionType: "default", triggerSenderId: inbound.event.sender.id },
+        signal: drainAbort.signal,
+        triggerEventId: inbound.event.id,
+        candidateSessionId: botMessage.agentSessionId ?? null,
+      });
+      logger.info("implicit_reply_evaluated", {
+        eventId: inbound.event.id,
+        botMessageId,
+        replies: outcome.verdict.replies,
+        probability: outcome.verdict.probability,
+        source: outcome.source,
+      });
+      if (!outcome.verdict.replies) continue;
+      // Consumed meanwhile (an edit, a late addition, another route): leave it.
+      if (steeredEventIds.has(inbound.event.id)) return;
+      markSteered(inbound.event.id);
+      await storage.insertReplyContext({
+        event_id: inbound.event.id,
+        reply_external_id: botMessage.externalId,
+        sender_id: botMessage.sender.id,
+        sender_display_name: botMessage.sender.displayName ?? null,
+        body: botMessage.body ?? null,
+        html_body: botMessage.htmlBody ?? null,
+        timestamp: botMessage.timestamp,
+        created_at: Date.now(),
+      });
+      const trigger: TriggerInfo = {
+        type: "reply",
+        reason: "implicit reply to the bot's message",
+        triggeredBy: inbound.event.sender,
+        groupedEventIds: [inbound.event.id],
+      };
+      const replyTo = { externalId: botMessage.externalId, agentSessionId: botMessage.agentSessionId };
+      await redispatchCoReply({ ...inbound, trigger, event: { ...inbound.event, replyTo, trigger } });
+      return;
+    }
   }
 
   /** Revive the owner of an unread steer or a settled fold, when it is revivable. */
@@ -7788,8 +7860,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // context-build mode, and typing suppression. Everything else — tool assembly,
     // capture, slot release, queued-trigger drainage — is shared.
     const proactive = opts?.proactive === true;
-    const ownerSessionId = opts?.ownerSessionId ?? foldOwners.get(inbound.event.id);
-    foldOwners.delete(inbound.event.id);
+    const ownerSessionId = opts?.ownerSessionId;
     // Resume fork (spec RESUMABLE-SESSIONS §7): a reply that continues a completed,
     // eligible session takes over this trigger's slot and returns true. Any gate
     // failing (or a non-reply/proactive trigger) falls through to the FRESH launch below.
@@ -7869,6 +7940,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // can be corrected after they start (trigger edits, late additions); the hold
     // applies to the default chat lane only.
     const lateCtl = createLateInputSession(inbound, session, { proactive, isBotTriggered });
+    const lateEntry = lateCtl
+      ? registerLateInputEntry({ sessionId: session.id, timelineKey: session.timelineKey, inbound, ctl: lateCtl })
+      : undefined;
     let userLimitForCreate: UserLimitGate["userLimit"];
     let userCeilingOverride: number | undefined;
     let initialUserModel: string | undefined;
@@ -8117,6 +8191,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     }
     sessions.attachAgent(session.id, agent!);
     lateCtl?.markRunning();
+    drainLateInputParked(session.id);
     // Success drain (spec DEFERRED-COALESCING): the session is now steerable, so fold
     // every co-reply parked on its trigger in as an interjection. Consumes the parked
     // entries, so the settle-fallback registered above then fires on nothing.
@@ -8435,7 +8510,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       });
       return reviving;
     };
-    if (lateCtl) registerLateInputEntry({ sessionId: session.id, timelineKey: session.timelineKey, inbound, ctl: lateCtl, revive });
+    if (lateEntry) lateEntry.revive = revive;
 
     void startRun(kickoff, { holdsSlot: true });
   }
@@ -9067,7 +9142,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // FOLLOWUP-FOLDING): the runtime is draining, so nothing more folds.
         followUpWatch.clear();
         pendingFollowUps.clear();
-        foldOwners.clear();
+        // Late input: nothing more is revived or corrected.
+        for (const entry of lateInputEntries.values()) if (entry.expiry) clearTimeout(entry.expiry);
+        lateInputEntries.clear();
         // Abort each caption client's scheduler-admission seam BEFORE awaiting
         // the pool's in-flight workers (#6). `captionPool.stop()` awaits
         // in-flight caption work, and a caption call queued behind a half-open
