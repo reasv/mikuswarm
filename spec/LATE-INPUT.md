@@ -1,6 +1,6 @@
 # Late input: trigger edits, late additions, redo and revival
 
-**Status**: PROPOSAL, revision 1 (2026-10-07, from the owner design discussion of the same day), ready for implementation; only the defaults of §11 remain to tune. Not implemented.
+**Status**: IMPLEMENTED 2026-10-07, superseded by ARCHITECTURE.md §8 "Late input" (with §8h, §8b, §8j, §10, §11); retained for review. Implementation notes: revival works within the in-memory window only (a session evicted by a restart is not rehydrated); Matrix message redactions are not routed (Discord deletions are); an implicit-reply verdict is recorded as the reply context of the message.
 **Realizes**: spec/SESSION-RECORDS.md §9 "Trigger edits, the hold, folding, interjection" (the owner direction recorded there).
 **Supersedes**: the settled branch of follow-up folding as shipped by SESSION-RECORDS §7 (`foldAfterSettle`: a fresh session with the owner's record). See §5.5.
 **Amends**: spec/FOLLOWUP-FOLDING.md (delivery while running, §5.2), the trigger hold (ARCHITECTURE.md §6, §7), the tool side-effect list (`src/tools/side-effects.ts`, REFUSAL-HANDLING §8.4), the branch reasons of REFUSAL-HANDLING §9.
