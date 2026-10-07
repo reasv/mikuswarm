@@ -77,6 +77,7 @@ import {
   routingInputFrom,
   toTranscriptMessage,
   routingPoint,
+  createDecisionImageLoader,
   DecisionClient,
   DecisionEngine,
   anyDecisionPointEnabled,
@@ -1973,6 +1974,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           logger: logger.child("decisions"),
         }),
         scheduler: llmScheduler,
+        // Subject images of vision-chain evaluations (ARCHITECTURE.md §8h).
+        loadImage: createDecisionImageLoader({ mozjpeg: inferenceImageOptions.mozjpeg }),
         budget: () => budgetHooks.engine,
         record: (event) => budgetHooks.record?.(event),
         // Persist every evaluated row (spec SESSION-RECORDS §6.2 + ARCHITECTURE §8h).
