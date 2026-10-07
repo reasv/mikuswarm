@@ -10746,6 +10746,38 @@ export class Storage {
     });
   }
 
+  /** One more redo from scratch (ARCHITECTURE.md §8 "Late input"). */
+  bumpAgentSessionRedoCount(id: string): Promise<void> {
+    return this.write((db) => {
+      const result = db.prepare(`update agent_sessions set redo_count = redo_count + 1 where id = ?`).run(id);
+      this.warnIfNoSessionRow("bumpAgentSessionRedoCount", id, result.changes);
+    });
+  }
+
+  /**
+   * The session a request message belongs to: the newest chat session whose
+   * trigger is this event or the trigger of this event's trigger group
+   * (ARCHITECTURE.md §8 "Late input": a reply to the request resolves to it).
+   */
+  getSessionIdForRequestEvent(eventId: string): string | undefined {
+    const row = this.read((db) =>
+      db.prepare(
+        `select s.id as id from agent_sessions s
+          where s.trigger_event_id = coalesce(
+            (select trigger_group_id from timeline_events where id = @id), @id)
+          order by s.created_at desc limit 1`,
+      ).get({ id: eventId }) as { id: string } | undefined,
+    );
+    return row?.id;
+  }
+
+  /** Take an event out of its trigger group (a grouped part was deleted). */
+  clearTriggerGroupMember(eventId: string): Promise<void> {
+    return this.write((db) => {
+      db.prepare(`update timeline_events set trigger_group_id = null, updated_at = ? where id = ?`).run(Date.now(), eventId);
+    });
+  }
+
   /** A session's sticky refusal pin, or undefined (none, or an unreadable value). */
   getAgentSessionRefusalPin(id: string): RefusalPin | undefined {
     const row = this.read((db) =>

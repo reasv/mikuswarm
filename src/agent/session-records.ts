@@ -119,7 +119,19 @@ export type RecordTurnFailure =
   | "llm_error"
   | "max_turns"
   | "shutdown"
+  | "revival"
   | "not_finalized";
+
+/**
+ * Where the last record turn starts in a transcript: the index of its harness
+ * kickoff (`harness.kind = "record_turn"`), or -1 when the transcript has none.
+ */
+export function recordTurnStartIndex(messages: readonly AgentMessage[]): number {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if ((messages[i] as { harness?: { kind?: string } }).harness?.kind === "record_turn") return i;
+  }
+  return -1;
+}
 
 /**
  * Why a record turn that ended on its own (no abort of ours) wrote nothing. A
@@ -141,7 +153,7 @@ export function classifyUnfinalizedRecordTurn(
   return "not_finalized";
 }
 
-type AbortReason = "max_turns" | "shutdown";
+type AbortReason = "max_turns" | "shutdown" | "revival";
 
 interface InflightEntry {
   outcome?: { status: string; reason?: string };
@@ -266,6 +278,18 @@ export class SessionRecordService {
     ]);
     clearTimeout(timer);
     return settled;
+  }
+
+  /**
+   * Revival (ARCHITECTURE.md §8 "Late input"): a message revives the settled
+   * session, so its record turn is stopped (it writes nothing; the record of the
+   * revived run is written at its new end). Resolves once the turn settled.
+   */
+  async abortForRevival(sessionId: string): Promise<void> {
+    const entry = this.inflight.get(sessionId);
+    if (!entry) return;
+    entry.abort?.("revival");
+    await entry.done;
   }
 
   /**

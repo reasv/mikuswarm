@@ -92,7 +92,15 @@ import { createActingPolicy } from "./checks/acting-policy.js";
 import { createRevisePolicyPart, priorRejections } from "./checks/revise.js";
 import { ContractReconciler, persistSessionContract } from "./agent/contract-store.js";
 import type { CreatedAgent } from "./agent/factory.js";
-import type { SessionRunnerOptions } from "./agent/runner.js";
+import type { LateInputStep, SessionRunnerOptions } from "./agent/runner.js";
+import type { Agent, AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
+import {
+  HELD_CALL_CANCELLED,
+  LateInputSession,
+  resolveLateInputSettings,
+  type RestartRequest,
+} from "./agent/late-input.js";
+import { compensationFor } from "./tools/side-effects.js";
 import { buildAgentModelOverrides } from "./agent/agent-model-overrides.js";
 import { emptyUsageTotals } from "./agent/usage.js";
 import { SessionUsageTracker, type CostRates, type SessionUsageTotals } from "./agent/usage.js";
@@ -159,7 +167,7 @@ import { createNoReplyTool } from "./tools/no-reply.js";
 import { createSessionRecordTool, SummaryDraft } from "./tools/session-record-tool.js";
 import { createReadSessionRecordTool, createReadSessionTranscriptTool } from "./tools/read-session-record.js";
 import type { SessionRecordHandles } from "./agent/record-turn.js";
-import { SessionRecordService } from "./agent/session-records.js";
+import { SessionRecordService, recordTurnStartIndex } from "./agent/session-records.js";
 import {
   decisionsFor,
   selectRecordsToInject,
@@ -176,7 +184,8 @@ import type { SyntheticCallSpec } from "./agent/synthetic-calls.js";
 import { SauceNaoRateLimiter } from "./saucenao/rate-limiter.js";
 import { setEgressGuardEnabled } from "./tools/ssrf.js";
 import { configureHttpLimiter } from "./tools/http-limiter.js";
-import type { CanonicalChatEvent, ChatProviderHost, IChatProvider, InboundChatEvent, OutboundTarget, TriggerInfo } from "./types.js";
+import type { CanonicalChatEvent, ChatProviderHost, IChatProvider, InboundChatEvent, OutboundTarget, SenderInfo, TriggerInfo } from "./types.js";
+import type { InterjectionSource } from "./agent/session-manager.js";
 import { EnrichmentWorkerPool, FetchClient } from "./enrichment/index.js";
 import { AttachmentStore } from "./enrichment/attachment-store.js";
 import { FxTwitterClient, resolveFxTwitterConfig } from "./fxtwitter/index.js";
@@ -4531,7 +4540,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   /** What foldAfterSettle takes: a follow-up, or a steered reply / co-reply never read. */
   interface FoldDelivery {
     inbound: InboundChatEvent;
-    form: FollowUpForm | "reply" | "co-reply";
+    form: FollowUpForm | "reply" | "co-reply" | "edit";
   }
 
   /**
@@ -5101,6 +5110,614 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       `Use judgment: treat it as part of the request if it fits, ignore it if unrelated, or ${spawnHint}.\n\n` +
       `${rendered}\n</interjection>`
     );
+  }
+
+  // ─── Late input (ARCHITECTURE.md §8 "Late input") ──────────────────────────
+  // A request can be corrected after its session started: an edit of a trigger-
+  // group message, a late addition from the same sender, a reply to the request.
+  // With no irreversible effect yet, the session is redone from scratch;
+  // otherwise the correction is interjected (aborting a generation in flight). A
+  // message sent before the run ended but arriving after it revives the settled
+  // session. Each human-triggered chat session has a `LateInputSession`
+  // controller; the entries below index them (live, and settled within the
+  // revival window) for the inbound routes.
+  const lateInputSettings = resolveLateInputSettings(config.agent.sessions.late_input);
+
+  interface LateInputEntry {
+    sessionId: string;
+    timelineKey: string;
+    /** The session's trigger inbound; its group grows and shrinks with corrections. */
+    inbound: InboundChatEvent;
+    ctl: LateInputSession;
+    /** Revive the settled session with these interjections (false = not revivable now). */
+    revive: (messages: AgentMessage[], cause: { eventId: string }) => Promise<boolean>;
+    /** Late-addition candidates judged / messages joined (the `max_judged` / `max_folded` bounds). */
+    judged: number;
+    folded: number;
+    /** Interjections that arrived while the session was still building. */
+    parked: Array<{ message: SteerMessage; source: InterjectionSource; delivery: FoldDelivery }>;
+    expiry?: ReturnType<typeof setTimeout>;
+  }
+  const lateInputEntries = new Map<string, LateInputEntry>();
+
+  /** A human sender: not this bot, not a sibling agent, not another bot (webhooks count as human). */
+  function isHumanSender(sender: SenderInfo): boolean {
+    if (sender.isSelf || botSelfIdsForLimits.has(sender.id)) return false;
+    return !(sender.isBot === true && sender.isWebhook !== true);
+  }
+
+  function createLateInputSession(
+    inbound: InboundChatEvent,
+    session: { id: string; sessionType: string },
+    opts: { proactive: boolean; isBotTriggered: boolean },
+  ): LateInputSession | undefined {
+    if (!lateInputSettings.enabled || opts.proactive || opts.isBotTriggered) return undefined;
+    const sender = inbound.trigger?.triggeredBy ?? inbound.event.sender;
+    if (!inbound.event.externalId || !isHumanSender(sender)) return undefined;
+    return new LateInputSession({
+      sessionId: session.id,
+      settings: lateInputSettings,
+      triggerReceivedAt: inbound.event.receivedAt ?? Date.now(),
+      holdApplies: session.sessionType === "default",
+      logger,
+    });
+  }
+
+  function registerLateInputEntry(entry: Pick<LateInputEntry, "sessionId" | "timelineKey" | "inbound" | "ctl" | "revive">): void {
+    lateInputEntries.set(entry.sessionId, { ...entry, judged: 0, folded: 0, parked: [] });
+  }
+
+  function unregisterLateInputEntry(sessionId: string): void {
+    const entry = lateInputEntries.get(sessionId);
+    if (entry?.expiry) clearTimeout(entry.expiry);
+    lateInputEntries.delete(sessionId);
+  }
+
+  /** Keep a completed session revivable for `revive_max_ms`, then finalize it. */
+  function scheduleLateInputExpiry(sessionId: string, finalize: () => void): void {
+    const entry = lateInputEntries.get(sessionId);
+    if (!entry) {
+      finalize();
+      return;
+    }
+    if (entry.expiry) clearTimeout(entry.expiry);
+    entry.expiry = setTimeout(finalize, lateInputSettings.reviveMaxMs + lateInputSettings.skewToleranceMs);
+    entry.expiry.unref?.();
+  }
+
+  /** Steer the interjections parked while the session was building (after `attachAgent`). */
+  function drainLateInputParked(sessionId: string): void {
+    const entry = lateInputEntries.get(sessionId);
+    if (!entry || entry.parked.length === 0) return;
+    const parked = entry.parked.splice(0);
+    for (const item of parked) {
+      if (sessions.steer(sessionId, item.message, item.source)) trackSteer(sessionId, item.message, item.delivery);
+    }
+  }
+
+  function triggerGroupOf(inbound: InboundChatEvent): string[] {
+    return [inbound.event.id, ...(inbound.trigger?.groupedEventIds ?? []).filter((id) => id !== inbound.event.id)];
+  }
+
+  /** The newest live-or-revivable session whose request contains `eventId`. */
+  function lateEntryForRequestEvent(timelineKey: string, eventId: string): LateInputEntry | undefined {
+    let best: LateInputEntry | undefined;
+    for (const entry of lateInputEntries.values()) {
+      if (entry.timelineKey !== timelineKey || !triggerGroupOf(entry.inbound).includes(eventId)) continue;
+      if (!best || entry.inbound.event.timestamp > best.inbound.event.timestamp) best = entry;
+    }
+    return best;
+  }
+
+  /** The newest live-or-revivable session `senderId` triggered in this timeline, other than `exceptEventId`'s. */
+  function lateEntryForSender(timelineKey: string, senderId: string, exceptEventId: string): LateInputEntry | undefined {
+    let best: LateInputEntry | undefined;
+    for (const entry of lateInputEntries.values()) {
+      if (entry.timelineKey !== timelineKey) continue;
+      const sender = entry.inbound.trigger?.triggeredBy ?? entry.inbound.event.sender;
+      if (sender.id !== senderId || triggerGroupOf(entry.inbound).includes(exceptEventId)) continue;
+      if (!best || entry.inbound.event.timestamp > best.inbound.event.timestamp) best = entry;
+    }
+    return best;
+  }
+
+  /** Sent (server time) before the run ended, and the run ended recently enough to revive. */
+  function sentBeforeRunEnd(ctl: LateInputSession, sentAt: number): boolean {
+    const endedAt = ctl.runEndedAt;
+    if (endedAt === undefined || ctl.phase !== "ended") return false;
+    if (Date.now() - endedAt > lateInputSettings.reviveMaxMs) return false;
+    return sentAt <= endedAt + lateInputSettings.skewToleranceMs;
+  }
+
+  /** Copy the stored (edited) trigger's content onto the session's in-memory trigger. */
+  function refreshTriggerFromStore(inbound: InboundChatEvent): void {
+    const stored = timeline.getById(inbound.event.id);
+    if (!stored) return;
+    inbound.event.body = stored.body;
+    inbound.event.htmlBody = stored.htmlBody;
+    inbound.event.attachments = stored.attachments;
+    inbound.event.linkedMedia = stored.linkedMedia;
+    inbound.event.linkPreviews = stored.linkPreviews;
+    inbound.event.mentions = stored.mentions;
+  }
+
+  /** A late addition joins the request; a deleted grouped part leaves it. */
+  function applyTriggerGroupChange(entry: LateInputEntry, added: readonly string[], removed: readonly string[]): void {
+    if (added.length === 0 && removed.length === 0) return;
+    const group = new Set(triggerGroupOf(entry.inbound));
+    for (const id of added) group.add(id);
+    for (const id of removed) group.delete(id);
+    const ids = [...group];
+    const trigger: TriggerInfo = { ...(entry.inbound.trigger ?? { type: "mention", reason: "late input", triggeredBy: entry.inbound.event.sender }), groupedEventIds: ids };
+    entry.inbound.trigger = trigger;
+    entry.inbound.event.trigger = trigger;
+    void timeline.setTriggerGroup(entry.inbound.event.id, ids).catch(() => undefined);
+    for (const id of removed) void storage.clearTriggerGroupMember(id).catch(() => undefined);
+  }
+
+  /** The replacement agent's interjections from the discarded span stay tracked as read-or-not. */
+  function rebindPendingSteers(sessionId: string, agent: Agent): void {
+    const slot = pendingSteers.get(sessionId);
+    if (slot) slot.agent = agent;
+  }
+
+  /** Undo the session's undoable effects (newest first) before a redo; false = one could not be undone. */
+  async function compensateUndoableEffects(ctl: LateInputSession, tools: readonly AgentTool[], sessionId: string): Promise<boolean> {
+    for (const effect of ctl.undoableEffects().reverse()) {
+      const call = compensationFor(effect.name, effect.args);
+      const tool = call ? tools.find((t) => t.name === call.name) : undefined;
+      if (!call || !tool) return false;
+      try {
+        const result = await tool.execute(`late-input-undo-${effect.toolCallId}`, call.args as never, undefined, undefined);
+        const first = (result as { content?: Array<{ type?: string; text?: string }> }).content?.[0];
+        if (first?.type === "text" && typeof first.text === "string" && /^error\b/i.test(first.text.trimStart())) return false;
+      } catch {
+        return false;
+      }
+      logger.info("late_input_compensated", { sessionId, tool: effect.name, compensation: call.name });
+    }
+    return true;
+  }
+
+  /** What a correction does to its session. */
+  interface CorrectionPlan {
+    kind: "edit" | "addition" | "reply" | "delete_trigger" | "delete_part" | "unmention";
+    causeEventId: string;
+    /** When the message was sent (server time; the revival test). */
+    sentAt: number;
+    /** The interjection when the session cannot redo; `late` = it revives a settled session. */
+    interjection: (opts: { late: boolean }) => Promise<SteerMessage>;
+    source: InterjectionSource;
+    delivery: FoldDelivery;
+    added?: string[];
+    removed?: string[];
+  }
+
+  type CorrectionOutcome = "redo" | "cancelled" | "interjected" | "revived" | "ignored";
+
+  /**
+   * Apply a correction to its session (§8 "Late input"): redo from scratch while
+   * nothing irreversible happened (a withdrawn trigger cancels), otherwise
+   * interject; a settled session is revived when the message was sent before
+   * its run ended, else the correction is ignored (the stored message changed).
+   */
+  async function deliverCorrection(entry: LateInputEntry, plan: CorrectionPlan): Promise<CorrectionOutcome> {
+    const ctl = entry.ctl;
+    if (ctl.phase !== "ended") {
+      if (ctl.canRedo()) {
+        if (plan.kind === "delete_trigger" || plan.kind === "unmention") {
+          ctl.requestCancel(plan.kind, plan.causeEventId);
+          logger.info("late_input_cancel_requested", { sessionId: entry.sessionId, kind: plan.kind, causeEventId: plan.causeEventId });
+          return "cancelled";
+        }
+        applyTriggerGroupChange(entry, plan.added ?? [], plan.removed ?? []);
+        const fallback = await plan.interjection({ late: false });
+        ctl.requestRestart({
+          reason: plan.kind === "edit" || plan.kind === "delete_part" ? "edit_redo" : "addition_redo",
+          causeEventIds: [plan.causeEventId],
+          fallbackInterjections: [fallback],
+          addedEventIds: plan.added ?? [],
+          removedEventIds: plan.removed ?? [],
+        });
+        logger.info("late_input_redo_requested", {
+          sessionId: entry.sessionId,
+          kind: plan.kind,
+          causeEventId: plan.causeEventId,
+          phase: ctl.phase,
+        });
+        return "redo";
+      }
+      const message = await plan.interjection({ late: false });
+      if (ctl.phase === "building") {
+        entry.parked.push({ message, source: plan.source, delivery: plan.delivery });
+        logger.info("late_input_interjected", { sessionId: entry.sessionId, kind: plan.kind, parked: true });
+        return "interjected";
+      }
+      if (ctl.phase === "running" && sessions.steer(entry.sessionId, message, plan.source)) {
+        trackSteer(entry.sessionId, message, plan.delivery);
+        ctl.abortGenerationForSteer();
+        logger.info("late_input_interjected", { sessionId: entry.sessionId, kind: plan.kind, causeEventId: plan.causeEventId });
+        return "interjected";
+      }
+    }
+    if (sentBeforeRunEnd(ctl, plan.sentAt)) {
+      const message = await plan.interjection({ late: true });
+      if (await entry.revive([message], { eventId: plan.causeEventId })) {
+        void storage.insertSessionInterjection({
+          sessionId: entry.sessionId,
+          eventId: plan.source.eventId ?? null,
+          externalId: plan.source.externalId ?? null,
+          senderId: plan.source.senderId ?? null,
+          senderDisplayName: plan.source.senderDisplayName ?? null,
+          kind: "revival",
+          body: (plan.source.body ?? "").slice(0, 500),
+          createdAt: Date.now(),
+        }).catch(() => undefined);
+        return "revived";
+      }
+    }
+    logger.info("late_input_ignored", { sessionId: entry.sessionId, kind: plan.kind, reason: ctl.phase === "ended" ? "after_run_end" : "not_steerable" });
+    return "ignored";
+  }
+
+  /** Display name for interjection texts (§6.2: `username ?? id` fallback). */
+  function senderLabel(sender: SenderInfo): string {
+    return escapeXml(sender.displayName ?? sender.username ?? sender.id);
+  }
+
+  const LATE_NOTE = (sender: SenderInfo): string => `${senderLabel(sender)} sent this before your reply reached them.`;
+
+  /** One interjection message (the content is wrapped in `<interjection>` again by convert.ts). */
+  function lateInterjection(reason: string, body: string, imageBlocks?: ImageBlock[]): SteerMessage {
+    return {
+      type: "interjection",
+      content: `<interjection reason="${reason}">\n${body}\n</interjection>`,
+      ...(imageBlocks ? { imageBlocks } : {}),
+    } as SteerMessage;
+  }
+
+  function sameRequestContent(a: CanonicalChatEvent, b: CanonicalChatEvent): boolean {
+    const norm = (text: string | undefined) => (text ?? "").replace(/\s+/g, " ").trim();
+    const atts = (e: CanonicalChatEvent) =>
+      (e.attachments ?? []).map((x) => `${x.mediaType}:${x.remoteUrl ?? x.id ?? x.filename ?? ""}`).join("|");
+    return norm(a.body) === norm(b.body) && atts(a) === atts(b);
+  }
+
+  /**
+   * A trigger-group message was edited or deleted (§8 "Late input"). Called by
+   * `applyEdit` once the stored row changed. Edits by anyone but the message's
+   * own human sender are content updates only; a formatting-only edit is a no-op.
+   */
+  function onRequestEdited(inbound: InboundChatEvent, prior: CanonicalChatEvent, after: CanonicalChatEvent): void {
+    if (!lateInputSettings.enabled) return;
+    const deleted = inbound.edit?.deleted === true;
+    const entry = lateEntryForRequestEvent(prior.timelineKey, prior.id);
+    if (!entry) {
+      if (!deleted) maybeTriggerOnAddedMention(inbound, prior, after);
+      return;
+    }
+    if (!deleted) {
+      if (inbound.event.sender.id !== prior.sender.id || !isHumanSender(inbound.event.sender)) return;
+      if (sameRequestContent(prior, after) && Boolean(prior.mentions?.mentionedSelf) === Boolean(after.mentions?.mentionedSelf)) {
+        logger.info("late_input_ignored", { sessionId: entry.sessionId, kind: "edit", reason: "no_op" });
+        return;
+      }
+    }
+    const isTrigger = prior.id === entry.inbound.event.id;
+    const unmention =
+      !deleted &&
+      isTrigger &&
+      channelTypeOf(entry.inbound) !== "dm" &&
+      entry.inbound.trigger?.type === "mention" &&
+      prior.mentions?.mentionedSelf === true &&
+      after.mentions?.mentionedSelf !== true;
+    const kind: CorrectionPlan["kind"] = deleted ? (isTrigger ? "delete_trigger" : "delete_part") : unmention ? "unmention" : "edit";
+    const who = senderLabel(prior.sender);
+    const beforeText = escapeXml(prior.body ?? "");
+    const afterText = escapeXml(after.body ?? "");
+    const text =
+      kind === "delete_trigger"
+        ? `${who} deleted the message you are answering.`
+        : kind === "delete_part"
+          ? `${who} deleted one of the messages you are answering:\n${beforeText}`
+          : `${who} edited the message you are answering.\nBefore:\n${beforeText}\nAfter:\n${afterText}`;
+    void deliverCorrection(entry, {
+      kind,
+      causeEventId: prior.id,
+      sentAt: inbound.event.timestamp,
+      interjection: async ({ late }) => lateInterjection(late ? "revival" : "edit", late ? `${LATE_NOTE(prior.sender)}\n${text}` : text),
+      source: {
+        eventId: prior.id,
+        externalId: prior.externalId,
+        senderId: prior.sender.id,
+        senderDisplayName: prior.sender.displayName,
+        kind: "edit",
+        body: after.body ?? "",
+      },
+      delivery: { inbound: { ...inbound, edit: undefined, event: after }, form: "edit" },
+      ...(kind === "delete_part" ? { removed: [prior.id] } : {}),
+    }).catch((error) => {
+      logger.error("late_input_edit_failed", { sessionId: entry.sessionId, error: error instanceof Error ? error.message : String(error) });
+    });
+  }
+
+  /**
+   * An edit that ADDS a mention of the bot to a recent message triggers as the
+   * original would have (within the late-addition candidate window of its send).
+   */
+  function maybeTriggerOnAddedMention(inbound: InboundChatEvent, prior: CanonicalChatEvent, after: CanonicalChatEvent): void {
+    if (prior.mentions?.mentionedSelf === true || after.mentions?.mentionedSelf !== true) return;
+    if (inbound.event.sender.id !== prior.sender.id || !isHumanSender(prior.sender)) return;
+    if (!inbound.outboundTarget || !after.externalId) return;
+    const knobs = lateAdditionKnobs(decisionsFor(config, agentNameForTimeline(after.timelineKey)));
+    if (Date.now() - prior.timestamp > knobs.candidateWindowMs) return;
+    if (storage.getSessionIdForRequestEvent(after.id) !== undefined) return;
+    const trigger: TriggerInfo = {
+      type: "mention",
+      reason: "an edit added a mention of the bot",
+      triggeredBy: after.sender,
+      groupedEventIds: [after.id],
+    };
+    const triggerInbound: InboundChatEvent = { ...inbound, edit: undefined, event: { ...after, trigger }, trigger };
+    logger.info("late_input_mention_edit_trigger", { timelineKey: after.timelineKey, eventId: after.id });
+    void redispatchCoReply(triggerInbound).catch((error) => {
+      logger.error("late_input_mention_edit_trigger_failed", { error: error instanceof Error ? error.message : String(error) });
+    });
+  }
+
+  /**
+   * Late additions (§8 "Late input"): a message the trigger's sender sent after
+   * the request and before the session's first delivery, within the candidate
+   * window. The `late_addition` decision point judges membership (in parallel
+   * with the session's work; the hold waits for the verdict); without it, the
+   * quick fold windows decide. A member joins the request (redo, interjection or
+   * revival); a non-member takes its native fate. Synchronous: returns true when
+   * the message was consumed.
+   */
+  function routeLateAddition(inbound: InboundChatEvent): boolean {
+    if (!lateInputSettings.enabled) return false;
+    if (inbound.event.replyTo?.externalId) return false;
+    const sender = inbound.event.sender;
+    if (!sender.id || !isHumanSender(sender)) return false;
+    const wouldTrigger = channelTypeOf(inbound) === "dm" || (inbound.event.mentions?.mentionedSelf ?? false);
+    // A trigger-bearing message is decided on its post-hold delivery (the raw one
+    // has no trigger to fall back to).
+    if (wouldTrigger && !inbound.trigger) return false;
+    if (steeredEventIds.has(inbound.event.id)) return true;
+    const entry = lateEntryForSender(inbound.timelineKey, sender.id, inbound.event.id);
+    if (!entry) return false;
+    const agentName = agentNameForTimeline(entry.timelineKey);
+    const knobs = lateAdditionKnobs(decisionsFor(config, agentName));
+    const sentAt = inbound.event.timestamp;
+    const requestTs = Math.max(
+      ...triggerGroupOf(entry.inbound).map((id) => (id === entry.inbound.event.id ? entry.inbound.event.timestamp : timeline.getById(id)?.timestamp ?? 0)),
+    );
+    if (sentAt <= requestTs) return false;
+    if (sentAt - entry.inbound.event.timestamp > knobs.candidateWindowMs) return false;
+    const firstDelivery = entry.ctl.firstDeliveryAt;
+    if (firstDelivery !== undefined && sentAt > firstDelivery + lateInputSettings.skewToleranceMs) return false;
+    // A settled session takes a late addition only through revival (sent before its end).
+    if (entry.ctl.phase === "ended" && !sentBeforeRunEnd(entry.ctl, sentAt)) return false;
+    if (entry.folded >= knobs.maxFolded) return false;
+    const form = classifyFollowUpForm(inbound.event);
+    const pointOn = decisionEngine?.isEnabled("late_addition", agentName) ?? false;
+    if (pointOn && entry.judged < knobs.maxJudged) {
+      entry.judged += 1;
+      markSteered(inbound.event.id);
+      const verdict = judgeLateAddition(entry, inbound);
+      entry.ctl.trackVerdict(verdict);
+      void verdict.then((v) => {
+        if (v.judged) {
+          if (v.belongs) return joinLateAddition(entry, inbound, form, "judged");
+          logger.info("late_input_ignored", { sessionId: entry.sessionId, kind: "addition", reason: "judged_not_belonging", probability: v.probability });
+          revertFollowUpToNativeFate(inbound, "late_addition_rejected");
+          return;
+        }
+        // No verdict (point failed): the quick fold windows decide, as without the point.
+        if (quickFoldPasses(entry, inbound, form)) return joinLateAddition(entry, inbound, form, "quick_window");
+        revertFollowUpToNativeFate(inbound, "late_addition_unjudged");
+      }).catch((error) => {
+        logger.error("late_input_addition_failed", { sessionId: entry.sessionId, error: error instanceof Error ? error.message : String(error) });
+        revertFollowUpToNativeFate(inbound, "late_addition_failed");
+      });
+      return true;
+    }
+    if (!quickFoldPasses(entry, inbound, form)) return false;
+    markSteered(inbound.event.id);
+    void joinLateAddition(entry, inbound, form, "quick_window").catch((error) => {
+      logger.error("late_input_addition_failed", { sessionId: entry.sessionId, error: error instanceof Error ? error.message : String(error) });
+    });
+    return true;
+  }
+
+  function quickFoldPasses(entry: LateInputEntry, inbound: InboundChatEvent, form: FollowUpForm): boolean {
+    if (!followUpActive) return false;
+    return followUpGateDecision({
+      form,
+      config: followUpConfig,
+      triggerOriginTs: entry.inbound.event.timestamp,
+      followUpOriginTs: inbound.event.timestamp,
+      armedAtWallClock: entry.ctl.triggerReceivedAt,
+      now: Date.now(),
+    });
+  }
+
+  /** Judge one late-addition candidate with the `late_addition` decision point. */
+  async function judgeLateAddition(entry: LateInputEntry, inbound: InboundChatEvent): Promise<LateAdditionVerdict> {
+    if (!decisionEngine) return LATE_ADDITION_NOT_JUDGED;
+    const agentName = agentNameForTimeline(entry.timelineKey);
+    const knobs = lateAdditionKnobs(decisionsFor(config, agentName));
+    // Pixels for the vision chain need the download, never the caption.
+    if (hasImageAttachment(inbound.event)) {
+      await awaitEnrichmentComplete(inbound.event.id, config.enrichment?.trigger_wait_timeout_ms ?? 30_000);
+    }
+    const groupIds = triggerGroupOf(entry.inbound);
+    const request = hydrateEvents(
+      storage,
+      groupIds.map((id) => timeline.getById(id)).filter((e): e is CanonicalChatEvent => e !== undefined),
+    ).sort((a, b) => a.timestamp - b.timestamp);
+    const firstTs = request[0]?.timestamp ?? entry.inbound.event.timestamp;
+    const lastTs = request.at(-1)?.timestamp ?? entry.inbound.event.timestamp;
+    const exclude = new Set([...groupIds, inbound.event.id]);
+    const before = timeline
+      .query({ timelineKey: entry.timelineKey, toTimestamp: firstTs, limit: knobs.recentMessages + groupIds.length + 1 })
+      .filter((e) => !exclude.has(e.id))
+      .slice(-knobs.recentMessages);
+    const between = timeline
+      .query({ timelineKey: entry.timelineKey, fromTimestamp: lastTs, toTimestamp: inbound.event.timestamp, limit: 50 })
+      .filter((e) => !exclude.has(e.id));
+    const [candidate] = hydrateEvents(storage, [timeline.getById(inbound.event.id) ?? inbound.event]);
+    const input = lateAdditionInputFrom({
+      before: hydrateEvents(storage, before),
+      request,
+      between: hydrateEvents(storage, between),
+      candidate: candidate!,
+      selfIds: botSelfIdsForLimits,
+      recentMessages: knobs.recentMessages,
+    });
+    const outcome = await decisionEngine.evaluate(lateAdditionPoint, input, {
+      agentName,
+      attribution: {
+        agentSessionId: entry.sessionId,
+        sessionType: "default",
+        timelineKey: entry.timelineKey,
+        triggerSenderId: inbound.event.sender.id,
+      },
+      signal: drainAbort.signal,
+      triggerEventId: entry.inbound.event.id,
+      candidateSessionId: entry.sessionId,
+    });
+    return outcome.verdict;
+  }
+
+  /** A late addition (or an explicit reply to the request) joins its request. */
+  async function joinLateAddition(
+    entry: LateInputEntry,
+    inbound: InboundChatEvent,
+    form: FollowUpForm | "reply",
+    admittedBy: "judged" | "quick_window" | "reply",
+  ): Promise<void> {
+    entry.folded += 1;
+    const gapMs = Math.abs(inbound.event.timestamp - entry.inbound.event.timestamp);
+    const outcome = await deliverCorrection(entry, {
+      kind: form === "reply" ? "reply" : "addition",
+      causeEventId: inbound.event.id,
+      sentAt: inbound.event.timestamp,
+      interjection: async ({ late }) => {
+        const built = await buildAdditionInterjection(entry.sessionId, inbound, form, gapMs);
+        if (!late) return built;
+        return lateInterjection("revival", `${LATE_NOTE(inbound.event.sender)}\n${(built as { content: string }).content}`, (built as { imageBlocks?: ImageBlock[] }).imageBlocks);
+      },
+      source: {
+        eventId: inbound.event.id,
+        externalId: inbound.event.externalId,
+        senderId: inbound.event.sender.id,
+        senderDisplayName: inbound.event.sender.displayName,
+        kind: "addition",
+        body: inbound.event.body ?? "",
+      },
+      delivery: { inbound, form: form === "reply" ? "reply" : form },
+      added: [inbound.event.id],
+    });
+    logger.info("late_input_addition", { sessionId: entry.sessionId, eventId: inbound.event.id, form, admittedBy, outcome });
+    if (outcome === "ignored") revertFollowUpToNativeFate(inbound, "late_addition_after_run_end");
+  }
+
+  /** The interjection of an addition that cannot redo: the fold texts (a reply quotes its target). */
+  async function buildAdditionInterjection(
+    sessionId: string,
+    inbound: InboundChatEvent,
+    form: FollowUpForm | "reply",
+    gapMs: number,
+  ): Promise<SteerMessage> {
+    if (form === "reply") {
+      const target = inbound.event.replyTo?.externalId
+        ? timeline.getByExternalId(inbound.provider, inbound.event.replyTo.externalId, inbound.timelineKey)
+        : undefined;
+      const rendered = renderRichMessage(target ? buildReplyHydratedEvent(inbound, target) : followUpHydratedEvent(inbound));
+      return lateInterjection("reply-to-request", `${senderLabel(inbound.event.sender)} replied to the request you are answering:\n\n${rendered}`);
+    }
+    if (form === "media") {
+      await awaitEnrichmentComplete(inbound.event.id, config.enrichment?.trigger_wait_timeout_ms ?? 30_000);
+    }
+    const hydrated = followUpHydratedEvent(inbound);
+    let imageBlocks: ImageBlock[] | undefined;
+    if (form === "media") {
+      try {
+        const sessionType = sessions.get(sessionId)?.sessionType ?? "default";
+        const modelKey = factory.resolveLogicalModelId(sessionType, inbound.timelineKey);
+        const seesImages = (config.models[modelKey] ?? config.models.default)?.input_modalities?.includes("image") ?? false;
+        const blocks = await contextBuilder.conditionEventImages(hydrated, factory.resolveSessionType(sessionType), seesImages);
+        if (blocks.length > 0) {
+          imageBlocks = blocks;
+          contextBuilder.markEventImageBlocks([hydrated], blocks);
+        }
+      } catch (error) {
+        logger.warn("late_input_image_condition_failed", { sessionId, eventId: inbound.event.id, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    const content = buildFollowUpInterjection(inbound, form, gapMs, hydrated);
+    return { type: "interjection", content, ...(imageBlocks ? { imageBlocks } : {}) } as SteerMessage;
+  }
+
+  /**
+   * An explicit reply from the trigger's sender to a message of the request (the
+   * trigger or a grouped part) while the session runs always belongs (§8 "Late
+   * input"): no time gate, no judgement, never a parallel session. Sent before
+   * the run ended, it revives the session; sent after, a group reply to the
+   * request triggers exactly like a reply to the bot's message (with that
+   * session's record, resolved through the trigger).
+   */
+  function routeReplyToRequest(inbound: InboundChatEvent): boolean {
+    if (!lateInputSettings.enabled) return false;
+    const replyExternalId = inbound.event.replyTo?.externalId;
+    if (!replyExternalId) return false;
+    const sender = inbound.event.sender;
+    if (!isHumanSender(sender)) return false;
+    if (steeredEventIds.has(inbound.event.id)) return true;
+    const target = timeline.getByExternalId(inbound.provider, replyExternalId, inbound.timelineKey);
+    if (!target || target.timelineKey !== inbound.timelineKey || target.sender.isSelf) return false;
+    const entry = lateEntryForRequestEvent(inbound.timelineKey, target.id);
+    if (entry) {
+      const triggerSender = entry.inbound.trigger?.triggeredBy ?? entry.inbound.event.sender;
+      if (triggerSender.id !== sender.id) return false;
+      if (entry.ctl.phase !== "ended" || sentBeforeRunEnd(entry.ctl, inbound.event.timestamp)) {
+        markSteered(inbound.event.id);
+        void joinLateAddition(entry, inbound, "reply", "reply").catch((error) => {
+          logger.error("late_input_reply_failed", { sessionId: entry.sessionId, error: error instanceof Error ? error.message : String(error) });
+        });
+        return true;
+      }
+    }
+    // After the run end: a bare group reply to the request triggers like a reply
+    // to the bot's message. A DM or a mention triggers natively anyway.
+    const wouldTrigger = channelTypeOf(inbound) === "dm" || (inbound.event.mentions?.mentionedSelf ?? false);
+    if (wouldTrigger || inbound.trigger) return false;
+    const requestSession = storage.getSessionIdForRequestEvent(target.id);
+    if (!requestSession || !inbound.outboundTarget) return false;
+    const row = storage.getAgentSession(requestSession);
+    if (!row || row.trigger_sender_id !== sender.id) return false;
+    markSteered(inbound.event.id);
+    const trigger: TriggerInfo = {
+      type: "reply",
+      reason: "reply to the request of a completed session",
+      triggeredBy: sender,
+      groupedEventIds: [inbound.event.id],
+    };
+    logger.info("late_input_reply_to_request_trigger", { sessionId: requestSession, eventId: inbound.event.id });
+    void redispatchCoReply({ ...inbound, trigger, event: { ...inbound.event, trigger } }).catch((error) => {
+      logger.error("late_input_reply_trigger_failed", { error: error instanceof Error ? error.message : String(error) });
+    });
+    return true;
+  }
+
+  /** Revive the owner of an unread steer or a settled fold, when it is revivable. */
+  async function tryReviveWithSteer(sessionId: string, message: SteerMessage, inbound: InboundChatEvent): Promise<boolean> {
+    const entry = lateInputEntries.get(sessionId);
+    if (!entry || !sentBeforeRunEnd(entry.ctl, inbound.event.timestamp)) return false;
+    const content = (message as { content?: string }).content ?? "";
+    const late = lateInterjection("revival", `${LATE_NOTE(inbound.event.sender)}\n${content}`, (message as { imageBlocks?: ImageBlock[] }).imageBlocks);
+    return entry.revive([late], { eventId: inbound.event.id });
   }
 
   /**
@@ -7235,6 +7852,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // [[limits]] only — no per-user attribution. Unlimited-mode third-party bots
     // preserve today's behaviour (Gate A runs, spend is attributed).
     const isBotTriggered = isBotTriggeredSender(inbound);
+    // Late input (ARCHITECTURE.md §8 "Late input"): human-triggered chat sessions
+    // can be corrected after they start (trigger edits, late additions); the hold
+    // applies to the default chat lane only.
+    const lateCtl = createLateInputSession(inbound, session, { proactive, isBotTriggered });
     let userLimitForCreate: UserLimitGate["userLimit"];
     let userCeilingOverride: number | undefined;
     let initialUserModel: string | undefined;
@@ -7357,6 +7978,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // created once and threaded into the tools so the record turn can drive them.
     const recordHandles: SessionRecordHandles = { gate: { active: false }, draft: new SummaryDraft() };
     let created: Awaited<ReturnType<typeof factory.create>> | undefined;
+    let createOpts: ((cutoff?: number) => CreateAgentOptions) | undefined;
+    let sessionTools: AgentTool[] = [];
+    let firstCutoff: number | undefined;
     let agent: Awaited<ReturnType<typeof factory.create>>["agent"] | undefined;
     let kickoff: Awaited<ReturnType<typeof factory.create>>["kickoff"];
     let snapshot: ContextMessage[] | undefined;
@@ -7387,16 +8011,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // whose catalog lacks read_session_record (session-type tools allowlist,
       // disabled_tools) could not execute an injection, so it plans none and
       // waits for nothing.
-      const injections = proactive || !inSessionCatalog(tools, session.sessionType, "read_session_record")
-        ? undefined
-        : planRecordInjections(inbound, session, ownerSessionId).catch((error) => {
-            logger.warn("records_injection_plan_failed", {
-              sessionId: session.id,
-              error: error instanceof Error ? error.message : String(error),
-            });
-            return [] as SyntheticCallSpec[];
-          });
-      created = await factory.create(session, tools, {
+      createOpts = (cutoff?: number): CreateAgentOptions => ({
         // Decision-model routing (ARCHITECTURE.md §8h): human-triggered chat-lane
         // sessions of an agent with routing on. Evaluated inside create(), after
         // the readiness wait above, so the trigger's captions are in the state.
@@ -7404,7 +8019,15 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           !proactive && !isBotTriggered && session.sessionType === "default"
             ? makeRouter(inbound, session)
             : undefined,
-        injections,
+        injections: proactive || !inSessionCatalog(tools, session.sessionType, "read_session_record")
+          ? undefined
+          : planRecordInjections(inbound, session, ownerSessionId).catch((error) => {
+              logger.warn("records_injection_plan_failed", {
+                sessionId: session.id,
+                error: error instanceof Error ? error.message : String(error),
+              });
+              return [] as SyntheticCallSpec[];
+            }),
         recordTurnGate: recordHandles.gate,
         proactive: proactive ? true : undefined,
         usage,
@@ -7415,7 +8038,36 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // Drain cancellation (spec §7.2): a build waiting on a summary job
         // aborts cleanly at shutdown instead of out-living the worker pool.
         abortSignal: drainAbort.signal,
+        // Late input (§8 "Late input"): replay, hold, request progress.
+        ...(lateCtl ? { lateInput: lateCtl } : {}),
+        ...(cutoff !== undefined ? { timelineCutoff: cutoff } : {}),
       });
+      sessionTools = tools;
+      // A correction that lands while the context is built redoes the build in
+      // place before the first request (nothing was generated, no branch).
+      for (;;) {
+        lateCtl?.markBuildStarted();
+        created = await factory.create(session, tools, createOpts(firstCutoff));
+        firstCutoff ??= created.timelineCutoff;
+        if (!lateCtl) break;
+        const cancelled = lateCtl.takeCancelBeforeStart();
+        if (cancelled) {
+          created.gate?.dispose();
+          lateCtl.markEnded();
+          sessions.markDiscarded(session.id, { error: `cancelled: ${cancelled.reason}` });
+          logger.info("late_input_cancelled", { sessionId: session.id, reason: cancelled.reason, phase: "building" });
+          drainNextQueuedTrigger(session.timelineKey);
+          return;
+        }
+        const rebuild = lateCtl.takeRebuildBeforeStart();
+        if (!rebuild || lateCtl.redoCount >= lateInputSettings.maxRedos) break;
+        created.gate?.dispose();
+        lateCtl.redoCount += 1;
+        void storage.bumpAgentSessionRedoCount(session.id).catch(() => undefined);
+        refreshTriggerFromStore(inbound);
+        logger.info("late_input_redo", { sessionId: session.id, reason: rebuild.reason, phase: "building", causes: rebuild.causeEventIds });
+        await awaitTriggerReadiness(inbound);
+      }
       ({ agent, kickoff, snapshot, tokenEstimate } = created);
       // Chat builds always emit a final trigger turn; absence indicates a build bug.
       if (!kickoff) throw new Error("context build produced no final user turn");
@@ -7451,6 +8103,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       return;
     }
     sessions.attachAgent(session.id, agent!);
+    lateCtl?.markRunning();
     // Success drain (spec DEFERRED-COALESCING): the session is now steerable, so fold
     // every co-reply parked on its trigger in as an interjection. Consumes the parked
     // entries, so the settle-fallback registered above then fires on nothing.
@@ -7470,146 +8123,308 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // the soft-warn watcher, rather than resolving it twice. The per-user dynamic
     // ceiling (PER-USER-LIMITS §6.3) tightens it to the user's remaining headroom.
     const costCeiling = userCeilingOverride ?? factory.resolveSessionCostCeiling(session.sessionType);
-    const captureHandle = attachSessionCapture(agent!, {
-      storage,
-      sessionId: session.id,
-      snapshot,
-      tokenEstimate,
-      usage,
-      timelineKey: session.timelineKey,
-      sessionType: session.sessionType,
-      // Thread `session.timelineKey` for per-agent model resolution (spec §4/§8).
-      model: factory.resolveModelId(session.sessionType, session.timelineKey),
-      maxSessionCostUsd: costCeiling,
-      logger,
-    });
-    // Soft cost-budget interjection (spec SESSION-COST-LIMITS §2.1); torn down in
-    // the run's .finally alongside the capture handle.
-    const costWarnUnsub = wireCostBudgetWarner(session.id, session.sessionType, usage, costCeiling);
-    const runner = new SessionRunner({
-      provider: providers.get(target.provider),
-      target,
-      suppressTyping: proactive,
-      endings: created?.gate,
-      ...sessionRedoOptions(created!, captureHandle),
-    });
+    // The session's live agent with its capture and cost warner. A redo from
+    // scratch (ARCHITECTURE.md §8 "Late input") replaces all three; a revival
+    // runs the same agent again. Torn down by `finalizeBinding` once the session
+    // can no longer be revived.
+    const binding = {
+      created: created!,
+      capture: undefined as unknown as SessionCaptureHandle,
+      costWarnUnsub: (() => undefined) as () => void,
+    };
+    const attachBinding = (next: CreatedAgent, nextSnapshot: ContextMessage[] | undefined, nextTokens: number | undefined): void => {
+      binding.created = next;
+      binding.capture = attachSessionCapture(next.agent, {
+        storage,
+        sessionId: session.id,
+        snapshot: nextSnapshot,
+        tokenEstimate: nextTokens,
+        usage,
+        timelineKey: session.timelineKey,
+        sessionType: session.sessionType,
+        // Thread `session.timelineKey` for per-agent model resolution (spec §4/§8).
+        model: factory.resolveModelId(session.sessionType, session.timelineKey),
+        maxSessionCostUsd: costCeiling,
+        logger,
+      });
+      // Soft cost-budget interjection (spec SESSION-COST-LIMITS §2.1).
+      binding.costWarnUnsub = wireCostBudgetWarner(session.id, session.sessionType, usage, costCeiling);
+    };
+    attachBinding(created!, snapshot, tokenEstimate);
+    let finalized = false;
+    const finalizeBinding = (): void => {
+      if (finalized) return;
+      finalized = true;
+      binding.capture.detach();
+      // The session is over: unclaimed gate evaluations are dropped (claimed ones still record).
+      binding.created.gate?.dispose();
+      binding.costWarnUnsub();
+      if (lateCtl) unregisterLateInputEntry(session.id);
+    };
 
-    // drainCalled: the success path releases the timeline slot itself (before the
-    // record turn), so the .finally drains only on the error path.
-    let drainCalled = false;
-    const run = runner
-      .run(agent!, session, config.agent.sessions.forced_completion_retries, kickoff, sessions.runLifecycle(session.id))
-      .then(async (result) => {
-        // An operator interrupt settles through here too (markCompleted keeps the
-        // `interrupted` status); such a run writes no record.
-        const interrupted = sessions.get(session.id)?.status === "interrupted";
-        sessions.markCompleted(session.id, { noReply: result.noReply });
-        // Send-contract record (spec REFUSAL-HANDLING §7.1), before the record turn appends.
-        void persistSessionContract({ storage, sessionId: session.id, messages: agent!.state.messages, interrupted, logger });
-        logger.info("session_completed", {
-          sessionId: session.id,
-          noReply: result.noReply,
-          duplicate,
-        });
-        // Record turn (spec SESSION-RECORDS §3.2): registered in flight BEFORE the
-        // slot is released, so the next queued trigger sees it; then the slot is
-        // freed and the turn runs while that trigger starts. The capture handle
-        // stays attached (detached in .finally) so the turn lands in the transcript.
-        const recordTurn = interrupted
-          ? undefined
-          : startRecordTurn({
+    // Redo from scratch (§8 "Late input"): discard the rollout into a branch,
+    // rebuild against the first build's timeline cutoff with the corrected
+    // trigger group (routing and record planning re-run), and hand the runner
+    // the new agent and kickoff. Falls back to interjecting when an undoable
+    // effect cannot be compensated.
+    const restartSession = async (request: RestartRequest, current: Agent): Promise<LateInputStep | undefined> => {
+      await current.waitForIdle();
+      const compensated = await compensateUndoableEffects(lateCtl!, sessionTools, session.id);
+      if (!compensated) {
+        for (const message of request.fallbackInterjections) current.steer(message);
+        logger.info("late_input_interjected", { sessionId: session.id, reason: "compensation_failed", causes: request.causeEventIds });
+        return continueAfterAbortedTurn(current);
+      }
+      const generated = current.state.messages.some((m) => (m as { role?: string }).role === "assistant");
+      let redeliver: AgentMessage[];
+      if (generated) {
+        const fork = binding.created.forkContext({ storage, flushTranscript: () => binding.capture.flushNow(), logger });
+        await forkSession(fork, { index: 0 }, { reason: request.reason, causeEventId: request.causeEventIds[0] });
+        redeliver = current.state.messages.slice();
+      } else {
+        redeliver = current.state.messages.filter((m) => (m as { type?: string }).type === "interjection");
+      }
+      binding.capture.detach();
+      binding.costWarnUnsub();
+      binding.created.gate?.dispose();
+      lateCtl!.redoCount += 1;
+      void storage.bumpAgentSessionRedoCount(session.id).catch(() => undefined);
+      // A redo from scratch re-runs routing: a refusal pin of the old rollout is dropped.
+      void storage.setAgentSessionRefusalPin(session.id, null).catch(() => undefined);
+      refreshTriggerFromStore(inbound);
+      await awaitTriggerReadiness(inbound);
+      const next = await factory.create(session, sessionTools, createOpts!(firstCutoff));
+      if (!next.kickoff) throw new Error("redo build produced no final user turn");
+      attachBinding(next, next.snapshot, next.tokenEstimate);
+      sessions.attachAgent(session.id, next.agent);
+      for (const message of redeliver) next.agent.steer(message);
+      rebindPendingSteers(session.id, next.agent);
+      logger.info("late_input_redo", {
+        sessionId: session.id,
+        reason: request.reason,
+        redoCount: lateCtl!.redoCount,
+        causes: request.causeEventIds,
+        discarded: generated,
+        redelivered: redeliver.length,
+      });
+      const redoOpts = sessionRedoOptions(next, binding.capture);
+      return { kind: "continue", agent: next.agent, kickoff: next.kickoff, redo: redoOpts.redo, ...(next.gate ? { endings: next.gate } : {}) };
+    };
+    // Abort-and-interject: drop the aborted partial turn (kept as a branch) and
+    // continue; the steered interjection is read before the next request.
+    const continueAfterAbortedTurn = async (current: Agent): Promise<LateInputStep | undefined> => {
+      await current.waitForIdle();
+      const messages = current.state.messages;
+      const last = messages.at(-1) as { role?: string; stopReason?: string } | undefined;
+      if (last?.role === "assistant" && last.stopReason === "aborted") {
+        const fork = binding.created.forkContext({ storage, flushTranscript: () => binding.capture.flushNow(), logger });
+        await forkSession(fork, { index: messages.length - 1 }, { reason: "turn_aborted" });
+      }
+      const tail = current.state.messages.at(-1) as { role?: string } | undefined;
+      // A finished assistant turn cannot be continued: the queued interjection is
+      // then read by the run's next turn, or revives the session at its end.
+      if (!tail || tail.role === "assistant") return undefined;
+      return { kind: "continue", agent: current };
+    };
+    const lateInputNext = async (current: Agent): Promise<LateInputStep | undefined> => {
+      const step = lateCtl?.takePending();
+      if (!step) return undefined;
+      if (step.kind === "cancel") {
+        await current.waitForIdle();
+        logger.info("late_input_cancelled", { sessionId: session.id, reason: step.reason, causeEventId: step.causeEventId });
+        return { kind: "end", noReply: true, cancelled: true };
+      }
+      if (step.kind === "interject") return continueAfterAbortedTurn(current);
+      return restartSession(step.request, current);
+    };
+
+    // One run of the session: the first, and each revival (§8 "Late input"). A
+    // run that holds the timeline slot releases it when the rollout ends.
+    let currentRun: Promise<void> = Promise.resolve();
+    const startRun = (kickoffMessages: AgentMessage[] | undefined, runOpts: { holdsSlot: boolean; revival?: boolean }): Promise<void> => {
+      const runner = new SessionRunner({
+        provider: providers.get(target.provider),
+        target,
+        suppressTyping: proactive,
+        endings: binding.created.gate,
+        ...sessionRedoOptions(binding.created, binding.capture),
+        ...(lateCtl ? { lateInput: { next: lateInputNext } } : {}),
+      });
+      // drainCalled: the success path releases the timeline slot itself (before the
+      // record turn), so the .finally drains only on the error path.
+      let drainCalled = !runOpts.holdsSlot;
+      let revivable = false;
+      const run = runner
+        .run(binding.created.agent, sessions.get(session.id) ?? session, config.agent.sessions.forced_completion_retries, kickoffMessages, sessions.runLifecycle(session.id))
+        .then(async (result) => {
+          if (result.cancelled) {
+            // The trigger was deleted (or stopped addressing the bot) before anything
+            // irreversible happened: nothing is sent and no record is written.
+            lateCtl?.markEnded();
+            sessions.markDiscarded(session.id, { error: "cancelled: the request was withdrawn" });
+            drainCalled = true;
+            if (runOpts.holdsSlot) drainNextQueuedTrigger(session.timelineKey);
+            return;
+          }
+          // An operator interrupt settles through here too (markCompleted keeps the
+          // `interrupted` status); such a run writes no record.
+          const interrupted = sessions.get(session.id)?.status === "interrupted";
+          lateCtl?.markEnded();
+          sessions.markCompleted(session.id, { noReply: result.noReply });
+          revivable = !interrupted && lateCtl !== undefined;
+          // Send-contract record (spec REFUSAL-HANDLING §7.1), before the record turn appends.
+          void persistSessionContract({ storage, sessionId: session.id, messages: binding.created.agent.state.messages, interrupted, logger });
+          logger.info("session_completed", {
+            sessionId: session.id,
+            noReply: result.noReply,
+            duplicate,
+            ...(runOpts.revival ? { revival: true } : {}),
+          });
+          // Record turn (spec SESSION-RECORDS §3.2): registered in flight BEFORE the
+          // slot is released, so the next queued trigger sees it; then the slot is
+          // freed and the turn runs while that trigger starts. The capture handle
+          // stays attached so the turn lands in the transcript.
+          const recordTurn = interrupted
+            ? undefined
+            : startRecordTurn({
+                sessionId: session.id,
+                timelineKey: session.timelineKey,
+                sessionType: session.sessionType,
+                inbound,
+                created: binding.created,
+                handles: recordHandles,
+                flush: () => binding.capture.flushNow(),
+              });
+          drainCalled = true;
+          if (runOpts.holdsSlot) drainNextQueuedTrigger(session.timelineKey);
+          await recordTurn;
+        })
+        .catch(async (error) => {
+          lateCtl?.markEnded();
+          // Best-effort transcript flush BEFORE any recovery decision (issue #1 +
+          // spec §6.2 persist-at-failure): if the run rejected before any
+          // turn_end, the only durable copy of the kickoff turn (+ any partial
+          // assistant message) is the live state — and resume-in-place seeds from
+          // exactly this flush. flushNow() never throws, but wrap it so it can
+          // never mask the original run error.
+          try {
+            await binding.capture.flushNow();
+          } catch (flushErr) {
+            logger.error("session capture: error-path flush failed", {
+              sessionId: session.id,
+              error: flushErr instanceof Error ? flushErr.message : String(flushErr),
+            });
+          }
+          // Park, never discard (spec LLM-FAILURE-HANDLING §8.2 / P5): ANY
+          // LLM-layer failure — environmental (interactive wall-clock budget
+          // exhausted) and content (oversized request) alike — is operator- or
+          // upstream-fixable; nothing about the session itself is unresumable.
+          // Layer-0 now owns ALL in-run retrying (the old Layer-2 auto-resume
+          // loop is deleted): once the budget is exhausted the maintainer
+          // explicitly does NOT want delayed automatic replies (P3) — the manual
+          // console resume is the sole resume path. `markDiscarded` remains only
+          // for untagged errors (our own code throwing) below.
+          if (isLlmRunFailure(error)) {
+            const message = error instanceof Error ? error.message : String(error);
+            // Read the LIVE record's startedAt: `markRunning` set it on the map
+            // record, but `update()` swapped in a fresh object — the `session`
+            // const captured at launch is the original `createPlaceholder` object
+            // whose `startedAt` is forever undefined. Reading it here (before the
+            // markFailedResumable eviction below) measures elapsed run time from
+            // when the run actually began, excluding trigger-queue + context-build
+            // time. Fallback to `createdAt` only if the live record is somehow gone.
+            const startedAt = sessions.get(session.id)?.startedAt ?? session.createdAt;
+            sessions.markFailedResumable(session.id, { error: message });
+            logger.error("session_parked_failed_resumable", {
               sessionId: session.id,
               timelineKey: session.timelineKey,
-              sessionType: session.sessionType,
-              inbound,
-              created: created!,
-              handles: recordHandles,
-              flush: () => captureHandle.flushNow(),
+              class: error.llmClass,
+              elapsedMs: Date.now() - startedAt,
+              error: message,
             });
-        drainCalled = true;
-        drainNextQueuedTrigger(session.timelineKey);
-        await recordTurn;
-      })
-      .catch(async (error) => {
-        // Best-effort transcript flush BEFORE any recovery decision (issue #1 +
-        // spec §6.2 persist-at-failure): if the run rejected before any
-        // turn_end, the only durable copy of the kickoff turn (+ any partial
-        // assistant message) is the live state — and resume-in-place seeds from
-        // exactly this flush. flushNow() never throws, but wrap it so it can
-        // never mask the original run error.
-        try {
-          await captureHandle.flushNow();
-        } catch (flushErr) {
-          logger.error("session capture: error-path flush failed", {
-            sessionId: session.id,
-            error: flushErr instanceof Error ? flushErr.message : String(flushErr),
+            // §8.3: user-triggered sessions may announce the give-up; proactive
+            // sessions never do — nobody asked them anything.
+            if (!proactive) sendFailureNotice(target, session.id);
+            return;
+          }
+          sessions.markDiscarded(session.id, {
+            error: error instanceof Error ? error.message : String(error),
           });
-        }
-        // Park, never discard (spec LLM-FAILURE-HANDLING §8.2 / P5): ANY
-        // LLM-layer failure — environmental (interactive wall-clock budget
-        // exhausted) and content (oversized request) alike — is operator- or
-        // upstream-fixable; nothing about the session itself is unresumable.
-        // Layer-0 now owns ALL in-run retrying (the old Layer-2 auto-resume
-        // loop is deleted): once the budget is exhausted the maintainer
-        // explicitly does NOT want delayed automatic replies (P3) — the manual
-        // console resume is the sole resume path. `markDiscarded` remains only
-        // for untagged errors (our own code throwing) below.
-        if (isLlmRunFailure(error)) {
-          const message = error instanceof Error ? error.message : String(error);
-          // Read the LIVE record's startedAt: `markRunning` set it on the map
-          // record, but `update()` swapped in a fresh object — the `session`
-          // const captured at launch is the original `createPlaceholder` object
-          // whose `startedAt` is forever undefined. Reading it here (before the
-          // markFailedResumable eviction below) measures elapsed run time from
-          // when the run actually began, excluding trigger-queue + context-build
-          // time. Fallback to `createdAt` only if the live record is somehow gone.
-          const startedAt = sessions.get(session.id)?.startedAt ?? session.createdAt;
-          sessions.markFailedResumable(session.id, { error: message });
-          logger.error("session_parked_failed_resumable", {
+          logger.error("session_failed", {
             sessionId: session.id,
-            timelineKey: session.timelineKey,
-            class: error.llmClass,
-            elapsedMs: Date.now() - startedAt,
-            error: message,
+            error: error instanceof Error ? error.message : String(error),
+            cause: error instanceof Error && error.cause instanceof Error ? error.cause.message : undefined,
           });
-          // §8.3: user-triggered sessions may announce the give-up; proactive
-          // sessions never do — nobody asked them anything.
-          if (!proactive) sendFailureNotice(target, session.id);
-          return;
-        }
-        sessions.markDiscarded(session.id, {
-          error: error instanceof Error ? error.message : String(error),
-        });
-        logger.error("session_failed", {
-          sessionId: session.id,
-          error: error instanceof Error ? error.message : String(error),
-          cause: error instanceof Error && error.cause instanceof Error ? error.cause.message : undefined,
-        });
-      })
-      .finally(() => {
-        captureHandle.detach();
-        // The session is over: unclaimed gate evaluations are dropped (claimed ones still record).
-        created?.gate?.dispose();
-        costWarnUnsub();
-        activeRuns.delete(run);
-        // Close this session's browser tab(s) when the run settles (the idle
-        // sweeper is only a backstop). Fire-and-forget; never block completion.
-        // Per-session browser (§10a): use the per-agent session in agents mode.
-        const sessionBrowserForClose = resolveAgentBrowserSession(
-          resolveWorkspaceForTimeline(session.timelineKey)?.agentName ?? null,
-        );
-        if (sessionBrowserForClose) {
-          void sessionBrowserForClose.closeSession(session.id).catch((error) => {
-            logger.warn("browser_session_close_failed", {
-              sessionId: session.id,
-              error: error instanceof Error ? error.message : String(error),
+        })
+        .finally(() => {
+          activeRuns.delete(run);
+          // Close this session's browser tab(s) when the run settles (the idle
+          // sweeper is only a backstop). Fire-and-forget; never block completion.
+          // Per-session browser (§10a): use the per-agent session in agents mode.
+          const sessionBrowserForClose = resolveAgentBrowserSession(
+            resolveWorkspaceForTimeline(session.timelineKey)?.agentName ?? null,
+          );
+          if (sessionBrowserForClose) {
+            void sessionBrowserForClose.closeSession(session.id).catch((error) => {
+              logger.warn("browser_session_close_failed", {
+                sessionId: session.id,
+                error: error instanceof Error ? error.message : String(error),
+              });
             });
-          });
+          }
+          // Only drain here when .then didn't (error path).
+          if (!drainCalled) drainNextQueuedTrigger(session.timelineKey);
+          // A completed session stays revivable for `revive_max_ms` (§8 "Late
+          // input"); its agent, capture and gate are kept until then.
+          if (revivable && !draining) scheduleLateInputExpiry(session.id, finalizeBinding);
+          else finalizeBinding();
+        });
+      activeRuns.add(run);
+      currentRun = run;
+      return run;
+    };
+
+    // Revival (§8 "Late input"): a message sent before the run ended reaches the
+    // settled session as it would have as an interjection. The record turn is
+    // stopped and discarded (a branch), the session runs again from where its
+    // rollout ended, and the record turn runs again at the new end.
+    let reviving: Promise<boolean> | undefined;
+    const revive = (messages: AgentMessage[], cause: { eventId: string }): Promise<boolean> => {
+      if (reviving) {
+        // A revival is already starting: the message joins it as a steer.
+        return reviving.then((ok) => {
+          if (ok) for (const message of messages) binding.created.agent.steer(message);
+          return ok;
+        });
+      }
+      reviving = (async () => {
+        if (finalized || draining || lateCtl?.phase !== "ended") return false;
+        await sessionRecordService.abortForRevival(session.id);
+        await currentRun;
+        if (finalized || draining) return false;
+        const agentNow = binding.created.agent;
+        const start = recordTurnStartIndex(agentNow.state.messages);
+        if (start >= 0 && start < agentNow.state.messages.length) {
+          const fork = binding.created.forkContext({ storage, flushTranscript: () => binding.capture.flushNow(), logger });
+          await forkSession(fork, { index: start }, { reason: "revival", causeEventId: cause.eventId });
         }
-        // Only drain here when .then didn't (error path).
-        if (!drainCalled) drainNextQueuedTrigger(session.timelineKey);
+        if (agentNow.hasQueuedMessages()) agentNow.clearAllQueues();
+        sessions.adopt({ ...session, status: "created", trigger: inbound });
+        sessions.markRunning(session.id);
+        sessions.attachAgent(session.id, agentNow);
+        lateCtl.markRevived();
+        const holdsSlot = triggerCoordinator.tryAcquire(session.timelineKey);
+        logger.info("late_input_revived", { sessionId: session.id, causeEventId: cause.eventId, messages: messages.length, holdsSlot });
+        void startRun(messages, { holdsSlot, revival: true });
+        return true;
+      })().finally(() => {
+        reviving = undefined;
       });
-    activeRuns.add(run);
+      return reviving;
+    };
+    if (lateCtl) registerLateInputEntry({ sessionId: session.id, timelineKey: session.timelineKey, inbound, ctl: lateCtl, revive });
+
+    void startRun(kickoff, { holdsSlot: true });
   }
 
   // Channel-lifecycle gating + first-trigger activation (§2–§4). Closures above

@@ -311,7 +311,11 @@ export interface InboundChatEvent {
    * the replacement to that target in place instead of appending a new timeline
    * row, mirroring how a normal client shows an edited message (issue #17).
    */
-  edit?: { targetExternalId: string };
+  /**
+   * An edit of `targetExternalId` (the replacement rides on `event`). `deleted`
+   * marks a deletion routed through the edit path as a tombstone (empty body).
+   */
+  edit?: { targetExternalId: string; deleted?: true };
 }
 
 export interface OutboundTarget {

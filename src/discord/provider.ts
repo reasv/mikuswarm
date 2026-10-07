@@ -1147,7 +1147,7 @@ export class DiscordProvider implements IChatProvider {
       provider: "discord",
       timelineKey,
       event: deleteEvent,
-      edit: { targetExternalId: externalId }, // reuse edit marker for delete routing
+      edit: { targetExternalId: externalId, deleted: true }, // reuse edit marker for delete routing
     });
   }
 

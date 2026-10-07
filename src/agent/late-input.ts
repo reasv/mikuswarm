@@ -219,6 +219,10 @@ export class LateInputSession {
   phase: SessionPhase = "building";
   /** When the main run ended (the settled point revival compares against). */
   runEndedAt?: number;
+  /** When the session's first message was delivered (late additions end there). */
+  firstDeliveryAt?: number;
+  /** The context build read the timeline: a correction from now on needs a rebuild. */
+  private buildStarted = false;
   redoCount = 0;
 
   private holdDeadlineAt: number;
@@ -329,7 +333,8 @@ export class LateInputSession {
   requestRestart(request: RestartRequest): void {
     this.extendHold();
     if (this.phase === "building") {
-      this.rebuildBeforeStart = mergeRestart(this.rebuildBeforeStart, request);
+      // Before the build read the timeline, the build sees the correction itself.
+      if (this.buildStarted) this.rebuildBeforeStart = mergeRestart(this.rebuildBeforeStart, request);
       return;
     }
     if (this.pending?.kind === "restart") {
@@ -399,6 +404,11 @@ export class LateInputSession {
     return p;
   }
 
+  /** The context build is about to read the timeline. */
+  markBuildStarted(): void {
+    this.buildStarted = true;
+  }
+
   markRunning(): void {
     this.phase = "running";
   }
@@ -455,6 +465,7 @@ export class LateInputSession {
         } finally {
           if (visible) {
             this.effects.push({ toolCallId, name: tool.name, args: params, effect, failed });
+            if (!failed && isPostingTool(tool.name) && this.firstDeliveryAt === undefined) this.firstDeliveryAt = this.now();
           }
         }
       };
