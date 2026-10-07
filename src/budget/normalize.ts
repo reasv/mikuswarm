@@ -14,6 +14,7 @@ import { isValidTimeZone, parseDuration } from "./window.js";
 export interface RawLimitRule {
   name: string;
   max_usd: number;
+  reserve_usd?: number;
   window:
     | { type: "rolling"; duration: string }
     | { type: "calendar"; period: "day" | "week" | "month"; tz?: string };
@@ -196,9 +197,16 @@ export function normalizeLimits(
       }
     }
 
+    if (entry.reserve_usd !== undefined && entry.reserve_usd > 0 && entry.reserve_usd >= entry.max_usd) {
+      warnings.push(
+        `[[limits]] "${entry.name}": reserve_usd (${entry.reserve_usd}) >= max_usd (${entry.max_usd}) — the rule always blocks`,
+      );
+    }
+
     rules.push({
       name: entry.name,
       maxUsd: entry.max_usd,
+      ...(entry.reserve_usd !== undefined && entry.reserve_usd > 0 ? { reserveUsd: entry.reserve_usd } : {}),
       window,
       selector,
       triggerRejectionMessage: entry.trigger_rejection_message,

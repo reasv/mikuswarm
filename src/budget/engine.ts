@@ -40,6 +40,11 @@ export interface RuleSelector {
 export interface LimitRule {
   name: string;
   maxUsd: number;
+  /**
+   * Headroom a new spend needs (`[[limits]].reserve_usd`): the rule blocks once
+   * `spent >= maxUsd - reserveUsd`. Absent = block only at the cap.
+   */
+  reserveUsd?: number;
   window: WindowSpec;
   selector: RuleSelector;
   /** Templated with `{resets_at}`; posted on a refused human trigger (§6.3). */
@@ -212,6 +217,11 @@ interface RuleState {
   wasBlocked: boolean;
 }
 
+/** A rule blocks at its cap, or earlier by its reserve (`[[limits]].reserve_usd`). */
+function isOverCap(state: RuleState): boolean {
+  return state.spent >= state.rule.maxUsd - (state.rule.reserveUsd ?? 0);
+}
+
 export class BudgetEngine {
   private readonly states: RuleState[];
   private readonly now: () => number;
@@ -380,7 +390,7 @@ export class BudgetEngine {
   /**
    * Admission check for one prospective spend (spec §6.2). Short-circuits to
    * allowed for a zero-cost model. A rule blocks when its window total is at or
-   * over the cap (cap 0 → always blocks any covered non-free spend).
+   * over the cap less its reserve (cap 0 → always blocks any covered non-free spend).
    */
   check(descriptor: SpendDescriptor): CheckResult {
     if (!descriptor.paidService && this.isZeroCost(descriptor.logicalModelId ?? descriptor.modelId)) {
@@ -391,7 +401,7 @@ export class BudgetEngine {
     for (const state of this.states) {
       this.rollIfNeeded(state, now);
       if (!this.selectorMatches(state.rule, descriptor)) continue;
-      if (state.spent >= state.rule.maxUsd) blocking.push(this.toBlocking(state));
+      if (isOverCap(state)) blocking.push(this.toBlocking(state));
     }
     if (blocking.length === 0) return { allowed: true, blockingRules: [] };
     const primary = blocking.reduce((earliest, r) => (r.resetsAt < earliest.resetsAt ? r : earliest));
@@ -574,7 +584,7 @@ export class BudgetEngine {
       this.rollIfNeeded(state, now);
       const cap = state.rule.maxUsd;
       const fraction = cap > 0 ? state.spent / cap : state.spent > 0 ? Infinity : 1;
-      const blocked = state.spent >= cap;
+      const blocked = isOverCap(state);
       const near = !blocked && fraction >= this.nearThreshold;
       const w = state.rule.window;
       const window =

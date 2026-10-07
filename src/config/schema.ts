@@ -2038,6 +2038,11 @@ const LimitWindowSchema = Type.Union([
 const LimitRuleSchema = StrictObject({
   name: Type.String({ minLength: 1 }),
   max_usd: Type.Number({ minimum: 0 }),
+  // Headroom a new spend needs: the rule blocks once less than this is left
+  // (`spent >= max_usd - reserve_usd`). Set it to about one call's cost on a rule
+  // over expensive single calls, so the last admitted call cannot overshoot far.
+  // Omitted/0 = block only at the cap.
+  reserve_usd: Type.Optional(Type.Number({ minimum: 0 })),
   window: LimitWindowSchema,
   // Selector dimensions — all optional. Omitted = wildcard.
   classes: Type.Optional(

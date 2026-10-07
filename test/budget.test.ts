@@ -120,6 +120,32 @@ test("check: cap 0 blocks any covered paid spend", () => {
   assert.equal(engine.check({ class: "tool", tool: "x_search", modelId: "m1" }).allowed, true);
 });
 
+test("check: reserveUsd blocks once less than the reserve is left", () => {
+  const rules: LimitRule[] = [
+    { name: "grok", maxUsd: 3, reserveUsd: 1, window: dayWindow, selector: { tools: ["x_search"] } },
+  ];
+  const engine = engineWith(rules);
+  const d = { class: "tool", tool: "x_search", modelId: "m1" } as const;
+  engine.record({ class: "tool", toolName: "x_search", modelId: "m1", costUsd: 1.9 });
+  assert.equal(engine.check(d).allowed, true); // $1.10 left > $1 reserve
+  engine.record({ class: "tool", toolName: "x_search", modelId: "m1", costUsd: 0.1 });
+  const blocked = engine.check(d); // $1 left: no longer enough for one call
+  assert.equal(blocked.allowed, false);
+  assert.equal(blocked.blockingRules[0]?.capUsd, 3);
+  assert.equal(engine.ruleStatuses()[0]?.state, "blocked");
+});
+
+test("normalizeLimits: reserve_usd passes through; reserve >= cap warns", () => {
+  const base = { defaultTz: "UTC", knownTools: new Set(["x_search"]), knownSessionTypes: new Set<string>() };
+  const ok = normalizeLimits([{ name: "a", max_usd: 3, reserve_usd: 1, window: dayWindow }], base);
+  assert.equal(ok.rules[0]?.reserveUsd, 1);
+  assert.deepEqual(ok.warnings, []);
+  const unset = normalizeLimits([{ name: "b", max_usd: 3, window: dayWindow }], base);
+  assert.equal(unset.rules[0]?.reserveUsd, undefined);
+  const always = normalizeLimits([{ name: "c", max_usd: 1, reserve_usd: 1, window: dayWindow }], base);
+  assert.match(always.warnings[0] ?? "", /always blocks/);
+});
+
 test("check: blockingRules lists ALL hit rules; primary is earliest reset", () => {
   const rolling = { type: "rolling", durationMs: 1000, duration: "1s" } as const;
   const rules: LimitRule[] = [

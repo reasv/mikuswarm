@@ -36,6 +36,10 @@ Unreleased section; it is not part of any release's notes.
 
 ### Added
 
+- **`[[limits]].reserve_usd`** (optional, default 0): the headroom a new spend needs.
+  The rule blocks once less than `reserve_usd` is left, so a cap over expensive single
+  calls (for example `x_search`) no longer lets the last call overshoot it by a full
+  call's cost.
 - Optional native Exa API search, batch page extraction and separately enabled
   durable delegated research, with cost accounting, runtime fallback and recoverable
   job results. New web/deep research skills combine web sources with Grok X evidence;
