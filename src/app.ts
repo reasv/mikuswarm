@@ -174,6 +174,16 @@ import {
   selectRecordsToInject,
   DEFAULT_RECORDS_CANDIDATES,
   type RecordsCandidate,
+  LATE_ADDITION_NOT_JUDGED,
+  lateAdditionInputFrom,
+  lateAdditionKnobs,
+  lateAdditionPoint,
+  type LateAdditionVerdict,
+  implicitReplyGateEventOf,
+  implicitReplyInputFrom,
+  implicitReplyKnobs,
+  implicitReplyPoint,
+  implicitReplyPreGate,
 } from "./decisions/index.js";
 import { buildCheckCatalogue } from "./checks/catalogue.js";
 import { ModelBehaviourService } from "./behaviour/index.js";
