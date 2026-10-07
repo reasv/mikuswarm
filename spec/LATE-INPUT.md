@@ -114,6 +114,12 @@ A redo replaces the session's rollout with a fresh one built from the corrected 
 
 **Bounds.** At most `max_redos` (default 3) per session; further corrections become interjections. A redo is never done after an irreversible effect.
 
+**Correction storms.** A redo builds from the latest stored state; corrections arriving while it waits for the aborted request's first event join it instead of starting another.
+
+**Built but not running.** A session that has built its context but not yet sent its first request (waiting for scheduler admission) is rebuilt in place, with no branch: nothing was generated.
+
+**Refusal pin.** A redo from scratch drops a refusal pin (REFUSAL-HANDLING §8.3): it re-runs routing anyway, and the refused content is what changed. Every other continuation (an interjection, a revival, a refusal or contract redo) keeps the session on its current model. Switching models mid-session after one model has done part of the work is never done for a correction, and a small edit is unlikely to avoid a refusal.
+
 ### 4.4 Abort and interject
 
 When a correction cannot redo (an irreversible effect exists) and the session is running:
@@ -158,7 +164,18 @@ The edited message is the trigger or any message of its trigger group, edited by
 | run ended, edit sent before the run end | revival with the same interjection |
 | edit sent after the run end | nothing (the stored message is updated, as today) |
 
-A **no-op filter** skips the redo when the normalized text and attachments are unchanged (formatting-only or mention-only edits). No decision model.
+A **no-op filter** skips the redo when the normalized text and attachments are unchanged (formatting-only edits). No decision model.
+
+**Deletions and edits that change addressing.** A deletion (a Matrix redaction, a Discord delete) reaches `handleInbound` through the edit path as a tombstone, and must not be treated as an edit to an empty message. The action is keyed on the session's state, never on whether a message was already sent:
+
+| | trigger deleted | mention of the bot removed from the trigger | grouped part deleted |
+|---|---|---|---|
+| running, no irreversible effect | cancel: abort, discard, no message, no notice | cancel | redo without it |
+| running, after an irreversible effect (an intermediate message included) | interject "{sender} deleted the message you are answering" | interject the correction (before/after) | interject |
+| run ended, sent before the run end | revival with the same interjection | revival with the interjection | revival with the interjection |
+| sent after the run end | nothing | nothing | nothing |
+
+An edit that **adds** a mention of the bot to a recent message triggers, as the original would have, only within `candidate_window_ms` of the original send.
 
 ### 5.2 Late additions
 
@@ -169,16 +186,22 @@ A message cannot be folded into a request just because its sender wrote it soon 
 - sent after the trigger group closed and **before the session's first delivered message** (after that, messages are explicit or implicit replies, §5.3, a different mechanism and meaning);
 - within `candidate_window_ms` of the trigger (time gate, default 60 s);
 - that is not an explicit reply to someone else's message;
-- up to `max_candidates` per session (default 3; a hard limit on how many messages are *considered*, judged or not). A decaying acceptance rule (accept fewer as time passes) was considered and is not adopted: the time gate and the hard limit already bound it.
+- up to `max_judged` candidates per session (default 8): a cost and noise bound on how many messages get a decision call at all.
+
+At most `max_folded` messages (default 3) **join** the request per session, whatever admitted them (a judgement, the quick windows, or an explicit reply below); a rejected candidate does not use this budget. A decaying acceptance rule (accept fewer as time passes) was considered and is not adopted: the time gate and the hard limits already bound it.
+
+**Explicit replies to the request always belong.** A reply from the trigger's sender to a message of the request (the trigger or a grouped part), sent while the session runs, is as unambiguous as an edit. It is the same case as replying to one of the session's own intermediate messages (reply-steer, ARCHITECTURE.md §8 "Message steering"). It skips eligibility and the decision model, with or without one: no time gate, no judgement. It redoes or is interjected like any late addition, counts toward `max_folded`, and never starts a parallel session. Today it matches no route (reply-steer resolves only bot messages, which carry the session id; the fold skips replies), so it is inert in a group and spawns a second session when it mentions the bot or is in a DM (§3: about one session in 300, median 107 s after the trigger).
 
 Edits are not candidates (§5.1). A DM message or a re-`@` is eligible like any other; when it is judged not to belong, it takes its native fate (its own session).
 
 **Membership** is judged by the `late_addition` decision point for every eligible message, **including those inside the quick fold windows** (no reason to exempt them). It is asked when the message arrives, in parallel with the model's work, so its latency hides inside the hold window (§4.2); the held call waits for a verdict still pending at the deadline, bounded by the point's timeout.
 
-- **State**: `{ request: [trigger group messages], between: [messages from others between the request and the candidate], message, age }`, the request rendered with its attachments' captions; nothing implies the candidate is addressed to the bot.
+- **State**: `{ request: [trigger group messages], between: [messages from others between the request and the candidate], message, age }`; nothing implies the candidate is addressed to the bot. Attachments appear as metadata (kind, type, filename, size) with a caption only if one already exists: the judgement **never waits** for captions or pixels. Whether an image posted right after a request belongs to it rarely depends on its contents.
 - **Question**: `belongs`, `noul`: "`message` continues, corrects or adds to `request`, written by the same person for the same purpose."
 - **Verdict**: `belongs ≥ threshold` → a late addition. Below → not folded (inert in a group, native fate in a DM or for a re-`@`).
 - **Fallback** (point off, no decision model, or a failed call): the quick fold windows of FOLLOWUP-FOLDING §4 decide, as today; the longer window only makes sense with a judgement.
+
+**Readiness.** Only once a message is accepted and the session redoes does the rebuild wait for the accepted media's download and conditioning, bounded like the trigger's readiness wait, so the main model receives pixels; past the bound it proceeds with the attachment reference. No step waits for a caption.
 
 A late addition redoes (§4.3) with the message joined to the trigger group when no irreversible effect exists; otherwise it is interjected (§4.4) with the fold's interjection texts. Sent before the run end but arrived after it, it revives the session (§4.5) when judged to belong.
 
@@ -221,7 +244,8 @@ A message reaches exactly one destination: trigger hold grouping, then redo, the
 enabled = false
 threshold = 0.7
 candidate_window_ms = 60000
-max_candidates = 3
+max_judged = 8
+max_folded = 3
 
 [decisions.implicit_reply].model`; reply-to detection benefits from a member strong at it, which need not be the routing head.
 
@@ -229,7 +253,8 @@ max_candidates = 3
 enabled = false
 threshold = 0.7
 candidate_window_ms = 60000
-max_candidates = 3
+max_judged = 8
+max_folded = 3
 
 [decisions.implicit_reply]` with `enabled = false`, `threshold`, `max_messages_after`, `max_age_ms`, per-agent overrides as for every point.
 
@@ -238,6 +263,8 @@ max_candidates = 3
 - Branch reasons gain `edit_redo`, `addition_redo` and `revival`; the console branch switcher (REFUSAL-HANDLING §12.1) shows them with the correcting message.
 - `agent_sessions` gains `redo_count`; `session_interjections.kind` gains `edit` and `revival`.
 - Held calls are recorded on the tool call (held ms, reason) and shown on its card; aborted turns are recorded like other discarded attempts.
+- **Aborted requests are billed.** A stream aborted mid-way reports its input usage but not the output produced so far. The attempt is written to the ledger with output estimated from the streamed deltas (flagged `estimated`), and it counts against every applicable limit, per-user included.
+- **Statistics.** Aborted turns and `edit_redo`/`addition_redo`/`revival` branches are their own outcome: excluded from send-contract failure rates (`deriveContractEvents`) and from model-behaviour misbehaviour counts (§8k rollups).
 - The implicit-reply point writes `decision_evaluations` rows like every point.
 - Logs: `late_input_redo`, `late_input_interjected`, `late_input_revived`, `late_input_ignored {reason}`, `irreversible_hold {ms}`, `turn_aborted_for_interjection`, `redo_replayed_call`, `implicit_reply_evaluated`.
 
@@ -259,7 +286,8 @@ skew_tolerance_ms = 0
 enabled = false
 threshold = 0.7
 candidate_window_ms = 60000
-max_candidates = 3
+max_judged = 8
+max_folded = 3
 
 [decisions.implicit_reply]
 enabled = false
@@ -289,14 +317,5 @@ max_age_ms = 120000
 
 ## 11. Open questions
 
-Not yet designed (each with a proposal):
-
-1. **Deletions.** A Matrix redaction or a Discord delete reaches `handleInbound` through the edit path as a tombstone (ARCHITECTURE.md §6 "Deletes"). Unhandled, §5.1 would redo with an empty trigger. Proposal: deleting the trigger cancels the session when no irreversible effect exists (abort, discard, no reply, no notice); after one, interject "{sender} deleted the message you are answering"; after the run end, nothing. Deleting a grouped part redoes without it.
-2. **Edits that change addressing.** An edit that adds a mention of the bot to a recent message: should it trigger, as the original would have? An edit that removes the mention from the trigger: cancel like a deletion, or treat as an ordinary correction? Proposal: adding triggers only within `candidate_window_ms` of the original send; removing cancels.
-3. **Correction storms.** Several edits or additions in quick succession. Proposal: a redo builds from the latest stored state, and corrections arriving during its first-event wait (§4.3) join it rather than starting another; `max_redos` bounds the rest.
-4. **Readiness of a late addition.** A redo that joins a media message must wait for its download and conditioning, like the trigger's readiness wait, or it redoes without pixels. Proposal: the same readiness wait, bounded; no wait for captions.
-5. **Accounting of aborted requests.** A stream aborted mid-way reports input usage but not the output produced so far, so the ledger undercounts it (the same gap as refused attempts). Proposal: record the aborted attempt with output estimated from the streamed deltas, flagged as estimated.
-6. **Refusal pin on redo.** A session pinned to a model by a refusal rule (REFUSAL-HANDLING §8.3) is redone from scratch with a corrected request. Proposal: the pin is cleared, since the refusal was about content that no longer exists; routing chooses afresh.
-7. **Statistics.** Aborted turns and `edit_redo`/`addition_redo`/`revival` branches must not count as send-contract failures or model misbehaviour (`deriveContractEvents`, §8k rollups). Proposal: they are excluded from failure rates and counted as their own outcome.
-8. **Built but not yet running.** A session that has built its context but waits for an LLM slot (scheduler admission) is rebuilt without a branch, since nothing was generated.
-9. `hold_ms`, `extend_ms`, `revive_max_ms`, `candidate_window_ms`, `max_candidates` and the `late_addition` threshold beyond the first measurement (§3).
+1. **A reply to one's own trigger after the run end.** It is a new request about the same work (§5.3), but its reply target is a user message, so the default record rule (replies to bot messages) injects nothing. Proposal: map the trigger message to its session through `agent_sessions.trigger_external_id` and inject that session's record, like a reply to the bot's message.
+2. Defaults beyond the first measurement (§3): `hold_ms`, `extend_ms`, `revive_max_ms`, `candidate_window_ms`, `max_judged`, `max_folded`, the `late_addition` threshold, the trigger hold (≤ 500 ms, proposed 250 ms).
