@@ -2,15 +2,23 @@ import { Type } from "@sinclair/typebox";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import { CallToolResultSchema, type CallToolResult, type Tool as McpToolDef } from "@modelcontextprotocol/sdk/types.js";
 import type { Logger } from "../observability/logger.js";
+import { mcpToolEffect, registerToolEffect, type ToolEffect } from "../tools/side-effects.js";
 import { isSessionTerminatedError, type McpClientPool } from "./client-pool.js";
 
+/**
+ * Adapt one MCP tool as `mcp_<server>_<tool>`, registering its effect class
+ * (spec LATE-INPUT §4.1): the server's `tools/list` annotations, or the
+ * per-server `effects` override keyed by the bare tool name.
+ */
 export function adaptMcpTool(
   serverName: string,
   toolDef: McpToolDef,
   pool: McpClientPool,
   logger: Logger,
+  effects?: Readonly<Record<string, ToolEffect>>,
 ): AgentTool {
   const name = `mcp_${serverName}_${toolDef.name}`;
+  registerToolEffect(name, mcpToolEffect(toolDef.annotations, effects?.[toolDef.name]));
   const parameters = Type.Unsafe(
     toolDef.inputSchema ?? { type: "object", properties: {} },
   );
@@ -114,8 +122,9 @@ export function adaptMcpTools(
   tools: McpToolDef[],
   pool: McpClientPool,
   logger: Logger,
+  effects?: Readonly<Record<string, ToolEffect>>,
 ): AgentTool[] {
   return tools.map((toolDef) =>
-    adaptMcpTool(serverName, toolDef, pool, logger),
+    adaptMcpTool(serverName, toolDef, pool, logger, effects),
   );
 }
