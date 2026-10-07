@@ -22,6 +22,7 @@
 	} from '$lib/branches';
 	import { buildBranchPlan } from '$lib/branch-plan';
 	import { evaluationsForCall, eventsForEvaluation, gateEvaluations } from '$lib/checks';
+	import { interjectionKindOf, isEstimated } from '$lib/late-input';
 	import AssistantTextCard from './AssistantTextCard.svelte';
 	import ThinkingCard from './ThinkingCard.svelte';
 	import ToolCallCard from './ToolCallCard.svelte';
@@ -41,6 +42,7 @@
 		SessionBranch,
 		SessionAudit,
 		SessionContract,
+		SessionInterjection,
 		ToolInvocation
 	} from '$lib/schemas';
 
@@ -65,6 +67,7 @@
 		contract,
 		checks = [],
 		audits = [],
+		interjections = [],
 		focus
 	}: {
 		messages: readonly unknown[];
@@ -77,6 +80,8 @@
 		checks?: readonly CheckInfo[];
 		/** The offline audit's rows (nudge cards' diagnosis chips and after-correction verdict). */
 		audits?: readonly SessionAudit[];
+		/** The session's interjection rows: the kind each interjection card is labelled with. */
+		interjections?: readonly SessionInterjection[];
 		focus?: { branchNo?: number | null; toolCallId?: string | null; attemptNo?: number | null } | null;
 	} = $props();
 
@@ -270,6 +275,7 @@
 								result={toolResults.get(block.id)}
 								usage={toolUsage?.get(block.id)}
 								requestFailed={msg.stopReason === 'aborted' || msg.stopReason === 'error'}
+								discarded={item.node !== LIVE_BRANCH}
 							/>
 						</div>
 						<!-- The output gate's verdict on this call (spec REFUSAL-HANDLING §12.2). -->
@@ -290,11 +296,16 @@
 				     produced the whole message. `ctx` is that request's totalTokens (the context
 				     size reached at this point). Messages without real usage render nothing. -->
 				{@const u = messageUsage(msg)}
+				{@const estimated = isEstimated((msg.usage as { estimated?: unknown } | undefined)?.estimated)}
 				{#if u}
 					<div
 						class="px-1 font-mono text-[10px] tabular-nums text-muted-foreground"
-						title={`context ${u.totalTokens} tokens · input ${u.input} · output ${u.output} · cache read ${u.cacheRead} · cache write ${u.cacheWrite} · cost ${u.cost}`}
+						title={`context ${u.totalTokens} tokens · input ${u.input} · output ${u.output} · cache read ${u.cacheRead} · cache write ${u.cacheWrite} · cost ${u.cost}${estimated ? ' · estimated (aborted stream)' : ''}`}
 					>
+						{#if estimated}<span
+								data-testid="usage-estimated"
+								class="mr-1 rounded bg-amber-500/15 px-1 text-amber-700 dark:text-amber-300">estimated</span
+							>{/if}
 						ctx {formatTokens(u.totalTokens)} · in {formatTokens(u.input)} · out {formatTokens(
 							u.output
 						)} · cr {formatTokens(u.cacheRead)} · cw {formatTokens(u.cacheWrite)}{#if u.cost > 0}
@@ -322,7 +333,7 @@
 				     forced-completion prompts arrive as `role:'user'` (src/agent/runner.ts).
 				     Both render as distinct user-role injections (spec §10b). The record-turn
 				     user prompt is filtered above (harness.kind === 'record_turn'). -->
-				<InterjectionCard text={contentText(msg.content)} />
+				<InterjectionCard text={contentText(msg.content)} kind={interjectionKindOf(msg, interjections)} />
 			{:else if msg.role === 'toolResult'}
 				<!-- rendered inside its tool-call card; skip standalone -->
 			{:else}

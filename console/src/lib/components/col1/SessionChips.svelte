@@ -4,11 +4,18 @@
 
 	// Session-list chips (spec REFUSAL-HANDLING §12.2): refused, redone (n),
 	// nudged (n), revised (n), unjudged (n). Nothing renders for a session with
-	// none of them (or a pre-feature backend).
-	let { chips }: { chips: SessionCheckChips | null | undefined } = $props();
+	// none of them (or a pre-feature backend). `redoCount` adds the late-input
+	// redos from scratch (an edited trigger, a late addition; ARCHITECTURE.md §8).
+	let {
+		chips,
+		redoCount = 0
+	}: { chips: SessionCheckChips | null | undefined; redoCount?: number | null } = $props();
 
-	const items = $derived(
-		chips
+	const items = $derived([
+		...(redoCount
+			? [{ key: 'restarted', label: `restarted ${redoCount}`, n: redoCount, title: 'redone from scratch after an edit or a late addition', tone: 'amber' }]
+			: []),
+		...(chips
 			? [
 					{ key: 'refused', label: 'refused', n: chips.refused, title: `${chips.refused} refusal events`, tone: 'red' },
 					{ key: 'redone', label: `redone ${chips.redone}`, n: chips.redone, title: 'rule and send-contract redos', tone: 'red' },
@@ -16,8 +23,8 @@
 					{ key: 'revised', label: `revised ${chips.revised}`, n: chips.revised, title: 'messages sent back for revision', tone: 'amber' },
 					{ key: 'unjudged', label: `unjudged ${chips.unjudged}`, n: chips.unjudged, title: 'outputs sent without a verdict (deadline)', tone: 'muted' }
 				].filter((c) => c.n > 0)
-			: []
-	);
+			: [])
+	]);
 </script>
 
 {#if items.length > 0}

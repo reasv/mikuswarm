@@ -75,7 +75,7 @@
 							<span class="line-clamp-2 text-xs text-muted-foreground">
 								{session.triggerBody ?? session.id}
 							</span>
-							<SessionChips chips={session.checkChips} />
+							<SessionChips chips={session.checkChips} redoCount={session.redoCount} />
 						</a>
 					</li>
 				{/each}

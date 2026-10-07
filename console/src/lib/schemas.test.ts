@@ -883,3 +883,93 @@ describe('session records schemas', () => {
 		expect(out.evaluations).toHaveLength(0);
 	});
 });
+
+// Late input (ARCHITECTURE.md §8 "Late input", §11): branch causes, interjection
+// kinds, the redo counter and the estimated usage flag, all optional for older backends.
+describe('late-input wire fields', () => {
+	const meta = {
+		id: 's',
+		timelineKey: 'k',
+		sessionType: 'default',
+		status: 'completed',
+		modelId: null,
+		triggerEventId: null,
+		triggerExternalId: null,
+		triggerBody: null,
+		tokenEstimate: null,
+		noReply: false,
+		error: null,
+		createdAt: 1,
+		startedAt: null,
+		updatedAt: 1,
+		completedAt: null
+	};
+	const branch = {
+		branchNo: 1,
+		parentBranchNo: 0,
+		forkIndex: 0,
+		reason: 'edit_redo',
+		checkCode: null,
+		decisionEvaluationId: null,
+		fromModel: null,
+		toModel: null,
+		messages: [],
+		costUsd: null,
+		createdAt: 2
+	};
+	const detail = { session: meta, contextSnapshot: [], transcript: [], rolloutStartIndex: 0, contextDumpPath: null };
+
+	it('decodes causes, interjections and the redo count', () => {
+		const out = decode(SessionDetailResponse, {
+			...detail,
+			session: { ...meta, redoCount: 2 },
+			branches: [
+				{
+					...branch,
+					causeEventId: 'matrix:a:$e',
+					cause: { eventId: 'matrix:a:$e', senderId: '@ada:x', senderName: 'Ada', body: 'at 7pm', timestamp: 1, editedAt: 5 }
+				},
+				{ ...branch, branchNo: 2, reason: 'turn_aborted', forkIndex: 3, causeEventId: null, cause: null }
+			],
+			interjections: [
+				{ eventId: null, externalId: null, senderId: '@g:x', senderName: null, kind: 'revival', body: 'hi', createdAt: 3 }
+			]
+		});
+		expect(out.session.redoCount).toBe(2);
+		expect(out.branches![0]!.cause?.editedAt).toBe(5);
+		expect(out.branches![1]!.cause).toBeNull();
+		expect(out.interjections![0]!.kind).toBe('revival');
+	});
+
+	it('tolerates a pre-feature backend', () => {
+		const out = decode(SessionDetailResponse, { ...detail, branches: [branch] });
+		expect(out.session.redoCount).toBeUndefined();
+		expect(out.branches![0]!.cause).toBeUndefined();
+		expect(out.interjections).toBeUndefined();
+	});
+
+	it('keeps the estimated flag on a usage event row, absent or set', () => {
+		const row = {
+			id: 'u',
+			ts: 1,
+			class: 'decision',
+			agent_session_id: null,
+			session_type: null,
+			timeline_key: null,
+			trigger_sender_id: null,
+			tool_name: null,
+			model_id: 'm',
+			provider: null,
+			input_tokens: 1,
+			output_tokens: 1,
+			cache_read_tokens: null,
+			cache_write_tokens: null,
+			images: null,
+			cost_usd: 0,
+			ref: null,
+			channel_label: null
+		};
+		expect(decode(UsageEventRow, { ...row, estimated: 1 }).estimated).toBe(1);
+		expect(decode(UsageEventRow, row).estimated).toBeUndefined();
+	});
+});

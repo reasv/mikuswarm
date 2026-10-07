@@ -16,6 +16,7 @@
 			"maxContextTokens": 128000,
 			"maxSessionCostUsd": null,
 			"noReply": false,
+			"redoCount": 0,
 			"checkChips": {
 				"refused": 2,
 				"redone": 1,
@@ -248,7 +249,9 @@
 					}
 				],
 				"costUsd": 0.0012,
-				"createdAt": 3200
+				"createdAt": 3200,
+				"causeEventId": null,
+				"cause": null
 			}
 		],
 		"refusalEvents": [
@@ -395,7 +398,8 @@
 				"description": "Overused assistant vocabulary"
 			}
 		],
-		"audits": []
+		"audits": [],
+		"interjections": []
 	},
 	"decisions": {
 		"evaluations": [

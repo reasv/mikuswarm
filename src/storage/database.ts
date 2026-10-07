@@ -1035,6 +1035,17 @@ export interface SessionInterjectionInsert {
   createdAt: number;
 }
 
+/** A persisted `session_interjections` row (snake_case columns), as the console reads it. */
+export interface SessionInterjectionRow {
+  event_id: string | null;
+  external_id: string | null;
+  sender_id: string | null;
+  sender_display_name: string | null;
+  kind: string;
+  body: string;
+  created_at: number;
+}
+
 /**
  * A persisted `agent_sessions` row as stored (snake_case columns). Read-side
  * shape returned by {@link Storage.getAgentSession}; mirrors the table in
@@ -1106,6 +1117,8 @@ export interface AgentSessionRow {
   contract_version?: number | null;
   /** Sticky refusal pin, JSON {@link RefusalPin} (spec REFUSAL-HANDLING §8.3; v25). */
   refusal_pin?: string | null;
+  /** Redos from scratch after a late input (ARCHITECTURE.md §8 "Late input"; v30). */
+  redo_count?: number | null;
 }
 
 const AGENT_SESSION_META_COLUMN_NAMES = [
@@ -1131,6 +1144,7 @@ const AGENT_SESSION_META_COLUMN_NAMES = [
   "started_at",
   "updated_at",
   "completed_at",
+  "redo_count",
 ] as const satisfies readonly (keyof AgentSessionRow)[];
 
 /**
@@ -2852,6 +2866,20 @@ export class Storage {
         }) as Array<{ event_json: string }>,
     );
     return rows.map((row) => JSON.parse(row.event_json) as CanonicalChatEvent);
+  }
+
+  /**
+   * When the stored message was last edited (`last_edit_timestamp`, the edit's
+   * origin time): null when never edited, undefined when the row is absent. The
+   * console marks an edited message with it (the body is already the edited one).
+   */
+  getTimelineEventLastEdit(id: string): number | null | undefined {
+    const row = this.read((db) =>
+      db.prepare(`select last_edit_timestamp from timeline_events where id = ?`).get(id) as
+        | { last_edit_timestamp: number | null }
+        | undefined,
+    );
+    return row ? row.last_edit_timestamp : undefined;
   }
 
   getTimelineEventById(id: string): CanonicalChatEvent | undefined {
@@ -10681,6 +10709,18 @@ export class Storage {
       });
       return next;
     });
+  }
+
+  /** A session's `session_interjections` rows in delivery order (console session view). */
+  listSessionInterjections(sessionId: string): SessionInterjectionRow[] {
+    return this.read((db) =>
+      db
+        .prepare(
+          `select event_id, external_id, sender_id, sender_display_name, kind, body, created_at
+             from session_interjections where session_id = ? order by created_at asc, rowid asc`,
+        )
+        .all(sessionId) as SessionInterjectionRow[],
+    );
   }
 
   /** A session's discarded branches in `branch_no` order. */

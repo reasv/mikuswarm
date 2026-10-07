@@ -55,6 +55,7 @@
 	const refusalEvents = $derived(session.data?.refusalEvents ?? []);
 	const contract = $derived(session.data?.contract);
 	const checks = $derived(session.data?.checks ?? []);
+	const interjections = $derived(session.data?.interjections ?? []);
 	// The offline audit's rows (send-contract diagnosis); [] until it has run.
 	const audits = $derived(session.data?.audits ?? []);
 	const auditLines = $derived(auditSummary(audits));
@@ -367,6 +368,7 @@
 					{refusalEvents}
 					{contract}
 					{checks}
+					{interjections}
 				/>
 			{/key}
 		{:else}
@@ -380,6 +382,7 @@
 				{contract}
 				{checks}
 				{audits}
+				{interjections}
 				{focus}
 			/>
 		{/if}

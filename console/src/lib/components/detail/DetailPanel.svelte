@@ -175,7 +175,9 @@
 				['created', fmtTime(meta.createdAt)],
 				['started', fmtTime(meta.startedAt)],
 				['completed', fmtTime(meta.completedAt)],
-				['duration', fmtDuration(meta.startedAt, meta.completedAt)]
+				['duration', fmtDuration(meta.startedAt, meta.completedAt)],
+				// Late input (ARCHITECTURE.md §8): redos from scratch after an edit / addition.
+				...(meta.redoCount ? ([['redone from scratch', `${meta.redoCount}×`]] as [string, string][]) : [])
 			])}
 
 			<!-- Agent-loop actuals (spec TOKEN-USAGE-TRACKING §7.2) -->

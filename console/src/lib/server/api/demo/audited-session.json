@@ -16,6 +16,7 @@
 			"maxContextTokens": 128000,
 			"maxSessionCostUsd": null,
 			"noReply": false,
+			"redoCount": 0,
 			"checkChips": {
 				"refused": 1,
 				"redone": 0,
@@ -456,7 +457,8 @@
 				"version": 1,
 				"createdAt": 88410000
 			}
-		]
+		],
+		"interjections": []
 	},
 	"decisions": {
 		"evaluations": [

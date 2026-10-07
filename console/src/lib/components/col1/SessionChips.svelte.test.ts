@@ -21,3 +21,8 @@ test('renders nothing without chips', async () => {
 	const zero = render(SessionChips, { chips: { refused: 0, redone: 0, nudged: 0, revised: 0, unjudged: 0 } });
 	expect(zero.container.querySelector('[data-testid="session-chips"]')).toBeNull();
 });
+
+test('adds the late-input redo count', async () => {
+	render(SessionChips, { chips: null, redoCount: 2 });
+	await expect.element(page.getByText('restarted 2')).toBeInTheDocument();
+});
