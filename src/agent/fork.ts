@@ -38,6 +38,8 @@ export interface ForkMeta {
   decisionEvaluationId?: number;
   fromModel?: string;
   toModel?: string;
+  /** The timeline event whose arrival discarded the span (late input reasons). */
+  causeEventId?: string;
 }
 
 /** What a fork changed, for the factory's re-derivation of append-only state. */
@@ -244,6 +246,7 @@ export async function forkSession(ctx: ForkContext, point: ForkPoint, meta: Fork
     toModel: meta.toModel ?? null,
     messagesJson: serializeForPersistence(discarded),
     costUsd: spanCost(costSpan),
+    causeEventId: meta.causeEventId ?? null,
   });
 
   agent.state.messages = kept;

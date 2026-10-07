@@ -1393,6 +1393,8 @@ export interface SessionBranchInsert {
   messagesJson: string;
   costUsd?: number | null;
   createdAt?: number;
+  /** The timeline event whose arrival discarded the span (late input reasons). */
+  causeEventId?: string | null;
 }
 
 /** A persisted `agent_session_branches` row (snake_case columns). */
@@ -1409,6 +1411,7 @@ export interface SessionBranchRow {
   messages_json: string;
   cost_usd: number | null;
   created_at: number;
+  cause_event_id: string | null;
 }
 
 /** `session_audits.status` (spec REFUSAL-HANDLING §7.6, DECISION-MODEL §5.8). */
@@ -10655,10 +10658,12 @@ export class Storage {
       db.prepare(
         `insert into agent_session_branches
            (session_id, branch_no, parent_branch_no, fork_index, reason, check_code,
-            decision_evaluation_id, from_model, to_model, messages_json, cost_usd, created_at)
+            decision_evaluation_id, from_model, to_model, messages_json, cost_usd, created_at,
+            cause_event_id)
          values
            (@sessionId, @branchNo, @parentBranchNo, @forkIndex, @reason, @checkCode,
-            @decisionEvaluationId, @fromModel, @toModel, @messagesJson, @costUsd, @createdAt)`,
+            @decisionEvaluationId, @fromModel, @toModel, @messagesJson, @costUsd, @createdAt,
+            @causeEventId)`,
       ).run({
         sessionId: row.sessionId,
         branchNo: next,
@@ -10672,6 +10677,7 @@ export class Storage {
         messagesJson: row.messagesJson,
         costUsd: row.costUsd ?? null,
         createdAt: row.createdAt ?? Date.now(),
+        causeEventId: row.causeEventId ?? null,
       });
       return next;
     });
@@ -11935,6 +11941,9 @@ create table if not exists agent_session_branches (
   messages_json          text not null,             -- the discarded span, sanitized like transcripts
   cost_usd               real,
   created_at             integer not null,
+  -- The timeline event whose arrival discarded the span (a trigger edit, a late
+  -- addition, a reviving message); null for the other reasons (added v30).
+  cause_event_id         text,
   primary key (session_id, branch_no)
 );`;
 
@@ -13507,7 +13516,7 @@ function addSessionAuditsTable(db: Database.Database): void {
 }
 
 // v29→v30 (ARCHITECTURE.md §8 "Late input"): agent_sessions.redo_count and
-// usage_events.estimated. Idempotent: a column already present is left alone.
+// usage_events.estimated, agent_session_branches.cause_event_id. Idempotent: a column already present is left alone.
 function addLateInputColumns(db: Database.Database): void {
   const has = (table: string, column: string) =>
     (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).some((c) => c.name === column);
@@ -13518,6 +13527,9 @@ function addLateInputColumns(db: Database.Database): void {
   }
   if (exists("usage_events") && !has("usage_events", "estimated")) {
     db.exec("ALTER TABLE usage_events ADD COLUMN estimated integer");
+  }
+  if (exists("agent_session_branches") && !has("agent_session_branches", "cause_event_id")) {
+    db.exec("ALTER TABLE agent_session_branches ADD COLUMN cause_event_id text");
   }
 }
 
