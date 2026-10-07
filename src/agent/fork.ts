@@ -105,15 +105,16 @@ export function forkFloor(messages: readonly AgentMessage[]): number {
 
 /**
  * The fork point of a redo (spec §8.4, owner decisions 2 and 23): the later of
- * the last delivered message and the last irreversible tool effect, never
+ * the last delivered message and the last tool effect that is not redo-safe
+ * (irreversible, repeatable or undoable; LATE-INPUT §4.1), never
  * before {@link forkFloor}. A posting call counts once its result is not an
- * error (delivered); any other irreversible call counts once it ran (has a
+ * error (delivered); any other effectful call counts once it ran (has a
  * result) or when its result is missing (conservative). The fork lands after
  * the effect's whole tool-result group.
  *
  * With `gatedToolCallId` (a refusal at a send), only messages before the gated
  * call's assistant message count; when that message has another call with an
- * irreversible effect, the fork point is the message itself with a sibling
+ * effect that is not redo-safe, the fork point is the message itself with a sibling
  * edit removing the gated call. When every sibling is redo-safe the whole
  * message is discarded and redone.
  */
@@ -129,7 +130,9 @@ export function findForkPoint(
     }
   });
   const hasEffect = (call: { id: string; name: string; args: unknown }): boolean => {
-    if (toolEffect(call.name, call.args) !== "irreversible") return false;
+    // Repeatable and undoable effects count like irreversible ones: the fork
+    // never discards a paid call or a visible change it does not compensate.
+    if (toolEffect(call.name, call.args) === "redo_safe") return false;
     const result = results.get(call.id);
     if (isPostingTool(call.name)) return result === undefined || !result.isError;
     return true;

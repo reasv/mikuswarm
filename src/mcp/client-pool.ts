@@ -7,12 +7,15 @@ import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import type { Tool as McpToolDef } from "@modelcontextprotocol/sdk/types.js";
 import { registerSecret } from "../config/redaction.js";
 import type { Logger } from "../observability/logger.js";
+import type { ToolEffect } from "../tools/side-effects.js";
 
 export interface McpServerConfig {
   enabled?: boolean;
   url: string;
   transport?: "streamable-http" | "sse";
   headers?: Record<string, string>;
+  /** Effect class per bare tool name, overriding the server's tool annotations. */
+  effects?: Record<string, ToolEffect>;
 }
 
 export interface McpServerEntry {

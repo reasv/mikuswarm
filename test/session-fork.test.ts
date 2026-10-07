@@ -88,6 +88,29 @@ test("findForkPoint: fork point table", () => {
       expect: { index: 5 },
     },
     {
+      name: "repeatable and undoable effects count; args-refined reads do not",
+      messages: [
+        kick(),
+        asst([call("g1", "image_generate", { prompt: "x" })]), res("g1", "image_generate"),
+        asst([call("v1", "str_replace_based_edit_tool", { command: "view", path: "a" })]), res("v1", "str_replace_based_edit_tool"),
+        asst([call("x1", "react", { message_id: "m", emoji: "👍" })]), res("x1", "react"),
+        asst([call("n1", "browser", { action: "snapshot" })]), res("n1", "browser"),
+        text("t"),
+      ],
+      expect: { index: 7 },
+    },
+    {
+      name: "a repeatable call alone moves the fork point past it",
+      messages: [kick(), asst([call("e1", "exa_research", { query: "q" })]), res("e1", "exa_research"), asst([call("w1", "web_search")]), res("w1", "web_search"), text("t")],
+      expect: { index: 3 },
+    },
+    {
+      name: "gated send with a repeatable sibling → sibling edit",
+      messages: [kick(), asst([call("g1", "send_message"), call("i1", "image_generate", { prompt: "x" })]), res("g1", "send_message", true), res("i1", "image_generate"), aborted()],
+      gated: "g1",
+      expect: { index: 1, siblingEdit: { messageIndex: 1, removeToolCallIds: ["g1"] } },
+    },
+    {
       name: "a resumed transcript forks no earlier than the current run",
       messages: [
         kick(), text("t"),

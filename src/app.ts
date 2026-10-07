@@ -2953,7 +2953,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // set they started with.
   const mcpTools = [] as ReturnType<typeof adaptMcpTools>;
   const registerMcpServerTools = (entry: McpServerEntry) => {
-    for (const tool of adaptMcpTools(entry.name, entry.tools, mcpPool, logger.child("mcp"))) {
+    for (const tool of adaptMcpTools(entry.name, entry.tools, mcpPool, logger.child("mcp"), entry.config.effects)) {
       mcpTools.push(tool);
       mcpToolServerMap.set(tool.name, entry.name);
     }

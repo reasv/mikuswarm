@@ -15,6 +15,8 @@ import {
   IRREVERSIBLE_TOOLS,
   POSTING_TOOL_NAMES,
   REDO_SAFE_TOOL_NAMES,
+  REPEATABLE_TOOL_NAMES,
+  UNDOABLE_TOOL_NAMES,
   isPostingTool,
 } from "../tools/side-effects.js";
 
@@ -158,7 +160,7 @@ function escapeRegExp(s: string): string {
 
 /** Every tool name the harness knows (the side-effect lists cover all of them). */
 export const KNOWN_TOOL_NAMES: readonly string[] = [
-  ...new Set([...POSTING_TOOL_NAMES, ...REDO_SAFE_TOOL_NAMES, ...IRREVERSIBLE_TOOLS]),
+  ...new Set([...POSTING_TOOL_NAMES, ...REDO_SAFE_TOOL_NAMES, ...REPEATABLE_TOOL_NAMES, ...UNDOABLE_TOOL_NAMES, ...IRREVERSIBLE_TOOLS]),
 ];
 
 /** Tool-call markup of the common chat templates and tool-call formats, written as text. */
