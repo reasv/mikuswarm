@@ -4,7 +4,7 @@
 **Realizes**: spec/SESSION-RECORDS.md §9 "Trigger edits, the hold, folding, interjection" (the owner direction recorded there).
 **Supersedes**: the settled branch of follow-up folding as shipped by SESSION-RECORDS §7 (`foldAfterSettle`: a fresh session with the owner's record). See §5.5.
 **Amends**: spec/FOLLOWUP-FOLDING.md (delivery while running, §5.2), the trigger hold (ARCHITECTURE.md §6, §7), the tool side-effect list (`src/tools/side-effects.ts`, REFUSAL-HANDLING §8.4), the branch reasons of REFUSAL-HANDLING §9.
-**Adds**: a decision point, `implicit_reply` (§6).
+**Adds**: two decision points, `late_addition` (§5.2) and `implicit_reply` (§6).
 **Target ARCHITECTURE.md home once implemented**: §8 (a new "Late input" subsection beside "Follow-up folding" and "Message steering"), §8j "Redo and branches", §8i "Resume and folding", §6/§7 "Trigger hold", §8h (the new point), §10 "Output-gated tools", §11 (console).
 **Related**: SESSION-RECORDS, FOLLOWUP-FOLDING, REFUSAL-HANDLING, DECISION-MODEL, RESUMABLE-SESSIONS, DUPLICATE-REPLY-MITIGATION.
 
@@ -95,7 +95,7 @@ The first `irreversible` call of a chat-lane session (or an `undoable` one, whos
 - The user sees the typing indicator during the wait, as during generation.
 - Proactive and synthetic sessions are never held. A session whose trigger has no human sender (a bot-chain trigger) is never held.
 
-**The trigger hold** (ARCHITECTURE.md §6) becomes a cost optimization only: with redo in place, a part that arrives after launch is no longer lost or answered half, it costs one redo. Whether to reduce it, and to what, is an owner decision (§11). Measured (§3 deployment, 30 days): the 2 s Matrix hold grouped parts into 53 of 5,905 sessions (0.9%); of the 70 grouped parts, 45 arrived within 250 ms of the trigger, 49 within 500 ms, 56 within 1 s, 66 within 2 s. A 250–500 ms hold would still group most of them; the rest, about 20 a month, would each cost a redo, against the hold's delay on every trigger.
+**The trigger hold** (ARCHITECTURE.md §6) becomes a cost optimization only: with redo in place, a part that arrives after launch is no longer lost or answered half, it costs one redo. It is reduced to **at most 500 ms**, proposed default 250 ms (owner: 500 ms is already generous). Measured (§3 deployment, 30 days): the 2 s Matrix hold grouped parts into 53 of 5,905 sessions (0.9%); of the 70 grouped parts, 45 arrived within 250 ms of the trigger, 49 within 500 ms, 56 within 1 s, 66 within 2 s. A 250–500 ms hold would still group most of them; the rest, about 20 a month, would each cost a redo, against the hold's delay on every trigger.
 
 ### 4.3 Redo from scratch
 
@@ -105,7 +105,9 @@ A redo replaces the session's rollout with a fresh one built from the corrected 
 2. **Branch**: the discarded span becomes an `agent_session_branches` row with `reason = "edit_redo"` or `"addition_redo"`, forked at index 0 (the whole rollout, including the harness injections of the old kickoff). The session id, claim, payee and typing indicator are unchanged.
 3. **Rebuild** the context against the **original build's timeline cutoff** with the correction applied: the edited body replaces the old one; a late addition joins the trigger group. Messages from other senders that arrived meanwhile are not pulled in; they reach the session as they would any running session. This keeps the prefix byte-identical to the first build up to breakpoint (c), which the cost model depends on. The runtime state (current time, active sessions) is recomputed; it lives in the final user turn, after the cached prefix.
 4. **Re-run routing and record planning** on the corrected trigger: the task may change, so may skill preloads, tail files and the routed model. A changed model loses the cache; that cost is accepted.
-5. **Replay**: a `redo_safe` or `repeatable` call whose name and canonical arguments match a call in any discarded span of the same session (whatever discarded it: an edit or addition redo, a refusal or contract redo, a revival fork) returns the stored result without executing, within `replay_max_age_ms`. A redo that issues the same search pays nothing for it. Calls on the live branch are never replayed: their results are already in context, and answering a repeated live call from a stored result would be duplicate-call dedup, a different feature.
+5. **Replay**: the session keeps, per call key (tool name + canonical arguments), the latest result of every `redo_safe` or `repeatable` call it executed, on any branch. A call is served from this store only when **no call with the same key has been served earlier on the current lineage** (the live branch from the session start to this point); otherwise it executes fresh, because an agent that asks again within one line of work wants a new value. So only results from discarded spans are ever replayed (whatever discarded them: an edit or addition redo, a refusal or contract redo, a revival fork), and each at most once per lineage. A later fork that discards the call which consumed a replay frees the entry for the new branch.
+   - An entry is never removed on use. It is replaced only when a fresh execution of the same key produces a newer value, and dropped when it is older than `replay_max_age_ms`. Removing it earlier could discard a result a later branch needs.
+   - A redo that issues the same search pays nothing for it.
 6. The hold deadline is extended (§4.2), and the run continues.
 
 **Cost.** With the cache rule above, a redo costs about one extra request: a cache read of the prefix, a cache write of the last timeline batch and the final user turn, and the output the aborted request produced before the abort (thinking tokens included).
@@ -160,9 +162,25 @@ A **no-op filter** skips the redo when the normalized text and attachments are u
 
 ### 5.2 Late additions
 
-A late addition is a same-sender message that the follow-up fold accepts (FOLLOWUP-FOLDING §4: the media, text and mention levers). While running, before any irreversible effect, it **redoes** with the addition joined to the trigger group, instead of being steered. After an irreversible effect it is interjected (§4.4), with the fold's interjection texts. After the run end it revives (§4.5) when sent before the run end.
+A message cannot be folded into a request just because its sender wrote it soon after: it may be about anything, or addressed to someone else. The quick fold windows are a heuristic that catches only what is very likely a follow-up. This spec separates **eligibility** (which messages are considered at all) from **membership** (which of them belong to the request).
 
-The quick fold windows remain the mechanical rule. Same-sender bare messages sent while the session runs but outside the windows are common (§3); whether they belong to the request is ambiguous, unlike an edit. Open question 1 (§11) is whether a decision model judges them. If it does, it is asked **when the message arrives**, in parallel with the model's work, so its latency hides inside the hold window; the held call waits for the verdict only if it is still pending at the deadline.
+**Eligible** (owner direction): a message from the trigger's sender, in the trigger's timeline,
+
+- sent after the trigger group closed and **before the session's first delivered message** (after that, messages are explicit or implicit replies, §5.3, a different mechanism and meaning);
+- within `candidate_window_ms` of the trigger (time gate, default 60 s);
+- that is not an explicit reply to someone else's message;
+- up to `max_candidates` per session (default 3; a hard limit on how many messages are *considered*, judged or not). A decaying acceptance rule (accept fewer as time passes) was considered and is not adopted: the time gate and the hard limit already bound it.
+
+Edits are not candidates (§5.1). A DM message or a re-`@` is eligible like any other; when it is judged not to belong, it takes its native fate (its own session).
+
+**Membership** is judged by the `late_addition` decision point for every eligible message, **including those inside the quick fold windows** (no reason to exempt them). It is asked when the message arrives, in parallel with the model's work, so its latency hides inside the hold window (§4.2); the held call waits for a verdict still pending at the deadline, bounded by the point's timeout.
+
+- **State**: `{ request: [trigger group messages], between: [messages from others between the request and the candidate], message, age }`, the request rendered with its attachments' captions; nothing implies the candidate is addressed to the bot.
+- **Question**: `belongs`, `noul`: "`message` continues, corrects or adds to `request`, written by the same person for the same purpose."
+- **Verdict**: `belongs ≥ threshold` → a late addition. Below → not folded (inert in a group, native fate in a DM or for a re-`@`).
+- **Fallback** (point off, no decision model, or a failed call): the quick fold windows of FOLLOWUP-FOLDING §4 decide, as today; the longer window only makes sense with a judgement.
+
+A late addition redoes (§4.3) with the message joined to the trigger group when no irreversible effect exists; otherwise it is interjected (§4.4) with the fold's interjection texts. Sent before the run end but arrived after it, it revives the session (§4.5) when judged to belong.
 
 ### 5.3 After the reply
 
@@ -199,9 +217,21 @@ A message reaches exactly one destination: trigger hold grouping, then redo, the
 
 **Verdict**: `replies ≥ threshold` (default high, 0.8) synthesizes a `reply` trigger with M as the reply target. Everything downstream is the normal reply path: claims, a fresh session, M's session record injected by the default rule or the records point, billing to the sender. Below threshold, or on any failure: inert, as today. No heuristic rung.
 
-**Model chain**: its own `[decisions.implicit_reply].model`; reply-to detection benefits from a member strong at it, which need not be the routing head.
+**Model chain**: its own `[decisions.late_addition]
+enabled = false
+threshold = 0.7
+candidate_window_ms = 60000
+max_candidates = 3
 
-**Config**: `[decisions.implicit_reply]` with `enabled = false`, `threshold`, `max_messages_after`, `max_age_ms`, per-agent overrides as for every point.
+[decisions.implicit_reply].model`; reply-to detection benefits from a member strong at it, which need not be the routing head.
+
+**Config**: `[decisions.late_addition]
+enabled = false
+threshold = 0.7
+candidate_window_ms = 60000
+max_candidates = 3
+
+[decisions.implicit_reply]` with `enabled = false`, `threshold`, `max_messages_after`, `max_age_ms`, per-agent overrides as for every point.
 
 ## 7. Storage, console, logs
 
@@ -225,6 +255,12 @@ replay_max_age_ms = 300000
 revive_max_ms = 300000
 skew_tolerance_ms = 0
 
+[decisions.late_addition]
+enabled = false
+threshold = 0.7
+candidate_window_ms = 60000
+max_candidates = 3
+
 [decisions.implicit_reply]
 enabled = false
 threshold = 0.8
@@ -246,13 +282,21 @@ max_age_ms = 120000
 
 1. **Effect classes and the audit** (§4.1), MCP annotations. Standalone; improves the refusal fork point too.
 2. **Edits**: redo from scratch with the rebuild-at-cutoff and the abort rule (§4.3), edit interjections (§4.4), the cache tests.
-3. **The irreversibility hold** (§4.2), then the trigger-hold change if the owner decides one (§11).
+3. **The irreversibility hold** (§4.2) and the trigger-hold reduction, together (the hold only shrinks once redo and the irreversibility hold catch what it used to).
 4. **Late additions as redo** (§5.2) and abort-and-interject for folds.
 5. **Revival** (§4.5), removing `foldAfterSettle`.
 6. **`implicit_reply`** (§6).
 
 ## 11. Open questions
 
-1. **Same-sender messages outside the quick fold windows.** A bare message from the trigger's sender, sent while the session runs and before its first delivery but outside the fold's user-gap windows (text 7 s, media 10 s, mention 5 s), is ignored today: inert in a group, never seen by the session. Example: `@bot weather in Paris`, then 15 s later `for tomorrow`. These are common (§3: most such group texts come 10–60 s after the trigger). Causality says they cannot be reactions to the reply, but not that they belong to the request; the sender may be talking to someone else. What decides membership: the fixed windows (today), mechanically wider windows (for example any same-sender message until the first delivery), or a decision model asked the moment the message arrives, in parallel with the model's work?
-2. **The trigger hold**: keep 2 s, reduce it (the data in §4.2 suggests 250–500 ms keeps most grouping), or remove it.
-3. `hold_ms`, `extend_ms`, `revive_max_ms` defaults beyond the first measurement (§3).
+Not yet designed (each with a proposal):
+
+1. **Deletions.** A Matrix redaction or a Discord delete reaches `handleInbound` through the edit path as a tombstone (ARCHITECTURE.md §6 "Deletes"). Unhandled, §5.1 would redo with an empty trigger. Proposal: deleting the trigger cancels the session when no irreversible effect exists (abort, discard, no reply, no notice); after one, interject "{sender} deleted the message you are answering"; after the run end, nothing. Deleting a grouped part redoes without it.
+2. **Edits that change addressing.** An edit that adds a mention of the bot to a recent message: should it trigger, as the original would have? An edit that removes the mention from the trigger: cancel like a deletion, or treat as an ordinary correction? Proposal: adding triggers only within `candidate_window_ms` of the original send; removing cancels.
+3. **Correction storms.** Several edits or additions in quick succession. Proposal: a redo builds from the latest stored state, and corrections arriving during its first-event wait (§4.3) join it rather than starting another; `max_redos` bounds the rest.
+4. **Readiness of a late addition.** A redo that joins a media message must wait for its download and conditioning, like the trigger's readiness wait, or it redoes without pixels. Proposal: the same readiness wait, bounded; no wait for captions.
+5. **Accounting of aborted requests.** A stream aborted mid-way reports input usage but not the output produced so far, so the ledger undercounts it (the same gap as refused attempts). Proposal: record the aborted attempt with output estimated from the streamed deltas, flagged as estimated.
+6. **Refusal pin on redo.** A session pinned to a model by a refusal rule (REFUSAL-HANDLING §8.3) is redone from scratch with a corrected request. Proposal: the pin is cleared, since the refusal was about content that no longer exists; routing chooses afresh.
+7. **Statistics.** Aborted turns and `edit_redo`/`addition_redo`/`revival` branches must not count as send-contract failures or model misbehaviour (`deriveContractEvents`, §8k rollups). Proposal: they are excluded from failure rates and counted as their own outcome.
+8. **Built but not yet running.** A session that has built its context but waits for an LLM slot (scheduler admission) is rebuilt without a branch, since nothing was generated.
+9. `hold_ms`, `extend_ms`, `revive_max_ms`, `candidate_window_ms`, `max_candidates` and the `late_addition` threshold beyond the first measurement (§3).
