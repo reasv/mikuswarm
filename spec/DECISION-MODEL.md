@@ -202,6 +202,8 @@ Every chat-window point uses `renderDecisionTranscript(timelineKey, opts)` → `
 
 ### 3.5 Images: captions by default, an optional vision decision model
 
+**Status**: IMPLEMENTED 2026-10-07 with spec/LATE-INPUT.md (the `late_addition` point is its first user), superseded by ARCHITECTURE.md §8h "Vision decision chain"; retained for review. Not built: the split of image-dependent and other questions across parallel calls (a vision evaluation sends all of the point's questions), and subject images for routing/presence/reactions.
+
 The text model sees images as their captions, which the captioning pipeline already produces for every image event. That covers most decisions, because the question is almost always about the *conversation* and a caption carries what the conversation needs. A vision decision model is an **optional second chain** for the cases where captions are missing or insufficient:
 
 ```toml

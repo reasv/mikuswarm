@@ -35,6 +35,7 @@ import { parseRetryAfterMs, type LlmScheduler, type PriorityClass } from "../age
 import { computeUsageCost } from "../agent/usage.js";
 import { estimateTokens } from "../context/tokens.js";
 import type { Logger } from "../observability/logger.js";
+import { wireImageState, type DecisionImage, type LoadedDecisionImage } from "./images.js";
 import {
   parseAnswers,
   requestShapeOf,
@@ -57,9 +58,11 @@ export interface DecisionRequest {
   /**
    * Build the state for a token budget. Called once per distinct effective
    * budget (memoized); must return a state whose JSON fits the budget. The
-   * client checks and shrinks if a builder overshoots.
+   * client checks and shrinks if a builder overshoots. On a vision request
+   * `imageLabels` maps each image ref id the member is sent to its label
+   * ("image 1"), so the state's attachments can reference it.
    */
-  state: (budgetTokens: number) => unknown;
+  state: (budgetTokens: number, imageLabels?: ReadonlyMap<string, string>) => unknown;
   /** The point's state cap (`state_max_tokens`). */
   stateMaxTokens: number;
   /** Members whose effective state budget is below this are skipped. */
@@ -71,11 +74,29 @@ export interface DecisionRequest {
    * (`state_shapes = "text_or_conversation"`) also accepts.
    */
   stateShape?: "object" | "conversation";
+  /**
+   * A vision request (DECISION-MODEL §3.5): the loaded, labelled images,
+   * newest first. Only members declaring `"image"` in `input_modalities` are
+   * tried; each gets at most its `decision.max_images` of them, re-encoded via
+   * `reload` when one exceeds its `decision.max_image_bytes`.
+   */
+  images?: DecisionRequestImages;
+}
+
+export interface DecisionRequestImages {
+  list: readonly DecisionImage[];
+  /** Re-condition one image under a smaller byte cap (undefined = drop it). */
+  reload?: (image: DecisionImage, maxBytes: number) => Promise<LoadedDecisionImage | undefined>;
 }
 
 export interface SentAttempt {
-  /** The state object that was JSON-serialised and placed in the request body. */
+  /**
+   * The state that was placed in the request body: the point's state, or on a
+   * vision request its wire form with every image replaced by a short marker.
+   */
   state: unknown;
+  /** Images sent with this attempt (0 on a text request). */
+  imageCount?: number;
   /** The questions map that was sent (same for every attempt in a call). */
   questions: Record<string, DecisionQuestion>;
   /** Logical model id of the member this was sent to. */
@@ -142,8 +163,12 @@ export function memberMisfit(
   effectiveStateBudget: number,
   minStateTokens: number,
   stateShape: "object" | "conversation" = "object",
+  hasImages = false,
 ): string | undefined {
   const fits = config.decision;
+  // A text-only member given image parts answers anyway, silently and wrongly
+  // (DECISION-MODEL §2): it never receives a vision request.
+  if (hasImages && !config.input_modalities.includes("image")) return "image_input";
   if (fits?.question_types) {
     for (const type of shape.questionTypes) {
       if (!fits.question_types.includes(type)) return `question_type:${type}`;
@@ -206,19 +231,20 @@ export class DecisionClient {
     const questionTokens = jsonTokens(request.questions);
     const effectiveBudget = (config: ModelConfig): number =>
       Math.floor(Math.min(request.stateMaxTokens, memberStateBudget(config)) - questionTokens - BUDGET_MARGIN_TOKENS);
-    const states = new Map<number, { state: unknown; tokens: number }>();
-    const stateFor = (budget: number): { state: unknown; tokens: number } => {
-      const cached = states.get(budget);
+    const states = new Map<string, { state: unknown; tokens: number }>();
+    const stateFor = (budget: number, labels?: ReadonlyMap<string, string>): { state: unknown; tokens: number } => {
+      const key = labels ? `${budget}|${[...labels.keys()].join(",")}` : String(budget);
+      const cached = states.get(key);
       if (cached) return cached;
       // The builder packs newest-first to the budget; shrink and rebuild if it
       // overshoots, so the provider never sees more than the member reads.
       let target = budget;
       for (let i = 0; i < 4; i++) {
-        const state = request.state(target);
+        const state = request.state(target, labels);
         const tokens = jsonTokens(state);
         if (tokens <= budget) {
           const built = { state, tokens };
-          states.set(budget, built);
+          states.set(key, built);
           return built;
         }
         target = Math.floor(target * 0.75);
@@ -254,20 +280,45 @@ export class DecisionClient {
               effectiveBudget(member.config),
               request.minStateTokens,
               request.stateShape,
+              request.images !== undefined,
             ) === undefined,
         },
         async (member) => {
           const remaining = deadline - Date.now();
           if (remaining <= 0) throw abortError();
+          let images: DecisionImage[] | undefined;
+          if (request.images) {
+            images = await imagesForMember(member.config, request.images);
+            // No image fits this member's limits: neutral, try the next member.
+            if (images.length === 0) {
+              return { ok: false, kind: "skip", error: new Error(`${member.logicalId}: no image fits its limits`) };
+            }
+          }
+          const labels = images ? new Map(images.map((image) => [image.ref.id, image.label])) : undefined;
           let built: { state: unknown; tokens: number };
           try {
-            built = stateFor(effectiveBudget(member.config));
+            built = stateFor(effectiveBudget(member.config), labels);
           } catch (error) {
             // A state builder failure is this request's content, never a health signal.
             return { ok: false, kind: "content", error };
           }
-          options.onSent?.({ state: built.state, questions: request.questions, memberKey: member.logicalId });
-          const outcome = await this.attempt(member, request.questions, built.state, remaining, controller.signal, options);
+          const wire = wireImageState(built.state, images ?? [], member.config.decision?.images ?? "state_parts");
+          options.onSent?.({
+            state: wire.logged,
+            questions: request.questions,
+            memberKey: member.logicalId,
+            ...(images ? { imageCount: images.length } : {}),
+          });
+          const outcome = await this.attempt(
+            member,
+            request.questions,
+            wire.state,
+            remaining,
+            controller.signal,
+            options,
+            wire.images,
+            built.state,
+          );
           if (outcome.ok) {
             result = { ...outcome.value, stateTokens: built.tokens };
             return { ok: true, value: result, status: outcome.status };
@@ -290,9 +341,12 @@ export class DecisionClient {
     timeoutMs: number,
     callSignal: AbortSignal,
     options: DecisionCallOptions,
+    imagesField?: string[],
+    estimateState: unknown = state,
   ): Promise<FetchAttemptOutcome<Omit<DecisionResult, "stateTokens">>> {
     const config = member.config;
     const body: Record<string, unknown> = { model: config.id, state, questions };
+    if (imagesField) body["images"] = imagesField;
     const routing = config.compat?.openrouter_routing;
     if (routing && Object.keys(routing).length > 0) body["provider"] = routing;
 
@@ -338,7 +392,7 @@ export class DecisionClient {
       const usage = readUsage(envelope["usage"]);
       const servedVersion = typeof envelope["model"] === "string" ? (envelope["model"] as string) : undefined;
       const billing = config.decision?.billing ?? "per_request";
-      const inputTokens = usage.inputTokens ?? estimateInputTokens(state, questions, billing);
+      const inputTokens = usage.inputTokens ?? estimateInputTokens(estimateState, questions, billing);
       const outputTokens = usage.outputTokens ?? 0;
       const providerCost = usage.cost !== undefined;
       const costUsd =
@@ -425,6 +479,27 @@ export class DecisionClient {
       error,
     };
   }
+}
+
+/**
+ * The images one member is sent: at most its `decision.max_images`, newest
+ * first; an image over its `decision.max_image_bytes` is re-conditioned under
+ * that cap (or dropped when that fails).
+ */
+async function imagesForMember(config: ModelConfig, request: DecisionRequestImages): Promise<DecisionImage[]> {
+  const maxImages = config.decision?.max_images ?? Number.POSITIVE_INFINITY;
+  const maxBytes = config.decision?.max_image_bytes ?? Number.POSITIVE_INFINITY;
+  const out: DecisionImage[] = [];
+  for (const image of request.list) {
+    if (out.length >= maxImages) break;
+    if (image.bytes <= maxBytes) {
+      out.push(image);
+      continue;
+    }
+    const reloaded = request.reload ? await request.reload(image, maxBytes) : undefined;
+    if (reloaded && reloaded.bytes <= maxBytes) out.push({ ...image, ...reloaded });
+  }
+  return out;
 }
 
 function environmental(status: number | undefined, message: string): FetchAttemptOutcome<never> {

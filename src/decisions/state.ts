@@ -35,11 +35,16 @@ export function packNewest<T>(items: readonly T[], budgetTokens: number, build: 
 
 /** "40s ago", "6m ago", "3h ago", "2d ago" — a label, never arithmetic input. */
 export function ageLabel(nowMs: number, thenMs: number): string {
-  const s = Math.max(0, Math.round((nowMs - thenMs) / 1000));
-  if (s < 60) return `${s}s ago`;
+  return `${durationLabel(nowMs - thenMs)} ago`;
+}
+
+/** "40s", "6m", "3h", "2d" (negative durations read as 0s). */
+export function durationLabel(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
   const m = Math.round(s / 60);
-  if (m < 60) return `${m}m ago`;
+  if (m < 60) return `${m}m`;
   const h = Math.round(m / 60);
-  if (h < 48) return `${h}h ago`;
-  return `${Math.round(h / 24)}d ago`;
+  if (h < 48) return `${h}h`;
+  return `${Math.round(h / 24)}d`;
 }

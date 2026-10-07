@@ -19,8 +19,40 @@ export const DEFAULT_TIMEOUT_MS = 3000;
 export const DEFAULT_MIN_CONFIDENCE = 0.6;
 export const DEFAULT_STATE_MAX_TOKENS = 8000;
 
-export type DecisionPointName = "routing" | "records" | "checks" | "audit";
-export const DECISION_POINT_NAMES: readonly DecisionPointName[] = ["routing", "records", "checks", "audit"];
+export type DecisionPointName = "routing" | "records" | "checks" | "audit" | "late_addition" | "implicit_reply";
+export const DECISION_POINT_NAMES: readonly DecisionPointName[] = [
+  "routing",
+  "records",
+  "checks",
+  "audit",
+  "late_addition",
+  "implicit_reply",
+];
+
+// Vision decision chain defaults (DECISION-MODEL §3.5).
+export const DEFAULT_VISION_TIMEOUT_MS = 8000;
+export const DEFAULT_MAX_IMAGES = 4;
+export const DEFAULT_IMAGE_MAX_PIXELS = 1_000_000;
+export const DEFAULT_MAX_IMAGE_BYTES = 200_000;
+
+/** When an evaluation of a point goes to the vision chain (DECISION-MODEL §3.5). */
+export type VisionMode = "off" | "uncaptioned" | "always";
+
+/**
+ * Per-point default `vision` mode, used when `[decisions.<point>].vision` is
+ * unset and a vision chain is configured. `late_addition` is `always`: its
+ * media candidates have no caption yet by construction (spec LATE-INPUT §5.2).
+ * Only a point that declares subject images (`DecisionPoint.images`) ever uses
+ * the vision chain, whatever its mode.
+ */
+export const DEFAULT_VISION_MODES: Record<DecisionPointName, VisionMode> = {
+  routing: "uncaptioned",
+  records: "off",
+  checks: "off",
+  audit: "off",
+  late_addition: "always",
+  implicit_reply: "off",
+};
 
 // `[decisions.checks]` defaults (spec REFUSAL-HANDLING §6.3, §6.4, §16.2).
 export const DEFAULT_CHECKS_SEND_DEADLINE_MS = 5000;
@@ -84,9 +116,36 @@ export interface PointSettings {
    * Other points leave this undefined.
    */
   injectThreshold?: number;
+  /**
+   * `late_addition` / `implicit_reply`: the resolved `threshold` (defaults
+   * 0.7 / 0.8). Other points leave this undefined.
+   */
+  threshold?: number;
   /** Per-member threshold overrides (`[decisions.calibration.<member>]`). */
   calibration: Record<string, Record<string, number>>;
   persona: string;
+  /**
+   * The vision decision chain of this point (DECISION-MODEL §3.5), or
+   * undefined when the point never uses one: no `vision_model` configured
+   * (`[decisions.<point>].vision_model` → `[decisions].vision_model`), or the
+   * point's mode is `off`.
+   */
+  vision?: PointVisionSettings;
+}
+
+/** Resolved vision settings of one point (DECISION-MODEL §3.5). */
+export interface PointVisionSettings {
+  /** The vision chain head (`[models.*]` key, a system-one model with image input). */
+  model: string;
+  mode: Exclude<VisionMode, "off">;
+  /** Hard timeout of a vision evaluation (whole chain). */
+  timeoutMs: number;
+  /** Most images per evaluation (further capped by a member's `decision.max_images`). */
+  maxImages: number;
+  /** Images are downscaled to at most this many pixels. */
+  imageMaxPixels: number;
+  /** ... and re-encoded as JPEG under this many bytes (min with a member's `decision.max_image_bytes`). */
+  maxImageBytes: number;
 }
 
 /**
@@ -116,7 +175,81 @@ export function pointSettings(decisions: DecisionsRawConfig, point: DecisionPoin
       base.injectThreshold = recordsRaw.inject_threshold;
     }
   }
+  if (point === "late_addition" || point === "implicit_reply") {
+    const thresholdRaw = (raw as { threshold?: number }).threshold;
+    base.threshold =
+      thresholdRaw ?? (point === "late_addition" ? DEFAULT_LATE_ADDITION_THRESHOLD : DEFAULT_IMPLICIT_REPLY_THRESHOLD);
+  }
+  const visionModel = raw.vision_model ?? decisions.vision_model;
+  const mode = raw.vision ?? DEFAULT_VISION_MODES[point];
+  if (visionModel && mode !== "off") {
+    base.vision = {
+      model: visionModel,
+      mode,
+      timeoutMs: decisions.vision_timeout_ms ?? DEFAULT_VISION_TIMEOUT_MS,
+      maxImages: decisions.max_images ?? DEFAULT_MAX_IMAGES,
+      imageMaxPixels: decisions.image_max_pixels ?? DEFAULT_IMAGE_MAX_PIXELS,
+      maxImageBytes: decisions.max_image_bytes ?? DEFAULT_MAX_IMAGE_BYTES,
+    };
+  }
   return base;
+}
+
+// `[decisions.late_addition]` defaults (spec LATE-INPUT §5.2, §8, §11).
+export const DEFAULT_LATE_ADDITION_THRESHOLD = 0.7;
+export const DEFAULT_LATE_ADDITION_CANDIDATE_WINDOW_MS = 60_000;
+export const DEFAULT_LATE_ADDITION_MAX_JUDGED = 8;
+export const DEFAULT_LATE_ADDITION_MAX_FOLDED = 3;
+export const DEFAULT_LATE_ADDITION_RECENT_MESSAGES = 5;
+
+/** The `[decisions.late_addition]` point-specific knobs, defaults applied. */
+export interface LateAdditionKnobs {
+  threshold: number;
+  candidateWindowMs: number;
+  maxJudged: number;
+  maxFolded: number;
+  recentMessages: number;
+}
+
+/**
+ * The late-addition knobs for an effective decisions table. Independent of
+ * whether the point is enabled: the window and the limits bound eligibility
+ * and folding with or without a judgement (spec LATE-INPUT §5.2).
+ */
+export function lateAdditionKnobs(decisions: DecisionsRawConfig): LateAdditionKnobs {
+  const raw = decisions.late_addition ?? {};
+  return {
+    threshold: raw.threshold ?? DEFAULT_LATE_ADDITION_THRESHOLD,
+    candidateWindowMs: raw.candidate_window_ms ?? DEFAULT_LATE_ADDITION_CANDIDATE_WINDOW_MS,
+    maxJudged: raw.max_judged ?? DEFAULT_LATE_ADDITION_MAX_JUDGED,
+    maxFolded: raw.max_folded ?? DEFAULT_LATE_ADDITION_MAX_FOLDED,
+    recentMessages: raw.recent_messages ?? DEFAULT_LATE_ADDITION_RECENT_MESSAGES,
+  };
+}
+
+// `[decisions.implicit_reply]` defaults (spec LATE-INPUT §6, §8).
+export const DEFAULT_IMPLICIT_REPLY_THRESHOLD = 0.8;
+export const DEFAULT_IMPLICIT_REPLY_MAX_MESSAGES_AFTER = 3;
+export const DEFAULT_IMPLICIT_REPLY_MAX_AGE_MS = 120_000;
+export const DEFAULT_IMPLICIT_REPLY_RECENT_MESSAGES = 6;
+
+/** The `[decisions.implicit_reply]` point-specific knobs, defaults applied. */
+export interface ImplicitReplyKnobs {
+  threshold: number;
+  maxMessagesAfter: number;
+  maxAgeMs: number;
+  recentMessages: number;
+}
+
+/** The implicit-reply knobs for an effective decisions table (enabled or not). */
+export function implicitReplyKnobs(decisions: DecisionsRawConfig): ImplicitReplyKnobs {
+  const raw = decisions.implicit_reply ?? {};
+  return {
+    threshold: raw.threshold ?? DEFAULT_IMPLICIT_REPLY_THRESHOLD,
+    maxMessagesAfter: raw.max_messages_after ?? DEFAULT_IMPLICIT_REPLY_MAX_MESSAGES_AFTER,
+    maxAgeMs: raw.max_age_ms ?? DEFAULT_IMPLICIT_REPLY_MAX_AGE_MS,
+    recentMessages: raw.recent_messages ?? DEFAULT_IMPLICIT_REPLY_RECENT_MESSAGES,
+  };
 }
 
 /** The `[decisions.checks]` point-specific knobs, defaults applied. */
@@ -323,6 +456,30 @@ function requireDecisionModel(
   if (!decisionKeys.has(key)) throw new Error(`${path} = "${key}" must name a model with api = "system-one"`);
 }
 
+/**
+ * A vision chain head: a system-one model whose every chain member declares
+ * `"image"` in `input_modalities` (a text-only member given image parts answers
+ * anyway, silently and wrongly, DECISION-MODEL §2).
+ */
+function requireVisionChain(
+  config: AppConfig,
+  decisionKeys: Set<string>,
+  key: string | undefined,
+  path: string,
+): void {
+  if (key === undefined) return;
+  requireDecisionModel(config, decisionKeys, key, path);
+  for (const member of [key, ...(config.models[key]!.fallback ?? [])]) {
+    const model = config.models[member];
+    if (!model) continue;
+    if (!model.input_modalities.includes("image")) {
+      throw new Error(
+        `${path} = "${key}": vision chain member "${member}" does not declare "image" in input_modalities`,
+      );
+    }
+  }
+}
+
 function validateEffective(
   config: AppConfig,
   decisions: DecisionsRawConfig,
@@ -348,6 +505,17 @@ function validateEffective(
   for (const point of DECISION_POINT_NAMES) {
     requireDecisionModel(config, decisionKeys, decisions[point]?.model, `${where}.${point}.model`);
     addChain(decisions[point]?.model);
+  }
+  // Vision chains (DECISION-MODEL §3.5): system-one, and every member reads images.
+  requireVisionChain(config, decisionKeys, decisions.vision_model, `${where}.vision_model`);
+  addChain(decisions.vision_model);
+  for (const point of DECISION_POINT_NAMES) {
+    requireVisionChain(config, decisionKeys, decisions[point]?.vision_model, `${where}.${point}.vision_model`);
+    addChain(decisions[point]?.vision_model);
+    const mode = decisions[point]?.vision;
+    if (mode !== undefined && mode !== "off" && !(decisions[point]?.vision_model ?? decisions.vision_model)) {
+      opts.warn?.("decisions_vision_without_chain", { where, point, vision: mode });
+    }
   }
   for (const member of Object.keys(decisions.calibration ?? {})) {
     if (!decisionKeys.has(member)) {
@@ -375,6 +543,15 @@ function validateEffective(
     throw new Error(
       `${where}.checks.min_confidence is not used by the checks point; set each question's threshold under [checks.<code>] instead`,
     );
+  }
+  for (const point of ["late_addition", "implicit_reply"] as const) {
+    if (decisions[point]?.min_confidence !== undefined) {
+      // One `noul` question gated by `threshold`; a confidence floor would be a
+      // second knob for the same number.
+      throw new Error(
+        `${where}.${point}.min_confidence is not used by the ${point} point; set ${where}.${point}.threshold instead`,
+      );
+    }
   }
   if (records?.enabled === true) {
     const inject = records.inject_threshold ?? 0.6;

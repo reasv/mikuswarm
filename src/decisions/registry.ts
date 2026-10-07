@@ -18,7 +18,14 @@ import type { AppConfig } from "../config/index.js";
 import type { LlmScheduler, PriorityClass } from "../agent/scheduler.js";
 import type { Logger } from "../observability/logger.js";
 import type { UsageEventInput } from "../storage/database.js";
-import { DecisionClient, NoFittingMemberError, type BilledAttempt, type SentAttempt } from "./client.js";
+import {
+  DecisionClient,
+  NoFittingMemberError,
+  type BilledAttempt,
+  type DecisionResult,
+  type SentAttempt,
+} from "./client.js";
+import type { DecisionImage, DecisionImageLoader, DecisionImageRef, LoadedDecisionImage } from "./images.js";
 import {
   calibratedThreshold,
   decisionsFor,
@@ -78,6 +85,14 @@ export interface DecisionEvaluationRow {
   latencyMs: number | null;
   inputTokens: number | null;
   costUsd: number | null;
+  /**
+   * Images loaded for a vision attempt (DECISION-MODEL §3.5); absent when no
+   * vision attempt was planned. Not a `decision_evaluations` column: the
+   * stored state carries the image markers.
+   */
+  imageCount?: number;
+  /** True when the vision chain served the verdict. */
+  visionServed?: boolean;
 }
 
 /** Who a decision is billed to (ARCHITECTURE.md §8f/§8h). */
@@ -91,11 +106,27 @@ export interface DecisionAttribution {
 /** Threshold lookup bound to the member that served the answers. */
 export type ThresholdFn = (name: string, pointValue: number) => number;
 
+/** What a vision evaluation tells a point's builders (DECISION-MODEL §3.5). */
+export interface DecisionStateView {
+  /** Image ref id → label ("image 1") of every image sent with this attempt. */
+  imageLabels: ReadonlyMap<string, string>;
+}
+
 export interface DecisionPoint<I, V> {
   name: DecisionPointName;
-  questions(input: I, settings: PointSettings): Record<string, DecisionQuestion>;
-  /** State for a token budget; must fit it (pack newest-first). */
-  state(input: I, budgetTokens: number): unknown;
+  /** `view.vision` is set on a vision-chain attempt, whose instructions may name images by label. */
+  questions(input: I, settings: PointSettings, view?: { vision: true }): Record<string, DecisionQuestion>;
+  /**
+   * State for a token budget; must fit it (pack newest-first). On a vision
+   * attempt `view` names the labels of the images sent, which the state's
+   * attachments reference; without it attachments carry captions only.
+   */
+  state(input: I, budgetTokens: number, view?: DecisionStateView): unknown;
+  /**
+   * The evaluation's subject images, newest first (DECISION-MODEL §3.5). A
+   * point without it never uses the vision chain.
+   */
+  images?(input: I): DecisionImageRef[];
   /** Map answers to a verdict, or null when not confident enough. */
   resolve(answers: DecisionAnswers, input: I, threshold: ThresholdFn, settings: PointSettings): V | null;
   /** Today's behaviour for this decision — the last rung. */
@@ -121,7 +152,28 @@ export interface DecisionOutcome<V> {
   costUsd: number;
   /** Groups this outcome with related evaluations (CONTRACT decision 6). */
   decisionGroup: string;
+  /** Images loaded for a vision attempt; absent when none was planned. */
+  imageCount?: number;
+  /** True when the vision chain served the verdict. */
+  visionServed?: boolean;
+  /** Why the vision attempt did not serve (the text chain was tried next). */
+  visionReason?: string;
 }
+
+interface VisionInfo {
+  imageCount: number;
+  served: boolean;
+  reason?: string;
+}
+
+type ChainRun<V> =
+  | {
+      ok: true;
+      verdict: V;
+      result: DecisionResult;
+      served: Record<string, unknown> & { answers: DecisionAnswers };
+    }
+  | { ok: false; reason: string; extra?: Record<string, unknown> };
 
 export interface BudgetCheck {
   check(descriptor: {
@@ -150,6 +202,12 @@ export interface DecisionEngineOptions {
   onEvaluation?: (row: DecisionEvaluationRow) => void;
   logger?: Logger;
   now?: () => number;
+  /**
+   * Loads and conditions a subject image for the vision chain (DECISION-MODEL
+   * §3.5); `createDecisionImageLoader()` (src/decisions/images.ts) is the
+   * production adapter. Without it no evaluation uses the vision chain.
+   */
+  loadImage?: DecisionImageLoader;
 }
 
 export interface EvaluateContext {
@@ -223,16 +281,14 @@ export class DecisionEngine {
     let costUsd = 0;
     let inputTokens = 0;
 
-    // Compute questions once (pure, deterministic for the same settings).
-    const questions = point.questions(input, settings);
-    const questionsJson = capJsonBytes(questions, 16 * 1024);
-
     // Track the last attempt actually sent to a member (via client.onSent).
     // Used for the evaluation row: spec §8 requires state_json/questions_json to
     // reflect what the member actually received, not a post-facto rebuild.
     // Fallbacks that made no request (disabled, budget, unavailable, …) leave
     // this null, and the row's state/questions fields are null accordingly.
     let lastSent: SentAttempt | null = null;
+    // The vision attempt of this evaluation, when one was planned (§3.5).
+    let vision: VisionInfo | undefined;
 
     // Emit one evaluation row to the optional sink (no storage import here).
     const sink = ctx.onEvaluation ?? this.options.onEvaluation;
@@ -246,8 +302,9 @@ export class DecisionEngine {
     ): void => {
       if (!sink) return;
       // Use the real sent payload when a request was made; null otherwise.
-      const stateJson = lastSent !== null ? capJsonBytes(lastSent.state, 64 * 1024) : null;
-      const qJson = lastSent !== null ? questionsJson : null;
+      const sent = lastSent as SentAttempt | null;
+      const stateJson = sent !== null ? capJsonBytes(sent.state, 64 * 1024) : null;
+      const qJson = sent !== null ? capJsonBytes(sent.questions, 16 * 1024) : null;
       try {
         sink({
           ts: now(),
@@ -269,11 +326,24 @@ export class DecisionEngine {
           latencyMs: now() - started,
           inputTokens: inputTokens > 0 ? inputTokens : null,
           costUsd: costUsd > 0 ? costUsd : null,
+          ...(vision ? { imageCount: vision.imageCount, visionServed: vision.served } : {}),
         });
       } catch (error) {
         this.options.logger?.warn("decision_emit_row_failed", { point: point.name, error: errorMessage(error) });
       }
     };
+    const visionFields = (): Record<string, unknown> =>
+      vision
+        ? {
+            imageCount: vision.imageCount,
+            visionServed: vision.served,
+            ...(vision.reason ? { visionReason: vision.reason } : {}),
+          }
+        : {};
+    const visionOutcome = (): Partial<DecisionOutcome<V>> =>
+      vision
+        ? { imageCount: vision.imageCount, visionServed: vision.served, ...(vision.reason ? { visionReason: vision.reason } : {}) }
+        : {};
 
     const fallback = (reason: string, extra: Record<string, unknown> = {}): DecisionOutcome<V> => {
       const verdict = point.fallback(input);
@@ -283,6 +353,7 @@ export class DecisionEngine {
         verdict: point.describe(verdict),
         costUsd,
         inputTokens,
+        ...visionFields(),
         ...extra,
       });
       const answersJson = "answers" in extra ? safeJson(extra["answers"]) : null;
@@ -300,48 +371,10 @@ export class DecisionEngine {
         reason,
         costUsd,
         decisionGroup,
+        ...visionOutcome(),
         ...("answers" in extra ? { answers: extra["answers"] as DecisionAnswers } : {}),
       };
     };
-
-    let chain;
-    try {
-      chain = this.options.client.chain(settings.model);
-    } catch (error) {
-      return fallback("config", { error: errorMessage(error) });
-    }
-
-    // Budget: a member is usable only while every covering [[limits]] rule has
-    // headroom. A blocked decision budget means "decide the old way".
-    const budget = this.options.budget?.();
-    const available = new Map<string, boolean>();
-    for (const member of chain) {
-      const allowed = budget
-        ? budget.check({
-            class: ctx.usageClass ?? "decision",
-            tool: point.name,
-            modelId: member.config.id,
-            logicalModelId: member.logicalId,
-            sessionType: ctx.attribution.sessionType ?? undefined,
-            timelineKey: ctx.attribution.timelineKey ?? undefined,
-          }).allowed
-        : true;
-      available.set(member.logicalId, allowed);
-    }
-    if (![...available.values()].some(Boolean)) return fallback("budget");
-
-    // Every member unhealthy with no probe due → do not even try.
-    const scheduler = this.options.scheduler;
-    if (scheduler) {
-      const usable = chain.some((member) => {
-        const key = `${member.config.endpoint ?? "unknown"}::${member.config.id}`;
-        return scheduler.modelHealth(key) === "healthy" || scheduler.isProbeDue(key);
-      });
-      if (!usable) {
-        this.logUnavailable(settings.model, chain.map((m) => m.logicalId));
-        return fallback("unavailable");
-      }
-    }
 
     const onBilled = (attempt: BilledAttempt): void => {
       costUsd += attempt.costUsd;
@@ -349,74 +382,210 @@ export class DecisionEngine {
       this.recordUsage(point, ctx.attribution, attempt, ctx.usageClass ?? "decision");
     };
 
-    let result;
-    try {
-      result = await this.options.client.decide(
-        settings.model,
-        {
-          questions,
-          state: (budgetTokens) => point.state(input, budgetTokens),
-          stateMaxTokens: settings.stateMaxTokens,
-          minStateTokens: settings.minStateTokens,
-          stateShape: point.stateShape?.(input) ?? "object",
-        },
-        {
-          consumer: `decision:${point.name}`,
-          priority: ctx.priority ?? "interactive",
-          timeoutMs: ctx.timeoutMs ?? settings.timeoutMs,
-          signal: ctx.signal,
-          isModelAvailable: (id) => available.get(id) ?? true,
-          onBilled,
-          onSent: (sent) => { lastSent = sent; },
-        },
-      );
-    } catch (error) {
-      if (error instanceof NoFittingMemberError) return fallback("no_fitting_member");
-      if (error instanceof Error && error.name === "AbortError") {
-        return fallback(ctx.signal?.aborted ? "aborted" : "timeout");
+    // One attempt of the evaluation on one chain: the text chain, or the vision
+    // chain with the loaded images.
+    const run = async (chainHead: string, images: DecisionImage[] | undefined): Promise<ChainRun<V>> => {
+      let chain;
+      try {
+        chain = this.options.client.chain(chainHead);
+      } catch (error) {
+        return { ok: false, reason: "config", extra: { error: errorMessage(error) } };
       }
-      return fallback("error", { error: errorMessage(error) });
+
+      // Budget: a member is usable only while every covering [[limits]] rule has
+      // headroom. A blocked decision budget means "decide the old way".
+      const budget = this.options.budget?.();
+      const available = new Map<string, boolean>();
+      for (const member of chain) {
+        const allowed = budget
+          ? budget.check({
+              class: ctx.usageClass ?? "decision",
+              tool: point.name,
+              modelId: member.config.id,
+              logicalModelId: member.logicalId,
+              sessionType: ctx.attribution.sessionType ?? undefined,
+              timelineKey: ctx.attribution.timelineKey ?? undefined,
+            }).allowed
+          : true;
+        available.set(member.logicalId, allowed);
+      }
+      if (![...available.values()].some(Boolean)) return { ok: false, reason: "budget" };
+
+      // Every member unhealthy with no probe due → do not even try.
+      const scheduler = this.options.scheduler;
+      if (scheduler) {
+        const usable = chain.some((member) => {
+          const key = `${member.config.endpoint ?? "unknown"}::${member.config.id}`;
+          return scheduler.modelHealth(key) === "healthy" || scheduler.isProbeDue(key);
+        });
+        if (!usable) {
+          this.logUnavailable(chainHead, chain.map((m) => m.logicalId));
+          return { ok: false, reason: "unavailable" };
+        }
+      }
+
+      const questions = point.questions(input, settings, images ? { vision: true } : undefined);
+      let result;
+      try {
+        result = await this.options.client.decide(
+          chainHead,
+          {
+            questions,
+            state: (budgetTokens, labels) =>
+              point.state(input, budgetTokens, labels ? { imageLabels: labels } : undefined),
+            stateMaxTokens: settings.stateMaxTokens,
+            minStateTokens: settings.minStateTokens,
+            stateShape: point.stateShape?.(input) ?? "object",
+            ...(images ? { images: { list: images, reload: this.reloader(settings) } } : {}),
+          },
+          {
+            consumer: `decision:${point.name}`,
+            priority: ctx.priority ?? "interactive",
+            timeoutMs: ctx.timeoutMs ?? (images ? settings.vision!.timeoutMs : settings.timeoutMs),
+            signal: ctx.signal,
+            isModelAvailable: (id) => available.get(id) ?? true,
+            onBilled,
+            onSent: (sent) => { lastSent = sent; },
+          },
+        );
+      } catch (error) {
+        if (error instanceof NoFittingMemberError) return { ok: false, reason: "no_fitting_member" };
+        if (error instanceof Error && error.name === "AbortError") {
+          return { ok: false, reason: ctx.signal?.aborted ? "aborted" : "timeout" };
+        }
+        return { ok: false, reason: "error", extra: { error: errorMessage(error) } };
+      }
+
+      const threshold: ThresholdFn = (name, pointValue) =>
+        calibratedThreshold(settings, result.logicalId, name, pointValue);
+      let verdict: V | null;
+      try {
+        verdict = point.resolve(result.answers, input, threshold, settings);
+      } catch (error) {
+        verdict = null;
+        this.options.logger?.warn("decision_resolve_failed", { point: point.name, error: errorMessage(error) });
+      }
+      const served = {
+        answers: result.answers,
+        servedModel: result.logicalId,
+        servedVersion: result.servedVersion,
+        stateTokens: result.stateTokens,
+        billing: result.billing,
+      };
+      if (verdict === null) return { ok: false, reason: "low_confidence", extra: served };
+      return { ok: true, verdict, result, served };
+    };
+
+    const succeed = (outcome: Extract<ChainRun<V>, { ok: true }>): DecisionOutcome<V> => {
+      const { verdict, result, served } = outcome;
+      this.log(point, settings, ctx, started, {
+        source: "model",
+        verdict: point.describe(verdict),
+        costUsd,
+        inputTokens,
+        ...visionFields(),
+        ...served,
+      });
+      emitRow(
+        "model",
+        null,
+        safeJson(point.describe(verdict)),
+        safeJson(result.answers),
+        result.logicalId,
+        result.servedVersion ?? null,
+      );
+      return {
+        verdict,
+        source: "model",
+        answers: result.answers,
+        servedModel: result.logicalId,
+        costUsd,
+        decisionGroup,
+        ...visionOutcome(),
+      };
+    };
+
+    // Vision chain (DECISION-MODEL §3.5): when the point's mode calls for it,
+    // try it first; any failure retries ONCE on the text chain with captions.
+    const refs = this.visionSubjects(point, input, settings);
+    if (refs.length > 0) {
+      const images = await this.loadImages(refs, settings);
+      if (images.length === 0) {
+        vision = { imageCount: 0, served: false, reason: this.options.loadImage ? "no_loadable_image" : "no_image_loader" };
+      } else {
+        const visionRun = await run(settings.vision!.model, images);
+        if (visionRun.ok) {
+          vision = { imageCount: images.length, served: true };
+          return succeed(visionRun);
+        }
+        vision = { imageCount: images.length, served: false, reason: visionRun.reason };
+        if (visionRun.reason === "aborted") return fallback("aborted", visionRun.extra);
+      }
     }
 
-    const threshold: ThresholdFn = (name, pointValue) =>
-      calibratedThreshold(settings, result.logicalId, name, pointValue);
-    let verdict: V | null;
+    const textRun = await run(settings.model, undefined);
+    if (textRun.ok) return succeed(textRun);
+    return fallback(textRun.reason, textRun.extra);
+  }
+
+  /**
+   * The subject images an evaluation sends to the vision chain: none when the
+   * point has no vision chain or declares no images, or (mode `uncaptioned`)
+   * when every subject image already has a caption. At most `max_images`, in
+   * the point's order (newest first).
+   */
+  private visionSubjects<I, V>(point: DecisionPoint<I, V>, input: I, settings: PointSettings): DecisionImageRef[] {
+    const vision = settings.vision;
+    if (!vision || !point.images) return [];
+    let refs: DecisionImageRef[];
     try {
-      verdict = point.resolve(result.answers, input, threshold, settings);
+      refs = point.images(input);
     } catch (error) {
-      verdict = null;
-      this.options.logger?.warn("decision_resolve_failed", { point: point.name, error: errorMessage(error) });
+      this.options.logger?.warn("decision_images_failed", { point: point.name, error: errorMessage(error) });
+      return [];
     }
-    const served = {
-      answers: result.answers,
-      servedModel: result.logicalId,
-      servedVersion: result.servedVersion,
-      stateTokens: result.stateTokens,
-      billing: result.billing,
-    };
-    if (verdict === null) return fallback("low_confidence", served);
-    this.log(point, settings, ctx, started, {
-      source: "model",
-      verdict: point.describe(verdict),
-      costUsd,
-      inputTokens,
-      ...served,
-    });
-    emitRow(
-      "model",
-      null,
-      safeJson(point.describe(verdict)),
-      safeJson(result.answers),
-      result.logicalId,
-      result.servedVersion ?? null,
+    if (refs.length === 0) return [];
+    if (vision.mode === "uncaptioned" && refs.every((ref) => ref.caption)) return [];
+    return refs.slice(0, vision.maxImages);
+  }
+
+  /** Load and condition the subject images (in parallel); failures are dropped. Labels follow the order. */
+  private async loadImages(refs: DecisionImageRef[], settings: PointSettings): Promise<DecisionImage[]> {
+    const loader = this.options.loadImage;
+    const vision = settings.vision;
+    if (!loader || !vision) return [];
+    const limits = { maxPixels: vision.imageMaxPixels, maxBytes: vision.maxImageBytes };
+    const loaded = await Promise.all(
+      refs.map(async (ref) => {
+        try {
+          return await loader(ref, limits);
+        } catch {
+          return undefined;
+        }
+      }),
     );
-    return {
-      verdict,
-      source: "model",
-      answers: result.answers,
-      servedModel: result.logicalId,
-      costUsd,
-      decisionGroup,
+    const images: DecisionImage[] = [];
+    loaded.forEach((image, i) => {
+      if (image) images.push({ ...image, ref: refs[i]!, label: `image ${images.length + 1}` });
+    });
+    return images;
+  }
+
+  /** Re-condition an image under a member's smaller byte cap (memoized per image and cap). */
+  private reloader(settings: PointSettings) {
+    const loader = this.options.loadImage;
+    const cache = new Map<string, Promise<LoadedDecisionImage | undefined>>();
+    return (image: DecisionImage, maxBytes: number): Promise<LoadedDecisionImage | undefined> => {
+      if (!loader) return Promise.resolve(undefined);
+      const key = `${image.ref.id}|${maxBytes}`;
+      let pending = cache.get(key);
+      if (!pending) {
+        pending = loader(image.ref, { maxPixels: settings.vision!.imageMaxPixels, maxBytes }).catch(
+          () => undefined,
+        );
+        cache.set(key, pending);
+      }
+      return pending;
     };
   }
 

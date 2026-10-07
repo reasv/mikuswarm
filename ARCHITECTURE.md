@@ -2676,7 +2676,7 @@ A system-one model is never offered to pi-ai. Startup (`validateDecisionsConfig`
 
 One hard deadline (`timeout_ms`) bounds the whole call, admission waits included. Each attempt gets the remaining time; an attempt that runs out is environmental, and when the deadline itself passes the call ends as a neutral abort.
 
-**Fits.** `[models.*.decision]` declares what a member accepts: `question_types`, `max_questions`, `max_choice_options`, `max_score_levels`, `state_shapes` (`"text_or_conversation"` marks a judge-only member that takes only a string or an `{input, output}` conversation: it is skipped for an object state and answers the checks point's conversation-shaped `noul` calls, `DecisionRequest.stateShape`, §8j), `state_budget_tokens` (the largest state the member actually reads; defaults to `context_window`), and `billing` (`"per_request"`, the default, or `"per_question"` for routes that re-bill the state for every question). `runFetchWithFallback` gained a per-call `memberFilter` that may drop the head: a member whose limits the request exceeds, or whose effective state budget is below the point's `min_state_tokens` (default 1000), is never sent the request. When no member fits, the call throws `NoFittingMemberError` without a request.
+**Fits.** `[models.*.decision]` declares what a member accepts: `question_types`, `max_questions`, `max_choice_options`, `max_score_levels`, `state_shapes` (`"text_or_conversation"` marks a judge-only member that takes only a string or an `{input, output}` conversation: it is skipped for an object state and answers the checks point's conversation-shaped `noul` calls, `DecisionRequest.stateShape`, §8j), `state_budget_tokens` (the largest state the member actually reads; defaults to `context_window`), and `billing` (`"per_request"`, the default, or `"per_question"` for routes that re-bill the state for every question); `max_images`, `max_image_bytes` and `images` govern vision requests ("Vision decision chain" below). A request carrying images never reaches a member without `"image"` in `input_modalities` (misfit `image_input`). `runFetchWithFallback` gained a per-call `memberFilter` that may drop the head: a member whose limits the request exceeds, or whose effective state budget is below the point's `min_state_tokens` (default 1000), is never sent the request. When no member fits, the call throws `NoFittingMemberError` without a request.
 
 **State clamping.** The point's state builder is called with a token budget per member: `min(point.state_max_tokens, member state budget) − question tokens − a small margin`, using the context builder's tokenizer (§9 "Tokenization"). Builders pack newest-first (`packNewest`); the client re-measures and rebuilds smaller if a builder overshoots. So a route that silently truncates sees exactly the window the log records, and provider truncation is never relied on.
 
@@ -2686,13 +2686,13 @@ One hard deadline (`timeout_ms`) bounds the whole call, admission waits included
 
 ### Decision points and `evaluate()` (`src/decisions/registry.ts`)
 
-A `DecisionPoint<I, V>` declares `questions(input)`, `state(input, budgetTokens)`, a pure `resolve(answers, input, threshold) → V | null` (null = not confident enough), `fallback(input)` (today's behaviour for that decision), and `describe(verdict)` for the log. `DecisionEngine.evaluate(point, input, ctx)`:
+A `DecisionPoint<I, V>` declares `questions(input, settings, view?)`, `state(input, budgetTokens, view?)`, a pure `resolve(answers, input, threshold) → V | null` (null = not confident enough), `fallback(input)` (today's behaviour for that decision), `describe(verdict)` for the log, and optionally `images(input)`, its subject images for the vision chain (below; `view` is set only on a vision attempt). `DecisionEngine.evaluate(point, input, ctx)`:
 
 1. Resolves the point's settings for the session's agent; a disabled point returns the fallback verdict with no call and no log.
 2. **Budget**: each chain member is checked with `BudgetEngine.check({ class: "decision", tool: <point>, modelId, logicalModelId, sessionType, timelineKey })`; a blocked member is skipped by the fetch chain, and with every member blocked the point falls back (`reason: "budget"`) without a call. A blocked decision budget means "decide the old way", never "refuse the work".
 3. **Health**: when every member is unhealthy with no probe due, it falls back (`unavailable`) without a call, logging `decision_model_unavailable` at most once a minute per chain.
-4. Calls the client. Any failure of the whole chain falls back with a reason: `no_fitting_member`, `timeout`, `aborted`, `error`, or, when `resolve` returns null, `low_confidence`.
-5. Logs one `decision_evaluated { point, agent, timelineKey, sessionId, model, source: "model"|"heuristic", reason?, verdict, answers (compact: "choice@confidence" / noul probability), servedModel, servedVersion, stateTokens, billing, inputTokens, costUsd, latencyMs, heuristicVerdict? }`. `heuristicVerdict` is the cheap verdict of today's code, logged alongside so the log doubles as an agreement record. Nothing gates on it. Besides the log line, every evaluation of an enabled point is recorded as one `decision_evaluations` row ("Decision visibility" below).
+4. Calls the client. Any failure of the whole chain falls back with a reason: `no_fitting_member`, `timeout`, `aborted`, `error`, or, when `resolve` returns null, `low_confidence`. When the evaluation uses the vision chain, steps 2–4 run on it first and any failure (including `low_confidence`) retries once on the text chain ("Vision decision chain" below).
+5. Logs one `decision_evaluated { point, agent, timelineKey, sessionId, model, source: "model"|"heuristic", reason?, verdict, answers (compact: "choice@confidence" / noul probability), servedModel, servedVersion, stateTokens, billing, inputTokens, costUsd, latencyMs, heuristicVerdict?, and on an evaluation that planned a vision attempt imageCount, visionServed, visionReason? }`. `heuristicVerdict` is the cheap verdict of today's code, logged alongside so the log doubles as an agreement record. Nothing gates on it. Besides the log line, every evaluation of an enabled point is recorded as one `decision_evaluations` row ("Decision visibility" below).
 6. Records one `usage_events` row per billed attempt (§8f): `class = "decision"`, `tool_name` = the point, `model_id`/`logical_model_id` = the member that billed, `ref` = the dated served id, plus the caller's attribution (`agent_session_id`, `session_type`, `timeline_key`, `trigger_sender_id`).
 
 **Billing follows the session.** A session-bound evaluation carries the session id, so the per-user fan-in (`recordUsageEvent`, §8g) meters it against the session's payee exactly like a tool row: total and pools, never a model-scoped sub-cap. An evaluation without a session carries only `timeline_key` (and the sender) and counts toward `[[limits]]` rules only. The aggregate cap is an ordinary rule: `[[limits]].classes` accepts `"decision"`.
@@ -2740,7 +2740,7 @@ Every decision is recorded and inspectable (spec SESSION-RECORDS §8). `Decision
 - `decisionGroup` (nanoid) identifies one **decision instance** and is returned on `DecisionOutcome.decisionGroup`: `EvaluateContext.decisionGroup` when the caller passes one, else a fresh id per `evaluate()`. Routing is one row in its own group; the records point is one row per candidate, all in one group made by `selectRecordsToInject`, never shared with routing; the checks point writes one row per call (plus pattern rows) of one output's evaluation in one group, through its per-call sink with the anchor and consequence (§8j); the audit point's send-contract calls are rows of their own groups (prefix `audit:`, §9i). Synthetic calls a decision produced carry the same group on their harness marker, which is how the console places the decision's card (§11).
 - Attribution: `point`, `agent`, `timelineKey`, `agentSessionId` (the session the decision is for, so billing and the console both find it), `triggerEventId` (set by the records point; routing leaves it null), `candidateSessionId` (records point only).
 - `source` (`"model"` | `"heuristic"`), `reason` (the fallback reason), `verdictJson` (the point's `describe(verdict)`), `answersJson` (the full answer map with probabilities and confidences, when answers came back).
-- `stateJson`, `questionsJson`: **what the member was actually sent**, captured through the client's `onSent` callback right before each fetch (the last attempt's payload, after any shrink-and-rebuild). Fallbacks that sent nothing (`disabled`, `budget`, `unavailable`, `config`, `no_fitting_member`) leave both null; fallbacks after a sent attempt (`error`, `timeout`, `low_confidence`) carry it. Capped by `capJsonBytes`: state at 64 KiB, questions at 16 KiB, with a `…[truncated]` marker.
+- `stateJson`, `questionsJson`: **what the member was actually sent** (on a vision attempt the wire form with image markers instead of pixels), captured through the client's `onSent` callback right before each fetch (the last attempt's payload, after any shrink-and-rebuild). Fallbacks that sent nothing (`disabled`, `budget`, `unavailable`, `config`, `no_fitting_member`) leave both null; fallbacks after a sent attempt (`error`, `timeout`, `low_confidence`) carry it. Capped by `capJsonBytes`: state at 64 KiB, questions at 16 KiB, with a `…[truncated]` marker.
 - `servedModel`, `servedVersion`, `latencyMs`, `inputTokens`, `costUsd` (null when zero or unknown).
 
 ### Records (`src/decisions/points/records.ts`)
@@ -2772,7 +2772,53 @@ The output gate's point (§8j): `CheckItem`s (one per question of each enabled c
 
 ### Audit (`[decisions.audit]`)
 
-The offline audit worker's point (§9i): its send-contract diagnosis is `contractAuditPoint`; its history pass runs the checks point's questions under the audit point's chain, timeout, priority and ledger class (`CheckEvaluatorOptions.judging`), while the rows it writes stay `point = 'checks'`. `DECISION_POINT_NAMES` = `routing`, `records`, `checks`, `audit`; every one resolves, merges per agent and validates like the others (`pointSettings`, `validateEffective`).
+The offline audit worker's point (§9i): its send-contract diagnosis is `contractAuditPoint`; its history pass runs the checks point's questions under the audit point's chain, timeout, priority and ledger class (`CheckEvaluatorOptions.judging`), while the rows it writes stay `point = 'checks'`. `DECISION_POINT_NAMES` = `routing`, `records`, `checks`, `audit`, `late_addition`, `implicit_reply`; every one resolves, merges per agent and validates like the others (`pointSettings`, `validateEffective`).
+
+### Vision decision chain (`src/decisions/images.ts`)
+
+Text decision models see images as their captions. A point may also use an optional **vision chain**: a system-one chain whose members read images (DECISION-MODEL §3.5).
+
+**Settings.** `[decisions.<point>].vision_model` → `[decisions].vision_model` names the chain head; `[decisions.<point>].vision` (`"off" | "uncaptioned" | "always"`) the mode, defaulting per point (`DEFAULT_VISION_MODES`): `routing` `uncaptioned`, `late_addition` `always` (its media candidates have no caption yet by construction), `records` / `checks` / `audit` / `implicit_reply` `off`. `pointSettings` resolves them into `PointSettings.vision` = `{ model, mode, timeoutMs ([decisions].vision_timeout_ms, default 8000), maxImages ([decisions].max_images, default 4), imageMaxPixels (image_max_pixels, default 1,000,000), maxImageBytes (max_image_bytes, default 200,000) }`, or undefined when no vision chain is configured or the mode is `off`. Startup validation: every vision chain (global and per point) must name a system-one model and every member of it must declare `"image"` in `input_modalities`; a point's `vision` set without any vision chain is a warning (`decisions_vision_without_chain`).
+
+**When it is used.** Only a point that declares `images(input)` (its **subject images**, newest first, as `DecisionImageRef { id, messageId, from, caption?, localPath?, mimeType? }`) ever uses the chain; today that is `late_addition` (routing has the setting but declares no images). Mode `uncaptioned` uses it when some subject image has no caption; `always` whenever there is a subject image. At most `max_images` refs are taken.
+
+**Images.** The engine loads them through `DecisionEngineOptions.loadImage` (`app.ts` passes `createDecisionImageLoader`, which reads the downloaded file at `localPath` and runs the inference conditioning `read_image` uses, `conditionImageBufferForInference`: downscaled to `image_max_pixels`, re-encoded JPEG under `max_image_bytes`, mozjpeg per `[media.image]`), in parallel; an image that cannot be loaded is dropped. The loaded ones are labelled `image 1`, `image 2`, … in order. With no loader, or no loadable image, the evaluation goes to the text chain directly (`visionReason` `no_image_loader` / `no_loadable_image`).
+
+**Members.** The client never sends a vision request to a member without image input (misfit `image_input`). Each member gets at most its `decision.max_images` of the images (newest first), and an image over its `decision.max_image_bytes` is re-conditioned under that cap (memoized per image and cap) or dropped; a member left with no image is skipped (`kind: "skip"`, neutral). The state is built per member with the labels of the images it is actually sent (`DecisionStateView.imageLabels`, ref id → label), so its attachments name exactly those.
+
+**Wire shape** (`wireImageState`), per member `decision.images`:
+- `"state_parts"` (default): `state = [ { type: "text", text: <the state as JSON> }, { type: "text", text: "image 1: attached to message $abc by Alice" }, { type: "image_url", image_url: { url: "data:image/jpeg;base64,…" } }, … ]`.
+- `"images_field"`: the plain state (an object state gains `image_labels`, the label lines in array order) plus a top-level `images` array of data URLs.
+
+A text request is byte-identical to one without the feature. Vision attempts get `questions(input, settings, { vision: true })`, whose instructions refer to images by label, and all of the point's questions (they are not split between the chains).
+
+**Fallback.** The vision attempt is a full chain run (budget, health, fits, `vision_timeout_ms`, or a per-call `timeoutMs`). Any failure, `low_confidence` included, retries the evaluation **once** on the text chain, whose state carries captions only (and the point's placeholders for undescribed images); a caller abort does not retry. A text-chain failure then gives the point's fallback verdict. The log line and the outcome carry `imageCount`, `visionServed` and `visionReason` (why the vision attempt did not serve); the evaluation row carries `imageCount` and `visionServed` for the sink (not `decision_evaluations` columns), and its `stateJson` is the wire form with each image replaced by a marker (`[image 1: image/jpeg, 41233 bytes]`), never pixels. Billing is unchanged: every billed attempt of either chain is a `decision` row, image tokens included in `usage.input_tokens`.
+
+### Late addition (`src/decisions/points/late-addition.ts`)
+
+**Purpose.** Whether a message the trigger's sender sent after the request belongs to that request (spec LATE-INPUT §5.2 "Membership"). The point, its input builder and its knobs are pure; eligibility and what a "yes" does are the caller's.
+
+**Input** (`lateAdditionInputFrom({ before, request, between, candidate, selfIds?, recentMessages? })`, from hydrated timeline events): the last `recent_messages` (default 5) messages before the request; the request (the trigger group, merged into one post: texts joined, attachments concatenated); up to 12 messages between the request and the candidate (newest kept); the candidate. Ages are precomputed labels relative to the request: `"40s before"` against its first part's send time, `"6s after request"` against its last part's. Texts are clipped (request and candidate 1200 characters, the others 400). Senders render as in the shared transcript (`senderName`), the bot's own messages marked `self: true` (`isSelf`, role `assistant`, or `selfIds`). Subject images: the candidate's image attachments, then the request's (latest part first).
+
+**State**: `{ before: [{ from, text, age, self? }], request: { from, text, attachments }, between_omitted?, between: [{ from, text, age, self? }], message: { from, text, attachments, age } }`, attachments as `{ kind, image?, caption }` where `caption` is the existing caption or null and `image` is the label on a vision attempt. Nothing in it implies the candidate is addressed to the bot. Packing drops the oldest `before` messages first; only when none fit are the oldest `between` messages dropped, counted in `between_omitted`.
+
+**Question**: `belongs` (`noul`): "`message` supplies something `request` refers to or expects, or continues, corrects or adds to it, written by the same person for the same purpose." (on a vision attempt it adds that images follow the state, labelled as in `attachments[].image`).
+
+**Verdict** `LateAdditionVerdict { belongs, probability, judged }`: `belongs = probability ≥ threshold` (`[decisions.late_addition].threshold`, default 0.7; calibration `"late_addition.threshold"` / `"threshold"`). **Fallback** `LATE_ADDITION_NOT_JUDGED` = `{ belongs: false, probability: null, judged: false }`. Vision mode default `always`.
+
+**Knobs** (`lateAdditionKnobs(decisions)`, defaults applied, readable with the point off): `threshold` 0.7, `candidateWindowMs` 60000, `maxJudged` 8, `maxFolded` 3, `recentMessages` 5. `min_confidence` is rejected at startup (one `noul`, gated by `threshold`).
+
+### Implicit reply (`src/decisions/points/implicit-reply.ts`)
+
+**Purpose.** Whether a bare group message responds to a specific recent bot message M without the reply function or a mention (spec LATE-INPUT §6). One evaluation per (candidate, M).
+
+**Pre-gate** (`implicitReplyPreGate`, pure, over `ImplicitReplyGateEvent { id, timestamp, author: "self" | "bot" | "human" }`): the timeline is a group; the candidate is from a human, has no reply, no mention of the bot, no trigger of its own, and was not consumed by late input. Walking back from the candidate over the preceding messages, every message of this agent within `max_messages_after` messages (the candidate is the 1st, 2nd, … message after it) and `max_age_ms` of it is an M; the walk stops at the first message of another bot (a sibling agent or any bot account), at the message bound, or at the age bound. The result is `{ eligible: true, botMessageIds }` (newest first) or `{ eligible: false, reason }` (`not_group`, `not_human`, `has_reply`, `mentions_bot`, `has_trigger`, `consumed`, `no_bot_message`). `implicitReplyGateEventOf(event, { selfIds?, otherBotIds? })` classifies a timeline event (`otherBotIds` first, then self, then bot accounts; webhooks count as human).
+
+**Input** (`implicitReplyInputFrom({ recent, botMessage, candidate, selfIds?, recentMessages?, now? })`): up to `recent_messages` (default 6) messages before M, M marked `bot_message: true`, and every message from M up to the candidate; ages are `"40s ago"` labels relative to `now` (default the candidate's send time); attachments are caption strings as in the shared transcript.
+
+**State**: the records point's non-reply framing, `{ recent_chat: [{ from, text, age, self?, bot_message?, attachments? }], message: { from, text, age, attachments? } }`. The suffix from M to the candidate is always kept whole; only context before M is dropped by packing, and a suffix that cannot fit is not judged (`error` fallback). **Question**: `replies` (`noul`): "`message` responds to the message marked `bot_message` in `recent_chat`: it answers it, reacts to it, or asks about it."
+
+**Verdict** `ImplicitReplyVerdict { replies, probability, judged, botMessageId }`: `replies = probability ≥ threshold` (default 0.8). **Fallback**: inert (`replies: false, judged: false`). Vision mode default `off`. **Knobs** (`implicitReplyKnobs`): `threshold` 0.8, `maxMessagesAfter` 3, `maxAgeMs` 120000, `recentMessages` 6. `min_confidence` is rejected at startup.
 
 ### Configuration
 
@@ -2784,12 +2830,18 @@ timeout_ms = 3000
 min_confidence = 0.6
 state_max_tokens = 8000    # clamped further to each member's state budget
 persona = ""               # short operator-written summary, used in question instructions (never in state)
+vision_model = ""          # optional vision chain (system-one, every member with "image" input)
+vision_timeout_ms = 8000
+max_images = 4             # per evaluation; min with a member's decision.max_images
+image_max_pixels = 1000000
+max_image_bytes = 200000   # JPEG; min with a member's decision.max_image_bytes
 
 [decisions.calibration.decider_alt]
 "routing.min_confidence" = 0.8
 
 [decisions.<point>]        # per point: enabled, model (per-point chain), timeout_ms,
-                           # state_max_tokens, min_state_tokens, min_confidence, + point knobs
+                           # state_max_tokens, min_state_tokens, min_confidence,
+                           # vision_model, vision ("off"|"uncaptioned"|"always"), + point knobs
 ```
 
 **Per-agent overrides.** `[agents.<name>.decisions]` has the same shape. `decisionsFor(config, agent)` deep-merges it over the global block (agent wins), except `routing.tasks`, which the agent replaces wholesale. So one agent can run a point the others do not, with its own task list.

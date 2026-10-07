@@ -7,6 +7,7 @@ export {
   unwrapEnvelope,
   type BilledAttempt,
   type DecisionRequest,
+  type DecisionRequestImages,
   type DecisionResult,
 } from "./client.js";
 export {
@@ -15,13 +16,20 @@ export {
   DECISION_POINT_NAMES,
   calibratedThreshold,
   checksPointKnobs,
+  DEFAULT_VISION_MODES,
   decisionsFor,
+  implicitReplyKnobs,
+  lateAdditionKnobs,
   isDecisionModel,
   pointSettings,
   validateDecisionsConfig,
   type ChecksPointKnobs,
   type DecisionPointName,
+  type ImplicitReplyKnobs,
+  type LateAdditionKnobs,
   type PointSettings,
+  type PointVisionSettings,
+  type VisionMode,
 } from "./config.js";
 export {
   DecisionEngine,
@@ -30,11 +38,12 @@ export {
   type DecisionEvaluationRow,
   type DecisionOutcome,
   type DecisionPoint,
+  type DecisionStateView,
   type EvaluateContext,
   type ThresholdFn,
 } from "./registry.js";
 export * from "./types.js";
-export { ageLabel, clipText, packNewest } from "./state.js";
+export { ageLabel, clipText, durationLabel, packNewest } from "./state.js";
 export { senderName, toTranscriptMessage, type TranscriptMessage } from "./transcript.js";
 export {
   NO_ROUTING,
@@ -78,3 +87,41 @@ export {
   type PlannedCall,
   type QuestionResult,
 } from "./points/checks.js";
+export {
+  createDecisionImageLoader,
+  imageAttachmentsOf,
+  imageDataUrl,
+  imageLabelLine,
+  imageRefsOf,
+  wireImageState,
+  type DecisionImage,
+  type DecisionImageLimits,
+  type DecisionImageLoader,
+  type DecisionImageRef,
+  type ImageTransport,
+  type LoadedDecisionImage,
+} from "./images.js";
+export {
+  LATE_ADDITION_NOT_JUDGED,
+  lateAdditionInputFrom,
+  lateAdditionPoint,
+  type LateAdditionAttachment,
+  type LateAdditionChatMessage,
+  type LateAdditionInput,
+  type LateAdditionPost,
+  type LateAdditionVerdict,
+} from "./points/late-addition.js";
+export {
+  implicitReplyGateEventOf,
+  implicitReplyInputFrom,
+  implicitReplyPoint,
+  implicitReplyPreGate,
+  type ImplicitReplyChatMessage,
+  type ImplicitReplyGateCandidate,
+  type ImplicitReplyGateEvent,
+  type ImplicitReplyGateReason,
+  type ImplicitReplyInput,
+  type ImplicitReplyPreGateInput,
+  type ImplicitReplyPreGateResult,
+  type ImplicitReplyVerdict,
+} from "./points/implicit-reply.js";
