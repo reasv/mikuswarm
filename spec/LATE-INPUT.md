@@ -65,7 +65,7 @@ The gateway logged the 0.3 s abort as "usage still recorded": the aborted reques
 
 ### 4.1 Effect classes
 
-`toolEffect(name, args)` returns one of four classes:
+`toolEffect(name, args)` returns one of four classes: `redo_safe` and `repeatable` behave the same for a redo from scratch and the hold; the distinction matters only to the refusal fork point (below), which must not discard a `repeatable` effect. A paid read (`web_search`, `x_search`) stays `redo_safe`: its cost is covered by replay.
 
 | class | meaning | redo-from-scratch | examples |
 |---|---|---|---|
@@ -103,7 +103,7 @@ A redo replaces the session's rollout with a fresh one built from the corrected 
 
 1. **Abort** the in-flight request and any running `redo_safe` tool. **Abort rule**: if the in-flight request has not yet produced its first stream event, the redo's first request is not sent until that event arrives or the request fails (bounded by `first_event_wait_ms`). A request aborted before its first event has not written its prompt to the cache, and is billed anyway on transports that do not propagate the cancellation (§3). Undoable effects are compensated.
 2. **Branch**: the discarded span becomes an `agent_session_branches` row with `reason = "edit_redo"` or `"addition_redo"`, forked at index 0 (the whole rollout, including the harness injections of the old kickoff). The session id, claim, payee and typing indicator are unchanged.
-3. **Rebuild** the context against the **original build's timeline cutoff** with the correction applied: the edited body replaces the old one; a late addition joins the trigger group. Messages from other senders that arrived meanwhile are not pulled in; they reach the session as they would any running session. This keeps the prefix byte-identical to the first build up to breakpoint (c), which the cost model depends on. The runtime state (current time, active sessions) is recomputed; it lives in the final user turn, after the cached prefix.
+3. **Rebuild** the context against the **original build's timeline cutoff** with the correction applied: the edited body replaces the old one; a late addition joins the trigger group. Messages from other senders that arrived meanwhile are not pulled in; they reach the session as they would any running session. Interjections already delivered in the discarded span (another sender's fold or steer) are not lost with it: they are delivered again after the rebuild, as pending interjections. This keeps the prefix byte-identical to the first build up to breakpoint (c), which the cost model depends on. The runtime state (current time, active sessions) is recomputed; it lives in the final user turn, after the cached prefix.
 4. **Re-run routing and record planning** on the corrected trigger: the task may change, so may skill preloads, tail files and the routed model. A changed model loses the cache; that cost is accepted.
 5. **Replay**: the session keeps, per call key (tool name + canonical arguments), the latest result of every `redo_safe` or `repeatable` call it executed, on any branch. A call is served from this store only when **no call with the same key has been served earlier on the current lineage** (the live branch from the session start to this point); otherwise it executes fresh, because an agent that asks again within one line of work wants a new value. So only results from discarded spans are ever replayed (whatever discarded them: an edit or addition redo, a refusal or contract redo, a revival fork), and each at most once per lineage. A later fork that discards the call which consumed a replay frees the entry for the new branch.
    - An entry is never removed on use. It is replaced only when a fresh execution of the same key produces a newer value, and dropped when it is older than `replay_max_age_ms`. Removing it earlier could discard a result a later branch needs.
@@ -154,7 +154,7 @@ Mechanics:
 
 ### 5.1 Trigger edits
 
-The edited message is the trigger or any message of its trigger group, edited by its own sender (edits by anyone else are content updates only).
+The edited message is the trigger or any message of its trigger group, edited by its own sender, who is a human (edits by anyone else, and every edit by another bot, are content updates only: bots that stream by editing would otherwise redo and interject on every edit).
 
 | when the edit arrives | action |
 |---|---|
@@ -250,23 +250,9 @@ A message reaches exactly one destination: trigger hold grouping, then redo, the
 
 **Verdict**: `replies ≥ threshold` (default high, 0.8) synthesizes a `reply` trigger with M as the reply target. Everything downstream is the normal reply path: claims, a fresh session, M's session record injected by the default rule or the records point, billing to the sender. Below threshold, or on any failure: inert, as today. No heuristic rung.
 
-**Model chain**: its own `[decisions.late_addition]
-enabled = false
-threshold = 0.7
-candidate_window_ms = 60000
-max_judged = 8
-max_folded = 3
+**Model chain**: its own `[decisions.implicit_reply].model`; reply-to detection benefits from a member strong at it, which need not be the routing head.
 
-[decisions.implicit_reply].model`; reply-to detection benefits from a member strong at it, which need not be the routing head.
-
-**Config**: `[decisions.late_addition]
-enabled = false
-threshold = 0.7
-candidate_window_ms = 60000
-max_judged = 8
-max_folded = 3
-
-[decisions.implicit_reply]` with `enabled = false`, `threshold`, `max_messages_after`, `max_age_ms`, per-agent overrides as for every point.
+**Config**: `[decisions.implicit_reply]` with `enabled = false`, `threshold`, `max_messages_after`, `max_age_ms`, per-agent overrides as for every point.
 
 ## 7. Storage, console, logs
 
@@ -306,6 +292,8 @@ max_messages_after = 3
 max_age_ms = 120000
 ```
 
+`[agent.sessions.late_input]` is global, like the rest of `[agent.sessions]` (which has no per-agent layer today); the two `[decisions.*]` points take per-agent overrides as every point does.
+
 ## 9. Testing
 
 - **Cache, the primary risk**: a test that builds the first and the redo context for an edited trigger and asserts byte-identity of the serialized payload up to breakpoint (c) on each wire API; a live probe script (like §3) that checks `cache_read` on the redo for each configured provider, including the abort-before-first-event rule.
@@ -327,4 +315,4 @@ max_age_ms = 120000
 
 ## 11. Defaults to tune
 
-Proposed, to be revisited with live data (§3): `hold_ms` 8 s, `extend_ms` 4 s, `max_hold_ms` 20 s, `revive_max_ms` 5 min, `candidate_window_ms` 60 s, `max_judged` 8, `max_folded` 3, `late_addition` threshold 0.7, `implicit_reply` threshold 0.8, trigger hold 250 ms (never above 500 ms). The hold, revival and trigger-hold values come from the measurements; the window, the limits and the thresholds are first guesses for calibration (DECISION-MODEL §3.6).
+Proposed, to be revisited with live data (§3): `hold_ms` 8 s, `extend_ms` 4 s, `max_hold_ms` 20 s, `revive_max_ms` 5 min, `candidate_window_ms` 60 s, `max_judged` 8, `max_folded` 3, `late_addition` threshold 0.7, `implicit_reply` threshold 0.8, trigger hold 250 ms (never above 500 ms), `max_redos` 3, `first_event_wait_ms` 10 s, `replay_max_age_ms` 5 min, `skew_tolerance_ms` 0. The hold, revival and trigger-hold values come from the measurements; the window, the limits and the thresholds are first guesses for calibration (DECISION-MODEL §3.6).
