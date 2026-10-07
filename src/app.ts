@@ -5227,13 +5227,18 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     return best;
   }
 
-  /** The newest live-or-revivable session `senderId` triggered in this timeline, other than `exceptEventId`'s. */
-  function lateEntryForSender(timelineKey: string, senderId: string, exceptEventId: string): LateInputEntry | undefined {
+  /**
+   * The request a message from `senderId` sent at `sentAt` followed (causality,
+   * §8 "Late input"): the newest live-or-revivable session that sender triggered
+   * in this timeline before `sentAt`, other than the one `exceptEventId` belongs to.
+   */
+  function lateEntryForSender(timelineKey: string, senderId: string, exceptEventId: string, sentAt: number): LateInputEntry | undefined {
     let best: LateInputEntry | undefined;
     for (const entry of lateInputEntries.values()) {
       if (entry.timelineKey !== timelineKey) continue;
       const sender = entry.inbound.trigger?.triggeredBy ?? entry.inbound.event.sender;
       if (sender.id !== senderId || triggerGroupOf(entry.inbound).includes(exceptEventId)) continue;
+      if (entry.inbound.event.timestamp >= sentAt) continue;
       if (!best || entry.inbound.event.timestamp > best.inbound.event.timestamp) best = entry;
     }
     return best;
@@ -5531,7 +5536,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // has no trigger to fall back to).
     if (wouldTrigger && !inbound.trigger) return false;
     if (steeredEventIds.has(inbound.event.id)) return true;
-    const entry = lateEntryForSender(inbound.timelineKey, sender.id, inbound.event.id);
+    const entry = lateEntryForSender(inbound.timelineKey, sender.id, inbound.event.id, inbound.event.timestamp);
     if (!entry) return false;
     const agentName = agentNameForTimeline(entry.timelineKey);
     const knobs = lateAdditionKnobs(decisionsFor(config, agentName));
