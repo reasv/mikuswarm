@@ -80,7 +80,7 @@ test("questions read the message and name their near misses in the false criteri
       assert.ok(q.criteria.false.length > 40, `${c.code} names its near misses`);
     }
   }
-  assert.deepEqual(check("style_not_x_but_y").questions.map((q) => q.threshold), [0.70, 0.70]);
+  assert.deepEqual(check("style_not_x_but_y").questions.map((q) => q.threshold), [0.60, 0.60]);
   for (const q of check("style_not_x_but_y").questions) {
     assert.match(q.criteria.false, /concrete factual correction/);
   }

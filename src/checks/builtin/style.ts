@@ -136,7 +136,7 @@ export const BUILTIN_STYLE_CHECKS: readonly CheckDefinition[] = [
             true: "The contrast mainly adds emphasis or rhetorical weight; stating Y directly would convey substantially the same information.",
             false: "The contrast makes a concrete factual correction, explains a useful practical distinction, or is only quoted or discussed.",
           },
-          0.70,
+          0.60,
         ),
         messageQuestion(
           "In `message`, the assistant uses \"X, not Y\" primarily to add rhetorical impact: " +
@@ -145,7 +145,7 @@ export const BUILTIN_STYLE_CHECKS: readonly CheckDefinition[] = [
             true: "The contrast mainly adds emphasis or rhetorical weight; stating X directly would convey substantially the same information.",
             false: "The contrast makes a concrete factual correction, explains a useful practical distinction, or is only quoted or discussed.",
           },
-          0.70,
+          0.60,
         ),
       ],
     },
