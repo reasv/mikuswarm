@@ -258,3 +258,45 @@ test("migration v25→v26: creates the tables and triggers, marks history dirty,
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("late-input branches and aborted requests are no behaviour samples", async () => {
+  await withStorage(async (storage) => {
+    // s9: one served request, one aborted (estimated) request, and a redo from
+    // scratch (branch 1, edit_redo) whose refusal and check verdict were
+    // re-anchored to that branch; a turn_aborted branch (2) with a verdict too.
+    await storage.insertAgentSession({ id: "s9", timelineKey: KEY_A, sessionType: "default", status: "completed", createdAt: H + 1_000, updatedAt: H + 1_000 });
+    await addRequest(storage, "s9", H + 2_000, "model_a", { key: KEY_A, type: "default" });
+    await storage.insertUsageEvent({
+      ts: H + 2_100, class: "agent_loop", agentSessionId: "s9", sessionType: "default", timelineKey: KEY_A,
+      modelId: "wire-model_a", logicalModelId: "model_a", costUsd: 0.01, estimated: true,
+    });
+    for (const reason of ["edit_redo", "turn_aborted"] as const) {
+      await storage.insertSessionBranch({ sessionId: "s9", forkIndex: 0, reason, messagesJson: "[]", createdAt: H + 2_200 });
+    }
+    await storage.insertRefusalEvent({
+      ts: H + 2_050, agentSessionId: "s9", branchNo: 1, site: "default", agent: "agent_a", timelineKey: KEY_A,
+      servedModel: "model_a", kind: "hard", checkCode: "refusal_safety", reason: "safety", method: "stop_reason",
+      checkpoint: "request", outcome: "observed",
+    });
+    const verdict = JSON.stringify({ fired: [{ code: "style_x", kind: "style" }] });
+    for (const branch_no of [1, 2]) {
+      await storage.insertDecisionEvaluation({
+        ts: H + 2_060, decision_group: "g9", point: "checks", agent_session_id: "s9", source: "model",
+        verdict_json: verdict, checkpoint: "send", branch_no, tool_call_id: `tc${branch_no}`, consequence: "revise",
+      });
+    }
+    // A live (branch 0) refusal still counts.
+    await storage.insertRefusalEvent({
+      ts: H + 2_070, agentSessionId: "s9", site: "default", agent: "agent_a", timelineKey: KEY_A,
+      servedModel: "model_a", kind: "hard", checkCode: "refusal_safety", reason: "safety", method: "stop_reason",
+      checkpoint: "request", outcome: "observed",
+    });
+    await rollups(storage).flush();
+    const rows = table(storage);
+    const v = (metric: string) => value(rows, { hour: H, model: "model_a", metric });
+    assert.equal(v("requests"), 1, "the estimated (aborted) row is billed, not a behaviour sample");
+    assert.equal(v("refusals_hard"), 1, "only the live refusal");
+    assert.equal(v("style_hits"), 0);
+    assert.equal(v("revisions"), 0);
+  });
+});

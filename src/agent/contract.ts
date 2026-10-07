@@ -281,6 +281,23 @@ export function isRunStart(message: unknown): boolean {
 // Derivation
 // ---------------------------------------------------------------------------
 
+/**
+ * Branch reasons whose discarded span is its own outcome, never a send-contract
+ * or model-behaviour sample (ARCHITECTURE.md §8j "Redo and branches", §8k): a
+ * rollout redone from scratch after a trigger edit or a late addition
+ * (`edit_redo`, `addition_redo`), a record turn discarded by a revival
+ * (`revival`), and an in-flight generation aborted to deliver an interjection
+ * (`turn_aborted`). Their messages are dropped from the derivation entirely —
+ * no attempts, nudges or deliveries — and their fork does not reset the
+ * attempt numbering of the run it interrupted.
+ */
+export const STATISTICS_EXCLUDED_BRANCH_REASONS: ReadonlySet<string> = new Set([
+  "edit_redo",
+  "addition_redo",
+  "revival",
+  "turn_aborted",
+]);
+
 /** A discarded branch as the derivation needs it (from `agent_session_branches`). */
 export interface ContractBranchInput {
   branchNo: number;
@@ -328,9 +345,13 @@ interface Located {
   m: unknown;
   /** Final location: 0 = live transcript, n = discarded branch n. */
   loc: number;
+  /** Produced inside a span discarded by a {@link STATISTICS_EXCLUDED_BRANCH_REASONS} branch. */
+  ex?: boolean;
 }
 
-export type ChronItem = { kind: "message"; m: unknown; loc: number } | { kind: "fork"; reason: string; branchNo: number };
+export type ChronItem =
+  | { kind: "message"; m: unknown; loc: number; excluded?: boolean }
+  | { kind: "fork"; reason: string; branchNo: number; excluded?: boolean };
 
 /**
  * Rebuild the order in which messages were produced from the live transcript
@@ -339,21 +360,34 @@ export type ChronItem = { kind: "message"; m: unknown; loc: number } | { kind: "
  * after it cut at `forkIndex` plus branch k's messages; walking the branches
  * newest-first recovers every earlier list, and each message keeps the branch
  * it finally landed in.
+ *
+ * Items produced inside a span that a {@link STATISTICS_EXCLUDED_BRANCH_REASONS}
+ * branch discarded are flagged `excluded`, with that branch's fork: the
+ * branch's own messages, and an earlier branch (and its fork) cut from inside
+ * that span (its fork point sits after an excluded message, or at 0 before one).
  */
 export function chronology(transcript: readonly unknown[], branches: readonly ContractBranchInput[]): ChronItem[] {
   const sorted = [...branches].sort((a, b) => a.branchNo - b.branchNo);
   let cur: Located[] = transcript.map((m) => ({ m, loc: 0 }));
-  const steps: { branch: ContractBranchInput; after: Located[] }[] = [];
+  const steps: { branch: ContractBranchInput; ex: boolean; after: Located[] }[] = [];
   for (let i = sorted.length - 1; i >= 0; i -= 1) {
     const b = sorted[i]!;
     const f = Math.max(0, Math.min(b.forkIndex, cur.length));
-    steps.unshift({ branch: b, after: cur.slice(f) });
-    cur = cur.slice(0, f).concat(b.messages.map((m) => ({ m, loc: b.branchNo })));
+    const inside = f > 0 ? cur[f - 1]!.ex === true : cur[0]?.ex === true;
+    const ex = STATISTICS_EXCLUDED_BRANCH_REASONS.has(b.reason) || inside;
+    steps.unshift({ branch: b, ex, after: cur.slice(f) });
+    cur = cur.slice(0, f).concat(b.messages.map((m) => ({ m, loc: b.branchNo, ...(ex ? { ex } : {}) })));
   }
-  const out: ChronItem[] = cur.map((x) => ({ kind: "message", m: x.m, loc: x.loc }));
+  const item = (x: Located): ChronItem => ({ kind: "message", m: x.m, loc: x.loc, ...(x.ex ? { excluded: true } : {}) });
+  const out: ChronItem[] = cur.map(item);
   for (const step of steps) {
-    out.push({ kind: "fork", reason: step.branch.reason, branchNo: step.branch.branchNo });
-    for (const x of step.after) out.push({ kind: "message", m: x.m, loc: x.loc });
+    out.push({
+      kind: "fork",
+      reason: step.branch.reason,
+      branchNo: step.branch.branchNo,
+      ...(step.ex ? { excluded: true } : {}),
+    });
+    for (const x of step.after) out.push(item(x));
   }
   return out;
 }
@@ -514,6 +548,9 @@ function runOutcome(run: RunState): ContractOutcome | null {
  *   the ending it cut (not a send-contract verdict); messages the fork kept
  *   stay in the attempt.
  * - An ending with `stopReason` aborted/error is not an attempt.
+ * - A branch with a {@link STATISTICS_EXCLUDED_BRANCH_REASONS} reason is
+ *   ignored with its fork: a rollout redone from scratch is judged by its
+ *   final rollout alone, so the outcome needs no value of its own.
  * - Attempt numbers are unique per (branch, redo): when two attempts collide
  *   (several runs in one transcript, a refusal fork after kept attempts), the
  *   group is renumbered 0..n-1 in production order.
@@ -532,7 +569,9 @@ export function deriveContractEvents(
     ...TOOL_CALL_MARKUP_PATTERNS,
     ...(opts.toolNames ? toolNamePatterns(opts.toolNames) : DEFAULT_TOOL_NAME_PATTERNS),
   ];
-  const items = chronology(transcript, opts.branches ?? []);
+  // Spans discarded by an excluded branch are not part of any run
+  // (STATISTICS_EXCLUDED_BRANCH_REASONS).
+  const items = chronology(transcript, opts.branches ?? []).filter((item) => !item.excluded);
   const runs: RunState[] = [];
   let run: RunState | undefined = newRun();
   let redoNo = 0;

@@ -115,6 +115,15 @@ test("contractRuns: a contract redo's discarded attempts are read from the branc
   assert.equal(runs[0]!.result, "sent");
 });
 
+test("contractRuns: a rollout redone from scratch (edit_redo) is not a run", () => {
+  const discarded = [kick("old"), asst([text("old try")]), nudge(1), asst([text("old again")])];
+  const live = [kick("new"), asst([text("new try")]), nudge(1), ...sent("s1", "the new reply")];
+  const runs = contractRuns(live, [{ branchNo: 1, forkIndex: 0, reason: "edit_redo", messages: discarded }]);
+  assert.equal(runs.length, 1);
+  assert.equal(runs[0]!.firstAttempt, "new try");
+  assert.equal(runs[0]!.nudges, 1);
+});
+
 test("textualCallMessage: JSON and keyword arguments; undefined without one", () => {
   assert.equal(textualCallMessage('<tool_call>{"name":"send_message","arguments":{"message":"a\\nb"}}'), "a\nb");
   assert.equal(textualCallMessage('send_message(message="hello \\"x\\"")'), 'hello "x"');

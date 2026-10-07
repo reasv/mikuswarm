@@ -377,3 +377,75 @@ test("refusal fork back to the kickoff: discarded attempts keep their branch", (
   assert.equal(d.nudges, 1);
   assert.equal(d.outcome, "recovered");
 });
+
+// --- derivation: late-input branches (their own outcome) ---------------------
+
+test("edit_redo / addition_redo: the discarded rollout counts no attempts, nudges or outcome", () => {
+  for (const reason of ["edit_redo", "addition_redo"]) {
+    // The discarded rollout ran into a nudge (a failed attempt), then was redone
+    // from scratch: the live transcript is the new rollout alone.
+    const branch = [kick("old"), asst([text("a")]), nudge(1), asst([text("b")], { stopReason: "aborted" })];
+    const live = [kick("new"), ...sent("s1")];
+    const d = deriveContractEvents(live, { branches: [{ branchNo: 1, forkIndex: 0, reason, messages: branch }] });
+    assert.equal(d.outcome, "clean", reason);
+    assert.equal(d.nudges, 0, reason);
+    assert.deepEqual(d.attempts.map((a) => [a.branchNo, a.attemptNo, a.primaryType]), [[0, 0, null]], reason);
+  }
+});
+
+test("edit_redo: a refusal branch cut inside the discarded rollout is discarded with it", () => {
+  // Branch 1 (refusal_redo, inside the first rollout) then branch 2 (edit_redo of
+  // that whole rollout). Only the live rollout counts.
+  const k = kick("old");
+  const refusalBranch = [asst([text("x")]), nudge(1), asst([text("y")])];
+  const redoBranch = [k, asst([text("kept by the refusal fork")]), nudge(1), asst([text("z")])];
+  const live = [kick("new"), ...sent("s2")];
+  const d = deriveContractEvents(live, {
+    branches: [
+      { branchNo: 1, forkIndex: 1, reason: "refusal_redo", messages: refusalBranch },
+      { branchNo: 2, forkIndex: 0, reason: "edit_redo", messages: redoBranch },
+    ],
+  });
+  assert.equal(d.outcome, "clean");
+  assert.equal(d.nudges, 0);
+  assert.deepEqual(d.attempts.map((a) => a.branchNo), [0]);
+});
+
+test("edit_redo of a resumed run keeps the earlier run's attempts", () => {
+  // Run 1 (kept, before the fork) recovered after a nudge; run 2 was redone.
+  const live = [kick("one"), asst([text("a")]), nudge(1), ...sent("s1"), kick("two-new"), ...sent("s3")];
+  const branch = [kick("two-old"), asst([text("b")]), nudge(1), asst([text("c")])];
+  const d = deriveContractEvents(live, { branches: [{ branchNo: 1, forkIndex: 5, reason: "edit_redo", messages: branch }] });
+  assert.equal(d.nudges, 1);
+  assert.equal(d.outcome, "recovered");
+  assert.deepEqual(d.attempts.map((a) => [a.branchNo, a.attemptNo, a.primaryType]), [
+    [0, 0, "text_only"],
+    [0, 1, null],
+    [0, 2, null], // two runs in one branch: renumbered in production order
+  ]);
+});
+
+test("turn_aborted: the aborted partial is no attempt and keeps the run's attempt numbering", () => {
+  // Nudge 1, the reply to it is aborted to deliver an interjection, then the
+  // model sends: the send is still attempt 1 of variant not_sent.
+  const live = [kick(), asst([text("a")]), nudge(1), { type: "interjection", content: "wait", timestamp: clock++ }, ...sent("s4")];
+  const partial = [asst([text("half an ans")], { stopReason: "aborted" })];
+  const d = deriveContractEvents(live, { branches: [{ branchNo: 1, forkIndex: 3, reason: "turn_aborted", messages: partial }] });
+  assert.equal(d.outcome, "recovered");
+  assert.deepEqual(d.attempts.map((a) => [a.branchNo, a.attemptNo, a.variant, a.primaryType]), [
+    [0, 0, "original", "text_only"],
+    [0, 1, "not_sent", null],
+  ]);
+});
+
+test("revival: the discarded record turn and its fork do not end or reset the revived run", () => {
+  const record = [
+    { role: "user", content: "write the record", harness: { kind: "record_turn" }, timestamp: clock++ },
+    asst([text("record draft")]),
+  ];
+  const live = [kick(), asst([text("a")]), nudge(1), ...sent("s5"), { type: "interjection", content: "one more", timestamp: clock++ }, ...sent("s6")];
+  const d = deriveContractEvents(live, { branches: [{ branchNo: 1, forkIndex: 5, reason: "revival", messages: record }] });
+  assert.equal(d.outcome, "recovered");
+  assert.equal(d.nudges, 1);
+  assert.deepEqual(d.attempts.map((a) => [a.branchNo, a.attemptNo]), [[0, 0], [0, 1]]);
+});

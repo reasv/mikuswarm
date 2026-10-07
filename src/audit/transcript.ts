@@ -301,7 +301,9 @@ export function textualCallMessage(text: string): string | undefined {
  * A run without a corrective prompt is not returned.
  */
 export function contractRuns(transcript: readonly unknown[], branches: readonly ContractBranchInput[] = []): ContractRun[] {
-  const items = chronology(transcript, branches);
+  // Spans discarded by a late-input redo, a revival or an aborted turn are not
+  // runs of the session (STATISTICS_EXCLUDED_BRANCH_REASONS).
+  const items = chronology(transcript, branches).filter((item) => !item.excluded);
   const runs: unknown[][] = [];
   let cur: unknown[] | undefined;
   for (const item of items) {

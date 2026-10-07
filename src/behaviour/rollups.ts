@@ -10,6 +10,7 @@
  */
 
 import type Database from "better-sqlite3";
+import { STATISTICS_EXCLUDED_BRANCH_REASONS } from "../agent/contract.js";
 import { estimateTokens } from "../context/tokens.js";
 import type { Logger } from "../observability/index.js";
 import type { Storage } from "../storage/index.js";
@@ -48,16 +49,16 @@ interface SessionRow {
   initial_preloads: string | null;
 }
 
-interface UsageRow { sid: string; ts: number; model: string }
+interface UsageRow { sid: string; ts: number; model: string; estimated: number | null }
 interface AttemptRow {
   sid: string; branch_no: number; redo_no: number; attempt_no: number; ts: number | null;
   served_model: string | null; primary_type: string | null;
 }
 interface RefusalRow {
-  sid: string | null; ts: number; site: string; agent: string | null; timeline_key: string | null;
+  sid: string | null; ts: number; branch_no: number; site: string; agent: string | null; timeline_key: string | null;
   tasks_json: string | null; served_model: string | null; kind: string; reason: string; method: string; outcome: string;
 }
-interface BranchRow { sid: string; reason: string; from_model: string | null; cost_usd: number | null }
+interface BranchRow { sid: string; branch_no: number; reason: string; from_model: string | null; cost_usd: number | null }
 interface DecisionRow {
   id: number; sid: string; ts: number; checkpoint: string | null; branch_no: number | null;
   tool_call_id: string | null; attempt_no: number | null; consequence: string | null; verdict_json: string | null;
@@ -230,7 +231,7 @@ export function computeHourRollups(
     const usage = groupBySession(
       db
         .prepare(
-          `select agent_session_id as sid, ts, coalesce(nullif(logical_model_id, ''), model_id) as model
+          `select agent_session_id as sid, ts, coalesce(nullif(logical_model_id, ''), model_id) as model, estimated
              from usage_events where class = 'agent_loop' and agent_session_id in ${inHour}
              order by ts, id`,
         )
@@ -248,7 +249,7 @@ export function computeHourRollups(
     const refusals = groupBySession(
       db
         .prepare(
-          `select agent_session_id as sid, ts, site, agent, timeline_key, tasks_json, served_model, kind, reason, method, outcome
+          `select agent_session_id as sid, ts, branch_no, site, agent, timeline_key, tasks_json, served_model, kind, reason, method, outcome
              from refusal_events where agent_session_id in ${inHour} order by ts, id`,
         )
         .all(p) as RefusalRow[],
@@ -256,7 +257,7 @@ export function computeHourRollups(
     const branches = groupBySession(
       db
         .prepare(
-          `select session_id as sid, reason, from_model, cost_usd
+          `select session_id as sid, branch_no, reason, from_model, cost_usd
              from agent_session_branches where session_id in ${inHour} order by branch_no`,
         )
         .all(p) as BranchRow[],
@@ -312,7 +313,7 @@ export function computeHourRollups(
   }
   const sessionlessRefusals = db
     .prepare(
-      `select agent_session_id as sid, ts, site, agent, timeline_key, tasks_json, served_model, kind, reason, method, outcome
+      `select agent_session_id as sid, ts, branch_no, site, agent, timeline_key, tasks_json, served_model, kind, reason, method, outcome
          from refusal_events where agent_session_id is null and ts >= @hour and ts < @end order by ts, id`,
     )
     .all(p) as RefusalRow[];
@@ -372,9 +373,18 @@ function accumulateSession(
     return model;
   };
 
-  // Requests and sessions.
+  // Spans discarded by a late-input redo, a revival or an aborted turn are their
+  // own outcome, never a behaviour sample (STATISTICS_EXCLUDED_BRANCH_REASONS):
+  // refusals and check verdicts re-anchored to such a branch are skipped.
+  const excludedBranches = new Set(
+    rows.branches.filter((b) => STATISTICS_EXCLUDED_BRANCH_REASONS.has(b.reason)).map((b) => b.branch_no),
+  );
+
+  // Requests and sessions. An aborted request (an `estimated` row, §8b "Aborted
+  // requests") is billed but is no sample of the model's behaviour.
   const served = new Set<string>();
   for (const u of rows.usage) {
+    if (u.estimated === 1) continue;
     add(u.model, "requests");
     served.add(u.model);
   }
@@ -422,6 +432,7 @@ function accumulateSession(
 
   // Refusals: their own site (a record turn inside a chat session is site record_turn).
   for (const r of rows.refusals) {
+    if (excludedBranches.has(r.branch_no)) continue;
     accumulateRefusal(acc, r, r.agent ?? agent, r.served_model ?? modelAt(r.ts), parseStringArray(r.tasks_json) ?? tasks);
   }
 
@@ -433,6 +444,7 @@ function accumulateSession(
   const overriddenAnchors = new Set<string>();
   const intentAnchors = new Set<string>();
   for (const d of rows.decisions) {
+    if (d.branch_no !== null && excludedBranches.has(d.branch_no)) continue;
     const anchor =
       d.tool_call_id !== null || d.attempt_no !== null
         ? `${d.branch_no ?? 0}|${d.checkpoint ?? ""}|${d.tool_call_id ?? ""}|${d.attempt_no ?? ""}`

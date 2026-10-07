@@ -559,7 +559,11 @@ export function usageSessions(_req: IncomingMessage, res: ServerResponse, ctx: R
 export function usageToolCalls(_req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
   const limit = Math.min(Math.max(Number(ctx.url.searchParams.get("limit")) || 50, 1), 500);
   const timelineKeyPrefixes = agentScopePrefixes(ctx);
-  sendJson(res, 200, { toolCalls: ctx.deps.storage.getUsageRecentToolCalls(limit, { timelineKeyPrefixes }) });
+  // `estimated` (1 | null in the ledger) is a boolean on the wire (§8b "Aborted requests").
+  const toolCalls = ctx.deps.storage
+    .getUsageRecentToolCalls(limit, { timelineKeyPrefixes })
+    .map((row) => ({ ...row, estimated: row.estimated === 1 }));
+  sendJson(res, 200, { toolCalls });
 }
 
 /** GET /api/usage/leaderboard?window=&limit=&agent= — top users by spend with per-user averages (§7.1 leaderboard). */

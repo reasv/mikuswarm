@@ -1657,6 +1657,8 @@ export interface UsageEventRow {
   cost_usd: number;
   ref: string | null;
   created_at: number;
+  /** 1 when the row's usage is estimated (an aborted request, ARCHITECTURE.md §8b "Aborted requests"); null otherwise. */
+  estimated: number | null;
 }
 
 /** One served member's model prompt within a session (see {@link Storage.getSessionModelPrompts}). */
@@ -1736,6 +1738,12 @@ export interface UsageEventInput {
   images?: number | null;
   costUsd: number;
   ref?: string | null;
+  /**
+   * The usage is an estimate: a request aborted by the run's signal, whose stream
+   * reported no output usage (ARCHITECTURE.md §8b "Aborted requests"). Stored as
+   * `estimated = 1`; omitted/false → null.
+   */
+  estimated?: boolean;
 }
 
 /**
@@ -4873,6 +4881,7 @@ export class Storage {
       cost_usd: input.costUsd,
       ref: input.ref ?? null,
       created_at: now,
+      estimated: input.estimated ? 1 : null,
     };
     return this.write((db) => {
       db.prepare(
@@ -4881,13 +4890,13 @@ export class Storage {
            tool_name, model_id, logical_model_id, requested_model_id, budget_partition, room_id, space_id,
            model_prompt, model_prompt_hash, system_prompt_hash,
            provider, input_tokens, output_tokens, cache_read_tokens,
-           cache_write_tokens, images, cost_usd, ref, created_at
+           cache_write_tokens, images, cost_usd, ref, created_at, estimated
          ) values (
            @id, @ts, @class, @agent_session_id, @session_type, @timeline_key, @trigger_sender_id,
            @tool_name, @model_id, @logical_model_id, @requested_model_id, @budget_partition, @room_id, @space_id,
            @model_prompt, @model_prompt_hash, @system_prompt_hash,
            @provider, @input_tokens, @output_tokens, @cache_read_tokens,
-           @cache_write_tokens, @images, @cost_usd, @ref, @created_at
+           @cache_write_tokens, @images, @cost_usd, @ref, @created_at, @estimated
          )`,
       ).run(row);
       // Overflow shared-pool memberships (spec MULTI-SHARED-POOL §4). Each carries the
