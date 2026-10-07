@@ -36,7 +36,7 @@ export interface AppHarness {
   llm: FakeLlm;
   sends: HarnessSend[];
   /** Deliver a user message; `mention` makes it a trigger. Returns its external id. */
-  say(body: string, opts?: { mention?: boolean; replyTo?: string; id?: string; attachments?: AttachmentMeta[]; sender?: { id: string; displayName: string; username?: string } }): string;
+  say(body: string, opts?: { mention?: boolean; replyTo?: string; id?: string; attachments?: AttachmentMeta[]; sender?: { id: string; displayName: string; username?: string }; timestamp?: number }): string;
   /** Edit a stored message (`m.replace`); `mention` = the new content mentions the bot. */
   edit(targetExternalId: string, body: string, opts?: { mention?: boolean; sender?: { id: string; displayName: string; username?: string } }): void;
   /** Delete a stored message (a tombstone through the edit path). */
@@ -205,6 +205,7 @@ export async function startHarness(opts: {
     say(body, sayOpts = {}) {
       seq += 1;
       const now = Date.now() + seq;
+      const sentAt = sayOpts.timestamp ?? now;
       const externalId = sayOpts.id ?? `$user${seq}`;
       const sender = sayOpts.sender ?? { id: "@alice:fake", displayName: "Alice", username: "alice" };
       const inbound: InboundChatEvent = {
@@ -219,7 +220,7 @@ export async function startHarness(opts: {
           role: "user",
           sender,
           body,
-          timestamp: now,
+          timestamp: sentAt,
           receivedAt: now,
           ...(sayOpts.mention ? { mentions: { mentionedSelf: true, userIds: [BOT_ID] } } : {}),
           ...(sayOpts.replyTo ? { replyTo: { externalId: sayOpts.replyTo } } : {}),

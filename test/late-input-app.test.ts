@@ -291,3 +291,101 @@ test("late input: a bare message after the bot's message is inert when the class
     await h.stop();
   }
 });
+
+const LATE_ADDITION = `
+[decisions.late_addition]
+enabled = true
+threshold = 0.7
+`;
+
+test("late input: a judged late addition joins the request; a rejected one stays inert", async () => {
+  for (const [noul, joins] of [[0.9, true], [0.1, false]] as const) {
+    let first = true;
+    const h = await startHarness({
+      toml: LATE() + DECIDER.replace("[decisions.implicit_reply]\nenabled = true", "[decisions.implicit_reply]\nenabled = false") + LATE_ADDITION,
+      decideNoul: () => noul,
+      script: (req) => {
+        if (isRecordTurnRequest(req)) return { text: "NO_REPLY" };
+        const reply = send(userText(req).includes("in Celsius") ? "20 C" : "68 F");
+        if (first) {
+          first = false;
+          return { ...reply, delayMs: 600 };
+        }
+        return reply;
+      },
+    });
+    try {
+      h.say("temperature in Rome?", { mention: true });
+      await h.until(() => h.llm.requests.length >= 1, "first request");
+      h.say("in Celsius please");
+      await h.until(() => settledAll(h)() && h.sends.length >= 1, "settled");
+      const bodies = h.sends.map((s) => (s.msg as { body?: string }).body);
+      if (joins) {
+        assert.deepEqual(bodies, ["20 C"]);
+        assert.ok(branches(h).some((b) => b.reason === "addition_redo"));
+        assert.ok(h.llm.decisions.some((d) => "belongs" in d.questions), "judged by late_addition");
+      } else {
+        assert.deepEqual(bodies, ["68 F"]);
+        assert.ok(hasLog(h, "late_input_ignored", { reason: "judged_not_belonging" }));
+      }
+      assert.equal(sessionRows(h).length, 1);
+    } finally {
+      await h.stop();
+    }
+  }
+});
+
+test("late input: a reply to the request while it runs joins it, never a parallel session", async () => {
+  let first = true;
+  const h = await startHarness({
+    toml: LATE(),
+    script: (req) => {
+      if (isRecordTurnRequest(req)) return { text: "NO_REPLY" };
+      const reply = send(userText(req).includes("the blue one") ? "blue it is" : "which one?");
+      if (first) {
+        first = false;
+        return { ...reply, delayMs: 600 };
+      }
+      return reply;
+    },
+  });
+  try {
+    const id = h.say("pick a color for me", { mention: true });
+    await h.until(() => h.llm.requests.length >= 1, "first request");
+    h.say("the blue one", { replyTo: id, mention: true });
+    await h.until(() => settledAll(h)() && h.sends.length >= 1, "settled");
+    assert.equal(sessionRows(h).length, 1, "no parallel session");
+    assert.deepEqual(h.sends.map((s) => (s.msg as { body?: string }).body), ["blue it is"]);
+    assert.ok(branches(h).some((b) => b.reason === "addition_redo"));
+  } finally {
+    await h.stop();
+  }
+});
+
+test("late input: an addition sent before the reply but arriving after the run ended revives the session", async () => {
+  let n = 0;
+  const h = await startHarness({
+    toml: LATE({ hold_ms: 0 }) + FOLLOWUP,
+    script: (req) => {
+      if (isRecordTurnRequest(req)) return { text: "NO_REPLY" };
+      n += 1;
+      return send(n === 1 ? "answer" : "addendum");
+    },
+  });
+  try {
+    h.say("what time is it in Tokyo", { mention: true });
+    await h.until(() => settledAll(h)() && h.sends.length >= 1, "first run");
+    const triggerTs = h.query<{ timestamp: number }>("select timestamp from timeline_events where external_id = '$user1'")[0]!.timestamp;
+    // Sent 1 s after the trigger (before the reply), delivered only now.
+    h.say("and in Osaka", { timestamp: triggerTs + 1 });
+    await h.until(() => hasLog(h, "late_input_revived"), "revived");
+    await h.until(() => settledAll(h)() && h.sends.length >= 2, "the revived run sent");
+    assert.equal(sessionRows(h).length, 1, "the same session");
+    assert.deepEqual(h.sends.map((s) => (s.msg as { body?: string }).body), ["answer", "addendum"]);
+    const revivedRequest = h.llm.requests.filter((r) => !isRecordTurnRequest(r)).at(-1)!;
+    assert.ok(userText(revivedRequest).includes("before your reply reached them"));
+    assert.ok(userText(revivedRequest).includes("and in Osaka"));
+  } finally {
+    await h.stop();
+  }
+});
