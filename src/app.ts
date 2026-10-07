@@ -4647,6 +4647,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     if (!senderId) return false;
     const watch = followUpWatch.get(inbound.timelineKey, senderId);
     if (!watch) return false;
+    // A session with late input decided the follow-up already (`routeLateAddition`):
+    // what it did not take is not part of the request (§8 "Late input").
+    if (lateInputEntries.has(watch.sessionId)) return false;
 
     // Trigger-hold double-delivery dedup (shared with reply-steer / co-reply): a
     // trigger-bearing follow-up reaches handleInbound twice. We fold it on its
@@ -5840,7 +5843,6 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       if (!outcome.verdict.replies) continue;
       // Consumed meanwhile (an edit, a late addition, another route): leave it.
       if (steeredEventIds.has(inbound.event.id)) return;
-      markSteered(inbound.event.id);
       await storage.insertReplyContext({
         event_id: inbound.event.id,
         reply_external_id: botMessage.externalId,
@@ -5858,7 +5860,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         groupedEventIds: [inbound.event.id],
       };
       const replyTo = { externalId: botMessage.externalId, agentSessionId: botMessage.agentSessionId };
-      await redispatchCoReply({ ...inbound, trigger, event: { ...inbound.event, replyTo, trigger } });
+      const replyInbound: InboundChatEvent = { ...inbound, trigger, event: { ...inbound.event, replyTo, trigger } };
+      // Exactly an explicit reply: into M's session while it still runs (reply-steer),
+      // else a reply trigger.
+      if (steerReplyToActiveSession(replyInbound)) return;
+      markSteered(inbound.event.id);
+      await redispatchCoReply(replyInbound);
       return;
     }
   }
