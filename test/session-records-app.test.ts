@@ -499,23 +499,19 @@ enabled = { group = true }
   }
 });
 
-test("app: a follow-up after the owner settled starts a fresh session with the owner's record", async () => {
+test("app: a follow-up sent after the owner settled takes its native fate (no fresh session, no revival)", async () => {
   const h = await startHarness({ script: chatScript({ recordTurn: () => finalize("owner record") }), toml: FOLLOWUP });
   try {
     h.say("[work] look it up", { mention: true });
     const [owner] = await settled(h, 1);
-    // A bare (un-mentioned) same-sender follow-up: folds, never resumes.
+    // A bare (un-mentioned) same-sender follow-up sent after the run ended: it is
+    // a reaction to the reply, not part of the request (ARCHITECTURE.md §8 "Late input").
     h.say("oh and the second one too");
-    const rows = await settled(h, 2);
-    assert.equal(rows.length, 2, "a fresh session");
-    const fresh = rows[1]!;
-    assert.notEqual(fresh.id, owner!.id);
+    await new Promise((r) => setTimeout(r, 500));
+    const rows = sessions(h);
+    assert.equal(rows.length, 1, "folding never starts a fresh session");
     assert.equal(owner!.status, "completed");
-    const injected = transcript(fresh).find((m) => m.role === "toolResult" && m.harness?.kind === "injection");
-    assert.ok(injected, "owner's record injected");
-    assert.ok(injected.content[0].text.includes("owner record"));
-    assert.equal(injected.harness.decisionGroup, undefined, "outside any judgement");
-    assert.ok(hasLog(h, "follow_up_fold_after_settle", { ownerSessionId: owner!.id, action: "spawn" }));
+    assert.ok(!hasLog(h, "late_input_revived"), "sent after the run end: no revival");
   } finally {
     await h.stop();
   }
@@ -551,11 +547,12 @@ candidates = 3
 inject_threshold = 0.6
 `;
 
-test("app: a reply steered after the rollout's last check is redelivered, not dropped (Z5)", async () => {
+test("app: a reply steered after the rollout's last check revives the session, not dropped (Z5)", async () => {
   let h!: AppHarness;
   let held = false;
   h = await startHarness({
     script: chatScript({ recordTurn: () => finalize("record A") }),
+    toml: "[agent.sessions.late_input]\nenabled = true\n",
     // The agent loop is over; the run has not settled yet. A reply to the bot now
     // still steers into the session (it is running) but nothing will read it.
     onTyping: async (on) => {
@@ -567,18 +564,18 @@ test("app: a reply steered after the rollout's last check is redelivered, not dr
   });
   try {
     h.say("[work] first", { mention: true });
-    const rows = await settled(h, 2);
+    await h.until(() => hasLog(h, "late_input_revived"), "the session revived");
+    const rows = await settled(h, 1);
     const a = rows[0]!;
     assert.ok(hasLog(h, "steer_unread_redelivered", { sessionId: a.id, form: "reply" }));
-    assert.ok(hasLog(h, "follow_up_fold_after_settle", { ownerSessionId: a.id, form: "reply" }));
-    assert.ok(!transcript(a).some((m) => JSON.stringify(m).includes("wait, also this")), "A never read it");
-    // Exactly once: one fresh session answers it, starting with A's record.
-    const handling = h.llm.requests.filter((r) => !isRecordTurnRequest(r) && triggerText(r).includes("wait, also this"));
-    assert.ok(handling.length >= 1);
-    assert.equal(sessions(h).length, 2);
-    const call = injectedCall(handling[0]!);
-    assert.ok(call, "the fresh session starts with the owner's record");
-    assert.deepEqual(JSON.parse(call!.tool_calls![0]!.function.arguments), { session_id: a.id });
+    assert.ok(hasLog(h, "late_input_revived", { sessionId: a.id }));
+    // Exactly once: the same session reads it; no second session.
+    assert.equal(sessions(h).length, 1);
+    assert.ok(transcript(a).some((m) => JSON.stringify(m).includes("wait, also this")), "A read it after the revival");
+    assert.ok(hasLog(h, "session_completed", { sessionId: a.id, revival: true }));
+    // The record is written once, at the revived run's end.
+    await h.until(() => records(h).length === 1, "the revived run's record");
+    assert.equal(records(h)[0]!.session_id, a.id);
   } finally {
     await h.stop();
   }

@@ -36,7 +36,11 @@ export interface AppHarness {
   llm: FakeLlm;
   sends: HarnessSend[];
   /** Deliver a user message; `mention` makes it a trigger. Returns its external id. */
-  say(body: string, opts?: { mention?: boolean; replyTo?: string; id?: string; attachments?: AttachmentMeta[] }): string;
+  say(body: string, opts?: { mention?: boolean; replyTo?: string; id?: string; attachments?: AttachmentMeta[]; sender?: { id: string; displayName: string; username?: string } }): string;
+  /** Edit a stored message (`m.replace`); `mention` = the new content mentions the bot. */
+  edit(targetExternalId: string, body: string, opts?: { mention?: boolean; sender?: { id: string; displayName: string; username?: string } }): void;
+  /** Delete a stored message (a tombstone through the edit path). */
+  remove(targetExternalId: string): void;
   /** Poll until `predicate` holds (default 10 s). */
   until(predicate: () => boolean, what: string, timeoutMs?: number): Promise<void>;
   /** Read-only query against the app's database. */
@@ -202,7 +206,7 @@ export async function startHarness(opts: {
       seq += 1;
       const now = Date.now() + seq;
       const externalId = sayOpts.id ?? `$user${seq}`;
-      const sender = { id: "@alice:fake", displayName: "Alice", username: "alice" };
+      const sender = sayOpts.sender ?? { id: "@alice:fake", displayName: "Alice", username: "alice" };
       const inbound: InboundChatEvent = {
         provider: "matrix",
         timelineKey: HARNESS_TK,
@@ -228,6 +232,50 @@ export async function startHarness(opts: {
       } as InboundChatEvent;
       host!.onEvent(inbound);
       return externalId;
+    },
+    edit(targetExternalId, body, editOpts = {}) {
+      seq += 1;
+      const now = Date.now() + seq;
+      const sender = editOpts.sender ?? { id: "@alice:fake", displayName: "Alice", username: "alice" };
+      host!.onEvent({
+        provider: "matrix",
+        timelineKey: HARNESS_TK,
+        channelType: "group",
+        event: {
+          id: `evt-$edit${seq}`,
+          externalId: `$edit${seq}`,
+          timelineKey: HARNESS_TK,
+          provider: "matrix",
+          role: "user",
+          sender,
+          body,
+          timestamp: now,
+          receivedAt: now,
+          ...(editOpts.mention ? { mentions: { mentionedSelf: true, userIds: [BOT_ID] } } : {}),
+        },
+        edit: { targetExternalId },
+        outboundTarget: { provider: "matrix", timelineKey: HARNESS_TK, accountId: "test", roomId: "!room" },
+      } as InboundChatEvent);
+    },
+    remove(targetExternalId) {
+      seq += 1;
+      const now = Date.now() + seq;
+      host!.onEvent({
+        provider: "matrix",
+        timelineKey: HARNESS_TK,
+        channelType: "group",
+        event: {
+          id: `evt-$del${seq}`,
+          timelineKey: HARNESS_TK,
+          provider: "matrix",
+          role: "user",
+          sender: { id: "system" },
+          body: "",
+          timestamp: now,
+          receivedAt: now,
+        },
+        edit: { targetExternalId, deleted: true },
+      } as InboundChatEvent);
     },
     async until(predicate, what, timeoutMs = 10_000) {
       const deadline = Date.now() + timeoutMs;
