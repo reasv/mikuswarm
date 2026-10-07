@@ -1,10 +1,10 @@
 # Late input: trigger edits, late additions, redo and revival
 
-**Status**: PROPOSAL, revision 1 (2026-10-07, from the owner design discussion of the same day). Not implemented.
+**Status**: PROPOSAL, revision 1 (2026-10-07, from the owner design discussion of the same day), ready for implementation; only the defaults of §11 remain to tune. Not implemented.
 **Realizes**: spec/SESSION-RECORDS.md §9 "Trigger edits, the hold, folding, interjection" (the owner direction recorded there).
 **Supersedes**: the settled branch of follow-up folding as shipped by SESSION-RECORDS §7 (`foldAfterSettle`: a fresh session with the owner's record). See §5.5.
 **Amends**: spec/FOLLOWUP-FOLDING.md (delivery while running, §5.2), the trigger hold (ARCHITECTURE.md §6, §7), the tool side-effect list (`src/tools/side-effects.ts`, REFUSAL-HANDLING §8.4), the branch reasons of REFUSAL-HANDLING §9.
-**Adds**: two decision points, `late_addition` (§5.2) and `implicit_reply` (§6).
+**Adds**: two decision points, `late_addition` (§5.2) and `implicit_reply` (§6), and builds the vision decision chain of DECISION-MODEL §3.5 for the first of them.
 **Target ARCHITECTURE.md home once implemented**: §8 (a new "Late input" subsection beside "Follow-up folding" and "Message steering"), §8j "Redo and branches", §8i "Resume and folding", §6/§7 "Trigger hold", §8h (the new point), §10 "Output-gated tools", §11 (console).
 **Related**: SESSION-RECORDS, FOLLOWUP-FOLDING, REFUSAL-HANDLING, DECISION-MODEL, RESUMABLE-SESSIONS, DUPLICATE-REPLY-MITIGATION.
 
@@ -175,7 +175,7 @@ A **no-op filter** skips the redo when the normalized text and attachments are u
 | run ended, sent before the run end | revival with the same interjection | revival with the interjection | revival with the interjection |
 | sent after the run end | nothing | nothing | nothing |
 
-An edit that **adds** a mention of the bot to a recent message triggers, as the original would have, only within `candidate_window_ms` of the original send.
+An edit that **adds** a mention of the bot to a recent message triggers, as the original would have, within `candidate_window_ms` of the original send.
 
 ### 5.2 Late additions
 
@@ -220,6 +220,7 @@ Messages sent after the run end are reactions to the response:
 
 - an edit: nothing (§2.8);
 - a trigger (`@`, explicit reply, DM): a fresh session, with records injected as today;
+- a reply to a message of the request (the trigger or a grouped part): exactly a reply to the bot's message of that session. It always triggers, and the default record rule injects that session's record (the trigger message resolves to its session through `agent_sessions.trigger_external_id`);
 - a bare group message: the implicit-reply point (§6), or inert when it is off.
 
 ### 5.4 Precedence
@@ -320,11 +321,10 @@ max_age_ms = 120000
 1. **Effect classes and the audit** (§4.1), MCP annotations. Standalone; improves the refusal fork point too.
 2. **Edits**: redo from scratch with the rebuild-at-cutoff and the abort rule (§4.3), edit interjections (§4.4), the cache tests.
 3. **The irreversibility hold** (§4.2) and the trigger-hold reduction, together (the hold only shrinks once redo and the irreversibility hold catch what it used to).
-4. **Late additions as redo** (§5.2) and abort-and-interject for folds.
+4. **Late additions**: the `late_addition` point with the vision decision chain (DECISION-MODEL §3.5: `vision_model`, per-point `vision` mode, image conditioning, labelled `image_url` parts in `state`, text-chain fallback; `late_addition` uses it for every media candidate, since none has a caption yet), redo and abort-and-interject for folds, explicit replies to the request.
 5. **Revival** (§4.5), removing `foldAfterSettle`.
 6. **`implicit_reply`** (§6).
 
-## 11. Open questions
+## 11. Defaults to tune
 
-1. **A reply to one's own trigger after the run end.** It is a new request about the same work (§5.3), but its reply target is a user message, so the default record rule (replies to bot messages) injects nothing. Proposal: map the trigger message to its session through `agent_sessions.trigger_external_id` and inject that session's record, like a reply to the bot's message.
-2. Defaults beyond the first measurement (§3): `hold_ms`, `extend_ms`, `revive_max_ms`, `candidate_window_ms`, `max_judged`, `max_folded`, the `late_addition` threshold, the trigger hold (≤ 500 ms, proposed 250 ms).
+Proposed, to be revisited with live data (§3): `hold_ms` 8 s, `extend_ms` 4 s, `max_hold_ms` 20 s, `revive_max_ms` 5 min, `candidate_window_ms` 60 s, `max_judged` 8, `max_folded` 3, `late_addition` threshold 0.7, `implicit_reply` threshold 0.8, trigger hold 250 ms (never above 500 ms). The hold, revival and trigger-hold values come from the measurements; the window, the limits and the thresholds are first guesses for calibration (DECISION-MODEL §3.6).
