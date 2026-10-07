@@ -240,11 +240,3 @@ function nonBlank(value: unknown): value is string {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
-
-/**
- * The inverse call that undoes an undoable call, through the same tool set;
- * undefined = it cannot be compensated (treated as irreversible).
- */
-export function compensationFor(_name: string, _args: unknown): { name: string; args: Record<string, unknown> } | undefined {
-  return undefined;
-}
