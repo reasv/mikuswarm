@@ -3,6 +3,7 @@
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
 	import TopBar from '$lib/components/layout/TopBar.svelte';
+	import { isEstimated } from '$lib/late-input';
 	import SpendSummaryCard from '$lib/components/SpendSummaryCard.svelte';
 	import ChannelCell from '$lib/components/ChannelCell.svelte';
 	import {
@@ -1259,7 +1260,13 @@
 								<td class="py-1 pr-3 text-right font-mono text-[11px]">{fmtInt(t.output_tokens)}</td>
 								<td class="py-1 pr-3 text-right font-mono text-[11px]">{fmtInt(t.cache_read_tokens)}</td>
 								<td class="py-1 pr-3 text-right font-mono text-[11px]">{t.images ? fmtInt(t.images) : '—'}</td>
-								<td class="py-1 pr-3 text-right font-mono text-[11px]">{fmtUsd(t.cost_usd)}</td>
+								<td class="py-1 pr-3 text-right font-mono text-[11px]">
+									{#if isEstimated(t.estimated)}<span
+											class="mr-1 rounded bg-amber-500/15 px-1 text-[9px] text-amber-700 dark:text-amber-300"
+											title="tokens estimated: the request was aborted mid-stream"
+											data-testid="usage-estimated">estimated</span
+										>{/if}{fmtUsd(t.cost_usd)}
+								</td>
 								<td class="py-1 text-[10px]">
 									{#if t.timeline_key}
 										<ChannelCell

@@ -19,7 +19,7 @@ import { parseTimelineKey } from "../../storage/timeline-key.js";
 import { sanitizeTriggerFtsMatch } from "../../search/query.js";
 import { sendJson, sendError } from "./responses.js";
 import { openSse } from "./sse.js";
-import { decisionAnchorWire, sessionCheckChips, sessionRefusalDetail } from "./refusal-detail.js";
+import { decisionAnchorWire, sessionCheckChips, sessionInterjections, sessionRefusalDetail } from "./refusal-detail.js";
 import type { RequestContext, RouteHandler } from "./types.js";
 
 /** GET /api/rooms — timelines, reverse-chron by last activity (spec §8). */
@@ -268,6 +268,9 @@ export function sessionDetail(
       ctx.deps.storage.getDecisionEvaluationsForSession(row.id),
       ctx.deps.checks,
     ),
+    // Interjections with their kind (ARCHITECTURE.md §11): the rollout labels its
+    // interjection cards from these (reply, co-reply, follow-up, edit, revival, addition).
+    interjections: sessionInterjections(ctx.deps.storage, row.id),
   });
 }
 
@@ -1031,6 +1034,8 @@ function sessionMeta(
     // numerator is `usage.cost` (§8b) + the §8c tool spend (`toolUsage.cost`).
     maxSessionCostUsd: factory.resolveSessionCostCeiling(row.session_type) ?? null,
     noReply: row.no_reply === 1,
+    // Redos from scratch after a late input (ARCHITECTURE.md §8 "Late input").
+    redoCount: row.redo_count ?? 0,
     // Session-list chips (spec REFUSAL-HANDLING §12.2): refused, redone, nudged,
     // revised, unjudged. null = nothing to show.
     checkChips: checkChips ?? null,

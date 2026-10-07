@@ -82,6 +82,7 @@ export {
   type RefusalPin,
   type SessionBranchInsert,
   type SessionBranchRow,
+  type SessionInterjectionRow,
   type SessionCheckChips,
   type SessionAuditStatus,
   type SessionAuditInsert,

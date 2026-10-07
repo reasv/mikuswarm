@@ -1,9 +1,12 @@
 <script lang="ts">
 	import CornerDownRightIcon from '@lucide/svelte/icons/corner-down-right';
+	import { interjectionKindLabel } from '$lib/late-input';
 
 	// User-role injections inside the rollout (interjections / forced-completion
 	// prompts / resume turns), shown distinctly from assistant output (spec §10b).
-	let { text }: { text: string } = $props();
+	// `kind` labels an interjection (session_interjections.kind or its tag reason:
+	// reply, co-reply, follow-up, edit, revival, addition); null = unlabelled.
+	let { text, kind = null }: { text: string; kind?: string | null } = $props();
 </script>
 
 <div
@@ -11,7 +14,11 @@
 >
 	<div class="mb-1 flex items-center gap-1.5 text-[10px] tracking-wide text-rose-500 uppercase">
 		<CornerDownRightIcon class="size-3" />
-		injected user turn
+		{#if kind}
+			interjection · <span data-testid="interjection-kind">{interjectionKindLabel(kind)}</span>
+		{:else}
+			injected user turn
+		{/if}
 	</div>
 	{text}
 </div>

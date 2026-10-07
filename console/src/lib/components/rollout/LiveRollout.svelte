@@ -9,6 +9,7 @@
 		DecisionEvaluation,
 		RefusalEvent,
 		SessionBranch,
+		SessionInterjection,
 		SessionContract
 	} from '$lib/schemas';
 
@@ -32,7 +33,8 @@
 		branches = [],
 		refusalEvents = [],
 		contract,
-		checks = []
+		checks = [],
+		interjections = []
 	}: {
 		sessionId: string;
 		onEnd?: () => void;
@@ -43,6 +45,7 @@
 		refusalEvents?: readonly RefusalEvent[];
 		contract?: SessionContract;
 		checks?: readonly CheckInfo[];
+		interjections?: readonly SessionInterjection[];
 	} = $props();
 
 	let messages = $state<RolloutMsg[]>([]);
@@ -240,6 +243,7 @@
 	{refusalEvents}
 	{contract}
 	{checks}
+	{interjections}
 />
 {#if !streaming && tentative}
 	<div class="px-3 opacity-60" title="Tentative — this attempt has not committed yet">

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { createQuery } from '@tanstack/svelte-query';
 	import TopBar from '$lib/components/layout/TopBar.svelte';
+	import { isEstimated } from '$lib/late-input';
 	import { getSchedulerSnapshot, getLlmRequests } from '$lib/api/scheduler.remote';
 	import { conversationsHref } from '$lib/nav';
 	import { fresh } from '$lib/query/client';
@@ -280,7 +281,12 @@
 										? `${formatTokens(request.usage.input)}/${formatTokens(request.usage.output)}`
 										: '—'}
 								</td>
-								<td class="pr-3 tabular-nums">{request.usage ? formatUsd(request.usage.cost) : '—'}</td>
+								<td class="pr-3 tabular-nums">
+									{#if isEstimated(request.estimated) || isEstimated(request.usage?.estimated)}<span
+											class="mr-1 rounded bg-amber-500/15 px-1 text-[9px] text-amber-700 dark:text-amber-300"
+											title="tokens estimated: the request was aborted mid-stream">estimated</span
+										>{/if}{request.usage ? formatUsd(request.usage.cost) : '—'}
+								</td>
 								<td
 									class={cn(
 										request.outcome === 'done'

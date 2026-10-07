@@ -6,12 +6,15 @@
 	import type { ForkInfo } from '$lib/branch-plan';
 	import type { CheckInfo } from '$lib/schemas';
 	import { formatUsd } from '$lib/format';
+	import { branchReasonDetail, branchReasonLabel, causeSender } from '$lib/late-input';
 
 	// A fork point in the rollout (spec REFUSAL-HANDLING §12.1): a `‹ x/y ›`
 	// switcher between the branches forked here (oldest first) and the
 	// continuation (the newest, shown by default), and why the fork happened:
 	// the check code and description with the probability that fired, or the
 	// nudges without a send, from-model → to-model, the discarded branch's cost.
+	// A late-input branch (edit / addition redo, revival, aborted turn) names the
+	// message whose arrival caused it: sender and current body, marked if edited.
 	let {
 		info,
 		checks = [],
@@ -32,6 +35,8 @@
 	const check = $derived(subject?.checkCode ? checks.find((c) => c.code === subject.checkCode) : undefined);
 	const why = $derived.by(() => {
 		if (!subject) return 'forked';
+		const late = branchReasonDetail(subject.reason);
+		if (late) return late;
 		if (subject.reason === 'contract_redo') {
 			const n = info.nudges || maxNudges || 0;
 			return `${n} ${n === 1 ? 'nudge' : 'nudges'} without a send`;
@@ -41,6 +46,7 @@
 		return parts.join(': ');
 	});
 	const probability = $derived(info.refusal?.probability ?? null);
+	const cause = $derived(subject?.cause ?? null);
 </script>
 
 <div
@@ -72,7 +78,7 @@
 		</button>
 	</span>
 	<span class="text-[10px] font-semibold tracking-wide text-sky-600 uppercase dark:text-sky-400">
-		{(subject?.reason ?? 'redo').replaceAll('_', ' ')}
+		{branchReasonLabel(subject?.reason)}
 	</span>
 	<span class="text-foreground">{why}</span>
 	{#if probability != null}
@@ -90,4 +96,21 @@
 	{/if}
 	<span class="flex-1"></span>
 	<span class="text-[10px] text-muted-foreground italic">viewing {viewing}</span>
+	{#if cause}
+		<span
+			data-testid="fork-cause"
+			class="flex min-w-0 basis-full items-baseline gap-1 rounded border-l-2 border-l-rose-400 bg-background/60 px-1.5 py-0.5"
+			title={cause.eventId}
+		>
+			<span class="shrink-0 font-semibold">{causeSender(cause)}:</span>
+			<span class="min-w-0 truncate">{cause.body}</span>
+			{#if cause.editedAt != null}
+				<span class="shrink-0 text-[10px] text-muted-foreground italic" data-testid="fork-cause-edited">(edited)</span>
+			{/if}
+		</span>
+	{:else if subject?.causeEventId}
+		<span class="font-mono text-[10px] text-muted-foreground" title="the causing message is no longer stored"
+			>{subject.causeEventId}</span
+		>
+	{/if}
 </div>

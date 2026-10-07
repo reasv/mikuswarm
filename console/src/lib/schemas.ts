@@ -195,6 +195,9 @@ export const SessionMeta = Schema.Struct({
 	// nudges, revised and unjudged judged calls. null = nothing to show; optional
 	// so a pre-feature backend still decodes.
 	checkChips: Schema.optional(Schema.NullOr(SessionCheckChips)),
+	// Redos from scratch after a late input (an edited trigger, a late addition;
+	// ARCHITECTURE.md §8 "Late input"). Optional so a pre-feature backend decodes.
+	redoCount: Schema.optional(Schema.NullOr(Schema.Number)),
 	error: Schema.NullOr(Schema.String),
 	createdAt: Schema.Number,
 	startedAt: Schema.NullOr(Schema.Number),
@@ -240,15 +243,30 @@ export type ToolInvocation = Schema.Schema.Type<typeof ToolInvocation>;
 // src/observability/server/refusal-detail.ts) ────────────────────────────────
 
 /**
+ * The message whose arrival caused a late-input branch (`cause_event_id`, resolved
+ * server-side): sender, CURRENT body (edits are stored in place) and the last edit time.
+ */
+export const BranchCause = Schema.Struct({
+	eventId: Schema.String,
+	senderId: Schema.String,
+	senderName: Schema.NullOr(Schema.String),
+	body: Schema.String,
+	timestamp: Schema.Number,
+	editedAt: Schema.NullOr(Schema.Number)
+});
+export type BranchCause = Schema.Schema.Type<typeof BranchCause>;
+
+/**
  * One discarded span (`agent_session_branches`). `forkIndex` is the index in the
  * live message list at fork time; `messages` the span (a sibling-edit fork's
  * first message is the ORIGINAL assistant message). Branch 0 is the live transcript.
+ * An edit/addition redo forks at 0: its span is the whole old rollout, kickoff included.
  */
 export const SessionBranch = Schema.Struct({
 	branchNo: Schema.Number,
 	parentBranchNo: Schema.Number,
 	forkIndex: Schema.Number,
-	/** refusal_redo | contract_redo */
+	/** refusal_redo | contract_redo | edit_redo | addition_redo | revival | turn_aborted */
 	reason: Schema.String,
 	checkCode: Schema.NullOr(Schema.String),
 	decisionEvaluationId: Schema.NullOr(Schema.Number),
@@ -256,9 +274,27 @@ export const SessionBranch = Schema.Struct({
 	toModel: Schema.NullOr(Schema.String),
 	messages: Schema.Array(PassthroughObject),
 	costUsd: Schema.NullOr(Schema.Number),
-	createdAt: Schema.Number
+	createdAt: Schema.Number,
+	// Late input (ARCHITECTURE.md §8): the causing message; optional for older backends.
+	causeEventId: Schema.optional(Schema.NullOr(Schema.String)),
+	cause: Schema.optional(Schema.NullOr(BranchCause))
 });
 export type SessionBranch = Schema.Schema.Type<typeof SessionBranch>;
+
+/**
+ * One interjection delivered into the session (`session_interjections`). `kind`:
+ * reply | co-reply | follow-up | edit | revival | addition (open-ended string).
+ */
+export const SessionInterjection = Schema.Struct({
+	eventId: Schema.NullOr(Schema.String),
+	externalId: Schema.NullOr(Schema.String),
+	senderId: Schema.NullOr(Schema.String),
+	senderName: Schema.NullOr(Schema.String),
+	kind: Schema.String,
+	body: Schema.String,
+	createdAt: Schema.Number
+});
+export type SessionInterjection = Schema.Schema.Type<typeof SessionInterjection>;
 
 /** One detected refusal (`refusal_events`), hard (checkpoint `request`) or judged. */
 export const RefusalEvent = Schema.Struct({
@@ -370,7 +406,9 @@ export const SessionDetailResponse = Schema.Struct({
 	refusalEvents: Schema.optional(Schema.Array(RefusalEvent)),
 	contract: Schema.optional(SessionContract),
 	checks: Schema.optional(Schema.Array(CheckInfo)),
-	audits: Schema.optional(Schema.Array(SessionAudit))
+	audits: Schema.optional(Schema.Array(SessionAudit)),
+	// The session's interjections with their kinds; optional for older backends.
+	interjections: Schema.optional(Schema.Array(SessionInterjection))
 });
 export type SessionDetailResponse = Schema.Schema.Type<typeof SessionDetailResponse>;
 
@@ -746,9 +784,13 @@ export const LlmRequestRecord = Schema.Struct({
 			cacheRead: Schema.Number,
 			cacheWrite: Schema.Number,
 			totalTokens: Schema.Number,
-			cost: Schema.Number
+			cost: Schema.Number,
+			estimated: Schema.optional(Schema.NullOr(Schema.Union(Schema.Boolean, Schema.Number)))
 		})
-	)
+	),
+	// Output (maybe input) tokens estimated: the stream was aborted mid-way (late
+	// input). Tolerated here or on `usage`; absent on older backends.
+	estimated: Schema.optional(Schema.NullOr(Schema.Union(Schema.Boolean, Schema.Number)))
 });
 export type LlmRequestRecord = Schema.Schema.Type<typeof LlmRequestRecord>;
 
@@ -857,7 +899,9 @@ export const UsageEventRow = Schema.Struct({
 	ref: Schema.NullOr(Schema.String),
 	// Human room label (`Name (Space)`) from room_metadata, else the raw key; null only
 	// when the event has no timeline_key (background caption/embedding).
-	channel_label: Schema.NullOr(Schema.String)
+	channel_label: Schema.NullOr(Schema.String),
+	// 1 when the row's tokens were estimated (an aborted stream); absent on older backends.
+	estimated: Schema.optional(Schema.NullOr(Schema.Number))
 });
 export const UsageToolCalls = Schema.Struct({ toolCalls: Schema.Array(UsageEventRow) });
 export type UsageToolCalls = Schema.Schema.Type<typeof UsageToolCalls>;

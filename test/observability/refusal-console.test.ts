@@ -103,6 +103,7 @@ test("session detail: branches, refusal events, contract attempts and the checks
       assert.deepEqual(body.branches[0], {
         branchNo: 1, parentBranchNo: 0, forkIndex: 2, reason: "refusal_redo", checkCode: "op_refusal",
         decisionEvaluationId: 7, fromModel: "model_a", toModel: "model_b", messages: span, costUsd: 0.01, createdAt: 5,
+        causeEventId: null, cause: null,
       });
       assert.equal(body.refusalEvents.length, 1);
       assert.equal(body.refusalEvents[0].outcome, "redo");

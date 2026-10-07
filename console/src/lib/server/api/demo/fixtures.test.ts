@@ -6,7 +6,8 @@ import {
 	DEMO_FEATURED_ROOM,
 	DEMO_FEATURED_CAPTION_ITEM,
 	DEMO_REFUSAL_SESSION,
-	DEMO_AUDITED_SESSION
+	DEMO_AUDITED_SESSION,
+	DEMO_LATE_INPUT_SESSION
 } from './fixtures';
 import {
 	UsageSummary,
@@ -60,6 +61,8 @@ const cases: Case[] = [
 	{ path: `/api/sessions/${DEMO_REFUSAL_SESSION}/decisions`, schema: SessionDecisionsResponse as never },
 	{ path: `/api/sessions/${DEMO_AUDITED_SESSION}`, schema: SessionDetailResponse as never },
 	{ path: `/api/sessions/${DEMO_AUDITED_SESSION}/decisions`, schema: SessionDecisionsResponse as never },
+	{ path: `/api/sessions/${DEMO_LATE_INPUT_SESSION}`, schema: SessionDetailResponse as never },
+	{ path: `/api/sessions/${DEMO_LATE_INPUT_SESSION}/decisions`, schema: SessionDecisionsResponse as never },
 	{ path: '/api/models/behaviour', query: { window: '24h' }, schema: ModelBehaviourResponse as never },
 	{ path: '/api/models/behaviour/incidents', schema: BehaviourIncidentPage as never },
 	{ path: '/api/pipelines', schema: PipelinesResponse as never },

@@ -6,6 +6,7 @@ import type {
   SessionAuditRow,
   SessionBranchRow,
   SessionCheckChips,
+  SessionInterjectionRow,
   Storage,
 } from "../../storage/index.js";
 import type { ConsoleCheckInfo, ConsoleChecksDeps } from "./types.js";
@@ -55,7 +56,7 @@ export function sessionRefusalDetail(
     }
   }
   return {
-    branches: branches.map(branchWire),
+    branches: branches.map((b) => branchWire(storage, b)),
     refusalEvents: events.map(refusalEventWire),
     contract: {
       outcome: row.contract_outcome ?? null,
@@ -84,7 +85,45 @@ export function sessionCheckChips(storage: Storage, ids: readonly string[]): Map
   return typeof storage.getSessionCheckChips === "function" ? storage.getSessionCheckChips(ids) : new Map();
 }
 
-function branchWire(row: SessionBranchRow): Record<string, unknown> {
+/**
+ * A session's interjections (`session_interjections`, ARCHITECTURE.md §11): the
+ * kind (`reply` | `co-reply` | `follow-up` | `edit` | `revival` | `addition`) the
+ * rollout's interjection cards are labelled with. [] when the store lacks the reader.
+ */
+export function sessionInterjections(storage: Storage, sessionId: string): Array<Record<string, unknown>> {
+  if (typeof storage.listSessionInterjections !== "function") return [];
+  return storage.listSessionInterjections(sessionId).map((row: SessionInterjectionRow) => ({
+    eventId: row.event_id,
+    externalId: row.external_id,
+    senderId: row.sender_id,
+    senderName: row.sender_display_name,
+    kind: row.kind,
+    body: row.body,
+    createdAt: row.created_at,
+  }));
+}
+
+/**
+ * The message whose arrival caused a late-input branch (`cause_event_id`): its
+ * sender and CURRENT body (edits are stored in place) and when it was last
+ * edited. null without a cause id or when the event is no longer stored.
+ */
+function branchCause(storage: Storage, eventId: string | null | undefined): Record<string, unknown> | null {
+  if (!eventId || typeof storage.getTimelineEventById !== "function") return null;
+  const event = storage.getTimelineEventById(eventId);
+  if (!event) return null;
+  const editedAt = typeof storage.getTimelineEventLastEdit === "function" ? storage.getTimelineEventLastEdit(eventId) : null;
+  return {
+    eventId,
+    senderId: event.sender.id,
+    senderName: event.sender.displayName ?? event.sender.username ?? null,
+    body: event.body,
+    timestamp: event.timestamp,
+    editedAt: editedAt ?? null,
+  };
+}
+
+function branchWire(storage: Storage, row: SessionBranchRow): Record<string, unknown> {
   return {
     branchNo: row.branch_no,
     parentBranchNo: row.parent_branch_no,
@@ -97,6 +136,8 @@ function branchWire(row: SessionBranchRow): Record<string, unknown> {
     messages: parseArray(row.messages_json),
     costUsd: row.cost_usd,
     createdAt: row.created_at,
+    causeEventId: row.cause_event_id ?? null,
+    cause: branchCause(storage, row.cause_event_id),
   };
 }
 

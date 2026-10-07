@@ -4,6 +4,7 @@
 	import { contentText, type RolloutMsg } from '$lib/rollout';
 	import { formatTokens, formatUsd } from '$lib/format';
 	import type { ToolInvocation } from '$lib/schemas';
+	import { holdLabel, holdOf } from '$lib/late-input';
 
 	let {
 		name,
@@ -13,9 +14,17 @@
 		// §10.3), matched by toolCallId — present for image_generate. A separate lane:
 		// these tokens are NOT context-bearing and never feed the §8b figures (§4).
 		usage,
-		requestFailed = false
-	}: { name: string; args: unknown; result: RolloutMsg | undefined; usage?: ToolInvocation; requestFailed?: boolean } =
-		$props();
+		requestFailed = false,
+		// The call sits in a discarded branch: no result means it never executed.
+		discarded = false
+	}: {
+		name: string;
+		args: unknown;
+		result: RolloutMsg | undefined;
+		usage?: ToolInvocation;
+		requestFailed?: boolean;
+		discarded?: boolean;
+	} = $props();
 
 	const argsPretty = $derived.by(() => {
 		try {
@@ -26,6 +35,10 @@
 	});
 	const resultText = $derived(result ? contentText(result.content) : null);
 	const isError = $derived(result?.isError === true);
+	// The irreversibility hold (ARCHITECTURE.md §8 "Late input"): the call waited
+	// before executing; a correction during the wait cancelled it (discarded branch).
+	const hold = $derived(holdOf(result));
+	const cancelled = $derived(hold?.reason === 'correction' && discarded);
 	// Some tools carry a terminate signal on the result (top-level or in details).
 	const terminate = $derived(
 		result
@@ -51,6 +64,14 @@
 			</span>
 		{/if}
 		<div class="flex-1"></div>
+		{#if hold}
+			<span
+				data-testid="tool-hold"
+				class="rounded bg-sky-500/15 px-1 font-mono text-[10px] text-sky-700 dark:text-sky-300"
+				title="irreversibility hold: the call waited before executing"
+				>{holdLabel(hold)}{cancelled ? ' · cancelled' : ''}</span
+			>
+		{/if}
 		{#if terminate}<Badge variant="outline" class="text-[10px]">terminate</Badge>{/if}
 		{#if isError}
 			<Badge class="bg-red-500/15 text-[10px] text-red-600 dark:text-red-400">error</Badge>
@@ -73,6 +94,8 @@
 			<pre class="overflow-x-auto text-xs whitespace-pre-wrap">{resultText}</pre>
 		{:else if requestFailed}
 			<div class="mt-2 text-xs text-muted-foreground italic">Not executed — request ended before completion.</div>
+		{:else if discarded}
+			<div class="mt-2 text-xs text-muted-foreground italic">Not executed — the branch was discarded first.</div>
 		{:else}
 			<div class="mt-2 text-xs text-muted-foreground italic">awaiting result…</div>
 		{/if}

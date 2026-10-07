@@ -81,6 +81,7 @@ MIKUSWARM_CONSOLE_DEMO=1 pnpm dev
 #   /?room=matrix%3Aaria%3Aroom%3A%21general%3Amatrix.example.org&session=ses_op4kq2  → session observability
 #   /?room=matrix%3Aaria%3Aroom%3A%21general%3Amatrix.example.org&session=ses_rf7w3k  → branches, check cards, nudges
 #   /?room=matrix%3Aaria%3Aroom%3A%21general%3Amatrix.example.org&session=ses_au4d1t  → an old session the offline audit judged
+#   /?room=matrix%3Aaria%3Aroom%3A%21general%3Amatrix.example.org&session=ses_li5e2d  → late input: edit/addition redos, aborted turn, revival, holds
 #   /models                                      → model behaviour page
 ```
 

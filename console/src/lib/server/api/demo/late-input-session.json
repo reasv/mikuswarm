@@ -1,0 +1,588 @@
+{
+	"session": {
+		"id": "ses_li5e2d",
+		"timelineKey": "matrix:aria:room:!general:matrix.example.org",
+		"sessionType": "default",
+		"status": "completed",
+		"modelId": "model_a",
+		"triggerEventId": "matrix:aria:$li-trigger",
+		"triggerExternalId": "$li-trigger",
+		"triggerBody": "can you post the meetup time in the events room? it's at 6pm",
+		"tokenEstimate": null,
+		"llmRequests": null,
+		"usage": null,
+		"contextTokens": null,
+		"maxContextTokens": 128000,
+		"maxSessionCostUsd": null,
+		"noReply": false,
+		"redoCount": 2,
+		"checkChips": null,
+		"error": null,
+		"createdAt": 1000,
+		"startedAt": 1000,
+		"updatedAt": 10300,
+		"completedAt": 10300,
+		"toolUsage": {
+			"calls": 0,
+			"inputTokens": 0,
+			"outputTokens": 0,
+			"cacheReadTokens": 0,
+			"cacheWriteTokens": 0,
+			"cost": 0
+		}
+	},
+	"toolInvocations": [],
+	"contextSnapshot": [],
+	"transcript": [
+		{
+			"type": "triggerGroup",
+			"role": "user",
+			"timestamp": 4200,
+			"content": "<message from=\"Ada\">can you post the meetup time in the events room? it's at 7pm</message>\n<message from=\"Grace\">also tell people to bring snacks!</message>"
+		},
+		{
+			"role": "assistant",
+			"content": [
+				{
+					"type": "toolCall",
+					"id": "call-li-3",
+					"name": "send_message",
+					"arguments": {
+						"message": "Meetup tonight at 7pm at the Elm St hall, bring snacks!"
+					}
+				}
+			],
+			"api": "openai-completions",
+			"provider": "example",
+			"model": "vendor/model_a",
+			"usage": {
+				"input": 6100,
+				"output": 40,
+				"cacheRead": 0,
+				"cacheWrite": 0,
+				"totalTokens": 6140,
+				"cost": {
+					"input": 0,
+					"output": 0,
+					"cacheRead": 0,
+					"cacheWrite": 0,
+					"total": 0.0011
+				}
+			},
+			"stopReason": "toolUse",
+			"timestamp": 4600,
+			"served": {
+				"logicalId": "model_a"
+			}
+		},
+		{
+			"role": "toolResult",
+			"toolCallId": "call-li-3",
+			"toolName": "send_message",
+			"content": [
+				{
+					"type": "text",
+					"text": "sent"
+				}
+			],
+			"isError": false,
+			"timestamp": 8000,
+			"lateInputHold": {
+				"heldMs": 3200,
+				"reason": "hold_deadline"
+			}
+		},
+		{
+			"type": "interjection",
+			"content": "<interjection reason=\"edit\">\nAda edited the message you answered.\nbefore: can you post the meetup time in the events room? it's at 7pm\nafter: can you post the meetup time in the events room? it's at 7:30pm\n</interjection>",
+			"timestamp": 8300
+		},
+		{
+			"role": "assistant",
+			"content": [
+				{
+					"type": "toolCall",
+					"id": "call-li-4",
+					"name": "send_message",
+					"arguments": {
+						"message": "Correction: the meetup is at 7:30pm, not 7pm."
+					}
+				}
+			],
+			"api": "openai-completions",
+			"provider": "example",
+			"model": "vendor/model_a",
+			"usage": {
+				"input": 6100,
+				"output": 40,
+				"cacheRead": 0,
+				"cacheWrite": 0,
+				"totalTokens": 6140,
+				"cost": {
+					"input": 0,
+					"output": 0,
+					"cacheRead": 0,
+					"cacheWrite": 0,
+					"total": 0.0011
+				}
+			},
+			"stopReason": "toolUse",
+			"timestamp": 8600,
+			"served": {
+				"logicalId": "model_a"
+			}
+		},
+		{
+			"role": "toolResult",
+			"toolCallId": "call-li-4",
+			"toolName": "send_message",
+			"content": [
+				{
+					"type": "text",
+					"text": "sent"
+				}
+			],
+			"isError": false,
+			"timestamp": 8700
+		},
+		{
+			"type": "interjection",
+			"content": "<message from=\"Grace\">is it still at the Elm St hall?</message>",
+			"timestamp": 9400
+		},
+		{
+			"role": "assistant",
+			"content": [
+				{
+					"type": "toolCall",
+					"id": "call-li-5",
+					"name": "send_message",
+					"arguments": {
+						"message": "Yes, still the Elm St hall."
+					}
+				}
+			],
+			"api": "openai-completions",
+			"provider": "example",
+			"model": "vendor/model_a",
+			"usage": {
+				"input": 6100,
+				"output": 40,
+				"cacheRead": 0,
+				"cacheWrite": 0,
+				"totalTokens": 6140,
+				"cost": {
+					"input": 0,
+					"output": 0,
+					"cacheRead": 0,
+					"cacheWrite": 0,
+					"total": 0.0011
+				}
+			},
+			"stopReason": "toolUse",
+			"timestamp": 9700,
+			"served": {
+				"logicalId": "model_a"
+			}
+		},
+		{
+			"role": "toolResult",
+			"toolCallId": "call-li-5",
+			"toolName": "send_message",
+			"content": [
+				{
+					"type": "text",
+					"text": "sent"
+				}
+			],
+			"isError": false,
+			"timestamp": 9800
+		},
+		{
+			"role": "user",
+			"content": [
+				{
+					"type": "text",
+					"text": "A later session will see only the chat and this record. Write what it needs to continue this work."
+				}
+			],
+			"harness": {
+				"kind": "record_turn"
+			},
+			"timestamp": 9900
+		},
+		{
+			"role": "assistant",
+			"content": [
+				{
+					"type": "toolCall",
+					"id": "call-li-rec-2",
+					"name": "session_record_tool",
+					"arguments": {
+						"action": "create",
+						"text": "Posted the meetup time (7:30pm, Elm St hall) and answered Grace about the venue."
+					}
+				}
+			],
+			"api": "openai-completions",
+			"provider": "example",
+			"model": "vendor/model_a",
+			"usage": {
+				"input": 6900,
+				"output": 50,
+				"cacheRead": 0,
+				"cacheWrite": 0,
+				"totalTokens": 6950,
+				"cost": {
+					"input": 0,
+					"output": 0,
+					"cacheRead": 0,
+					"cacheWrite": 0,
+					"total": 0.0012
+				}
+			},
+			"stopReason": "toolUse",
+			"timestamp": 10100,
+			"served": {
+				"logicalId": "model_a"
+			}
+		},
+		{
+			"role": "toolResult",
+			"toolCallId": "call-li-rec-2",
+			"toolName": "session_record_tool",
+			"content": [
+				{
+					"type": "text",
+					"text": "Record saved."
+				}
+			],
+			"isError": false,
+			"timestamp": 10200
+		}
+	],
+	"rolloutStartIndex": 1,
+	"contextDumpPath": null,
+	"modelPrompts": [],
+	"branches": [
+		{
+			"branchNo": 1,
+			"parentBranchNo": 0,
+			"forkIndex": 0,
+			"reason": "edit_redo",
+			"checkCode": null,
+			"decisionEvaluationId": null,
+			"fromModel": null,
+			"toModel": null,
+			"messages": [
+				{
+					"type": "triggerGroup",
+					"role": "user",
+					"timestamp": 1000,
+					"content": "<message from=\"Ada\">can you post the meetup time in the events room? it's at 6pm</message>"
+				},
+				{
+					"role": "assistant",
+					"content": [
+						{
+							"type": "toolCall",
+							"id": "call-li-1",
+							"name": "send_message",
+							"arguments": {
+								"message": "Meetup tonight at 6pm, see you there!"
+							}
+						}
+					],
+					"api": "openai-completions",
+					"provider": "example",
+					"model": "vendor/model_a",
+					"usage": {
+						"input": 6100,
+						"output": 40,
+						"cacheRead": 0,
+						"cacheWrite": 0,
+						"totalTokens": 6140,
+						"cost": {
+							"input": 0,
+							"output": 0,
+							"cacheRead": 0,
+							"cacheWrite": 0,
+							"total": 0.0011
+						}
+					},
+					"stopReason": "toolUse",
+					"timestamp": 1600,
+					"served": {
+						"logicalId": "model_a"
+					}
+				},
+				{
+					"role": "toolResult",
+					"toolCallId": "call-li-1",
+					"toolName": "send_message",
+					"content": [
+						{
+							"type": "text",
+							"text": "Not sent: the request was corrected while this call was held."
+						}
+					],
+					"isError": true,
+					"timestamp": 3000,
+					"lateInputHold": {
+						"heldMs": 1400,
+						"reason": "correction"
+					}
+				}
+			],
+			"costUsd": 0.0011,
+			"createdAt": 3000,
+			"causeEventId": "matrix:aria:$li-trigger",
+			"cause": {
+				"eventId": "matrix:aria:$li-trigger",
+				"senderId": "@ada:matrix.example.org",
+				"senderName": "Ada",
+				"body": "can you post the meetup time in the events room? it's at 7:30pm",
+				"timestamp": 1000,
+				"editedAt": 8250
+			}
+		},
+		{
+			"branchNo": 2,
+			"parentBranchNo": 0,
+			"forkIndex": 0,
+			"reason": "addition_redo",
+			"checkCode": null,
+			"decisionEvaluationId": null,
+			"fromModel": null,
+			"toModel": null,
+			"messages": [
+				{
+					"type": "triggerGroup",
+					"role": "user",
+					"timestamp": 3000,
+					"content": "<message from=\"Ada\">can you post the meetup time in the events room? it's at 7pm</message>"
+				},
+				{
+					"role": "assistant",
+					"content": [
+						{
+							"type": "toolCall",
+							"id": "call-li-2",
+							"name": "search_messages",
+							"arguments": {
+								"query": "meetup venue"
+							}
+						}
+					],
+					"api": "openai-completions",
+					"provider": "example",
+					"model": "vendor/model_a",
+					"usage": {
+						"input": 6100,
+						"output": 40,
+						"cacheRead": 0,
+						"cacheWrite": 0,
+						"totalTokens": 6140,
+						"cost": {
+							"input": 0,
+							"output": 0,
+							"cacheRead": 0,
+							"cacheWrite": 0,
+							"total": 0.0011
+						}
+					},
+					"stopReason": "toolUse",
+					"timestamp": 3400,
+					"served": {
+						"logicalId": "model_a"
+					}
+				},
+				{
+					"role": "toolResult",
+					"toolCallId": "call-li-2",
+					"toolName": "search_messages",
+					"content": [
+						{
+							"type": "text",
+							"text": "2 messages: the meetup is at the Elm St hall."
+						}
+					],
+					"isError": false,
+					"timestamp": 3600
+				}
+			],
+			"costUsd": 0.0011,
+			"createdAt": 4200,
+			"causeEventId": "matrix:aria:$li-addition",
+			"cause": {
+				"eventId": "matrix:aria:$li-addition",
+				"senderId": "@grace:matrix.example.org",
+				"senderName": "Grace",
+				"body": "also tell people to bring snacks!",
+				"timestamp": 3700,
+				"editedAt": null
+			}
+		},
+		{
+			"branchNo": 3,
+			"parentBranchNo": 0,
+			"forkIndex": 3,
+			"reason": "turn_aborted",
+			"checkCode": null,
+			"decisionEvaluationId": null,
+			"fromModel": null,
+			"toModel": null,
+			"messages": [
+				{
+					"role": "assistant",
+					"content": [
+						{
+							"type": "text",
+							"text": "Posted! Anything else you"
+						}
+					],
+					"api": "openai-completions",
+					"provider": "example",
+					"model": "vendor/model_a",
+					"usage": {
+						"input": 0,
+						"output": 0,
+						"cacheRead": 0,
+						"cacheWrite": 0,
+						"totalTokens": 0,
+						"cost": {
+							"input": 0,
+							"output": 0,
+							"cacheRead": 0,
+							"cacheWrite": 0,
+							"total": 0
+						}
+					},
+					"stopReason": "aborted",
+					"timestamp": 8100,
+					"served": {
+						"logicalId": "model_a"
+					}
+				}
+			],
+			"costUsd": null,
+			"createdAt": 8300,
+			"causeEventId": null,
+			"cause": null
+		},
+		{
+			"branchNo": 4,
+			"parentBranchNo": 0,
+			"forkIndex": 6,
+			"reason": "revival",
+			"checkCode": null,
+			"decisionEvaluationId": null,
+			"fromModel": null,
+			"toModel": null,
+			"messages": [
+				{
+					"role": "user",
+					"content": [
+						{
+							"type": "text",
+							"text": "A later session will see only the chat and this record. Write what it needs to continue this work."
+						}
+					],
+					"harness": {
+						"kind": "record_turn"
+					},
+					"timestamp": 9000
+				},
+				{
+					"role": "assistant",
+					"content": [
+						{
+							"type": "toolCall",
+							"id": "call-li-rec-1",
+							"name": "session_record_tool",
+							"arguments": {
+								"action": "create",
+								"text": "Posted the meetup time (7:30pm, Elm St hall)."
+							}
+						}
+					],
+					"api": "openai-completions",
+					"provider": "example",
+					"model": "vendor/model_a",
+					"usage": {
+						"input": 6900,
+						"output": 50,
+						"cacheRead": 0,
+						"cacheWrite": 0,
+						"totalTokens": 6950,
+						"cost": {
+							"input": 0,
+							"output": 0,
+							"cacheRead": 0,
+							"cacheWrite": 0,
+							"total": 0.0012
+						}
+					},
+					"stopReason": "toolUse",
+					"timestamp": 9200,
+					"served": {
+						"logicalId": "model_a"
+					}
+				},
+				{
+					"role": "toolResult",
+					"toolCallId": "call-li-rec-1",
+					"toolName": "session_record_tool",
+					"content": [
+						{
+							"type": "text",
+							"text": "Record saved."
+						}
+					],
+					"isError": false,
+					"timestamp": 9300
+				}
+			],
+			"costUsd": 0.0012,
+			"createdAt": 9400,
+			"causeEventId": "matrix:aria:$li-revival",
+			"cause": {
+				"eventId": "matrix:aria:$li-revival",
+				"senderId": "@grace:matrix.example.org",
+				"senderName": "Grace",
+				"body": "is it still at the Elm St hall?",
+				"timestamp": 8900,
+				"editedAt": null
+			}
+		}
+	],
+	"refusalEvents": [],
+	"contract": {
+		"outcome": null,
+		"nudges": null,
+		"maxNudges": null,
+		"attempts": []
+	},
+	"checks": [],
+	"audits": [],
+	"interjections": [
+		{
+			"eventId": "matrix:aria:$li-trigger",
+			"externalId": "$li-trigger",
+			"senderId": "@ada:matrix.example.org",
+			"senderName": "Ada",
+			"kind": "edit",
+			"body": "can you post the meetup time in the events room? it's at 7:30pm",
+			"createdAt": 8300
+		},
+		{
+			"eventId": "matrix:aria:$li-revival",
+			"externalId": "$li-revival",
+			"senderId": "@grace:matrix.example.org",
+			"senderName": "Grace",
+			"kind": "revival",
+			"body": "is it still at the Elm St hall?",
+			"createdAt": 9400
+		}
+	]
+}
