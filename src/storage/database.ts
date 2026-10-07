@@ -1363,13 +1363,28 @@ export interface RefusalPin {
   at: number;
 }
 
+/**
+ * Why a span was discarded (ARCHITECTURE.md §8j "Redo and branches"):
+ * `refusal_redo` / `contract_redo` (REFUSAL-HANDLING), `edit_redo` /
+ * `addition_redo` (a redo from scratch after a trigger edit or a late addition),
+ * `revival` (the record turn of a settled session revived by a message), and
+ * `turn_aborted` (an in-flight generation aborted to deliver an interjection).
+ */
+export type SessionBranchReason =
+  | "refusal_redo"
+  | "contract_redo"
+  | "edit_redo"
+  | "addition_redo"
+  | "revival"
+  | "turn_aborted";
+
 /** Insert payload for {@link Storage.insertSessionBranch}; `branch_no` is allocated by the store. */
 export interface SessionBranchInsert {
   sessionId: string;
   parentBranchNo?: number;
   /** Index in the parent branch's message list where this branch diverges. */
   forkIndex: number;
-  reason: "refusal_redo" | "contract_redo";
+  reason: SessionBranchReason;
   checkCode?: string | null;
   decisionEvaluationId?: number | null;
   fromModel?: string | null;
@@ -11076,7 +11091,7 @@ create table if not exists session_interjections (
   external_id         text,   -- Matrix $… id of the inbound message
   sender_id           text,
   sender_display_name text,
-  kind                text not null,            -- 'reply' | 'co-reply' | 'follow-up'
+  kind                text not null,            -- 'reply' | 'co-reply' | 'follow-up' | 'edit' | 'revival' | 'addition'
   body                text not null default '', -- raw inbound body (search corpus)
   created_at          integer not null
 );
@@ -11246,7 +11261,11 @@ create table if not exists usage_events (
   created_at integer not null,
   -- Short hash of the frozen system prompt the request carried (spec
   -- REFUSAL-HANDLING §12.4; added v25). Null for non-agent lanes.
-  system_prompt_hash text
+  system_prompt_hash text,
+  -- 1 when the output tokens are estimated from streamed deltas: a request
+  -- aborted mid-stream reports no output usage (ARCHITECTURE.md §8 "Late input";
+  -- added v30). Null otherwise.
+  estimated integer
 );
 
 -- NB: there is intentionally NO session_type index. Session-scoped budget rules
@@ -11908,7 +11927,7 @@ create table if not exists agent_session_branches (
   branch_no              integer not null,          -- 1.. per session; 0 is the live transcript
   parent_branch_no       integer not null default 0,
   fork_index             integer not null,          -- index in the parent's message list where it diverges
-  reason                 text not null,             -- 'refusal_redo' | 'contract_redo'
+  reason                 text not null,             -- SessionBranchReason
   check_code             text,
   decision_evaluation_id integer,
   from_model             text,
@@ -12372,7 +12391,10 @@ create table if not exists agent_sessions (
   contract_outcome text,
   contract_nudges integer,
   contract_version integer,
-  refusal_pin text
+  refusal_pin text,
+  -- Late input (ARCHITECTURE.md §8 "Late input"; added v30): redos from scratch
+  -- after a trigger edit or a late addition.
+  redo_count integer not null default 0
 );
 
 create index if not exists idx_agent_sessions_timeline
@@ -12512,7 +12534,7 @@ ${EXA_RESEARCH_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 29;
+export const LATEST_SCHEMA_VERSION = 30;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -13484,6 +13506,21 @@ function addSessionAuditsTable(db: Database.Database): void {
   db.exec(SESSION_AUDITS_SCHEMA);
 }
 
+// v29→v30 (ARCHITECTURE.md §8 "Late input"): agent_sessions.redo_count and
+// usage_events.estimated. Idempotent: a column already present is left alone.
+function addLateInputColumns(db: Database.Database): void {
+  const has = (table: string, column: string) =>
+    (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).some((c) => c.name === column);
+  const exists = (table: string) =>
+    (db.prepare(`select count(*) as n from sqlite_master where type = 'table' and name = ?`).get(table) as { n: number }).n > 0;
+  if (exists("agent_sessions") && !has("agent_sessions", "redo_count")) {
+    db.exec("ALTER TABLE agent_sessions ADD COLUMN redo_count integer not null default 0");
+  }
+  if (exists("usage_events") && !has("usage_events", "estimated")) {
+    db.exec("ALTER TABLE usage_events ADD COLUMN estimated integer");
+  }
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -13521,6 +13558,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
     if (columns.length && !columns.some((column) => column.name === "metadata_json")) db.exec("ALTER TABLE tool_invocations ADD COLUMN metadata_json TEXT");
   },                                   // v27→v28 paid service provenance
   (db) => db.exec(EXA_RESEARCH_SCHEMA),  // v28→v29 durable Exa research
+  addLateInputColumns,                  // v29→v30 late input
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write

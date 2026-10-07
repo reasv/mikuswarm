@@ -445,6 +445,32 @@ const FollowUpSchema = StrictObject({
   mention: Type.Optional(FollowUpLeverSchema),
 });
 
+// Late input (ARCHITECTURE.md §8 "Late input"): trigger edits, late additions,
+// redo from scratch, the irreversibility hold and revival. Whole block optional;
+// omitting it (or enabled = false) keeps today's behaviour: edits only update
+// the stored message, follow-ups fold through the quick windows.
+const LateInputSchema = StrictObject({
+  enabled: Type.Optional(Type.Boolean()),
+  // Hold the first irreversible call of a chat session until the trigger's
+  // arrival + this. Default 8000.
+  hold_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  // Each correction extends the hold deadline by this. Default 4000.
+  extend_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  // Absolute bound on the hold deadline, from the trigger's arrival. Default 20000.
+  max_hold_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  // Redos from scratch per session; later corrections are interjected. Default 3.
+  max_redos: Type.Optional(Type.Integer({ minimum: 0, maximum: 20 })),
+  // A request aborted before its first stream event has not written the cache:
+  // the redo waits for that event (or the request's end) at most this long. Default 10000.
+  first_event_wait_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  // Replayed tool results older than this are dropped. Default 300000.
+  replay_max_age_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  // A settled session is revived only within this long after its run ended. Default 300000.
+  revive_max_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  // Clock-skew allowance when comparing a message's send time to the run end. Default 0.
+  skew_tolerance_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+});
+
 // Capability feature gates. Each boolean turns a related group of agent tools ON.
 // Every flag is OFF by default: an absent `[features]` table — or an absent key —
 // means the feature is disabled, so its tools are NOT registered for ANY session
@@ -562,6 +588,13 @@ const DecisionFitsSchema = StrictObject({
   // "per_request" (default): the state is billed once per request.
   // "per_question": the state is re-billed for every question.
   billing: Type.Optional(Type.Union([Type.Literal("per_request"), Type.Literal("per_question")])),
+  // Most images the member reads in one request. Unset = unlimited.
+  max_images: Type.Optional(Type.Integer({ minimum: 1 })),
+  // Largest JPEG-encoded image (bytes) the member accepts. Unset = unlimited.
+  max_image_bytes: Type.Optional(Type.Integer({ minimum: 1024 })),
+  // Image transport: "state_parts" (default; labelled image_url parts after the
+  // state) or "images_field" (a top-level `images` array, the native Cloudflare shape).
+  images: Type.Optional(Type.Union([Type.Literal("state_parts"), Type.Literal("images_field")])),
 });
 
 const ModelSchema = StrictObject({
@@ -1037,6 +1070,13 @@ const DecisionPointCommonFields = {
   min_state_tokens: Type.Optional(Type.Integer({ minimum: 1 })),
   // Confidence floor for this point's choice/score verdicts.
   min_confidence: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+  // Vision decision chain for this point (a system-one chain whose members read
+  // images). Unset = `[decisions].vision_model`.
+  vision_model: Type.Optional(Type.String({ minLength: 1 })),
+  // When an evaluation of this point goes to the vision chain: "off" (captions
+  // only), "uncaptioned" (a subject image has no caption yet), "always" (any
+  // subject image). Default per point; every point is "off" without a vision chain.
+  vision: Type.Optional(Type.Union([Type.Literal("off"), Type.Literal("uncaptioned"), Type.Literal("always")])),
 };
 
 const DecisionRoutingSchema = StrictObject({
@@ -1063,6 +1103,38 @@ const DecisionRecordsSchema = StrictObject({
   candidate_max_age_ms: Type.Optional(Type.Integer({ minimum: 1 })),
   // Maximum records injected into a single session. Default 2.
   max_injected: Type.Optional(Type.Integer({ minimum: 0, maximum: 10 })),
+});
+
+// Late additions (ARCHITECTURE.md §8 "Late input"): does a message the trigger's
+// sender sent after the request (before the bot's first delivery) belong to it?
+// Without this point only the quick fold windows decide, as before.
+const DecisionLateAdditionSchema = StrictObject({
+  ...DecisionPointCommonFields,
+  // `belongs` probability at or above which a candidate joins the request. Default 0.7.
+  threshold: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+  // Candidates are messages sent within this long of the trigger. Default 60000.
+  candidate_window_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  // Most candidates judged per session (cost and noise bound). Default 8.
+  max_judged: Type.Optional(Type.Integer({ minimum: 0, maximum: 50 })),
+  // Most messages that join one request, whatever admitted them. Default 3.
+  max_folded: Type.Optional(Type.Integer({ minimum: 0, maximum: 20 })),
+  // Messages before the trigger in the state. Default 5.
+  recent_messages: Type.Optional(Type.Integer({ minimum: 0, maximum: 30 })),
+});
+
+// Implicit replies (ARCHITECTURE.md §8 "Late input"): does a bare group message
+// reply to a specific recent bot message without the reply function or a
+// mention? A yes is handled exactly as an explicit reply to it.
+const DecisionImplicitReplySchema = StrictObject({
+  ...DecisionPointCommonFields,
+  // `replies` probability at or above which the message becomes a reply. Default 0.8.
+  threshold: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+  // The message must come within this many messages after the bot message. Default 3.
+  max_messages_after: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+  // ... and within this long of it. Default 120000.
+  max_age_ms: Type.Optional(Type.Integer({ minimum: 0 })),
+  // Recent chat messages before the bot message in the state. Default 6.
+  recent_messages: Type.Optional(Type.Integer({ minimum: 0, maximum: 30 })),
 });
 
 // The output gate's decision point (spec REFUSAL-HANDLING §6): judged checks at
@@ -1223,10 +1295,23 @@ const DecisionsSchema = StrictObject({
   // Per-member threshold overrides, keyed by `[models.*]` key: a threshold name
   // ("min_confidence") overrides it for every point, "<point>.<name>" for one.
   calibration: Type.Optional(Type.Record(Type.String(), Type.Record(Type.String(), Type.Number({ minimum: 0, maximum: 1 })))),
+  // Default vision decision chain (a system-one chain whose members declare
+  // "image" input). Unset = no vision evaluations; every point uses captions.
+  vision_model: Type.Optional(Type.String({ minLength: 1 })),
+  // Hard timeout of a vision evaluation (whole chain). Default 8000.
+  vision_timeout_ms: Type.Optional(Type.Integer({ minimum: 100 })),
+  // Most images per evaluation (further capped by the member's decision.max_images). Default 4.
+  max_images: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })),
+  // Images are downscaled to at most this many pixels. Default 1000000.
+  image_max_pixels: Type.Optional(Type.Integer({ minimum: 1024 })),
+  // ... and re-encoded as JPEG under this many bytes. Default 200000.
+  max_image_bytes: Type.Optional(Type.Integer({ minimum: 1024 })),
   routing: Type.Optional(DecisionRoutingSchema),
   records: Type.Optional(DecisionRecordsSchema),
   checks: Type.Optional(DecisionChecksSchema),
   audit: Type.Optional(DecisionAuditSchema),
+  late_addition: Type.Optional(DecisionLateAdditionSchema),
+  implicit_reply: Type.Optional(DecisionImplicitReplySchema),
 });
 
 const AgentModelsSchema = StrictObject({
@@ -1502,6 +1587,14 @@ const McpServerSchema = StrictObject({
     Type.Literal("sse"),
   ])),
   headers: Type.Optional(Type.Record(Type.String(), Type.String())),
+  // Effect class per tool (the tool's bare MCP name), overriding the server's
+  // tool annotations (ARCHITECTURE.md §10 "Tool effect classes").
+  effects: Type.Optional(Type.Record(Type.String(), Type.Union([
+    Type.Literal("redo_safe"),
+    Type.Literal("repeatable"),
+    Type.Literal("undoable"),
+    Type.Literal("irreversible"),
+  ]))),
 });
 
 const McpSchema = StrictObject({
@@ -2335,6 +2428,9 @@ export const AppConfigSchema = StrictObject({
       // Whole block optional; omitting it leaves folding off. Cross-field checks
       // (per-lever user_gap_ms ≤ wall_clock_ms) in app.ts.
       followup: Type.Optional(FollowUpSchema),
+      // Late input (ARCHITECTURE.md §8 "Late input"): redo from scratch on a
+      // trigger edit or late addition, the irreversibility hold, revival.
+      late_input: Type.Optional(LateInputSchema),
     }),
     system: StrictObject({
       fallback_prompt: Type.Optional(Type.String()),

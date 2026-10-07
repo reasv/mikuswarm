@@ -36,7 +36,7 @@ export type SessionLiveEvent =
       type: "branch_forked";
       branchNo: number;
       forkIndex: number;
-      reason: "refusal_redo" | "contract_redo";
+      reason: import("../storage/database.js").SessionBranchReason;
       checkCode?: string;
       fromModel?: string;
       toModel?: string;

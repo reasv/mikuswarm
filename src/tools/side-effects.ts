@@ -9,7 +9,12 @@
  * safe direction only moves the fork point later.
  */
 
-export type ToolEffect = "redo_safe" | "irreversible";
+/**
+ * `redo_safe`: no external effect. `repeatable`: no effect anyone else sees, but
+ * repeating it costs money or time (its result is replayed on a redo).
+ * `undoable`: visible, with a compensating action. `irreversible`: anything else.
+ */
+export type ToolEffect = "redo_safe" | "repeatable" | "undoable" | "irreversible";
 
 /** Tools that post or edit model-written text in a chat (the output gate's tools, §6.1). */
 const POSTING_TOOLS = new Set(["send_message", "send_dm", "send_to_channel", "edit_message", "create_poll"]);

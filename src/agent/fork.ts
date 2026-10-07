@@ -13,6 +13,7 @@
 
 import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Storage } from "../storage/index.js";
+import type { SessionBranchReason } from "../storage/database.js";
 import type { Logger } from "../observability/logger.js";
 import type { SessionLiveEventBus } from "../observability/live-events.js";
 import { isPostingTool, toolEffect } from "../tools/side-effects.js";
@@ -32,7 +33,7 @@ export interface ForkPoint {
 }
 
 export interface ForkMeta {
-  reason: "refusal_redo" | "contract_redo";
+  reason: SessionBranchReason;
   checkCode?: string;
   decisionEvaluationId?: number;
   fromModel?: string;

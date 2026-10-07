@@ -71,19 +71,20 @@ function downgradeToV24(storage: Storage): Promise<void> {
     db.exec("drop table refusal_events");
     db.exec("drop table contract_attempts");
     db.exec("drop table agent_session_branches");
-    for (const col of ["contract_outcome", "contract_nudges", "contract_version", "refusal_pin"]) {
+    for (const col of ["contract_outcome", "contract_nudges", "contract_version", "refusal_pin", "redo_count"]) {
       db.exec(`alter table agent_sessions drop column ${col}`);
     }
     for (const col of ["checkpoint", "branch_no", "tool_call_id", "attempt_no", "consequence"]) {
       db.exec(`alter table decision_evaluations drop column ${col}`);
     }
     db.exec("alter table usage_events drop column system_prompt_hash");
+    db.exec("alter table usage_events drop column estimated");
     db.pragma("user_version = 24");
   });
 }
 
-test("schema: LATEST_SCHEMA_VERSION is 29 (v25 refusals, v26 behaviour, v27 audits, v28 metadata, v29 research)", () => {
-  assert.equal(LATEST_SCHEMA_VERSION, 29);
+test("schema: LATEST_SCHEMA_VERSION is 30 (v25 refusals, v26 behaviour, v27 audits, v28 metadata, v29 research, v30 late input)", () => {
+  assert.equal(LATEST_SCHEMA_VERSION, 30);
 });
 
 test("migration: a v24 database migrates to the fresh-DB shape, rows kept", async () => {

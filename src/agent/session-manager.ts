@@ -31,7 +31,7 @@ export interface InterjectionSource {
   externalId?: string | null;
   senderId?: string | null;
   senderDisplayName?: string | null;
-  kind: "reply" | "co-reply" | "follow-up";
+  kind: "reply" | "co-reply" | "follow-up" | "edit" | "revival" | "addition";
   body: string;
 }
 
