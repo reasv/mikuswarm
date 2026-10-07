@@ -155,9 +155,20 @@ export function formatChange(
 
 // ── Over-time chart (inline SVG, the usage page's approach) ──────────────────
 
+export interface BehaviourChartPoint {
+	bucket: number;
+	rate: number;
+	count: number;
+	denominator: number;
+	/** Denominator below the rate's minSample: drawn hollow, like the scorecard greys it. */
+	low: boolean;
+}
+
 export interface BehaviourLine {
 	group: string;
-	points: Array<{ bucket: number; rate: number }>;
+	points: BehaviourChartPoint[];
+	/** `points` split where a bucket has no rate: a line never bridges a gap. */
+	runs: BehaviourChartPoint[][];
 }
 
 export interface BehaviourChartModel {
@@ -170,27 +181,40 @@ export interface BehaviourChartModel {
 }
 
 /**
- * Lines per group over the window's buckets. Buckets without a rate (no
- * denominator) break nothing: the line simply connects the buckets that have
- * one. Markers are kept as given (the API already filtered and collapsed them).
+ * Lines per group over the window's buckets, ordered by group. A bucket without a rate (no
+ * denominator) breaks the line: the runs on either side are drawn apart.
+ * Markers are kept as given (the API already filtered and collapsed them).
  */
 export function buildBehaviourChart(
 	points: readonly BehaviourSeriesPoint[],
 	since: number,
 	until: number,
 	bucketMs: number,
-	markers: readonly BehaviourMarker[]
+	markers: readonly BehaviourMarker[],
+	minSample = 0
 ): BehaviourChartModel {
-	const byGroup = new Map<string, Array<{ bucket: number; rate: number }>>();
+	const byGroup = new Map<string, BehaviourChartPoint[]>();
 	let max = 0;
 	for (const p of points) {
 		if (p.rate == null) continue;
 		const arr = byGroup.get(p.group) ?? [];
-		arr.push({ bucket: p.bucket, rate: p.rate });
+		arr.push({ bucket: p.bucket, rate: p.rate, count: p.count, denominator: p.denominator, low: p.denominator < minSample });
 		byGroup.set(p.group, arr);
 		if (p.rate > max) max = p.rate;
 	}
-	const lines = [...byGroup].map(([group, pts]) => ({ group, points: pts.sort((a, b) => a.bucket - b.bucket) }));
+	const lines = [...byGroup]
+		.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+		.map(([group, pts]) => {
+			pts.sort((a, b) => a.bucket - b.bucket);
+			const runs: BehaviourChartPoint[][] = [];
+			for (const p of pts) {
+				const run = runs.at(-1);
+				const prev = run?.at(-1);
+				if (run && prev && bucketMs > 0 && p.bucket - prev.bucket <= bucketMs) run.push(p);
+				else runs.push([p]);
+			}
+			return { group, points: pts, runs };
+		});
 	const buckets: number[] = [];
 	if (bucketMs > 0) {
 		const first = Math.min(Math.floor(since / bucketMs) * bucketMs, ...points.map((p) => p.bucket));

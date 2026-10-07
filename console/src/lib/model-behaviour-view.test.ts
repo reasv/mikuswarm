@@ -109,6 +109,16 @@ describe('chart model', () => {
 		expect(x).toBeLessThan(1);
 	});
 
+	it('a missing bucket splits the line into runs; small samples are flagged', () => {
+		const H = 3_600_000;
+		const pt = (bucket: number, denominator: number, group = 'g') => ({ bucket: bucket * H, group, count: 1, denominator, rate: 1 / denominator });
+		const m = buildBehaviourChart([pt(0, 30), pt(1, 2), pt(3, 25), pt(0, 5, 'a')], 0, 4 * H, H, [], 20);
+		expect(m.lines.map((l) => l.group)).toEqual(['a', 'g']);
+		const g = m.lines[1]!;
+		expect(g.runs.map((r) => r.map((p) => p.bucket / H))).toEqual([[0, 1], [3]]);
+		expect(g.points.map((p) => p.low)).toEqual([false, true, false]);
+	});
+
 	it('buckets without a rate draw nothing; an empty series has no lines', () => {
 		const m = buildBehaviourChart([{ bucket: 0, group: 'g', count: 0, denominator: 0, rate: null }], 0, 3_600_000, 3_600_000, []);
 		expect(m.lines).toEqual([]);

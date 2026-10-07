@@ -46,7 +46,7 @@ test('chart: one line per group, change markers listing their events on hover', 
 		selected: 'model_b'
 	});
 	await expect.element(page.getByTestId('behaviour-chart')).toBeInTheDocument();
-	expect(container.querySelectorAll('polyline')).toHaveLength(3);
+	expect(container.querySelectorAll('[data-testid="series"]')).toHaveLength(3);
 	expect(container.querySelectorAll('[data-testid="change-marker"]')).toHaveLength(1);
 	const hit = container.querySelector('rect[role="presentation"]')!;
 	hit.dispatchEvent(new PointerEvent('pointerenter', { bubbles: true }));
@@ -138,7 +138,7 @@ test('chart: a keyed family plots one line per key; an empty one explains itself
 		selected: 'model_b',
 		scope: 'model_b'
 	});
-	expect(container.querySelectorAll('polyline')).toHaveLength(1);
+	expect(container.querySelectorAll('[data-testid="series"]')).toHaveLength(1);
 	await expect.element(page.getByText('text_only').first()).toBeInTheDocument();
 });
 
