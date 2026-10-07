@@ -196,8 +196,17 @@ Edits are not candidates (§5.1). A DM message or a re-`@` is eligible like any 
 
 **Membership** is judged by the `late_addition` decision point for every eligible message, **including those inside the quick fold windows** (no reason to exempt them). It is asked when the message arrives, in parallel with the model's work, so its latency hides inside the hold window (§4.2); the held call waits for a verdict still pending at the deadline, bounded by the point's timeout.
 
-- **State**: `{ request: [trigger group messages], between: [messages from others between the request and the candidate], message, age }`; nothing implies the candidate is addressed to the bot. Attachments appear as metadata (kind, type, filename, size) with a caption only if one already exists: the judgement **never waits** for captions or pixels. Whether an image posted right after a request belongs to it rarely depends on its contents.
-- **Question**: `belongs`, `noul`: "`message` continues, corrects or adds to `request`, written by the same person for the same purpose."
+- **Where the signal is.** For a media candidate it is usually in the text around it, not in its contents: the request points at something it does not contain ("look at this", "what's this?", a question about a picture with none attached); whether the request already carries attachments; what others said in between and whether the conversation moved on; whether the sender was exchanging media with someone else just before the trigger; the gap. Attachment metadata alone (an image was posted) says nothing about what it relates to.
+- **State**:
+  ```json
+  { "before":  [ { "from": "...", "text": "...", "age": "40s before" } ],          // ~5 messages before the trigger
+    "request": { "from": "A", "text": "what breed is this?", "attachments": [] },
+    "between": [ { "from": "B", "text": "...", "age": "6s after request" } ],
+    "message": { "from": "A", "text": "", "attachments": [ { "kind": "image", "caption": null } ], "age": "12s after request" } }
+  ```
+  Attachments of the request and the candidate are listed with a caption only when one already exists: the judgement never waits for captioning. Nothing implies the candidate is addressed to the bot.
+- **Question**: `belongs`, `noul`: "`message` supplies something `request` refers to or expects, or continues, corrects or adds to it, written by the same person for the same purpose."
+- **Pixels.** A media candidate goes to the point's `vision_model` chain with its pixels when one is configured (DECISION-MODEL §3.5; decision members that read images, not one that answers from an image it cannot see), waiting only for the download, which the redo needs anyway. Without a vision member, the text-only state above is used; the case it cannot settle (a request complete on its own, followed by an image) leans to "no" through the threshold.
 - **Verdict**: `belongs ≥ threshold` → a late addition. Below → not folded (inert in a group, native fate in a DM or for a re-`@`).
 - **Fallback** (point off, no decision model, or a failed call): the quick fold windows of FOLLOWUP-FOLDING §4 decide, as today; the longer window only makes sense with a judgement.
 
