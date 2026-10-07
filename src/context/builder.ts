@@ -96,6 +96,13 @@ export interface ImageBlock {
 export interface BuildContextOptions {
   /** Decision-model routing additions to the satellite (ARCHITECTURE.md §8h). */
   routedSatellite?: RoutedSatellite;
+  /**
+   * Redo rebuild (ARCHITECTURE.md §8 "Late input"): render only timeline events
+   * received at or before this instant (the first build's
+   * {@link BuiltContext.timelineCutoff}), plus the trigger group whenever it
+   * arrived, so the rebuilt prefix matches the first build byte for byte.
+   */
+  timelineCutoff?: number;
   timelineKey: string;
   trigger: CanonicalChatEvent;
   activeSessions: AgentSessionRecord[];
@@ -233,6 +240,12 @@ export interface BuiltContext {
    * {@link ToolBlockSummary}.
    */
   toolBlock?: ToolBlockSummary;
+  /**
+   * Live chat builds: the latest `receivedAt` among the timeline events the build
+   * read, i.e. the cutoff a redo rebuild passes back as
+   * {@link BuildContextOptions.timelineCutoff}. Undefined for generation builds.
+   */
+  timelineCutoff?: number;
 }
 
 /**
@@ -436,6 +449,16 @@ export class ContextBuilder {
       }
     }
 
+    // Redo rebuild (§8 "Late input"): only what the first build saw, plus the
+    // (possibly grown) trigger group. A first build records its own cutoff.
+    const cutoffKeep = !generation && options.timelineCutoff !== undefined
+      ? (e: CanonicalChatEvent) => e.receivedAt <= options.timelineCutoff! || triggerGroupIds.has(e.id)
+      : undefined;
+    if (cutoffKeep) events = events.filter(cutoffKeep);
+    const timelineCutoff = generation
+      ? undefined
+      : options.timelineCutoff ?? events.reduce((max, e) => Math.max(max, e.receivedAt ?? 0), 0);
+
     this.logger?.debug("summary_coverage_resolved", {
       timelineKey: options.timelineKey,
       coverageEndEventId: selection.coverageEndEventId,
@@ -472,6 +495,7 @@ export class ContextBuilder {
         selection,
         options.priority ?? "interactive",
         options.abortSignal,
+        cutoffKeep,
       );
       compactionInput = resolved.events;
       // Adopt the post-wait selection so the summary layer renders the summary
@@ -855,6 +879,7 @@ export class ContextBuilder {
       renderedInputIds,
       systemPromptSegments,
       toolBlock,
+      ...(timelineCutoff !== undefined ? { timelineCutoff } : {}),
     };
   }
 
@@ -1214,6 +1239,7 @@ export class ContextBuilder {
     selection: SummarySelection,
     waiterClass: PriorityClass,
     abortSignal?: AbortSignal,
+    keep?: (event: CanonicalChatEvent) => boolean,
   ): Promise<{
     events: CanonicalChatEvent[];
     selection: SummarySelection;
@@ -1284,7 +1310,7 @@ export class ContextBuilder {
         // failed job's placeholder) advances the coverage cursor and trims the
         // raw set; the events move from the raw turns into the summary layer
         // together — never dropped from both.
-        const requeried = this.requeryAfterCoverageAdvance(timelineKey, triggerGroupIds);
+        const requeried = this.requeryAfterCoverageAdvance(timelineKey, triggerGroupIds, keep);
         current = requeried ?? current;
         continue;
       }
@@ -1376,6 +1402,7 @@ export class ContextBuilder {
   private requeryAfterCoverageAdvance(
     timelineKey: string,
     triggerGroupIds: Set<string>,
+    keep?: (event: CanonicalChatEvent) => boolean,
   ): {
     events: CanonicalChatEvent[];
     selection: SummarySelection;
@@ -1383,9 +1410,8 @@ export class ContextBuilder {
   } | null {
     const reselected = selectSummaryCoverage(this.storage, timelineKey);
     if (!reselected.coverageEndEventId) return null;
-    const allRequeried = this.hydrateEvents(
-      this.store.queryAfterContext(timelineKey, reselected.coverageEndEventId),
-    );
+    const queried = this.store.queryAfterContext(timelineKey, reselected.coverageEndEventId);
+    const allRequeried = this.hydrateEvents(keep ? queried.filter(keep) : queried);
     return {
       events: allRequeried.filter((e) => !triggerGroupIds.has(e.id)),
       selection: reselected,

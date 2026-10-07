@@ -18,6 +18,10 @@ export interface SessionRunResult {
   sessionId: string;
   noReply: boolean;
   retries: number;
+  /** The request was cancelled by a late-input step (its trigger was deleted). */
+  cancelled?: boolean;
+  /** The agent the run ended on (a redo from scratch replaces the initial one). */
+  agent?: Agent;
 }
 
 export class SessionRunnerError extends Error {
@@ -93,7 +97,30 @@ export interface SessionRunnerOptions {
    * gate implements it; observe-only, it returns without waiting.
    */
   endings?: SessionEndingHook;
+  /**
+   * Late input (ARCHITECTURE.md §8 "Late input"): consulted at every idle point
+   * before the run's state is read. A step either continues the run (a redo
+   * from scratch hands over a rebuilt agent and its kickoff; an abort-and-
+   * interject continues the same agent, whose aborted turn the step removed),
+   * or ends it (a cancelled request).
+   */
+  lateInput?: {
+    next(agent: Agent): Promise<LateInputStep | undefined>;
+  };
 }
+
+/** What the runner does with a late-input step. */
+export type LateInputStep =
+  | {
+      kind: "continue";
+      agent: Agent;
+      /** Prompted on `agent` (a restart's kickoff); absent = `agent.continue()`. */
+      kickoff?: AgentMessage | AgentMessage[];
+      /** The new agent's redo handler and ending hook (a restart). */
+      redo?: SessionRunnerOptions["redo"];
+      endings?: SessionEndingHook;
+    }
+  | { kind: "end"; noReply: boolean; cancelled?: boolean };
 
 /** A run that ended without a send tool, as the runner reports it. */
 export interface SessionEnding {
@@ -132,7 +159,14 @@ export type RedoOutcome =
 const TYPING_KEEPALIVE_MS = 1_000;
 
 export class SessionRunner {
-  constructor(private readonly options: SessionRunnerOptions = {}) {}
+  /** The redo handler and ending hook in use; a redo from scratch replaces them. */
+  private redoBinding: SessionRunnerOptions["redo"];
+  private endingsBinding: SessionEndingHook | undefined;
+
+  constructor(private readonly options: SessionRunnerOptions = {}) {
+    this.redoBinding = options.redo;
+    this.endingsBinding = options.endings;
+  }
 
   /**
    * Drive a session run to a terminal state. `kickoff` is the frozen final user
@@ -144,12 +178,13 @@ export class SessionRunner {
    * starting a new turn.
    */
   async run(
-    agent: Agent,
+    initialAgent: Agent,
     session: AgentSessionRecord,
     maxRetries: number,
     kickoff: AgentMessage | AgentMessage[] | undefined,
     lifecycle?: SessionRunLifecycle,
   ): Promise<SessionRunResult> {
+    let agent = initialAgent;
     let retries = 0;
     let nudges = 0;
     let typingInterval: NodeJS.Timeout | undefined;
@@ -201,10 +236,36 @@ export class SessionRunner {
       };
       // A redo the ending hook filed (a refusal judged at an ending, spec §5.4).
       const takeRedo = (): RedoRequest | undefined =>
-        !lifecycle?.isInterrupted() ? this.options.redo?.control.take() : undefined;
+        !lifecycle?.isInterrupted() ? this.redoBinding?.control.take() : undefined;
+
+      // Late input (§8 "Late input"): a pending step is applied before anything
+      // reads the settled turn. Returns a result to end the run with, true to
+      // re-enter the loop, or false when nothing was pending.
+      const applyLateInput = async (): Promise<SessionRunResult | boolean> => {
+        if (!this.options.lateInput || lifecycle?.isInterrupted()) return false;
+        const step = await this.options.lateInput.next(agent);
+        if (!step) return false;
+        if (step.kind === "end") {
+          return { sessionId: session.id, noReply: step.noReply, retries: nudges, cancelled: step.cancelled, agent };
+        }
+        if (step.agent !== agent) {
+          agent = step.agent;
+          if (step.redo) this.redoBinding = step.redo;
+          this.endingsBinding = step.endings;
+          contractRedone.clear();
+        }
+        retries = 0;
+        if (step.kickoff !== undefined) await promptAgent(agent, step.kickoff);
+        else await continueAgent(agent);
+        return true;
+      };
 
       for (;;) {
         await waitForAgentIdle(agent);
+
+        const late = await applyLateInput();
+        if (late === true) continue;
+        if (late) return late;
 
         // A redo request filed during the run (the gate, spec §8.4) is taken
         // before anything reads the settled turn: the run stopped on purpose
@@ -235,13 +296,17 @@ export class SessionRunner {
         ) {
           // An ending without a send is judged (spec §5.4); a refusal there
           // discards it and redoes the turn on the rule's model (§8.4).
-          await reportEnding(this.options.endings, agent, nudges, lifecycle);
+          await reportEnding(this.endingsBinding, agent, nudges, lifecycle);
           const endingRedo = takeRedo();
           if (endingRedo) {
             const result = await applyRedo(endingRedo);
             if (result) return result;
             continue;
           }
+          // A correction that landed while the ending settled still applies.
+          const lateAtEnd = await applyLateInput();
+          if (lateAtEnd === true) continue;
+          if (lateAtEnd) return lateAtEnd;
           break;
         }
 
@@ -257,14 +322,14 @@ export class SessionRunner {
         // judged refusal with a matching rule redoes the turn on the rule's
         // model; otherwise one same-model contract redo per failure point (§7.5);
         // a second exhaustion in the same span gives up as before.
-        await reportEnding(this.options.endings, agent, nudges, lifecycle);
+        await reportEnding(this.endingsBinding, agent, nudges, lifecycle);
         const refusalRedo = takeRedo();
         if (refusalRedo) {
           const result = await applyRedo(refusalRedo);
           if (result) return result;
           continue;
         }
-        if (this.options.contractRedo && this.options.redo) {
+        if (this.options.contractRedo && this.redoBinding) {
           const point = failurePoint(agent.state.messages);
           if (!contractRedone.has(point)) {
             contractRedone.add(point);
@@ -287,11 +352,12 @@ export class SessionRunner {
         sessionId: session.id,
         noReply,
         retries: nudges,
+        agent,
       };
     } finally {
       // A redo nobody took (an operator Stop won) must not outlive the run: it
       // would stop the record turn's loop after its first turn.
-      this.options.redo?.control.take();
+      this.redoBinding?.control.take();
       // The run has settled: clear the logically-running flag so a late Stop is
       // (correctly) reported as "not running" and defers to the terminal handler.
       lifecycle?.clearRunInProgress();
@@ -304,7 +370,7 @@ export class SessionRunner {
 
   /** Hand a redo request to `onRedo`; a throwing handler gives up silently (logged). */
   private async redo(req: RedoRequest, agent: Agent, session: AgentSessionRecord): Promise<RedoOutcome> {
-    const handler = this.options.redo;
+    const handler = this.redoBinding;
     if (!handler) return { action: "give_up", noReply: true };
     try {
       return await handler.onRedo(req, agent);

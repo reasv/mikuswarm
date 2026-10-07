@@ -55,6 +55,8 @@ import type {
 } from "../budget/index.js";
 import { TurnResultBudget } from "./tool-result-budget.js";
 import { wrapToolsWithResultBudget } from "./tool-result-wrap.js";
+import { RequestProgress, withRequestProgress } from "./request-progress.js";
+import type { LateInputSession } from "./late-input.js";
 import {
   DynamicToolRegistry,
   matchToolPatterns,
@@ -462,6 +464,18 @@ export interface CreateAgentOptions {
    * user's REMAINING total headroom. Absent = the static ceiling (today's behavior).
    */
   costCeilingOverride?: number;
+  /**
+   * Late input (ARCHITECTURE.md §8 "Late input"): the session's controller. The
+   * factory routes the raw catalog through its replay store and the final tool
+   * list through its irreversibility hold, and tracks request progress for its
+   * abort rule. Absent = no late input (internal jobs, proactive).
+   */
+  lateInput?: LateInputSession;
+  /**
+   * Redo rebuild: the first build's {@link CreatedAgent.timelineCutoff}, so the
+   * rebuilt prefix matches it (ARCHITECTURE.md §8 "Late input").
+   */
+  timelineCutoff?: number;
 }
 
 export interface CreatedAgent {
@@ -497,6 +511,10 @@ export interface CreatedAgent {
   snapshot?: ContextMessage[];
   /** Snapshot-level token totals copied verbatim from `BuiltContext` (§11 top bar). */
   tokenEstimate?: number;
+  /** The build's timeline cutoff (latest `receivedAt` it read); a redo rebuild reuses it. */
+  timelineCutoff?: number;
+  /** Where the in-flight LLM request is (the late-input abort rule). */
+  requestProgress: RequestProgress;
   compactTokens?: number;
   richTokens?: number;
   /**
@@ -1005,6 +1023,7 @@ export class AgentSessionFactory {
               sessionType: session.sessionType,
               onAdmissionWait: (waitMs) => {
                 admissionWait.last = waitMs;
+                requestProgress.noteAdmitted();
               },
             }
           : undefined,
@@ -1400,7 +1419,9 @@ export class AgentSessionFactory {
     // which have no tool-cost lane).
     const usage = opts?.usage ?? new SessionUsageTracker(opts?.usageSeed);
     usage.setPaidServiceCeiling(costCeiling);
-    const streamFn = withRequestRetry(
+    // Request progress (§8 "Late input" abort rule): call → admission → first event → end.
+    const requestProgress = new RequestProgress(scheduler !== undefined);
+    const retryingStreamFn = withRequestRetry(
       sessionStreamFn,
       {
         maxWaitMs: interactiveBudget ? interactiveMaxWaitMs : undefined,
@@ -1449,14 +1470,18 @@ export class AgentSessionFactory {
         // The output gate joins the same tap to start judging a send at
         // `toolcall_end` (spec REFUSAL-HANDLING §6.3).
         ...withGateTap(
-          this.options.liveEvents
-            ? {
-                onAttemptEvent: (attempt: number, event: unknown) =>
-                  this.options.liveEvents!.publish(session.id, { type: "tentative_event", attempt, event }),
-                onAttemptDiscarded: (attempt: number, reason: string) =>
-                  this.options.liveEvents!.publish(session.id, { type: "attempt_discarded", attempt, reason }),
-              }
-            : {},
+          {
+            onAttemptEvent: (attempt: number, event: unknown) => {
+              requestProgress.noteAttemptEvent();
+              this.options.liveEvents?.publish(session.id, { type: "tentative_event", attempt, event });
+            },
+            ...(this.options.liveEvents
+              ? {
+                  onAttemptDiscarded: (attempt: number, reason: string) =>
+                    this.options.liveEvents!.publish(session.id, { type: "attempt_discarded", attempt, reason }),
+                }
+              : {}),
+          },
           outputGate,
         ),
         // Per-request usage capture (spec TOKEN-USAGE-TRACKING §3.1): the
@@ -1795,6 +1820,7 @@ export class AgentSessionFactory {
           : {}),
       },
     );
+    const streamFn = withRequestProgress(retryingStreamFn, () => requestProgress);
 
     // Load workspace files from disk at session creation time
     const workspace = earlyWorkspace ?? (await loadWorkspace(workspaceRoot, sessionTypeConfig));
@@ -1868,9 +1894,15 @@ export class AgentSessionFactory {
     const prefillText = chain.find(
       (m) => m.config.prefill?.enabled && m.config.prefill.text,
     )?.config.prefill?.text;
-    const prefillCatalog = prefillText
-      ? sessionCatalog.map(wrapToolWithAnalysisStripping)
+    // Late input (§8 "Late input"): redo-safe results are replayed from the
+    // session's store innermost, so the stored result is the raw one and the
+    // key is the call's own arguments.
+    const replayCatalog = opts?.lateInput
+      ? opts.lateInput.wrapReplayTools(sessionCatalog, () => agentRef.agent?.state.messages ?? [])
       : sessionCatalog;
+    const prefillCatalog = prefillText
+      ? replayCatalog.map(wrapToolWithAnalysisStripping)
+      : replayCatalog;
 
     // Wrap each catalog tool with the result-shaping layer (spec TOOL-RESULT-BUDGET
     // §2) BEFORE the dynamic split, so dynamically loaded tools get result shaping
@@ -1911,7 +1943,10 @@ export class AgentSessionFactory {
     // The output gate (spec REFUSAL-HANDLING §6.1) wraps inside the record-turn
     // gate, so a call the record turn blocks is never judged, and outside the
     // prefill stripping, so it sees the call's `analysis` argument.
-    const gatedTools = outputGate ? wrapToolsWithOutputGate(budgetedTools, outputGate) : budgetedTools;
+    const outputGatedTools = outputGate ? wrapToolsWithOutputGate(budgetedTools, outputGate) : budgetedTools;
+    // The irreversibility hold (§8 "Late input") wraps outside the output gate, so
+    // the gate's evaluation (started at toolcall_end) runs during the hold.
+    const gatedTools = opts?.lateInput ? opts.lateInput.wrapHoldTools(outputGatedTools) : outputGatedTools;
     const wrappedTools = opts?.recordTurnGate
       ? wrapToolsWithRecordTurnGate(gatedTools, opts.recordTurnGate)
       : gatedTools;
@@ -2089,6 +2124,7 @@ export class AgentSessionFactory {
     // §3.1): the builder's rendered input IDs, passed back to the worker for the
     // declared-vs-rendered assertion. Undefined in resume mode (no fresh build).
     let renderedInputIds: string[] | undefined;
+    let builtTimelineCutoff: number | undefined;
     if (opts?.resume) {
       // Defensive copy: the resume snapshot is a persisted array owned by the caller
       // (parsed `context_snapshot_json`). Copying it keeps the live runtime prefix
@@ -2161,7 +2197,9 @@ export class AgentSessionFactory {
         // pixel-block gate reflects the actual serving model (spec FIX 5).
         replyModelCanSeeImages,
         routedSatellite,
+        timelineCutoff: opts?.timelineCutoff,
       });
+      builtTimelineCutoff = built.timelineCutoff;
       await dumpBuiltContext(
         this.options.config.app.context_dump_dir,
         session.timelineKey,
@@ -2290,6 +2328,19 @@ export class AgentSessionFactory {
         : {}),
     });
     agentRef.agent = agent;
+    // Late input (§8 "Late input"): bind the controller to this agent, and record
+    // each held call's wait on its tool result (shown on the console's card).
+    if (opts?.lateInput) {
+      const lateInput = opts.lateInput;
+      lateInput.bind(agent, requestProgress);
+      agent.subscribe((event) => {
+        if (event.type !== "message_end") return;
+        const message = event.message as { role?: unknown; toolCallId?: unknown };
+        if (message.role !== "toolResult" || typeof message.toolCallId !== "string") return;
+        const hold = lateInput.holdRecordFor(message.toolCallId);
+        if (hold) (message as { lateInputHold?: unknown }).lateInputHold = hold;
+      });
+    }
     // A delivered message ends the refusal point: a later refusal starts its rule
     // from the first entry (spec REFUSAL-HANDLING §8.1 "Tries and same-model retries").
     agent.subscribe((event) => {
@@ -2409,6 +2460,8 @@ export class AgentSessionFactory {
       kickoff,
       snapshot,
       tokenEstimate: snapshotTokenEstimate,
+      timelineCutoff: builtTimelineCutoff,
+      requestProgress,
       compactTokens: snapshotCompactTokens,
       richTokens: snapshotRichTokens,
       usage,
@@ -2539,6 +2592,7 @@ export class AgentSessionFactory {
     replyModelCanSeeImages?: boolean;
     /** Decision-model routing additions to the satellite (§8h). */
     routedSatellite?: RoutedSatellite;
+    timelineCutoff?: number;
   }): Promise<BuiltContext> {
     const generation = Boolean(args.summarizationCutoff || args.condenseInputs || args.diaryRange);
     return this.options.contextBuilder.build({
@@ -2559,6 +2613,7 @@ export class AgentSessionFactory {
       abortSignal: args.abortSignal,
       replyModelCanSeeImages: args.replyModelCanSeeImages,
       routedSatellite: args.routedSatellite,
+      timelineCutoff: args.timelineCutoff,
     });
   }
 
