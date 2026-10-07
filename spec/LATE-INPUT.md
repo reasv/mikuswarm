@@ -95,7 +95,7 @@ The first `irreversible` call of a chat-lane session (or an `undoable` one, whos
 - The user sees the typing indicator during the wait, as during generation.
 - Proactive and synthetic sessions are never held. A session whose trigger has no human sender (a bot-chain trigger) is never held.
 
-**The trigger hold** (ARCHITECTURE.md §6) stays, shortened: its remaining job is grouping parts sent at nearly the same moment, so that routing and record selection see them together before the first request and a redo is not needed for them. With redo in place the hold is a cost optimization only; its default is chosen from the grouping data (§10).
+**The trigger hold** (ARCHITECTURE.md §6) becomes a cost optimization only: with redo in place, a part that arrives after launch is no longer lost or answered half, it costs one redo. Whether to reduce it, and to what, is an owner decision (§11). Measured (§3 deployment, 30 days): the 2 s Matrix hold grouped parts into 53 of 5,905 sessions (0.9%); of the 70 grouped parts, 45 arrived within 250 ms of the trigger, 49 within 500 ms, 56 within 1 s, 66 within 2 s. A 250–500 ms hold would still group most of them; the rest, about 20 a month, would each cost a redo, against the hold's delay on every trigger.
 
 ### 4.3 Redo from scratch
 
@@ -105,7 +105,7 @@ A redo replaces the session's rollout with a fresh one built from the corrected 
 2. **Branch**: the discarded span becomes an `agent_session_branches` row with `reason = "edit_redo"` or `"addition_redo"`, forked at index 0 (the whole rollout, including the harness injections of the old kickoff). The session id, claim, payee and typing indicator are unchanged.
 3. **Rebuild** the context against the **original build's timeline cutoff** with the correction applied: the edited body replaces the old one; a late addition joins the trigger group. Messages from other senders that arrived meanwhile are not pulled in; they reach the session as they would any running session. This keeps the prefix byte-identical to the first build up to breakpoint (c), which the cost model depends on. The runtime state (current time, active sessions) is recomputed; it lives in the final user turn, after the cached prefix.
 4. **Re-run routing and record planning** on the corrected trigger: the task may change, so may skill preloads, tail files and the routed model. A changed model loses the cache; that cost is accepted.
-5. **Replay**: a `redo_safe` or `repeatable` call in the new branch whose name and canonical arguments match a call in the discarded span returns the stored result without executing (bounded age `replay_max_age_ms`). A redo that issues the same search pays nothing for it.
+5. **Replay**: a `redo_safe` or `repeatable` call whose name and canonical arguments match a call in any discarded span of the same session (whatever discarded it: an edit or addition redo, a refusal or contract redo, a revival fork) returns the stored result without executing, within `replay_max_age_ms`. A redo that issues the same search pays nothing for it. Calls on the live branch are never replayed: their results are already in context, and answering a repeated live call from a stored result would be duplicate-call dedup, a different feature.
 6. The hold deadline is extended (§4.2), and the run continues.
 
 **Cost.** With the cache rule above, a redo costs about one extra request: a cache read of the prefix, a cache write of the last timeline batch and the final user turn, and the output the aborted request produced before the abort (thinking tokens included).
@@ -246,14 +246,13 @@ max_age_ms = 120000
 
 1. **Effect classes and the audit** (§4.1), MCP annotations. Standalone; improves the refusal fork point too.
 2. **Edits**: redo from scratch with the rebuild-at-cutoff and the abort rule (§4.3), edit interjections (§4.4), the cache tests.
-3. **The irreversibility hold** (§4.2), then shorten the trigger hold after measuring how often grouped parts arrive within each candidate hold value.
+3. **The irreversibility hold** (§4.2), then the trigger-hold change if the owner decides one (§11).
 4. **Late additions as redo** (§5.2) and abort-and-interject for folds.
 5. **Revival** (§4.5), removing `foldAfterSettle`.
 6. **`implicit_reply`** (§6).
 
 ## 11. Open questions
 
-1. Do same-sender bare messages outside the quick fold windows, sent while the session runs, get a decision-model judgement ("part of the request")? Its state, question and threshold.
-2. The default of the shortened trigger hold.
+1. **Same-sender messages outside the quick fold windows.** A bare message from the trigger's sender, sent while the session runs and before its first delivery but outside the fold's user-gap windows (text 7 s, media 10 s, mention 5 s), is ignored today: inert in a group, never seen by the session. Example: `@bot weather in Paris`, then 15 s later `for tomorrow`. These are common (§3: most such group texts come 10–60 s after the trigger). Causality says they cannot be reactions to the reply, but not that they belong to the request; the sender may be talking to someone else. What decides membership: the fixed windows (today), mechanically wider windows (for example any same-sender message until the first delivery), or a decision model asked the moment the message arrives, in parallel with the model's work?
+2. **The trigger hold**: keep 2 s, reduce it (the data in §4.2 suggests 250–500 ms keeps most grouping), or remove it.
 3. `hold_ms`, `extend_ms`, `revive_max_ms` defaults beyond the first measurement (§3).
-4. Whether `repeatable` results are replayed across the whole session or only across a redo.
