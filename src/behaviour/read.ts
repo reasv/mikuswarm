@@ -175,7 +175,9 @@ function rollupSums(
     metricClauses.push(`metric like @p${i}`);
   });
   if (metricClauses.length > 0) where.push(`(${metricClauses.join(" or ")})`);
-  const cols = dims.map((d) => (d === "bucket" ? `(hour / @bucketMs) * @bucketMs as bucket` : d));
+  // The cast floors: better-sqlite3 binds a JS number as REAL, so a bare
+  // `hour / @bucketMs` is float division and every hour was its own bucket.
+  const cols = dims.map((d) => (d === "bucket" ? `cast(hour / @bucketMs as integer) * @bucketMs as bucket` : d));
   const groups = dims.map((d) => (d === "bucket" ? "bucket" : d));
   const sql = `select ${[...cols, "metric", "sum(value) as value"].join(", ")}
                  from ${table} where ${where.join(" and ")}

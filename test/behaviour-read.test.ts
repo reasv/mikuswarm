@@ -148,7 +148,13 @@ test("series: the selected rate per bucket and group; bucket width by window", a
       r.series.points.map((p) => [p.bucket, p.group, p.count, p.denominator, p.rate]),
       [[H, "model_a", 1, 2, 0.5], [H, "model_b", 1, 1, 1]],
     );
-    assert.equal(readModelBehaviour(ctxFor(storage), q({ window: "7d" })).series.bucketMs, 24 * HOUR);
+    const week = readModelBehaviour(ctxFor(storage), q({ window: "7d", metric: "nudged_per_session" }));
+    assert.equal(week.series.bucketMs, 24 * HOUR);
+    // Points land on the day's start, not the hour's (H is not day-aligned).
+    const day = Math.floor(H / (24 * HOUR)) * 24 * HOUR;
+    assert.notEqual(day, H);
+    assert.deepEqual([...new Set(week.series.points.map((p) => p.bucket))], [day]);
+    assert.ok(week.overview.metrics.every((m) => m.points.every((p) => p.bucket === day)));
     assert.equal(readModelBehaviour(ctxFor(storage), q({ window: "all" })).series.bucketMs, 7 * 24 * HOUR);
     // An unknown metric (or none) is the overview: no per-group series.
     const overview = readModelBehaviour(ctxFor(storage), q({ metric: "nope" }));
