@@ -138,6 +138,27 @@ enabled = true
 user_gap_ms = 5000       # tightest — an explicit re-@ may be a genuinely new ask
 wall_clock_ms = 12000
 
+# Late input (ARCHITECTURE.md §8 "Late input"). A request can be corrected after its
+# session started. An edit of a trigger-group message, a late addition from the same
+# sender (judged by [decisions.late_addition] when on, else the quick follow-up windows
+# above) or a reply to the request REDOES the session from scratch while nothing
+# irreversible has happened, and is interjected otherwise (a generation in flight is
+# aborted). The first irreversible tool call (a send included) is HELD until the
+# trigger's arrival + hold_ms, extended by each correction, so corrections usually
+# land before anything is sent. A message sent before the run ended but arriving after
+# it REVIVES the settled session. With late input on, the provider trigger hold is
+# clamped to at most 500 ms. Defaults from 30 days of production measurements.
+[agent.sessions.late_input]
+enabled = true
+hold_ms = 8000              # hold the first irreversible call until trigger arrival + this
+extend_ms = 4000            # each correction extends the deadline
+max_hold_ms = 20000         # absolute bound from trigger arrival
+max_redos = 3               # further corrections are interjected
+first_event_wait_ms = 10000 # never abort a request before its first stream event (cache write)
+replay_max_age_ms = 300000  # redo-safe results replayed on a redo
+revive_max_ms = 300000      # a settled session is revivable this long after its run ended
+skew_tolerance_ms = 0       # clock-skew allowance for the sent-before-run-end test
+
 [agent.system]
 fallback_prompt = "You are Miku, a helpful Matrix chat agent. Reply naturally and call no_reply when no response is needed."
 
@@ -501,7 +522,7 @@ gap_backfetch_concurrency = 3             # rooms fetched in parallel on startup
 
 [matrix]
 enabled = false
-trigger_hold_ms = 2000
+trigger_hold_ms = 250       # late input redoes what arrives later; at most 500 ms with it on
 trigger_group_lookback_ms = 20000
 
 [discord]

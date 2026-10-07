@@ -441,7 +441,10 @@ export class LateInputSession {
         let held: HoldRecord | undefined;
         if (visible && tool.name !== "session_record_tool" && this.holdActive()) {
           const outcome = await this.waitHold(signal);
-          if (outcome.cancelled) return cancelledResult();
+          if (outcome.cancelled) {
+            this.holds.set(toolCallId, { heldMs: outcome.heldMs, reason: "correction" });
+            return cancelledResult();
+          }
           if (outcome.heldMs > 0) {
             held = { heldMs: outcome.heldMs, reason: outcome.reason };
             this.holds.set(toolCallId, held);

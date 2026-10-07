@@ -247,6 +247,30 @@ export interface StartMikuAgentOptions {
   providers?: Map<string, IChatProvider>;
 }
 
+/** The provider trigger hold's ceiling while late input is on (ARCHITECTURE.md §8 "Late input"). */
+export const LATE_INPUT_MAX_TRIGGER_HOLD_MS = 500;
+
+/**
+ * Clamp every provider's `trigger_hold_ms` to {@link LATE_INPUT_MAX_TRIGGER_HOLD_MS}
+ * when late input is enabled. Mutates `config`; returns the providers it clamped.
+ */
+export function clampTriggerHoldsForLateInput(config: AppConfig): string[] {
+  if (config.agent.sessions.late_input?.enabled !== true) return [];
+  const clamped: string[] = [];
+  const blocks: Array<[string, { trigger_hold_ms?: number } | undefined]> = [
+    ["matrix", config.matrix],
+    ["discord", config.discord],
+    ["irc", config.irc],
+  ];
+  for (const [name, block] of blocks) {
+    if (block && (block.trigger_hold_ms ?? 0) > LATE_INPUT_MAX_TRIGGER_HOLD_MS) {
+      block.trigger_hold_ms = LATE_INPUT_MAX_TRIGGER_HOLD_MS;
+      clamped.push(name);
+    }
+  }
+  return clamped;
+}
+
 export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOptions): Promise<MikuAgentRuntime> {
   const logger = createLogger("mikuswarm", config.app.log_level);
 
@@ -550,6 +574,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // exported pure helper so it's unit-testable. Advisory warnings (out-of-class
   // account key characters) follow, emitted with the logger.
   validateAgentConfig(config);
+  // Late input (ARCHITECTURE.md §8 "Late input"): with redo and the irreversibility
+  // hold catching what arrives after launch, the provider trigger hold is a cost
+  // optimization only and never exceeds 500 ms.
+  for (const name of clampTriggerHoldsForLateInput(config)) {
+    logger.warn("trigger_hold_clamped", { provider: name, maxMs: LATE_INPUT_MAX_TRIGGER_HOLD_MS });
+  }
 
   for (const accountKey of Object.keys(config.matrix?.accounts ?? {})) {
     if (!AGENT_NAME_RE_EXPORTED.test(accountKey)) {
@@ -4070,6 +4100,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     if (ok) {
       markSteered(inbound.event.id);
       trackSteer(target.agentSessionId, message, { inbound, form: "reply" });
+      // A reply to the session's own message comes after an irreversible effect:
+      // a generation in flight is aborted so the reply is read now (§8 "Late input").
+      lateInputEntries.get(target.agentSessionId)?.ctl.abortGenerationForSteer();
       logger.info("reply_steered", {
         sessionId: target.agentSessionId,
         timelineKey: inbound.timelineKey,
@@ -5343,6 +5376,35 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     }
     logger.info("late_input_ignored", { sessionId: entry.sessionId, kind: plan.kind, reason: ctl.phase === "ended" ? "after_run_end" : "not_steerable" });
     return "ignored";
+  }
+
+  /**
+   * Fork a late-input branch (§8 "Late input": edit/addition redo, revival, an
+   * aborted turn) and move the discarded span's decision rows and refusal events
+   * onto it, so the statistics treat them as that branch's outcome.
+   */
+  async function forkLateInputBranch(
+    created: Pick<CreatedAgent, "agent" | "forkContext">,
+    capture: SessionCaptureHandle,
+    index: number,
+    meta: Parameters<typeof forkSession>[2],
+  ): Promise<void> {
+    const discarded = created.agent.state.messages.slice(index);
+    const fork = created.forkContext({ storage, flushTranscript: () => capture.flushNow(), logger });
+    const { branchNo } = await forkSession(fork, { index }, meta);
+    const toolCallIds: string[] = [];
+    let sinceTs: number | undefined;
+    for (const raw of discarded) {
+      const m = raw as { role?: string; content?: unknown; timestamp?: number };
+      if (sinceTs === undefined && typeof m.timestamp === "number") sinceTs = m.timestamp;
+      if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
+      for (const block of m.content as Array<{ type?: string; id?: string }>) {
+        if (block?.type === "toolCall" && typeof block.id === "string") toolCallIds.push(block.id);
+      }
+    }
+    await storage
+      .reanchorSessionBranch(fork.sessionId, { branchNo, toolCallIds, ...(sinceTs !== undefined ? { sinceTs } : {}) })
+      .catch((error) => logger.warn("late_input_reanchor_failed", { sessionId: fork.sessionId, error: error instanceof Error ? error.message : String(error) }));
   }
 
   /** Display name for interjection texts (§6.2: `username ?? id` fallback). */
@@ -7244,9 +7306,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       ? timeline.getByExternalId(inbound.provider, replyExternalId, inbound.timelineKey)
       : undefined;
     let replyTarget: string | undefined;
-    if (replyEvent?.agentSessionId && replyEvent.agentSessionId !== owner && (injectOnReply || pointOn)) {
-      await sessionRecordService.waitFor(replyEvent.agentSessionId);
-      if (ownRecord(replyEvent.agentSessionId)) replyTarget = replyEvent.agentSessionId;
+    // A reply to a message of a request (its trigger or a grouped part) is a reply
+    // to that session (§8 "Late input"): resolved through the session's trigger.
+    const repliedSessionId =
+      replyEvent?.agentSessionId ??
+      (replyEvent && !replyEvent.sender.isSelf ? storage.getSessionIdForRequestEvent(replyEvent.id) : undefined);
+    if (repliedSessionId && repliedSessionId !== owner && repliedSessionId !== session.id && (injectOnReply || pointOn)) {
+      await sessionRecordService.waitFor(repliedSessionId);
+      if (ownRecord(repliedSessionId)) replyTarget = repliedSessionId;
     }
     const ruleSpecs = (): SyntheticCallSpec[] => [
       ...(owner ? [spec(owner)] : []),
@@ -8266,8 +8333,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       const generated = current.state.messages.some((m) => (m as { role?: string }).role === "assistant");
       let redeliver: AgentMessage[];
       if (generated) {
-        const fork = binding.created.forkContext({ storage, flushTranscript: () => binding.capture.flushNow(), logger });
-        await forkSession(fork, { index: 0 }, { reason: request.reason, causeEventId: request.causeEventIds[0] });
+        await forkLateInputBranch(binding.created, binding.capture, 0, { reason: request.reason, causeEventId: request.causeEventIds[0] });
         redeliver = current.state.messages.slice();
       } else {
         redeliver = current.state.messages.filter((m) => (m as { type?: string }).type === "interjection");
@@ -8305,8 +8371,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       const messages = current.state.messages;
       const last = messages.at(-1) as { role?: string; stopReason?: string } | undefined;
       if (last?.role === "assistant" && last.stopReason === "aborted") {
-        const fork = binding.created.forkContext({ storage, flushTranscript: () => binding.capture.flushNow(), logger });
-        await forkSession(fork, { index: messages.length - 1 }, { reason: "turn_aborted" });
+        await forkLateInputBranch(binding.created, binding.capture, messages.length - 1, { reason: "turn_aborted" });
       }
       const tail = current.state.messages.at(-1) as { role?: string } | undefined;
       // A finished assistant turn cannot be continued: the queued interjection is
@@ -8329,6 +8394,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // One run of the session: the first, and each revival (§8 "Late input"). A
     // run that holds the timeline slot releases it when the rollout ends.
     let currentRun: Promise<void> = Promise.resolve();
+    // A revival requested as the run ends: its record turn is not started at all.
+    let revivalRequested = false;
     const startRun = (kickoffMessages: AgentMessage[] | undefined, runOpts: { holdsSlot: boolean; revival?: boolean }): Promise<void> => {
       const runner = new SessionRunner({
         provider: providers.get(target.provider),
@@ -8372,7 +8439,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           // slot is released, so the next queued trigger sees it; then the slot is
           // freed and the turn runs while that trigger starts. The capture handle
           // stays attached so the turn lands in the transcript.
-          const recordTurn = interrupted
+          const recordTurn = interrupted || revivalRequested
             ? undefined
             : startRecordTurn({
                 sessionId: session.id,
@@ -8478,6 +8545,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // rollout ended, and the record turn runs again at the new end.
     let reviving: Promise<boolean> | undefined;
     const revive = (messages: AgentMessage[], cause: { eventId: string }): Promise<boolean> => {
+      revivalRequested = true;
       if (reviving) {
         // A revival is already starting: the message joins it as a steer.
         return reviving.then((ok) => {
@@ -8486,15 +8554,17 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         });
       }
       reviving = (async () => {
-        if (finalized || draining || lateCtl?.phase !== "ended") return false;
+        if (finalized || draining || lateCtl?.phase !== "ended") {
+          revivalRequested = false;
+          return false;
+        }
         await sessionRecordService.abortForRevival(session.id);
         await currentRun;
         if (finalized || draining) return false;
         const agentNow = binding.created.agent;
         const start = recordTurnStartIndex(agentNow.state.messages);
         if (start >= 0 && start < agentNow.state.messages.length) {
-          const fork = binding.created.forkContext({ storage, flushTranscript: () => binding.capture.flushNow(), logger });
-          await forkSession(fork, { index: start }, { reason: "revival", causeEventId: cause.eventId });
+          await forkLateInputBranch(binding.created, binding.capture, start, { reason: "revival", causeEventId: cause.eventId });
         }
         if (agentNow.hasQueuedMessages()) agentNow.clearAllQueues();
         sessions.adopt({ ...session, status: "created", trigger: inbound });
@@ -8503,6 +8573,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         lateCtl.markRevived();
         const holdsSlot = triggerCoordinator.tryAcquire(session.timelineKey);
         logger.info("late_input_revived", { sessionId: session.id, causeEventId: cause.eventId, messages: messages.length, holdsSlot });
+        revivalRequested = false;
         void startRun(messages, { holdsSlot, revival: true });
         return true;
       })().finally(() => {
