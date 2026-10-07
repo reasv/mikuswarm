@@ -6,7 +6,7 @@ import {
 } from "@earendil-works/pi-ai";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Logger } from "../observability/logger.js";
-import { classifyLlmError, extractStatus, isStallAbort, type LlmErrorClass } from "./request-retry.js";
+import { classifyLlmError, extractStatus, getRequestAttemptState, isStallAbort, type LlmErrorClass } from "./request-retry.js";
 
 // =============================================================================
 // Local LLM request scheduler (spec CONCURRENCY-AND-RATE-LIMITING §5 / Design A).
@@ -1188,9 +1188,15 @@ export function withSchedulerAdmission(
     // produce one probe during an outage instead of N retry loops).
     const modelKey = modelHealthKey(model);
 
+    // Layer 0's per-request state: flagged while this attempt waits for a slot,
+    // so an abort during the wait is known to have reached no wire (no billed
+    // request, ARCHITECTURE.md §8b "Aborted requests").
+    const attemptState = getRequestAttemptState(streamOptions);
+
     void (async () => {
       let release: ReleaseFn;
       const acquireStart = Date.now();
+      if (attemptState) attemptState.awaitingAdmission = true;
       try {
         release = await scheduler.acquire({
           group: options.group,
@@ -1202,6 +1208,7 @@ export function withSchedulerAdmission(
           sessionType: options.sessionType,
           signal,
         });
+        if (attemptState) attemptState.awaitingAdmission = false;
         try {
           options.onAdmissionWait?.(Date.now() - acquireStart);
         } catch {

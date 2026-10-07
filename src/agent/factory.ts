@@ -45,7 +45,13 @@ import type { RefusalPin, SessionRoutingState } from "../storage/database.js";
 import type { Logger } from "../observability/logger.js";
 import type { SessionLiveEventBus } from "../observability/live-events.js";
 import type { LlmRequestRing } from "./request-ring.js";
-import { SessionUsageTracker, type SessionUsageTotals } from "./usage.js";
+import {
+  SessionUsageTracker,
+  estimateAbortedRequestUsage,
+  type AbortedRequestEstimate,
+  type PromptCacheBaseline,
+  type SessionUsageTotals,
+} from "./usage.js";
 import type { AttachmentMeta, CanonicalChatEvent } from "../types.js";
 import type {
   BudgetHooks,
@@ -1421,6 +1427,150 @@ export class AgentSessionFactory {
     usage.setPaidServiceCeiling(costCeiling);
     // Request progress (§8 "Late input" abort rule): call → admission → first event → end.
     const requestProgress = new RequestProgress(scheduler !== undefined);
+    // The last billed request's prompt (any session, per-user or not): the cache
+    // read an aborted request's input estimate credits (§8b "Aborted requests").
+    const lastPromptBaseline: PromptCacheBaseline = { tokens: 0, atMs: 0, healthKey: "" };
+    const healthKeyOf = (logicalId: string): string => {
+      const cfg = this.options.config.models[logicalId];
+      return cfg ? modelHealthKey({ baseUrl: cfg.endpoint, id: cfg.id }) : logicalId;
+    };
+    // The Layer-0 commit of one billed request (spec TOKEN-USAGE-TRACKING §3.1):
+    // feeds the tracker AND (spec USAGE-COST-LIMITS §3.1) emits one per-request
+    // agent-loop row to the unified `usage_events` ledger + increments the
+    // BudgetEngine. The ledger write is additive — the §8b
+    // `agent_sessions.usage_*` aggregate is still maintained by the tracker's
+    // persistence subscriber. `est` is set for a request the run aborted on the
+    // wire (§8b "Aborted requests"): its estimated usage replaces the message's,
+    // and the row is flagged `estimated`.
+    const commitRequest = (message: AssistantMessage, est?: AbortedRequestEstimate): void => {
+      // A clean commit ends the request: the models that refused it may serve
+      // the next one (a refused attempt's usage arrives here too, §10.3).
+      if (message.stopReason !== "error" && message.stopReason !== "aborted") refusal.noteCommitted();
+      // Same billed-model expression the ledger row below uses (spec
+      // MODEL-FALLBACK §2.2/§6.1): the committed message's own `model` when
+      // the provider reports one, else this attempt's descriptor. Feeding it
+      // to the tracker is what lets the durable `agent_sessions.model_id`
+      // agree with the ledger under fallback / per-user model selection,
+      // instead of freezing the session type's configured model.
+      usage.record(est?.usage ?? message.usage, message.model ?? model.id);
+      // Served-member attribution on the transcript (spec REFUSAL-HANDLING
+      // §7.1): the committed message is the object the agent stores.
+      stampServedModel(message, resolvedMember.logicalId);
+      // Tool-result budget reset (spec TOOL-RESULT-BUDGET §4): each committed
+      // LLM request starts a fresh tool-result turn; the accumulator resets so
+      // the next batch of tool calls gets the full per-turn budget again.
+      turnBudget.reset();
+      if (userSelectionActive && est) {
+        // An aborted request (§8b "Aborted requests") wrote the prompt cache only
+        // when its stream started (LATE-INPUT §3): only then does it advance the
+        // baseline, from its (reported or estimated) prompt size. The running
+        // counter is reconciled only against a provider-reported input.
+        if (est.firstEventSeen) {
+          refreshRunningContext();
+          if (est.inputReported) ctxCounter.running = est.promptTokens;
+          ctxCounter.cachedAtLast = est.promptTokens;
+          ctxCounter.lastRequestAtMs = Date.now();
+          ctxCounter.cacheDomainAtLast = est.healthKey;
+        }
+      } else if (userSelectionActive) {
+        // Advance the prompt-cache baseline (spec §5.3): the just-committed
+        // request's prompt is now the cached prefix for the NEXT request's
+        // estimate, dated for the cache-TTL test.
+        refreshRunningContext();
+        // Reconcile the running estimate against the provider-reported actual —
+        // the committed request's totalTokens, the same authority the resume
+        // seed and the (non-per-user) context gate use. Without this the counter
+        // only ever accumulates estimator error, and once the drift crossed a
+        // model's operative window the §4.2 fits check terminated a healthy
+        // rollout ("no healthy model fits") at a real context far below the
+        // ceiling — recoverable only by a manual resume (whose seed IS this
+        // actual). The committed assistant turn is not yet in `state.messages`;
+        // its later re-estimate overlaps the output already inside the actual —
+        // a small over-count (one turn's output), erased at the next commit.
+        const actual = usage.snapshot().contextTokens;
+        if (actual !== null) ctxCounter.running = actual;
+        ctxCounter.cachedAtLast = ctxCounter.running;
+        ctxCounter.lastRequestAtMs = Date.now();
+        // Stamp the cache domain this commit established: the served chain
+        // member's health key (endpoint::wire-model — the upstream identity a
+        // prompt cache is scoped to). The next pre-flight credits the cache-read
+        // discount only to candidates predicted to be served from this same
+        // domain; any other candidate is priced as a cache miss. The logical-id
+        // fallback (member not found in the dispatched composite — shouldn't
+        // happen) can only mismatch, i.e. deny credit: conservative.
+        ctxCounter.cacheDomainAtLast =
+          activeSelection.fallback.survivorMembers.find(
+            (m) => m.logicalId === resolvedMember.logicalId,
+          )?.healthKey ?? resolvedMember.logicalId;
+      }
+      const budget = this.options.budget;
+      if (budget?.record) {
+        const u = est?.usage ?? message.usage;
+        const cost = u.cost?.total ?? 0;
+        // Per-user limits attribution (spec PER-USER-LIMITS §7): the REQUESTED
+        // virtual model the per-user selector chose for this request (distinct from
+        // `logical_model_id` under active fallback), null when per-user selection is
+        // inactive. The SHARED-POOL key set (spec MULTI-SHARED-POOL §4) is NOT
+        // computed here: app.ts's `recordUsageEvent` fan-in owns it for BOTH the
+        // agent loop and the tool lane, model-aware via `sharedPoolKeys`, so the
+        // stamping lives in exactly one place. The in-memory partitioned counter
+        // records the ACTUAL served cost against the requested model's covering
+        // meters (incl. every shared pool) before the ledger write.
+        const requestedModelId = userSelectionActive ? requestedMember.logicalId : null;
+        // The partitioned per-user counter is incremented centrally in app.ts's
+        // `recordUsageEvent` fan-in (the single place that covers BOTH the agent
+        // loop AND its tool lane, §6), keyed off the stamped `requestedModelId`.
+        // Here we only surface a budget-capped (output-truncated) turn — a
+        // degradation signal, not an organic completion (spec §5.4/§14).
+        if (userSelectionActive && message.stopReason === "length") {
+          this.options.logger?.info("user_limit_output_capped", {
+            sessionId: session.id,
+            timelineKey: session.timelineKey,
+            requestedModel: requestedMember.logicalId,
+            servedModel: resolvedMember.logicalId,
+            maxTokens: activeSelection.maxTokens,
+            outputTokens: u.output ?? null,
+          });
+        }
+        // Exact attribution under fallback (spec MODEL-FALLBACK §2.2/§6.1):
+        // `model_id` is the UPSTREAM wire id actually billed (the committed
+        // message's `model`/`provider`), `logical_model_id` is the chain
+        // member chosen for this attempt — so a request that fell to `Y` is
+        // billed and budget-scoped to `Y`, not the head.
+        budget.record({
+          class: "agent_loop",
+          agentSessionId: session.id,
+          sessionType: session.sessionType,
+          timelineKey: session.timelineKey,
+          triggerSenderId,
+          modelId: message.model ?? model.id,
+          logicalModelId: resolvedMember.logicalId,
+          requestedModelId,
+          // The model prompt the served member sent (ARCHITECTURE.md §8 "Model prompts").
+          modelPrompt: modelPrompts.get(resolvedMember.logicalId)?.profile ?? null,
+          modelPromptHash: modelPrompts.get(resolvedMember.logicalId)?.hash ?? null,
+          // The frozen, model-neutral system prompt (spec REFUSAL-HANDLING §12.4).
+          systemPromptHash,
+          provider: message.provider ?? model.provider ?? null,
+          inputTokens: u.input ?? null,
+          outputTokens: u.output ?? null,
+          cacheReadTokens: u.cacheRead ?? null,
+          cacheWriteTokens: u.cacheWrite ?? null,
+          costUsd: cost,
+          ...(est ? { estimated: true } : {}),
+        });
+      }
+      if (!est) {
+        const u = message.usage;
+        lastPromptBaseline.tokens = (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
+        lastPromptBaseline.atMs = Date.now();
+        lastPromptBaseline.healthKey = healthKeyOf(resolvedMember.logicalId);
+      } else if (est.firstEventSeen) {
+        lastPromptBaseline.tokens = est.promptTokens;
+        lastPromptBaseline.atMs = Date.now();
+        lastPromptBaseline.healthKey = est.healthKey;
+      }
+    };
     const retryingStreamFn = withRequestRetry(
       sessionStreamFn,
       {
@@ -1485,116 +1635,32 @@ export class AgentSessionFactory {
           outputGate,
         ),
         // Per-request usage capture (spec TOKEN-USAGE-TRACKING §3.1): the
-        // committed `done` message's authoritative usage feeds the tracker AND
-        // (spec USAGE-COST-LIMITS §3.1) emits one per-request agent-loop row to
-        // the unified `usage_events` ledger + increments the BudgetEngine. The
-        // ledger write is additive — the §8b `agent_sessions.usage_*` aggregate
-        // is still maintained by the tracker's persistence subscriber.
-        onRequestCommitted: (message: AssistantMessage) => {
-          // A clean commit ends the request: the models that refused it may serve
-          // the next one (a refused attempt's usage arrives here too, §10.3).
-          if (message.stopReason !== "error" && message.stopReason !== "aborted") refusal.noteCommitted();
-          // Same billed-model expression the ledger row below uses (spec
-          // MODEL-FALLBACK §2.2/§6.1): the committed message's own `model` when
-          // the provider reports one, else this attempt's descriptor. Feeding it
-          // to the tracker is what lets the durable `agent_sessions.model_id`
-          // agree with the ledger under fallback / per-user model selection,
-          // instead of freezing the session type's configured model.
-          usage.record(message.usage, message.model ?? model.id);
-          // Served-member attribution on the transcript (spec REFUSAL-HANDLING
-          // §7.1): the committed message is the object the agent stores.
-          stampServedModel(message, resolvedMember.logicalId);
-          // Tool-result budget reset (spec TOOL-RESULT-BUDGET §4): each committed
-          // LLM request starts a fresh tool-result turn; the accumulator resets so
-          // the next batch of tool calls gets the full per-turn budget again.
-          turnBudget.reset();
-          if (userSelectionActive) {
-            // Advance the prompt-cache baseline (spec §5.3): the just-committed
-            // request's prompt is now the cached prefix for the NEXT request's
-            // estimate, dated for the cache-TTL test.
-            refreshRunningContext();
-            // Reconcile the running estimate against the provider-reported actual —
-            // the committed request's totalTokens, the same authority the resume
-            // seed and the (non-per-user) context gate use. Without this the counter
-            // only ever accumulates estimator error, and once the drift crossed a
-            // model's operative window the §4.2 fits check terminated a healthy
-            // rollout ("no healthy model fits") at a real context far below the
-            // ceiling — recoverable only by a manual resume (whose seed IS this
-            // actual). The committed assistant turn is not yet in `state.messages`;
-            // its later re-estimate overlaps the output already inside the actual —
-            // a small over-count (one turn's output), erased at the next commit.
-            const actual = usage.snapshot().contextTokens;
-            if (actual !== null) ctxCounter.running = actual;
-            ctxCounter.cachedAtLast = ctxCounter.running;
-            ctxCounter.lastRequestAtMs = Date.now();
-            // Stamp the cache domain this commit established: the served chain
-            // member's health key (endpoint::wire-model — the upstream identity a
-            // prompt cache is scoped to). The next pre-flight credits the cache-read
-            // discount only to candidates predicted to be served from this same
-            // domain; any other candidate is priced as a cache miss. The logical-id
-            // fallback (member not found in the dispatched composite — shouldn't
-            // happen) can only mismatch, i.e. deny credit: conservative.
-            ctxCounter.cacheDomainAtLast =
-              activeSelection.fallback.survivorMembers.find(
-                (m) => m.logicalId === resolvedMember.logicalId,
-              )?.healthKey ?? resolvedMember.logicalId;
-          }
-          const budget = this.options.budget;
-          if (budget?.record) {
-            const u = message.usage;
-            const cost = u.cost?.total ?? 0;
-            // Per-user limits attribution (spec PER-USER-LIMITS §7): the REQUESTED
-            // virtual model the per-user selector chose for this request (distinct from
-            // `logical_model_id` under active fallback), null when per-user selection is
-            // inactive. The SHARED-POOL key set (spec MULTI-SHARED-POOL §4) is NOT
-            // computed here: app.ts's `recordUsageEvent` fan-in owns it for BOTH the
-            // agent loop and the tool lane, model-aware via `sharedPoolKeys`, so the
-            // stamping lives in exactly one place. The in-memory partitioned counter
-            // records the ACTUAL served cost against the requested model's covering
-            // meters (incl. every shared pool) before the ledger write.
-            const requestedModelId = userSelectionActive ? requestedMember.logicalId : null;
-            // The partitioned per-user counter is incremented centrally in app.ts's
-            // `recordUsageEvent` fan-in (the single place that covers BOTH the agent
-            // loop AND its tool lane, §6), keyed off the stamped `requestedModelId`.
-            // Here we only surface a budget-capped (output-truncated) turn — a
-            // degradation signal, not an organic completion (spec §5.4/§14).
-            if (userSelectionActive && message.stopReason === "length") {
-              this.options.logger?.info("user_limit_output_capped", {
-                sessionId: session.id,
-                timelineKey: session.timelineKey,
-                requestedModel: requestedMember.logicalId,
-                servedModel: resolvedMember.logicalId,
-                maxTokens: activeSelection.maxTokens,
-                outputTokens: u.output ?? null,
-              });
-            }
-            // Exact attribution under fallback (spec MODEL-FALLBACK §2.2/§6.1):
-            // `model_id` is the UPSTREAM wire id actually billed (the committed
-            // message's `model`/`provider`), `logical_model_id` is the chain
-            // member chosen for this attempt — so a request that fell to `Y` is
-            // billed and budget-scoped to `Y`, not the head.
-            budget.record({
-              class: "agent_loop",
-              agentSessionId: session.id,
-              sessionType: session.sessionType,
-              timelineKey: session.timelineKey,
-              triggerSenderId,
-              modelId: message.model ?? model.id,
-              logicalModelId: resolvedMember.logicalId,
-              requestedModelId,
-              // The model prompt the served member sent (ARCHITECTURE.md §8 "Model prompts").
-              modelPrompt: modelPrompts.get(resolvedMember.logicalId)?.profile ?? null,
-              modelPromptHash: modelPrompts.get(resolvedMember.logicalId)?.hash ?? null,
-              // The frozen, model-neutral system prompt (spec REFUSAL-HANDLING §12.4).
-              systemPromptHash,
-              provider: message.provider ?? model.provider ?? null,
-              inputTokens: u.input ?? null,
-              outputTokens: u.output ?? null,
-              cacheReadTokens: u.cacheRead ?? null,
-              cacheWriteTokens: u.cacheWrite ?? null,
-              costUsd: cost,
-            });
-          }
+        // committed `done` message's authoritative usage (see `commitRequest`).
+        onRequestCommitted: (message: AssistantMessage) => commitRequest(message),
+        // A request the run aborted on the wire is billed by the provider (§8b
+        // "Aborted requests"): one estimated ledger row through the same commit.
+        onRequestAborted: (info) => {
+          const servedId = servedModelForAttempt ?? resolvedMember.logicalId;
+          refreshRunningContext();
+          const est = estimateAbortedRequestUsage(info, {
+            costRates: this.options.config.models[servedId]?.cost,
+            healthKey: healthKeyOf(servedId),
+            promptEstimate: ctxCounter.running + (modelPrompts.get(servedId)?.tokens ?? 0),
+            cacheBaseline: lastPromptBaseline,
+            now: Date.now(),
+          });
+          commitRequest(info.message, est);
+          this.options.logger?.info("llm_request_aborted", {
+            sessionId: session.id,
+            model: servedId,
+            inputTokens: est.usage.input + est.usage.cacheRead + est.usage.cacheWrite,
+            outputTokens: est.usage.output,
+            estimated: true,
+            inputReported: est.inputReported,
+            costUsd: est.usage.cost.total,
+            firstEventSeen: info.firstEventSeen,
+          });
+          return est.usage;
         },
         // Pre-flight context-budget enforcement (spec CONTEXT-LIMIT-UNIFICATION
         // §2.3 / PER-MEMBER-CONTEXT-FITS §2.3). Terminates only when the observed

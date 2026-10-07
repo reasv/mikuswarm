@@ -54,9 +54,10 @@ export interface LlmRequestRecord {
   errorMessage?: string;
   /**
    * Usage of the committed response (spec TOKEN-USAGE-TRACKING §3.2). Present on
-   * `done` outcomes only; ABSENT on error/aborted (their usage is stub zeros, so
-   * absence means "not a committed response" rather than a misleading 0). `cost`
-   * is `usage.cost.total` (USD).
+   * `done` outcomes, on failed attempts whose stream reported usage, and on an
+   * attempt the caller aborted on the wire (with {@link estimated}); absent
+   * otherwise (stub zeros, so absence means "not billed" rather than a
+   * misleading 0). `cost` is `usage.cost.total` (USD).
    */
   usage?: {
     input: number;
@@ -66,6 +67,12 @@ export interface LlmRequestRecord {
     totalTokens: number;
     cost: number;
   };
+  /**
+   * True when {@link usage} is an estimate: the caller aborted the attempt on
+   * the wire, so the output (and, without a reported usage, the input) was
+   * estimated (ARCHITECTURE.md §8b "Aborted requests").
+   */
+  estimated?: boolean;
 }
 
 export const DEFAULT_LLM_REQUEST_RING_SIZE = 500;

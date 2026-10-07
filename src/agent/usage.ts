@@ -1,4 +1,6 @@
-import type { Usage } from "@earendil-works/pi-ai";
+import { calculateCost, type Api, type Model, type Usage } from "@earendil-works/pi-ai";
+import { estimateTokens } from "../context/tokens.js";
+import type { AbortedRequestInfo } from "./request-retry.js";
 
 // =============================================================================
 // Session usage tracker (spec TOKEN-USAGE-TRACKING §3.3).
@@ -273,4 +275,139 @@ export function computeUsageCost(rates: CostRates, u: RawTokenUsage): ComputedCo
     image,
     total: input + output + cacheRead + cacheWrite + image,
   };
+}
+
+// =============================================================================
+// Aborted-request estimate (ARCHITECTURE.md §8b "Aborted requests").
+//
+// A request the run aborts after it reached the wire is billed by the provider,
+// but its stream reports at most the input usage (Anthropic's `message_start`),
+// never the output produced so far, and nothing at all before the first event or
+// on transports that report usage only at the end. The estimate keeps every
+// reported count, estimates the output from the streamed deltas, estimates a
+// missing input from the session's running context size, and prices the result
+// with the served member's own `cost` block — the same `calculateCost` pi-ai
+// applies to a committed request.
+// =============================================================================
+
+/** The prompt size of the session's last billed request, for the cache-read credit of an input estimate. */
+export interface PromptCacheBaseline {
+  /** Prompt tokens (`input + cacheRead + cacheWrite`) of that request; 0 = none yet. */
+  tokens: number;
+  /** When it was billed (epoch ms). */
+  atMs: number;
+  /** Health key (endpoint::wire-model) of the member that served it: the cache's domain. */
+  healthKey: string;
+}
+
+/** `[models.*].cost` rates (USD per 1M tokens), as configured. */
+export interface ConfigCostRates {
+  input?: number;
+  output?: number;
+  cache_read?: number;
+  cache_write?: number;
+}
+
+export interface AbortedRequestEstimateOptions {
+  /** The served member's cost block; absent = unpriced (cost 0). */
+  costRates?: ConfigCostRates;
+  /** Health key of the served member. */
+  healthKey: string;
+  /** Estimated prompt size of the aborted request (the factory's running context counter). */
+  promptEstimate: number;
+  /** The last billed request's prompt, credited as a cache read when fresh and from the same domain. */
+  cacheBaseline?: PromptCacheBaseline;
+  now: number;
+  /** Prompt-cache lifetime for the baseline credit (default 5 minutes). */
+  cacheTtlMs?: number;
+}
+
+/** The usage recorded for an aborted request, plus what the factory needs to advance its baselines. */
+export interface AbortedRequestEstimate {
+  usage: Usage;
+  /** `input + cacheRead + cacheWrite` of {@link usage}. */
+  promptTokens: number;
+  /** The provider reported the input (the stream got that far); else it is estimated. */
+  inputReported: boolean;
+  /** A stream event arrived before the abort: the prompt was written to the cache. */
+  firstEventSeen: boolean;
+  /** Health key of the served member. */
+  healthKey: string;
+}
+
+const DEFAULT_PROMPT_CACHE_TTL_MS = 300_000;
+
+/**
+ * Estimate the billed usage of an aborted request. Reported input counts
+ * (input, cache read, cache write) are kept as reported; without them the prompt
+ * estimate is split into a cache read of the last billed prompt (same cache
+ * domain, within the TTL) and uncached input for the rest. The output is the
+ * larger of the reported output and the token count of the streamed text,
+ * thinking and tool-call argument deltas.
+ */
+export function estimateAbortedRequestUsage(
+  info: Pick<AbortedRequestInfo, "message" | "streamedText" | "firstEventSeen">,
+  opts: AbortedRequestEstimateOptions,
+): AbortedRequestEstimate {
+  const reported = info.message?.usage as Partial<Usage> | undefined;
+  const rInput = finiteOrZero(reported?.input);
+  const rCacheRead = finiteOrZero(reported?.cacheRead);
+  const rCacheWrite = finiteOrZero(reported?.cacheWrite);
+  const inputReported = rInput + rCacheRead + rCacheWrite > 0;
+  let input: number;
+  let cacheRead: number;
+  let cacheWrite: number;
+  if (inputReported) {
+    input = rInput;
+    cacheRead = rCacheRead;
+    cacheWrite = rCacheWrite;
+  } else {
+    const prompt = Math.max(0, Math.round(finiteOrZero(opts.promptEstimate)));
+    const base = opts.cacheBaseline;
+    const fresh =
+      base !== undefined &&
+      base.tokens > 0 &&
+      base.healthKey === opts.healthKey &&
+      opts.now - base.atMs < (opts.cacheTtlMs ?? DEFAULT_PROMPT_CACHE_TTL_MS);
+    cacheRead = fresh ? Math.min(base.tokens, prompt) : 0;
+    input = prompt - cacheRead;
+    cacheWrite = 0;
+  }
+  let streamed = 0;
+  try {
+    streamed = estimateTokens(info.streamedText);
+  } catch {
+    /* tokenization is best-effort */
+  }
+  const output = Math.max(finiteOrZero(reported?.output), streamed);
+  const usage: Usage = {
+    input,
+    output,
+    cacheRead,
+    cacheWrite,
+    ...(inputReported && reported?.cacheWrite1h ? { cacheWrite1h: reported.cacheWrite1h } : {}),
+    totalTokens: input + output + cacheRead + cacheWrite,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+  const rates = opts.costRates;
+  const pricing = {
+    cost: {
+      input: rates?.input ?? 0,
+      output: rates?.output ?? 0,
+      cacheRead: rates?.cache_read ?? 0,
+      cacheWrite: rates?.cache_write ?? 0,
+    },
+  } as unknown as Model<Api>;
+  usage.cost = { ...calculateCost(pricing, usage) };
+  return {
+    usage,
+    promptTokens: input + cacheRead + cacheWrite,
+    inputReported,
+    firstEventSeen: info.firstEventSeen,
+    healthKey: opts.healthKey,
+  };
+}
+
+function finiteOrZero(n: number | undefined): number {
+  return typeof n === "number" && Number.isFinite(n) && n > 0 ? n : 0;
 }

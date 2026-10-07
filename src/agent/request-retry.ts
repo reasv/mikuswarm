@@ -4,6 +4,7 @@ import {
   type AssistantMessage,
   type AssistantMessageEvent,
   type AssistantMessageEventStream,
+  type Usage,
 } from "@earendil-works/pi-ai";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Logger } from "../observability/logger.js";
@@ -86,6 +87,13 @@ export interface RequestAttemptState {
    * another member (not refused, healthy, in budget, fits) can take the request.
    */
   refusalFalloverAvailable: boolean;
+  /**
+   * True while THIS attempt waits for a scheduler slot (set by
+   * `withSchedulerAdmission` around its acquire). An attempt aborted while it is
+   * still true never reached the wire, so Layer 0 records no aborted request
+   * for it (ARCHITECTURE.md §8b "Aborted requests"). Reset per attempt.
+   */
+  awaitingAdmission?: boolean;
 }
 
 export const REQUEST_ATTEMPT_STATE: unique symbol = Symbol("mikuswarm.requestAttemptState");
@@ -167,6 +175,20 @@ export interface RequestRetryContext {
    */
   onRequestCommitted?: (message: AssistantMessage) => void;
   /**
+   * Fired once for an attempt the CALLER aborted (the run's signal: operator
+   * Stop, a redo, an interjection, a tool/turn cap) after the request reached
+   * the wire — before or after its first stream event (ARCHITECTURE.md §8b
+   * "Aborted requests"). The provider bills such a request although its stream
+   * carries no (or only input) usage, so the hook records it with estimated
+   * usage and returns that usage for the request ring. When wired, it replaces
+   * the {@link onRequestCommitted} capture of an aborted attempt's reported
+   * usage, so the attempt is counted exactly once. Best-effort: exceptions are
+   * swallowed. Not fired for an attempt aborted while waiting for admission,
+   * one whose signal was already aborted when it started, or a budget (stall)
+   * abort, which is an environmental failure.
+   */
+  onRequestAborted?: (info: AbortedRequestInfo) => Usage | undefined;
+  /**
    * Pre-flight context-budget check (spec TOKEN-USAGE-TRACKING §6.2). Evaluated
    * ONCE per request, before the first attempt (every Layer-0 attempt replays
    * the identical context, so per-attempt re-checking is meaningless). Returns a
@@ -247,6 +269,18 @@ export interface RequestRetryContext {
 }
 
 /** What Layer 0 knows about a refused attempt (see {@link RequestRetryContext.onRefusal}). */
+/** What Layer 0 knows about a caller-aborted attempt ({@link RequestRetryContext.onRequestAborted}). */
+export interface AbortedRequestInfo {
+  /** The attempt's terminal `aborted` message; its usage is what the stream reported (often zeros). */
+  message: AssistantMessage;
+  /** Whether any stream event arrived before the abort (pi-ai's `start` follows the response headers). */
+  firstEventSeen: boolean;
+  /** The text, thinking and tool-call argument deltas streamed before the abort, concatenated. */
+  streamedText: string;
+  /** 1-based attempt number within the request. */
+  attempt: number;
+}
+
 export interface RefusalAttemptInfo {
   /** The refused attempt's terminal message: raw stop reason, category, usage, wire model. */
   message: AssistantMessage | undefined;
@@ -730,6 +764,13 @@ export function withRequestRetry(
           const buffered: AssistantMessageEvent[] = [];
           let errorEvent: Extract<AssistantMessageEvent, { type: "error" }> | undefined;
           let producedTokens = false;
+          // Aborted-request accounting (§8b "Aborted requests"): a signal already
+          // aborted at the attempt's start never reaches the wire; any stream
+          // event marks the request as answered; the streamed deltas are the
+          // basis of the output estimate (collected only when the hook is wired).
+          const abortedAtStart = callerSignal?.aborted === true;
+          let firstEventSeen = false;
+          const streamedDeltas: string[] | undefined = ctx.onRequestAborted ? [] : undefined;
 
           // Per-attempt abort: the caller's abort (drain/Stop) always reaches
           // the inner stream; the budget's abort reaches it ONLY while the
@@ -763,6 +804,7 @@ export function withRequestRetry(
           attemptState.failoverOnFailure = false;
           attemptState.servedKey = undefined;
           attemptState.refusalFalloverAvailable = false;
+          attemptState.awaitingAdmission = undefined;
           const attemptOptions = {
             ...((streamOptions as object | undefined) ?? {}),
             signal: attemptCtrl.signal,
@@ -780,6 +822,13 @@ export function withRequestRetry(
                 break;
               }
               buffered.push(event);
+              firstEventSeen = true;
+              if (
+                streamedDeltas &&
+                (event.type === "text_delta" || event.type === "thinking_delta" || event.type === "toolcall_delta")
+              ) {
+                streamedDeltas.push(event.delta);
+              }
               if (event.type !== "start" && !producedTokens) {
                 // First model-produced content of any kind (incl. reasoning):
                 // the attempt is now immune to the wall-clock budget.
@@ -914,9 +963,45 @@ export function withRequestRetry(
             },
           );
 
+          // A request the CALLER aborted after it reached the wire is billed by
+          // the provider although its stream reported little or no usage (§8b
+          // "Aborted requests"): the hook records it once, with estimated usage,
+          // in place of the reported-usage capture below. Never retried, so no
+          // later attempt can count it again.
+          const abortedOnWire =
+            verdict === "aborted" &&
+            callerSignal?.aborted === true &&
+            !abortedAtStart &&
+            attemptState.awaitingAdmission !== true &&
+            ctx.onRequestAborted !== undefined;
+          if (abortedOnWire) {
+            let recorded: Usage | undefined;
+            try {
+              recorded = ctx.onRequestAborted!({
+                message: failure,
+                firstEventSeen,
+                streamedText: streamedDeltas?.join("") ?? "",
+                attempt: attempt + 1,
+              });
+            } catch {
+              /* best-effort: the capture hook can never affect the run */
+            }
+            if (attemptRecord && recorded) {
+              attemptRecord.usage = {
+                input: recorded.input,
+                output: recorded.output,
+                cacheRead: recorded.cacheRead,
+                cacheWrite: recorded.cacheWrite,
+                totalTokens: recorded.totalTokens,
+                cost: recorded.cost?.total ?? 0,
+              };
+              attemptRecord.estimated = true;
+            }
+          }
+
           // Preserve provider-reported usage for EVERY failed attempt, including
           // aborted and retried streams. Zero-usage stubs are not estimates.
-          const billedUsage = failure?.usage;
+          const billedUsage = abortedOnWire ? undefined : failure?.usage;
           if (billedUsage && [billedUsage.totalTokens, billedUsage.input, billedUsage.output,
             billedUsage.cacheRead, billedUsage.cacheWrite, billedUsage.cost?.total ?? 0].some((n) => n > 0)) {
             if (attemptRecord) {
