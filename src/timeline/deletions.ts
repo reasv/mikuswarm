@@ -19,6 +19,16 @@ export function isDeleted(event: Pick<CanonicalChatEvent, "deleted">, asOf?: num
 }
 
 /**
+ * True when `event` was deleted by its own sender: the deleter matches, or the
+ * provider did not say who (a Discord deletion counts as the sender's). A
+ * moderator's deletion (another deleter) is not: it never withdraws a request.
+ */
+export function deletedBySender(event: Pick<CanonicalChatEvent, "deleted" | "sender">): boolean {
+  if (!event.deleted) return false;
+  return event.deleted.by === undefined || event.deleted.by === event.sender.id;
+}
+
+/**
  * The placeholder a deleted message shows in place of its content:
  * `[message deleted]`, or `[message deleted by <deleter>]` when the deleter is
  * known and is not the sender (a moderator).

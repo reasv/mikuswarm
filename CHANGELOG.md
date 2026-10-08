@@ -47,7 +47,9 @@ Unreleased section; it is not part of any release's notes.
   it without any judgement; after the run ended it triggers like a reply to the bot's
   message. A Matrix redaction of a message is a deletion like a Discord one (only the
   sender's own redaction withdraws a request; a moderator's leaves the request alone),
-  and a session evicted by a restart cannot be revived.
+  and a session evicted by a restart cannot be revived. A trigger deleted before its
+  session launched (during the trigger hold, while queued, during activation) is
+  never answered, and a part deleted by then leaves the request.
   A discarded rollout is kept as a branch with the message that caused it. The console
   session view labels redo, revival and aborted-turn branches with that message, shows
   how long a call was held, labels each interjection's kind, and marks redone sessions

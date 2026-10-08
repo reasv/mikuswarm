@@ -26,6 +26,7 @@ import {
   applyEditToCanonical,
   AssistantEchoResolver,
   channelTypeOf,
+  deletedBySender,
   deletedPlaceholder,
   editStatus,
   markDeletedReplyTargets,
@@ -3297,6 +3298,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     const enrichmentStatus = needsEnrichment(inbound.event) ? "pending" : "skipped";
     const routed = await router.route(inbound, enrichmentStatus);
 
+    // A message its sender deleted before it got here (a trigger delivered after
+    // its trigger hold, a re-dispatch) is no request any more (§8 "Late input"):
+    // stored and marked, never handled. Synchronous (no await before accept).
+    if (inputWithdrawn(inbound)) {
+      logger.info("late_input_ignored", { timelineKey: inbound.timelineKey, eventId: inbound.event.id, kind: "delete", reason: "deleted_before_launch" });
+      return;
+    }
+
     // Identity upsert (§6.5 + §8.4 cross-channel prerequisite): data-presence-driven.
     // Discord/IRC carry a distinct `username`; Matrix uses the MXID (localpart) as
     // the username so the resolution corpus is populated for all three providers.
@@ -5285,7 +5294,47 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     sessions.onSettle(entry.sessionId, (status) => {
       if (status !== "completed") unregisterLateInputEntry(entry.sessionId);
     });
+    replayPreLaunchDeletions(registered);
     return registered;
+  }
+
+  /**
+   * The stored message `inbound` carries, when its own human sender already
+   * deleted it (late input on): it is no input any more. A moderator's deletion
+   * leaves it (§8 "Late input").
+   */
+  function inputWithdrawn(inbound: InboundChatEvent): boolean {
+    if (!lateInputSettings.enabled || !isHumanSender(inbound.event.sender)) return false;
+    const stored = timeline.getById(inbound.event.id)
+      ?? (inbound.event.externalId ? timeline.getByExternalId(inbound.provider, inbound.event.externalId, inbound.timelineKey) : undefined);
+    return !!stored && deletedBySender(stored);
+  }
+
+  /**
+   * Deletions marked before this entry existed (during the trigger hold, the
+   * queue, the activation hold, a re-dispatch, the readiness wait) never reached
+   * `onRequestEdited`. Replayed now, in the same synchronous span as the
+   * registration, so no deletion falls in between: a deleted trigger cancels the
+   * session before it builds, a deleted part leaves the group, and a moderator's
+   * deletion changes nothing (the marker's deleter is replayed as such).
+   */
+  function replayPreLaunchDeletions(entry: LateInputEntry): void {
+    for (const id of triggerGroupOf(entry.inbound)) {
+      const stored = timeline.getById(id);
+      if (!stored?.deleted) continue;
+      const { deleted: marker, ...prior } = stored;
+      const synthetic: InboundChatEvent = {
+        provider: stored.provider,
+        timelineKey: stored.timelineKey,
+        event: { ...prior, id: `${stored.id}:deleted`, body: "", attachments: [], timestamp: marker.at },
+        edit: {
+          targetExternalId: stored.externalId ?? stored.id,
+          deleted: true,
+          ...(marker.by !== undefined ? { deletedBy: marker.by } : {}),
+        },
+      };
+      onRequestEdited(synthetic, prior, { ...prior, body: "", attachments: [] });
+    }
   }
 
   function unregisterLateInputEntry(sessionId: string): void {
@@ -7720,6 +7769,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     const resumeCfg = config.agent.sessions.resume;
     if (resumeCfg?.enabled?.[ctx] !== true) return false; // §7 step 0: enabled? else FRESH
 
+    // A reply its sender deleted is not resumed: the fresh launch's late-input
+    // registration withdraws it (§8 "Late input").
+    if (inputWithdrawn(inbound)) return false;
     const targetEvent = timeline.getByExternalId(inbound.provider, replyExternalId, inbound.timelineKey);
     const sessionId = targetEvent?.agentSessionId;
     if (!targetEvent || targetEvent.timelineKey !== inbound.timelineKey || !sessionId) return false;
@@ -7794,6 +7846,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // All gates pass → ACCEPT. Single-consumption CAS (§6): completed → resuming,
       // bump generation. A racing reply that already consumed this state gets
       // `undefined` here → FRESH.
+      // Deleted while the gate ran: checked again right before the slot is taken.
+      if (inputWithdrawn(inbound)) return false;
       const generation = await storage.acceptResumeGeneration(sessionId);
       if (generation === undefined) return false;
       // Gap backfill (spec RESUMABLE-SESSIONS §9): active only when BOTH limits are
@@ -8287,6 +8341,16 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     const lateEntry = lateCtl
       ? registerLateInputEntry({ sessionId: session.id, timelineKey: session.timelineKey, sessionType: session.sessionType, inbound, ctl: lateCtl })
       : undefined;
+    // The trigger was withdrawn before the session launched (replayed at the
+    // registration): nothing is built or sent.
+    const cancelledBeforeLaunch = lateCtl?.takeCancelBeforeStart();
+    if (cancelledBeforeLaunch) {
+      lateCtl!.markSettled();
+      sessions.markDiscarded(session.id, { error: `cancelled: ${cancelledBeforeLaunch.reason}` });
+      logger.info("late_input_cancelled", { sessionId: session.id, reason: cancelledBeforeLaunch.reason, phase: "launch" });
+      drainNextQueuedTrigger(session.timelineKey);
+      return;
+    }
     let userLimitForCreate: UserLimitGate["userLimit"];
     let userCeilingOverride: number | undefined;
     let initialUserModel: string | undefined;
