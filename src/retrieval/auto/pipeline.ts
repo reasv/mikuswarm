@@ -467,9 +467,12 @@ export class MemoryRetrievalPipeline {
         pool = [...pool, ...exclude(extra)];
         for (const c of pool) c.late = out.scores.get(c.chunk.contentHash) ?? null;
         const scored = pool.filter((c) => c.late !== null).sort((a, b) => b.late! - a.late!);
-        const missing = pool.filter((c) => c.late === null);
+        // Only blocks with no vectors bypass the cut; anything else left unscored is cut.
+        const noVectors = new Set(out.missingHashes);
+        const missing = pool.filter((c) => c.late === null && noVectors.has(c.chunk.contentHash));
         const kept = scored.slice(0, cfg.late.topN);
         for (const c of scored.slice(cfg.late.topN)) itemStage.set(c.chunk.contentHash, "cut_late");
+        for (const c of pool) if (c.late === null && !noVectors.has(c.chunk.contentHash)) itemStage.set(c.chunk.contentHash, "cut_late");
         pool = [...kept, ...missing];
       }
     }

@@ -149,3 +149,53 @@ test("score rejects with AbortError when the signal aborts, and the scorer stays
   }
   await assert.rejects(scorer.score(randomMatrix(rng(1), 1, 4), { docs: [] }), /closed/);
 });
+
+test("stored fp16 / int8 rows are decoded in the worker; windows update in place", async () => {
+  const { encodeTokenMatrix, decodeTokenMatrix } = await import("../src/retrieval/late/codec.js");
+  const scorer = await ExactMaxSimScorer.create({ threads: 1 });
+  try {
+    const rand = rng(7);
+    const dim = 16;
+    const plain = docs(rand, 6, dim, "d");
+    const encoded = plain.map((d, i) => ({ key: d.key, encoded: encodeTokenMatrix(d.matrix, i % 2 === 0 ? "fp16" : "int8") }));
+    const asStored = plain.map((d, i) => ({ key: d.key, matrix: decodeTokenMatrix(encoded[i]!.encoded) }));
+    const query = randomMatrix(rand, 3, dim);
+    assertScores(await scorer.score(query, { docs: encoded }), query, asStored);
+    await scorer.addToWindow("w", encoded.slice(0, 4));
+    assert.equal(scorer.hasWindow("w"), true);
+    await scorer.addToWindow("w", encoded.slice(4));
+    await scorer.removeFromWindow("w", ["d0", "d1"]);
+    assertScores(await scorer.score(query, { windowId: "w" }), query, asStored.slice(2));
+    // A corrupt blob is skipped (no score), the rest still score.
+    const broken = { key: "bad", encoded: { ...encoded[0]!.encoded, vectors: Buffer.alloc(3) } };
+    const got = await scorer.score(query, { docs: [broken, encoded[2]!] });
+    assert.deepEqual([...got.keys()], ["d2"]);
+  } finally {
+    await scorer.close();
+  }
+});
+
+test("a dead worker is respawned on the next call (with backoff); its windows are reported lost", async () => {
+  const scorer = await ExactMaxSimScorer.create({ threads: 1, respawnDelayMs: 300 });
+  try {
+    const dim = 2;
+    const q = { tokens: 1, dim, data: new Float32Array([1, 0]) };
+    const d = [{ key: "a", matrix: { tokens: 1, dim, data: new Float32Array([1, 0]) } }];
+    await scorer.setWindow("w", d);
+    const kill = async () => {
+      const child = (scorer as unknown as { rpc: { child: import("node:child_process").ChildProcess } }).rpc.child;
+      const exited = new Promise((r) => child.once("exit", r));
+      child.kill("SIGKILL");
+      await exited;
+    };
+    await kill();
+    assert.equal(scorer.hasWindow("w"), false, "the window died with the worker");
+    assert.equal((await scorer.score(q, { docs: d })).get("a"), 1, "the first death respawns at once");
+    await kill();
+    await assert.rejects(scorer.score(q, { docs: d }), /respawning/, "a second death backs off");
+    await new Promise((r) => setTimeout(r, 350));
+    assert.equal((await scorer.score(q, { docs: d })).get("a"), 1);
+  } finally {
+    await scorer.close();
+  }
+});

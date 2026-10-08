@@ -117,13 +117,18 @@ const EMBED = Array.from({ length: VOCAB_SIZE }, (_, r) => [r + 1, (r % 3) - 1, 
  * pooled output comes first, so the encoder must pick `last_hidden_state`.
  * No token_type_ids input: the encoder must not feed one.
  */
-function lateEncoderModel(): Uint8Array {
+function lateEncoderModel(opts: { projected?: string } = {}): Uint8Array {
+  // `projected`: also a ColBERT-style projection output (here the negated states), listed after the raw states.
+  const projection = opts.projected
+    ? { nodes: [{ opType: "Neg", inputs: ["last_hidden_state"], outputs: [opts.projected] }], outputs: [{ name: opts.projected, elemType: F32, dims: ["batch", "seq", DIM] }] }
+    : { nodes: [], outputs: [] };
   return encodeModel({
     opset: 13,
     graph: {
       name: "fake_late",
       nodes: [
         { opType: "Gather", inputs: ["E", "input_ids"], outputs: ["last_hidden_state"], attributes: { axis: { int: 0 } } },
+        ...projection.nodes,
         {
           opType: "ReduceMean",
           inputs: ["last_hidden_state"],
@@ -138,6 +143,7 @@ function lateEncoderModel(): Uint8Array {
       outputs: [
         { name: "pooler_output", elemType: F32, dims: ["batch", DIM] },
         { name: "last_hidden_state", elemType: F32, dims: ["batch", "seq", DIM] },
+        ...projection.outputs,
       ],
       initializers: [floatInit("E", [VOCAB_SIZE, DIM], EMBED.flat())],
     },
@@ -409,5 +415,65 @@ test("model workers are isolated: concurrent models and a main-thread session ke
     await b.close();
     assert.equal((await main.run(feeds)).logits!.data[0], before);
     await main.release();
+  });
+});
+
+test("resolveModelFiles: a pinned revision has its own cache dir, sha256 is enforced, concurrent resolves share downloads", async () => {
+  const { createHash } = await import("node:crypto");
+  await withTemp(async (root) => {
+    const commit = "0123456789abcdef0123456789abcdef01234567";
+    const onnx = Buffer.from(crossEncoderModel("pinned"));
+    const tok = Buffer.from(tokenizerJson());
+    const served: Record<string, Buffer> = {
+      [`/org/pinned/resolve/${commit}/tokenizer.json`]: tok,
+      [`/org/pinned/resolve/${commit}/onnx/model.onnx`]: onnx,
+    };
+    const hits: string[] = [];
+    const server: Server = createServer((req, res) => {
+      hits.push(req.url ?? "");
+      const body = served[req.url ?? ""];
+      if (!body) {
+        res.statusCode = 404;
+        res.end("not found");
+        return;
+      }
+      setTimeout(() => res.end(body), 30);
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const sha = (b: Buffer) => createHash("sha256").update(b).digest("hex");
+    try {
+      const cacheRoot = join(root, "cache");
+      const opts = { model: "org/pinned", revision: commit, onnxFile: "onnx/model.onnx", cacheRoot, baseUrl, sha256: { "onnx/model.onnx": sha(onnx) } };
+      const [a, b] = await Promise.all([resolveModelFiles(opts), resolveModelFiles(opts)]);
+      assert.equal(a.dir, b.dir);
+      assert.equal(a.dir, join(cacheRoot, `${repoSlug("org/pinned")}@${commit.slice(0, 12)}`));
+      assert.equal(hits.filter((h) => h.endsWith("model.onnx")).length, 1, "one download for two concurrent resolves");
+      assert.ok(hits.every((h) => h.includes(`/resolve/${commit}/`)), "every file comes from the pinned commit");
+      // A wrong digest refuses the download (and leaves nothing behind that later looks complete).
+      const bad = { ...opts, cacheRoot: join(root, "cache2"), sha256: { "onnx/model.onnx": "0".repeat(64) } };
+      await assert.rejects(resolveModelFiles(bad), /checksum mismatch/);
+      await assert.rejects(resolveModelFiles(bad), /checksum mismatch/);
+      // A model_dir file is checked too.
+      await assert.rejects(resolveModelFiles({ modelDir: a.dir, onnxFile: "onnx/model.onnx", cacheRoot, sha256: { "tokenizer.json": "1".repeat(64) } }), /checksum mismatch/);
+      await resolveModelFiles({ modelDir: a.dir, onnxFile: "onnx/model.onnx", cacheRoot, sha256: { "tokenizer.json": sha(tok) } });
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+});
+
+test("LocalLateEncoder: a projected ColBERT output is preferred over last_hidden_state", async () => {
+  await withTemp(async (root) => {
+    for (const name of ["token_embeddings", "linear_out"]) {
+      const dir = await modelDir(root, `late-${name}`, lateEncoderModel({ projected: name }), { pad_token_id: 5 });
+      const enc = new LocalLateEncoder(provider({ modelDir: dir, maxTokens: 6 }), { cacheRoot: root });
+      await enc.warm();
+      const [m] = await enc.encodeDocuments(["alpha"], never);
+      const raw = EMBED[VOCAB.alpha!]!;
+      const norm = Math.hypot(...raw);
+      for (let k = 0; k < DIM; k++) assert.ok(Math.abs(m!.data[1 * DIM + k]! + raw[k]! / norm) < 1e-6, `${name}: the projected (negated) vectors`);
+      await enc.close();
+    }
   });
 });

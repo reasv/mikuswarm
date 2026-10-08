@@ -184,7 +184,7 @@ test("config: remote providers need zdr or self_hosted; local needs a model; cha
         enabled: true,
         late: { enabled: true, model: "big", chain: ["a"], providers: { a: { kind: "remote", endpoint: "http://x", zdr: true, model: "other" } } },
       } as any),
-    /not the index model "big" or of its family/,
+    /the index model is "big"/,
   );
   const ok = resolveRetrievalConfig({
     enabled: true,
@@ -203,4 +203,65 @@ test("config: remote providers need zdr or self_hosted; local needs a model; cha
   assert.equal(ok.late.quantization, "turboquant");
   assert.equal(judgedPassageCap(ok), 8);
   assert.equal(judgedPassageCap(resolveRetrievalConfig({ enabled: true })), 12);
+});
+
+test("chain: past its backoff an unhealthy member gets a single probe, not one per concurrent caller", async () => {
+  let now = 1_000_000;
+  let fail = true;
+  const gpu = fake("gpu", () => new Promise((resolve, reject) => setTimeout(() => (fail ? reject(new Error("down")) : resolve([0.7])), 30)));
+  const cpu = fake("cpu", async () => [0.1]);
+  const chain = new ProviderChain(
+    "rerank",
+    [
+      { provider: gpu, enabled: true, timeoutMs: 1000 },
+      { provider: cpu, enabled: true, timeoutMs: 1000 },
+    ],
+    { now: () => now, baseBackoffMs: 10_000 },
+  );
+  await chain.run((p, s) => p.score("q", ["d"], s));
+  assert.equal(gpu.calls, 1);
+  fail = false;
+  now += 10_001;
+  const results = await Promise.all(Array.from({ length: 5 }, () => chain.run((p, s) => p.score("q", ["d"], s))));
+  assert.equal(gpu.calls, 2, "one probe for five concurrent callers");
+  assert.deepEqual(results.map((r) => r.provider.name).sort(), ["cpu", "cpu", "cpu", "cpu", "gpu"]);
+  await chain.run((p, s) => p.score("q", ["d"], s));
+  assert.equal(gpu.calls, 3, "recovered: back in use");
+});
+
+test("remote rerank: documents trimmed to max_tokens client-side; the response cap holds without content-length", async () => {
+  const seen: any[] = [];
+  await withServer(
+    (body) => {
+      seen.push(body);
+      return { results: body.documents.map((_d: string, index: number) => ({ index, relevance_score: 0.5 })) };
+    },
+    async (base) => {
+      const p = new RemoteRerankProvider(providerCfg({ endpoint: base, maxTokens: 128 }));
+      await p.score("query", ["short", "x".repeat(10_000)], new AbortController().signal);
+      assert.equal(seen[0].documents[0], "short");
+      assert.ok(seen[0].documents[1].length <= 128 * 3, `trimmed to ${seen[0].documents[1].length} chars`);
+    },
+  );
+  // A chunked response (no content-length) larger than the cap is refused while streaming.
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.write(`{"results":[`);
+    const chunk = `{"index":0,"relevance_score":0.5},`.repeat(1000);
+    let sent = 0;
+    const pump = () => {
+      if (sent++ > 200 || res.destroyed) return res.end("]}");
+      res.write(chunk, () => setImmediate(pump));
+    };
+    pump();
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  try {
+    const port = (server.address() as { port: number }).port;
+    const p = new RemoteRerankProvider(providerCfg({ endpoint: `http://127.0.0.1:${port}` }), { maxResponseBytes: 64 * 1024 });
+    await assert.rejects(p.score("q", ["d"], new AbortController().signal), /too large/);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((r) => server.close(() => r(undefined)));
+  }
 });

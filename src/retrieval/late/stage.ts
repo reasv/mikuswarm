@@ -17,9 +17,27 @@
  * model on a GPU first and a small one on CPU; switching members never
  * touches the index). The whole stage
  * (query encode + MaxSim) is bounded by `late.timeout_ms`; past it the stage
- * is skipped for that query. Windows are rebuilt in the background when the
- * index or the recency layer changes, never on the query path: a query uses
- * the window it finds (or none, the first time).
+ * is skipped for that query.
+ *
+ * Every recall candidate inside the window is re-scored exactly along with the
+ * shortlist, so only a block with no (decodable) vectors goes unscored; those
+ * are reported in `missingHashes` and bypass the cut. The window itself merges
+ * into the pool as its best `max(late.rescore, late.top_n)` blocks (the rest
+ * could never survive the cut).
+ *
+ * With `late.resident = false` nothing stays resident: the window's stored
+ * vectors are read and scored exactly on every query (the quantised scan is
+ * never used per query; re-quantising per query would be both slower and
+ * approximate).
+ *
+ * Windows are maintained in the background, never on the query path: a query
+ * uses the window it finds (or none, the first time). Index and recency
+ * changes are coalesced (`refreshDebounceMs`, at most `refreshMaxWaitMs`
+ * apart during a backfill) and applied incrementally: only blocks that joined
+ * or left the window are read, and they cross to the scorer as stored rows,
+ * decoded off the event loop (natively or in the scorer worker). Per-query
+ * vectors are read in small chunks with a yield in between, so the query's
+ * deadline is honoured.
  */
 import type { Logger } from "../../observability/logger.js";
 import type { LexicalHit } from "../../storage/database.js";
@@ -27,7 +45,7 @@ import type { MemoryRetrievalStore } from "../../storage/memory-retrieval-store.
 import type { ResolvedRetrievalConfig } from "../config.js";
 import type { ProviderChain } from "../models/chain.js";
 import type { LateEncoder, TokenMatrix } from "../models/types.js";
-import { decodeTokenMatrix } from "./codec.js";
+import { lateIndexKey } from "./index-key.js";
 import type { MaxSimScorer, ScoredDoc } from "./scorer.js";
 
 export interface LateOutcome {
@@ -41,6 +59,8 @@ export interface LateOutcome {
   queryModel: string | null;
   /** Candidates that had no vectors (they bypass the cut). */
   missing: number;
+  /** ... their content hashes. */
+  missingHashes: string[];
   windowSize: number;
   ms: number;
   error?: string;
@@ -48,9 +68,8 @@ export interface LateOutcome {
 
 interface WindowState {
   key: string;
-  chunks: Map<string, LexicalHit>;
-  /** Decoded vectors when the window is not resident in the scan scorer. */
-  docs?: ScoredDoc[];
+  /** Member content hash → the chunk rowid it was taken from. */
+  members: Map<string, number>;
 }
 
 export interface LateStageOptions {
@@ -64,9 +83,18 @@ export interface LateStageOptions {
   recencyPaths: (agent: string | null) => Promise<Set<string>>;
   /** Current index version (bumps when vectors change). */
   indexVersion: () => number;
+  /** Quiet time before a requested window update runs (default 2 s). */
+  refreshDebounceMs?: number;
+  /** Longest a requested update waits while requests keep coming (default 60 s). */
+  refreshMaxWaitMs?: number;
   logger?: Logger;
   now?: () => number;
 }
+
+/** Stored vectors read per synchronous query (~16 blocks, ~1.4 MB at 340 × 128 fp16: a few ms). */
+const READ_CHUNK = 16;
+/** Bytes of stored rows per scorer load call during a window update. */
+const LOAD_BYTES = 8 * 1024 * 1024;
 
 function abortError(): Error {
   const e = new Error("aborted");
@@ -74,12 +102,21 @@ function abortError(): Error {
   return e;
 }
 
+const yieldToLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
 export class LateStage {
   private readonly windows = new Map<string, WindowState>();
   private readonly building = new Map<string, Promise<void>>();
-  private indexedCache: { version: number; hashes: Set<string> } | null = null;
+  /** Window ids whose update was requested while one was running. */
+  private readonly rerun = new Set<string>();
+  private readonly timers = new Map<string, { timer: NodeJS.Timeout; firstAt: number }>();
+  private closed = false;
+  /** The vector index key (the model plus its document-side settings). */
+  readonly indexKey: string;
 
-  constructor(private readonly options: LateStageOptions) {}
+  constructor(private readonly options: LateStageOptions) {
+    this.indexKey = lateIndexKey(options.config);
+  }
 
   private now(): number {
     return (this.options.now ?? Date.now)();
@@ -89,57 +126,131 @@ export class LateStage {
     return `agent:${agent ?? ""}`;
   }
 
-  private indexedHashes(): Set<string> {
-    const version = this.options.indexVersion();
-    if (!this.indexedCache || this.indexedCache.version !== version) {
-      this.indexedCache = { version, hashes: this.options.store.lateIndexedHashes(this.options.config.model) };
-    }
-    return this.indexedCache.hashes;
-  }
-
-  private decode(hashes: string[]): ScoredDoc[] {
-    const rows = this.options.store.lateVectors(this.options.config.model, hashes);
+  /** Stored rows of `hashes` (missing ones are absent), as scorer docs. */
+  private readEncoded(hashes: string[]): ScoredDoc[] {
+    const rows = this.options.store.lateVectors(this.indexKey, hashes);
     const out: ScoredDoc[] = [];
-    for (const [hash, row] of rows) {
-      try {
-        out.push({ key: hash, matrix: decodeTokenMatrix(row) });
-      } catch {
-        // a corrupt blob is skipped (the block bypasses the cut)
-      }
+    for (const [key, row] of rows) {
+      out.push({ key, encoded: { dtype: row.dtype, dim: row.dim, tokenCount: row.tokenCount, vectors: row.vectors, scales: row.scales } });
     }
     return out;
   }
 
-  /** Rebuild an agent's window in the background when the index or recency layer changed. */
+  /** {@link readEncoded} in chunks with a yield between them; rejects once `signal` aborts. */
+  private async readEncodedAsync(hashes: string[], signal: AbortSignal): Promise<ScoredDoc[]> {
+    const out: ScoredDoc[] = [];
+    for (let i = 0; i < hashes.length; i += READ_CHUNK) {
+      if (signal.aborted) throw abortError();
+      if (i > 0) await yieldToLoop();
+      if (signal.aborted) throw abortError();
+      out.push(...this.readEncoded(hashes.slice(i, i + READ_CHUNK)));
+    }
+    return out;
+  }
+
+  /**
+   * Ask for an agent's window to be brought up to date: coalesced, run after
+   * `refreshDebounceMs` of quiet, and at most `refreshMaxWaitMs` after the
+   * first pending request.
+   */
+  requestRefresh(agent: string | null): void {
+    if (this.closed || this.options.config.exhaustiveBlocks <= 0) return;
+    const id = this.windowId(agent);
+    const debounce = this.options.refreshDebounceMs ?? 2000;
+    const maxWait = this.options.refreshMaxWaitMs ?? 60_000;
+    const pending = this.timers.get(id);
+    const firstAt = pending?.firstAt ?? this.now();
+    if (pending) clearTimeout(pending.timer);
+    const delay = Math.max(0, Math.min(debounce, firstAt + maxWait - this.now()));
+    const timer = setTimeout(() => {
+      this.timers.delete(id);
+      void this.refreshWindow(agent);
+    }, delay);
+    timer.unref();
+    this.timers.set(id, { timer, firstAt });
+  }
+
+  /** Bring an agent's window up to date now (one update at a time per agent). */
   refreshWindow(agent: string | null): Promise<void> {
     const id = this.windowId(agent);
     const running = this.building.get(id);
-    if (running) return running;
-    const task = (async () => {
-      const cfg = this.options.config;
-      if (cfg.exhaustiveBlocks <= 0) return;
-      const recency = await this.options.recencyPaths(agent);
-      const key = `${this.options.indexVersion()}|${[...recency].sort().join(",")}`;
-      if (this.windows.get(id)?.key === key) return;
-      const indexed = this.indexedHashes();
-      const limit = Number.isFinite(cfg.exhaustiveBlocks) ? cfg.exhaustiveBlocks : Number.MAX_SAFE_INTEGER;
-      const rows = this.options.store.newestChunks(agent, limit, recency, (r) => indexed.has(r.contentHash));
-      const chunks = new Map(rows.map((r) => [r.contentHash, r]));
-      const docs = this.decode([...chunks.keys()]);
-      if (cfg.resident) {
-        await this.options.scan.setWindow(id, docs);
-        this.windows.set(id, { key, chunks });
-      } else {
-        this.windows.set(id, { key, chunks, docs });
-      }
-      this.options.logger?.debug("late_window_built", { agent: agent ?? undefined, blocks: docs.length, resident: cfg.resident });
-    })()
+    if (running) {
+      this.rerun.add(id);
+      return running;
+    }
+    const task = this.update(agent)
       .catch((error) =>
         this.options.logger?.warn("late_window_build_failed", { error: error instanceof Error ? error.message : String(error) }),
       )
-      .finally(() => this.building.delete(id));
+      .finally(() => {
+        this.building.delete(id);
+        if (this.rerun.delete(id) && !this.closed) void this.refreshWindow(agent);
+      });
     this.building.set(id, task);
     return task;
+  }
+
+  private async update(agent: string | null): Promise<void> {
+    const cfg = this.options.config;
+    if (cfg.exhaustiveBlocks <= 0 || this.closed) return;
+    const id = this.windowId(agent);
+    const recency = await this.options.recencyPaths(agent);
+    const key = `${this.options.indexVersion()}|${[...recency].sort().join(",")}`;
+    const current = this.windows.get(id);
+    const scanHas = !cfg.resident || this.options.scan.hasWindow(id);
+    if (current?.key === key && scanHas) return;
+    const started = this.now();
+    const limit = Number.isFinite(cfg.exhaustiveBlocks) ? cfg.exhaustiveBlocks : Number.MAX_SAFE_INTEGER;
+    const rows = await this.options.store.newestLateWindow(agent, this.indexKey, limit, recency);
+    const members = new Map(rows.map((r) => [r.contentHash, r.rowid]));
+    let added = 0;
+    let removed: string[] = [];
+    if (cfg.resident) {
+      const base = scanHas && current ? current.members : new Map<string, number>();
+      const toAdd = [...members.keys()].filter((h) => !base.has(h));
+      removed = [...base.keys()].filter((h) => !members.has(h));
+      if (!this.options.scan.hasWindow(id)) await this.options.scan.addToWindow(id, []);
+      // Small synchronous reads with a yield between them, handed to the scorer in ~8 MB loads.
+      let batch: ScoredDoc[] = [];
+      let bytes = 0;
+      for (let i = 0; i < toAdd.length && !this.closed; i += READ_CHUNK) {
+        if (i > 0) await yieldToLoop();
+        for (const d of this.readEncoded(toAdd.slice(i, i + READ_CHUNK))) {
+          batch.push(d);
+          bytes += d.encoded!.vectors.byteLength;
+        }
+        if (bytes >= LOAD_BYTES || i + READ_CHUNK >= toAdd.length) {
+          added += batch.length;
+          await this.options.scan.addToWindow(id, batch);
+          batch = [];
+          bytes = 0;
+        }
+      }
+      if (this.closed) return;
+      this.windows.set(id, { key, members });
+      if (removed.length > 0) await this.options.scan.removeFromWindow(id, removed);
+    } else {
+      this.windows.set(id, { key, members });
+    }
+    this.options.logger?.debug("late_window_updated", {
+      agent: agent ?? undefined,
+      blocks: members.size,
+      added,
+      removed: removed.length,
+      resident: cfg.resident,
+      ms: this.now() - started,
+    });
+  }
+
+  /** The window's chunk rows for `keys` (the member rowid's row when several share a hash), in order. */
+  private windowRows(agent: string | null, keys: string[], members: Map<string, number>): LexicalHit[] {
+    if (keys.length === 0) return [];
+    const byHash = new Map<string, LexicalHit>();
+    for (const row of this.options.store.chunksByContentHashes(keys, agent)) {
+      const have = byHash.get(row.contentHash);
+      if (!have || row.rowid === members.get(row.contentHash)) byHash.set(row.contentHash, row);
+    }
+    return keys.map((k) => byHash.get(k)).filter((r): r is LexicalHit => r !== undefined);
   }
 
   /** Score one query: the window (when built) plus the given recall candidates. */
@@ -151,6 +262,7 @@ export class LateStage {
   }): Promise<LateOutcome> {
     const cfg = this.options.config;
     const started = this.now();
+    const candidateHashes = [...new Set(input.candidates.map((c) => c.contentHash))];
     const base = (status: LateOutcome["status"], extra: Partial<LateOutcome> = {}): LateOutcome => ({
       status,
       scores: new Map(),
@@ -158,6 +270,7 @@ export class LateStage {
       backend: null,
       queryModel: null,
       missing: input.candidates.length,
+      missingHashes: candidateHashes,
       windowSize: 0,
       ms: this.now() - started,
       ...extra,
@@ -166,8 +279,8 @@ export class LateStage {
     const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
     const onAbort = () => controller.abort();
     input.signal?.addEventListener("abort", onAbort, { once: true });
-    // The window rebuild never blocks a query.
-    if (cfg.exhaustiveBlocks > 0) void this.refreshWindow(input.agent);
+    // Window updates never block a query.
+    this.requestRefresh(input.agent);
     try {
       const queryText = input.queryText.trim();
       if (!queryText) return base("unavailable", { error: "empty query" });
@@ -181,40 +294,58 @@ export class LateStage {
         if (controller.signal.aborted) throw abortError();
         return base("unavailable", { error: error instanceof Error ? error.message : String(error) });
       }
-      const win = cfg.exhaustiveBlocks > 0 ? this.windows.get(this.windowId(input.agent)) : undefined;
-      const inWindow = win?.chunks ?? new Map<string, LexicalHit>();
-      const beyond = [...new Set(input.candidates.map((c) => c.contentHash).filter((h) => !inWindow.has(h)))];
-      const beyondDocs = this.decode(beyond);
+      const id = this.windowId(input.agent);
+      const { exact, scan } = this.options;
+      const found = cfg.exhaustiveBlocks > 0 ? this.windows.get(id) : undefined;
+      // A resident window the scorer lost (a worker restart) is rebuilt in the background.
+      const win = found && (!cfg.resident || scan.hasWindow(id)) ? found : undefined;
+      const members = win?.members ?? new Map<string, number>();
+      const beyond = candidateHashes.filter((h) => !members.has(h));
+      const inWindow = candidateHashes.filter((h) => members.has(h));
+      const keep = Math.max(cfg.rescore, cfg.topN);
+      const best = (scores: Map<string, number>): string[] =>
+        [...members.keys()]
+          .filter((k) => scores.has(k))
+          .sort((a, b) => scores.get(b)! - scores.get(a)!)
+          .slice(0, keep);
       let scores = new Map<string, number>();
-      let windowChunks: LexicalHit[] = [];
-      let backend = this.options.exact.backend;
-      if (win && this.options.scan.approximate && cfg.resident) {
-        // Quantised scan → shortlist → exact rescoring from the stored vectors.
-        backend = this.options.scan.backend;
-        const shortlist = await this.options.scan.score(query, { windowId: this.windowId(input.agent), windowTopK: cfg.rescore }, controller.signal);
-        const keys = [...shortlist.keys()];
-        const rescoreDocs = this.decode(keys);
-        scores = await this.options.exact.score(query, { docs: [...rescoreDocs, ...beyondDocs] }, controller.signal);
-        windowChunks = keys.map((k) => inWindow.get(k)).filter((r): r is LexicalHit => r !== undefined);
+      let windowKeys: string[] = [];
+      let backend = exact.backend;
+      if (win && cfg.resident && scan.approximate) {
+        // Quantised scan → shortlist; the shortlist, every in-window candidate
+        // and the beyond-window candidates are re-scored exactly.
+        backend = scan.backend;
+        const shortlist = await scan.score(query, { windowId: id, windowTopK: cfg.rescore }, controller.signal);
+        windowKeys = [...shortlist.keys()].filter((k) => members.has(k));
+        const docs = await this.readEncodedAsync([...new Set([...windowKeys, ...inWindow, ...beyond])], controller.signal);
+        if (docs.length > 0) scores = await exact.score(query, { docs }, controller.signal);
+        windowKeys = windowKeys.filter((k) => scores.has(k));
+      } else if (win && cfg.resident) {
+        // An exact resident window (the scan is the exact scorer) plus the beyond-window candidates.
+        backend = scan.backend;
+        const docs = await this.readEncodedAsync(beyond, controller.signal);
+        scores = await scan.score(query, { windowId: id, docs }, controller.signal);
+        windowKeys = best(scores);
       } else if (win) {
-        backend = this.options.scan.backend;
-        const target = cfg.resident
-          ? { windowId: this.windowId(input.agent), docs: beyondDocs }
-          : { docs: [...(win.docs ?? []), ...beyondDocs] };
-        scores = await this.options.scan.score(query, target, controller.signal);
-        windowChunks = [...inWindow.values()];
+        // Not resident: the window's stored vectors are read and scored exactly per query.
+        const docs = await this.readEncodedAsync([...new Set([...members.keys(), ...beyond])], controller.signal);
+        if (docs.length > 0) scores = await exact.score(query, { docs }, controller.signal);
+        windowKeys = best(scores);
       } else {
-        scores = beyondDocs.length > 0 ? await this.options.exact.score(query, { docs: beyondDocs }, controller.signal) : new Map();
+        const docs = await this.readEncodedAsync(beyond, controller.signal);
+        if (docs.length > 0) scores = await exact.score(query, { docs }, controller.signal);
       }
-      const missing = input.candidates.filter((c) => !scores.has(c.contentHash) && !inWindow.has(c.contentHash)).length;
+      if (controller.signal.aborted) throw abortError();
+      const missingHashes = candidateHashes.filter((h) => !scores.has(h));
       return {
         status: "ok",
         scores,
-        windowChunks,
+        windowChunks: this.windowRows(input.agent, windowKeys, members),
         backend,
         queryModel,
-        missing,
-        windowSize: inWindow.size,
+        missing: missingHashes.length,
+        missingHashes,
+        windowSize: members.size,
         ms: this.now() - started,
       };
     } catch (error) {
@@ -234,6 +365,10 @@ export class LateStage {
   }
 
   async close(): Promise<void> {
+    this.closed = true;
+    for (const t of this.timers.values()) clearTimeout(t.timer);
+    this.timers.clear();
+    await Promise.all([...this.building.values()]).catch(() => undefined);
     await Promise.all([this.options.scan.close(), this.options.scan === this.options.exact ? undefined : this.options.exact.close()]);
   }
 }

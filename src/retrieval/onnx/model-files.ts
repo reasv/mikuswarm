@@ -4,8 +4,15 @@
  * once into the cache root. Downloads write to a temp file and rename, so a
  * crash never leaves a truncated file that later looks complete; files that
  * exist are never fetched again.
+ *
+ * Pinning: `revision` (a commit) downloads that commit into its own cache
+ * directory (`<slug>@<commit prefix>`), so an upstream push never changes the
+ * files under a running index; `sha256` (per file) refuses a download, a
+ * cached file or a `modelDir` file whose digest does not match. Concurrent
+ * resolves of the same file share one download.
  */
-import { createWriteStream } from "node:fs";
+import { createHash } from "node:crypto";
+import { createReadStream, createWriteStream } from "node:fs";
 import { access, mkdir, rename, rm, stat } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
@@ -28,8 +35,12 @@ export interface ResolveModelFilesOptions {
   /** Downloads go to `<cacheRoot>/<repo slug>/`. */
   cacheRoot: string;
   httpProxyUrl?: string;
-  /** Hub base URL (default https://huggingface.co); files at `<base>/<repo>/resolve/main/<file>`. */
+  /** Hub base URL (default https://huggingface.co); files at `<base>/<repo>/resolve/<revision>/<file>`. */
   baseUrl?: string;
+  /** Pinned commit (default: `main`, unpinned). */
+  revision?: string;
+  /** Expected sha256 per file (relative path → hex digest). */
+  sha256?: Record<string, string>;
   signal?: AbortSignal;
 }
 
@@ -66,11 +77,36 @@ function assertRelative(file: string): void {
 
 class NotFoundError extends Error {}
 
+/** In-flight downloads by destination: concurrent resolves share one. */
+const inflight = new Map<string, Promise<void>>();
+/** Files whose digest matched, by path and size/mtime (hashed once per process). */
+const verified = new Map<string, string>();
+
+async function sha256File(path: string): Promise<string> {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) hash.update(chunk as Buffer);
+  return hash.digest("hex");
+}
+
+/** Throw unless `path` has the expected digest (cached per path, size and mtime). */
+async function verifyFile(path: string, expected: string | undefined, label: string): Promise<void> {
+  if (!expected) return;
+  const st = await stat(path);
+  const stamp = `${st.size}:${st.mtimeMs}:${expected}`;
+  if (verified.get(path) === stamp) return;
+  const actual = await sha256File(path);
+  if (actual !== expected.toLowerCase()) {
+    throw new Error(`model file checksum mismatch: ${label}: expected ${expected}, got ${actual}`);
+  }
+  verified.set(path, stamp);
+}
+
 async function download(
   url: string,
   dest: string,
   dispatcher: Dispatcher | undefined,
   signal: AbortSignal | undefined,
+  expectedSha256?: string,
 ): Promise<void> {
   const res = await fetch(url, { dispatcher, signal, redirect: "follow" });
   if (res.status === 404) {
@@ -85,6 +121,7 @@ async function download(
   const tmp = `${dest}.part-${process.pid}-${Date.now()}`;
   try {
     await pipeline(Readable.fromWeb(res.body as WebReadableStream<Uint8Array>), createWriteStream(tmp), { signal });
+    await verifyFile(tmp, expectedSha256, url);
     await rename(tmp, dest);
   } catch (error) {
     await rm(tmp, { force: true }).catch(() => undefined);
@@ -101,27 +138,45 @@ async function download(
  */
 export async function resolveModelFiles(opts: ResolveModelFilesOptions): Promise<ModelFiles> {
   assertRelative(opts.onnxFile);
+  const expected = (file: string): string | undefined => opts.sha256?.[file];
   if (opts.modelDir) {
     const dir = resolve(opts.modelDir);
     const files = layout(dir, opts.onnxFile);
     for (const path of [files.onnxPath, files.tokenizerPath]) {
       if (!(await exists(path))) throw new Error(`model directory is missing ${path.slice(dir.length + 1)}: ${dir}`);
     }
+    for (const [file, digest] of Object.entries(opts.sha256 ?? {})) {
+      assertRelative(file);
+      await verifyFile(join(dir, ...file.split("/")), digest, `${dir}/${file}`);
+    }
     return withConfig(files);
   }
   const repo = opts.model?.trim();
   if (!repo) throw new Error("a local model needs a Hugging Face repo id or a model directory");
-  const dir = join(resolve(opts.cacheRoot), repoSlug(repo));
+  const revision = opts.revision?.trim() || undefined;
+  const dir = join(resolve(opts.cacheRoot), revision ? `${repoSlug(repo)}@${revision.slice(0, 12)}` : repoSlug(repo));
   const base = (opts.baseUrl ?? DEFAULT_HF_BASE_URL).replace(/\/+$/, "");
   const repoPath = repo.split("/").map(encodeURIComponent).join("/");
+  const ref = encodeURIComponent(revision ?? "main");
   const dispatcher = opts.httpProxyUrl ? new ProxyAgent(opts.httpProxyUrl) : undefined;
   const fetchFile = async (file: string, required: boolean): Promise<void> => {
     const dest = join(dir, ...file.split("/"));
     if (!dest.startsWith(dir + sep)) throw new Error(`model file escapes the cache: ${file}`);
-    if (await exists(dest)) return;
-    const url = `${base}/${repoPath}/resolve/main/${file.split("/").map(encodeURIComponent).join("/")}`;
+    // Registered before the first await, so a concurrent resolve joins this one.
+    let task = inflight.get(dest);
+    if (!task) {
+      const url = `${base}/${repoPath}/resolve/${ref}/${file.split("/").map(encodeURIComponent).join("/")}`;
+      const own: Promise<void> = (async () => {
+        if (await exists(dest)) await verifyFile(dest, expected(file), dest);
+        else await download(url, dest, dispatcher, opts.signal, expected(file));
+      })().finally(() => {
+        if (inflight.get(dest) === own) inflight.delete(dest);
+      });
+      inflight.set(dest, own);
+      task = own;
+    }
     try {
-      await download(url, dest, dispatcher, opts.signal);
+      await task;
     } catch (error) {
       if (!required && error instanceof NotFoundError) return;
       throw error;

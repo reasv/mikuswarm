@@ -20,6 +20,12 @@
  *   arrays cross as copies.
  * - The child is unref'd while idle, so it never keeps the process alive, and
  *   exits when the parent disconnects.
+ * - A hang watchdog: every request has a deadline (`callTimeoutMs`, per call
+ *   overridable), and an aborted request must be acknowledged by the child
+ *   within `cancelGraceMs`. Past either, the child is wedged (a stuck native
+ *   call blocks everything queued behind it): it is killed, every pending
+ *   request rejects, and `onDead` lets the owner respawn it. `close()` has the
+ *   same deadline, then kills.
  */
 import { fork, type ChildProcess } from "node:child_process";
 import { setPriority } from "node:os";
@@ -84,6 +90,18 @@ interface Pending {
   reject: (error: Error) => void;
 }
 
+/** Default per-request deadline (a healthy request is far shorter). */
+export const DEFAULT_CALL_TIMEOUT_MS = 120_000;
+/** Default time a child has to acknowledge an aborted request. */
+export const DEFAULT_CANCEL_GRACE_MS = 10_000;
+/** Default deadline of the `close` op before the child is killed. */
+export const DEFAULT_CLOSE_TIMEOUT_MS = 2_000;
+
+export interface CallOptions {
+  /** This request's deadline (default: the worker's `callTimeoutMs`). */
+  timeoutMs?: number;
+}
+
 export interface StartOptions {
   /** Short name, for logs and errors. */
   label: string;
@@ -92,24 +110,46 @@ export interface StartOptions {
   onDead?: (error: Error) => void;
   /** OS niceness for the child (e.g. 10 for background work); best effort. */
   nice?: number;
+  /** Per-request deadline before the child counts as wedged and is killed (default 120 s). */
+  callTimeoutMs?: number;
+  /** Time an aborted request has to be acknowledged before the child is killed (default 10 s). */
+  cancelGraceMs?: number;
+  /** Deadline of `close()`'s close op before the child is killed (default 2 s). */
+  closeTimeoutMs?: number;
 }
 
 export class WorkerRpc {
   private readonly pending = new Map<number, Pending>();
+  /** Deadline timers of in-flight requests, and grace timers of aborted ones. */
+  private readonly timers = new Map<string, NodeJS.Timeout>();
+  /** Ids sent and not yet answered by the child (pending or aborted), oldest first. */
+  private readonly outstanding = new Set<number>();
+  /** Aborted ids awaiting the child's acknowledgement, with their grace. */
+  private readonly abandoned = new Map<number, { op: string; graceMs: number }>();
   private nextId = 1;
   private deadError: Error | null = null;
   private closing = false;
+  private readonly label: string;
+  private readonly logger?: Logger;
+  private readonly onDead?: (error: Error) => void;
 
   private constructor(
     private readonly child: ChildProcess,
-    private readonly label: string,
-    private readonly logger?: Logger,
-    private readonly onDead?: (error: Error) => void,
+    private readonly opts: StartOptions,
   ) {
+    this.label = opts.label;
+    this.logger = opts.logger;
+    this.onDead = opts.onDead;
+    const label = opts.label;
     child.on("message", (msg: Reply | Ready) => {
       if (!("id" in msg)) return;
+      this.clearTimer(`d${msg.id}`);
+      this.clearTimer(`g${msg.id}`);
+      this.outstanding.delete(msg.id);
+      this.abandoned.delete(msg.id);
+      this.armHead();
       const p = this.pending.get(msg.id);
-      if (!p) return; // abandoned (aborted) request
+      if (!p) return; // abandoned (aborted) request, now acknowledged
       this.settle(msg.id);
       if (msg.ok) p.resolve(msg.result);
       else p.reject(new Error(msg.message));
@@ -168,7 +208,7 @@ export class WorkerRpc {
       child.kill("SIGKILL");
       throw error;
     }
-    const rpc = new WorkerRpc(child, opts.label, opts.logger, opts.onDead);
+    const rpc = new WorkerRpc(child, opts);
     rpc.idle();
     return { rpc, info };
   }
@@ -177,15 +217,20 @@ export class WorkerRpc {
     return this.deadError !== null;
   }
 
-  call<T>(op: string, payload: unknown, signal?: AbortSignal): Promise<T> {
+  call<T>(op: string, payload: unknown, signal?: AbortSignal, callOpts: CallOptions = {}): Promise<T> {
     if (this.deadError) return Promise.reject(this.deadError);
     if (signal?.aborted) return Promise.reject(abortError(signal));
     const id = this.nextId++;
+    const timeoutMs = callOpts.timeoutMs ?? this.opts.callTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS;
     return new Promise<T>((resolve, reject) => {
       const onAbort = (): void => {
         if (!this.pending.has(id)) return;
         this.settle(id);
         this.send({ cancel: id });
+        // Once it is the oldest outstanding request, the child must acknowledge
+        // the cancel (its reply for `id`) within the grace.
+        this.abandoned.set(id, { op, graceMs: Math.min(this.opts.cancelGraceMs ?? DEFAULT_CANCEL_GRACE_MS, timeoutMs) });
+        this.armHead();
         reject(abortError(signal!));
       };
       this.pending.set(id, {
@@ -200,16 +245,18 @@ export class WorkerRpc {
       });
       signal?.addEventListener("abort", onAbort, { once: true });
       if (this.pending.size === 1) this.busy();
+      this.outstanding.add(id);
+      this.setTimer(`d${id}`, timeoutMs, `${op} exceeded its ${timeoutMs} ms deadline`);
       this.send({ id, op, payload });
     });
   }
 
-  /** Ask the child to release its resources (`close` op), then make sure it is gone. */
+  /** Ask the child to release its resources (`close` op, with a deadline), then make sure it is gone. */
   async close(): Promise<void> {
     if (this.deadError) return;
     this.closing = true;
     try {
-      await this.call("close", null);
+      await this.call("close", null, undefined, { timeoutMs: this.opts.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS });
     } catch {
       // killed below regardless
     }
@@ -226,6 +273,42 @@ export class WorkerRpc {
         });
       });
     }
+  }
+
+  /** Kill a wedged child: every pending request rejects and `onDead` runs. */
+  private wedged(reason: string): void {
+    if (this.deadError) return;
+    try {
+      this.child.kill("SIGKILL");
+    } catch {
+      // already gone
+    }
+    this.fail(new Error(`${this.label} worker wedged (${reason}); killed`));
+  }
+
+  /** Start the grace of the oldest outstanding request if it was aborted (the child is on it). */
+  private armHead(): void {
+    const head = this.outstanding.values().next();
+    if (head.done) return;
+    const a = this.abandoned.get(head.value);
+    if (!a || this.timers.has(`g${head.value}`)) return;
+    this.setTimer(`g${head.value}`, a.graceMs, `${a.op} did not stop within ${a.graceMs} ms of its abort`);
+  }
+
+  private setTimer(id: string, ms: number, reason: string): void {
+    this.clearTimer(id);
+    const timer = setTimeout(() => {
+      this.timers.delete(id);
+      this.wedged(reason);
+    }, ms);
+    timer.unref();
+    this.timers.set(id, timer);
+  }
+
+  private clearTimer(id: string): void {
+    const timer = this.timers.get(id);
+    if (timer) clearTimeout(timer);
+    this.timers.delete(id);
   }
 
   private send(msg: Request): void {
@@ -252,6 +335,10 @@ export class WorkerRpc {
   }
 
   private fail(error: Error): void {
+    for (const timer of this.timers.values()) clearTimeout(timer);
+    this.timers.clear();
+    this.outstanding.clear();
+    this.abandoned.clear();
     if (this.deadError) return;
     this.deadError = this.closing ? new Error(`${this.label} closed`) : error;
     if (!this.closing) {

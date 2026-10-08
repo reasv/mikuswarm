@@ -18,6 +18,7 @@ import { configureAgentTimezone, resetAgentTimezone, parseZonedWallClock } from 
 import { MemoryRetrievalStore } from "../src/storage/memory-retrieval-store.js";
 import { decodeTokenMatrix, encodeTokenMatrix, fromHalf, toHalf } from "../src/retrieval/late/codec.js";
 import { LateIndexWorker } from "../src/retrieval/late/indexer.js";
+import { lateIndexKey } from "../src/retrieval/late/index-key.js";
 import { LateStage } from "../src/retrieval/late/stage.js";
 import { ExactMaxSimScorer } from "../src/retrieval/late/maxsim.js";
 import type { MaxSimScorer } from "../src/retrieval/late/scorer.js";
@@ -113,6 +114,9 @@ async function withFixture(files: Record<string, string>, run: (f: Fixture) => P
   }
 }
 
+/** The vector index key of the default late config (the model plus its document-side settings). */
+const KEY = lateIndexKey(resolveRetrievalConfig({ enabled: true, late: { enabled: true, model: "late-toy", chain: ["cpu"], providers: { cpu: { kind: "local", model: "late-toy" } } } } as any).late);
+
 const lateCfg = (over: Record<string, unknown> = {}) =>
   resolveRetrievalConfig({
     enabled: true,
@@ -154,22 +158,65 @@ test("indexer: encodes blocks newest first in batches, prunes other models, repo
       recencyPaths: async () => new Set(["memory/2026-04-02.md"]),
     });
     while ((await drain.batch()) > 0);
-    assert.equal(store.lateIndexedHashes("late-toy").size, 4);
+    assert.equal(store.lateIndexedHashes(KEY).size, 4);
     assert.equal(store.lateIndexedHashes("old-model").size, 0, "other models' vectors pruned");
     assert.deepEqual(await drain.lag(), { missing: 0, outsideRecency: 0 });
   });
   await withFixture(FILES, async ({ store }) => {
-    const enc = fakeEncoder("cpu", { fail: true });
+    let clock = 1_000_000;
+    let failing = true;
+    const enc = fakeEncoder("cpu");
+    const flaky = { ...enc, async encodeDocuments(texts: string[]) { enc.docCalls++; if (failing) throw new Error("encoder down"); return texts.map(encodeText); } };
     const worker = new LateIndexWorker({
       store,
       config: lateCfg({ index_batch_size: 10 }),
-      chain: new ProviderChain("late_documents", [{ provider: enc, enabled: true, timeoutMs: 5000 }], { baseBackoffMs: 0 }),
+      chain: new ProviderChain("late_documents", [{ provider: flaky, enabled: true, timeoutMs: 5000 }], { baseBackoffMs: 0 }),
       recencyPaths: async () => new Set(),
+      now: () => clock,
     });
     for (let i = 0; i < 5; i++) await worker.batch();
-    assert.equal(enc.docCalls, 3, "each block retried at most 3 times");
+    assert.equal(enc.docCalls, 1, "a failed block waits for its backoff, never every poll");
+    for (let i = 0; i < 6; i++) {
+      clock += 2 * 3_600_000; // past even the capped backoff
+      await worker.batch();
+    }
+    assert.equal(enc.docCalls, 7, "...and is retried at a capped pace, never dropped for good");
+    assert.equal(store.indexFailureCount(`late:${worker.indexKey}`), 4);
+    failing = false;
+    clock += 2 * 3_600_000;
+    assert.equal(await worker.batch(), 4, "the outage is over: every block is indexed");
+    assert.equal(store.indexFailureCount(`late:${worker.indexKey}`), 0, "and its failure rows are cleared");
   });
 });
+
+/** A fake quantised scan scorer that records its window updates. */
+function fakeScan(score?: MaxSimScorer["score"]) {
+  const windows = new Map<string, Set<string>>();
+  const calls: Array<{ op: "add" | "remove"; keys: string[]; encoded: boolean }> = [];
+  return {
+    backend: "fake-quantised",
+    approximate: true,
+    windows,
+    calls,
+    async setWindow() {},
+    async addToWindow(id: string, docs: Array<{ key: string; encoded?: unknown }>) {
+      const w = windows.get(id) ?? new Set<string>();
+      windows.set(id, w);
+      for (const d of docs) w.add(d.key);
+      if (docs.length > 0) calls.push({ op: "add" as const, keys: docs.map((d) => d.key), encoded: docs.every((d) => d.encoded !== undefined) });
+    },
+    async removeFromWindow(id: string, keys: string[]) {
+      for (const k of keys) windows.get(id)?.delete(k);
+      calls.push({ op: "remove" as const, keys, encoded: false });
+    },
+    hasWindow: (id: string) => windows.has(id),
+    async dropWindow(id: string) {
+      windows.delete(id);
+    },
+    score: score ?? (async () => new Map<string, number>()),
+    async close() {},
+  } satisfies MaxSimScorer & Record<string, unknown>;
+}
 
 async function indexAll(store: MemoryRetrievalStore) {
   const worker = new LateIndexWorker({
@@ -197,7 +244,7 @@ test("stage: exhaustive window + re-score beyond it; a missing block bypasses; t
         indexVersion: () => worker.version,
       });
       await stage.refreshWindow(null);
-      const old = store.chunksByContentHashes([...store.lateIndexedHashes("late-toy")], null).find((r) => r.text.includes("pancake"))!;
+      const old = store.chunksByContentHashes([...store.lateIndexedHashes(KEY)], null).find((r) => r.text.includes("pancake"))!;
       const out = await stage.score({ agent: null, queryText: "pancake recipe", candidates: [{ contentHash: old.contentHash }, { contentHash: "unindexed" }] });
       assert.equal(out.status, "ok");
       assert.equal(out.windowSize, 2, "the two newest indexed blocks");
@@ -230,14 +277,12 @@ test("stage: a quantised scan's shortlist is re-scored exactly from the stored v
       const worker = await indexAll(store);
       let windowTopK: number | undefined;
       const approx: MaxSimScorer = {
+        ...fakeScan(),
         backend: "fake-quantised",
-        approximate: true,
-        async setWindow() {},
-        async dropWindow() {},
         async score(_q, target) {
           windowTopK = target.windowTopK;
           // Pretend the scan put every window block in the shortlist with a wrong score.
-          const keys = [...store.lateIndexedHashes("late-toy")];
+          const keys = [...store.lateIndexedHashes(KEY)];
           return new Map(keys.map((k) => [k, 0.01]));
         },
         async close() {},
@@ -318,4 +363,143 @@ test("pipeline: late cut + cross-encoder top_n before the judge; unjudged select
   } finally {
     await exact.close();
   }
+});
+
+test("stage: in-window recall candidates outside the shortlist are re-scored exactly, never bypass", async () => {
+  const exact = await ExactMaxSimScorer.create({ threads: 1 });
+  try {
+    await withFixture(FILES, async ({ store }) => {
+      const worker = await indexAll(store);
+      const rows = store.chunksByContentHashes([...store.lateIndexedHashes(KEY)], null);
+      const garden = rows.find((r) => r.text.includes("garden"))!;
+      const pancake = rows.find((r) => r.text.includes("pancake"))!;
+      // The scan's shortlist (rescore = 1) is the garden block only.
+      const approx = fakeScan(async () => new Map([[garden.contentHash, 0.5]]));
+      const stage = new LateStage({
+        config: lateCfg({ exhaustive_blocks: "all", rescore: 1 }),
+        store,
+        queryChain: new ProviderChain("q", [{ provider: fakeEncoder(), enabled: true, timeoutMs: 1000 }]),
+        exact,
+        scan: approx,
+        recencyPaths: async () => new Set(),
+        indexVersion: () => worker.version,
+      });
+      await stage.refreshWindow(null);
+      const out = await stage.score({ agent: null, queryText: "pancake", candidates: [{ contentHash: pancake.contentHash }, { contentHash: "unindexed" }] });
+      assert.equal(out.status, "ok");
+      assert.equal(out.windowSize, 4);
+      assert.ok(Math.abs(out.scores.get(pancake.contentHash)! - 1) < 1e-3, "the in-window candidate is scored exactly");
+      assert.deepEqual(out.missingHashes, ["unindexed"], "only the vector-less block is missing");
+      assert.deepEqual(out.windowChunks.map((r) => r.contentHash), [garden.contentHash]);
+      await stage.close();
+    });
+  } finally {
+    await exact.close();
+  }
+});
+
+test("stage: resident = false scores the window exactly per query, even with a quantised scan", async () => {
+  const exact = await ExactMaxSimScorer.create({ threads: 1 });
+  try {
+    await withFixture(FILES, async ({ store }) => {
+      const worker = await indexAll(store);
+      const approx = fakeScan(async (_q, target) => new Map((target.docs ?? []).map((d) => [d.key, 0.123])));
+      const stage = new LateStage({
+        config: lateCfg({ exhaustive_blocks: "all", rescore: 2, top_n: 1, resident: false }),
+        store,
+        queryChain: new ProviderChain("q", [{ provider: fakeEncoder(), enabled: true, timeoutMs: 1000 }]),
+        exact,
+        scan: approx,
+        recencyPaths: async () => new Set(),
+        indexVersion: () => worker.version,
+      });
+      await stage.refreshWindow(null);
+      assert.equal(approx.calls.length, 0, "nothing is loaded into the scan");
+      const out = await stage.score({ agent: null, queryText: "garden", candidates: [] });
+      assert.equal(out.status, "ok");
+      assert.equal(out.backend, "exact");
+      const garden = store.chunksByContentHashes([...store.lateIndexedHashes(KEY)], null).find((r) => r.text.includes("garden"))!;
+      assert.ok(out.scores.get(garden.contentHash)! > 0.9, "exact MaxSim, not a quantised score");
+      assert.equal(out.windowChunks.length, 2, "the window's best max(rescore, top_n) blocks join the pool");
+      assert.equal(out.windowChunks[0]!.contentHash, garden.contentHash);
+      await stage.close();
+    });
+  } finally {
+    await exact.close();
+  }
+});
+
+test("stage: window updates are incremental, pass stored rows (decoded off the event loop) and are debounced", async () => {
+  await withFixture(FILES, async ({ store, storage, root }) => {
+    const worker = await indexAll(store);
+    const scan = fakeScan();
+    let updates = 0;
+    const stage = new LateStage({
+      config: lateCfg({ exhaustive_blocks: 2 }),
+      store,
+      queryChain: new ProviderChain("q", [{ provider: fakeEncoder(), enabled: true, timeoutMs: 1000 }]),
+      exact: scan,
+      scan,
+      recencyPaths: async () => new Set(),
+      indexVersion: () => worker.version,
+      refreshDebounceMs: 30,
+      refreshMaxWaitMs: 1000,
+      logger: { debug: (e: string) => e === "late_window_updated" && updates++, info() {}, warn() {} } as any,
+    });
+    await stage.refreshWindow(null);
+    assert.equal(scan.calls.length, 1);
+    assert.equal(scan.calls[0]!.keys.length, 2);
+    assert.ok(scan.calls[0]!.encoded, "the scan receives stored rows, not main-thread-decoded floats");
+    // A newer block is indexed: one block joins, the oldest member leaves; nothing else is re-sent.
+    await writeFile(path.join(root, "memory", "2026-04-03.md"), `${header("2026-04-03", "10:00")}\nrain music\n`);
+    await new MemoryIndexer({ storage, workspaceRoot: root, config: resolveRetrievalConfig({ enabled: true }), tokenizer: new GptTokenizer() }).reconcileAll();
+    while ((await worker.batch()) > 0);
+    scan.calls.length = 0;
+    updates = 0;
+    for (let i = 0; i < 20; i++) stage.requestRefresh(null);
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(updates, 1, "twenty requests coalesce into one update");
+    assert.deepEqual(scan.calls.map((c) => [c.op, c.keys.length]), [["add", 1], ["remove", 1]]);
+    assert.equal(scan.windows.get("agent:")!.size, 2);
+    // A window the scorer lost (a worker restart) is not used and is rebuilt in full.
+    scan.windows.clear();
+    const out = await stage.score({ agent: null, queryText: "rain", candidates: [] });
+    assert.equal(out.windowSize, 0, "a lost resident window is not used");
+    await stage.refreshWindow(null);
+    assert.equal(scan.windows.get("agent:")!.size, 2);
+    await stage.close();
+  });
+});
+
+test("index key: every document-side setting that shapes vectors is part of it; query-side ones are not", () => {
+  const cfg = (cpu: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+    lateIndexKey(
+      resolveRetrievalConfig({
+        enabled: true,
+        late: { enabled: true, model: "late-toy", family: ["late-toy-l"], chain: ["cpu"], providers: { cpu: { kind: "local", model: "late-toy", ...cpu } }, ...extra },
+      } as any).late,
+    );
+  const base = cfg({});
+  assert.match(base, /^late-toy#[0-9a-f]{12}$/);
+  for (const change of [
+    { revision: "a".repeat(40) },
+    { onnx_file: "onnx/model_int8.onnx" },
+    { document_prefix: "[D] " },
+    { max_tokens: 256 },
+    { sha256: { "onnx/model.onnx": "b".repeat(64) } },
+  ]) {
+    assert.notEqual(cfg(change), base, `${Object.keys(change)[0]} re-indexes`);
+  }
+  assert.equal(cfg({ query_prefix: "[Q] " }), base, "a query prefix does not");
+  assert.equal(cfg({}, { top_n: 5, exhaustive_blocks: 10 }), base);
+});
+
+test("config: document encoders serve exactly the index model; family models only encode queries; model_dir providers name their model", () => {
+  const late = (late: Record<string, unknown>) => () => resolveRetrievalConfig({ enabled: true, late: { enabled: true, model: "late-toy", family: ["late-toy-l"], ...late } } as any);
+  assert.throws(late({ chain: ["big"], providers: { big: { kind: "local", model: "late-toy-l" } } }), /query_chain only/);
+  assert.doesNotThrow(
+    late({ chain: ["cpu"], query_chain: ["big", "cpu"], providers: { cpu: { kind: "local", model: "late-toy" }, big: { kind: "local", model: "late-toy-l" } } }),
+  );
+  assert.throws(late({ chain: ["cpu"], query_chain: ["dir"], providers: { cpu: { kind: "local", model: "late-toy" }, dir: { kind: "local", model_dir: "/models/x" } } }), /set `model`/);
+  assert.throws(late({ chain: ["cpu"], query_chain: ["x"], providers: { cpu: { kind: "local", model: "late-toy" }, x: { kind: "local", model: "other" } } }), /not the index model/);
 });

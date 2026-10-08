@@ -27,8 +27,18 @@
  *   bounded number of times instead of every poll.
  * - `memory_retrievals`: one row per auto-retrieval build (counts, source,
  *   timings, the per-candidate report) and the session's follow-up, if any.
- * - `idx_timeline_events_sender`: the display-name history lookup of the user
- *   lanes (distinct `sender_display_name` values of one sender id).
+ * - `idx_memory_chunks_content_hash` / `idx_memory_chunks_entry_ts`: lookups of
+ *   blocks by content hash (candidate rows, the late-vector joins and prunes)
+ *   and the newest-first walk of the late-interaction window.
+ * - `memory_sender_names`: the display-name history of the user lanes (each
+ *   `sender_display_name` a sender id has used, with its latest timestamp),
+ *   kept by triggers on `timeline_events` and back-filled for older rows in
+ *   small background batches (`MemoryRetrievalStore.backfillSenderNames`).
+ *   An index on `timeline_events(provider, sender_id, timestamp)` would serve
+ *   the same lookup, but building it takes seconds on a large timeline (6.5 s
+ *   on 2M events), a write lock the single connection holds on the event loop.
+ *   `idx_memory_sender_names_name` serves the reverse lookup (the senders a
+ *   display name belongs to, case-insensitively) for `recall_memory(user=…)`.
  */
 export const MEMORY_RETRIEVAL_TABLES_SCHEMA = `
 create table if not exists memory_block_provenance (
@@ -128,14 +138,43 @@ create index if not exists idx_memory_retrievals_session
   on memory_retrievals(agent_session_id);
 create index if not exists idx_memory_retrievals_ts
   on memory_retrievals(ts);
+
+create index if not exists idx_memory_chunks_content_hash
+  on memory_chunks(content_hash);
+create index if not exists idx_memory_chunks_entry_ts
+  on memory_chunks(entry_ts);
 `;
 
-/** Index on `timeline_events`, created only where that table exists. */
+/** The sender display-name history and its `timeline_events` triggers, created only where that table exists. */
 export const MEMORY_RETRIEVAL_TIMELINE_INDEX = `
-create index if not exists idx_timeline_events_sender
-  on timeline_events(provider, sender_id, timestamp);
-create index if not exists idx_timeline_events_sender_name
-  on timeline_events(sender_display_name collate nocase, provider, sender_id);
+drop index if exists idx_timeline_events_sender;
+drop index if exists idx_timeline_events_sender_name;
+
+create table if not exists memory_sender_names (
+  provider      text not null,
+  sender_id     text not null,
+  display_name  text not null,
+  last_ts       integer not null,
+  primary key (provider, sender_id, display_name)
+);
+create index if not exists idx_memory_sender_names_name
+  on memory_sender_names(display_name collate nocase);
+
+create trigger if not exists memory_sender_names_ai after insert on timeline_events
+  when new.sender_display_name is not null and new.sender_display_name != ''
+begin
+  insert into memory_sender_names (provider, sender_id, display_name, last_ts)
+  values (new.provider, new.sender_id, new.sender_display_name, new.timestamp)
+  on conflict(provider, sender_id, display_name) do update set last_ts = max(last_ts, excluded.last_ts);
+end;
+
+create trigger if not exists memory_sender_names_au after update of sender_display_name on timeline_events
+  when new.sender_display_name is not null and new.sender_display_name != ''
+begin
+  insert into memory_sender_names (provider, sender_id, display_name, last_ts)
+  values (new.provider, new.sender_id, new.sender_display_name, new.timestamp)
+  on conflict(provider, sender_id, display_name) do update set last_ts = max(last_ts, excluded.last_ts);
+end;
 `;
 
 export const MEMORY_RETRIEVAL_SCHEMA = `${MEMORY_RETRIEVAL_TABLES_SCHEMA}${MEMORY_RETRIEVAL_TIMELINE_INDEX}`;

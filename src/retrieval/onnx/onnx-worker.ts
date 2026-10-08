@@ -34,8 +34,22 @@ interface State {
   padId: number;
 }
 
-/** Output names preferred over the first output for token vectors, in order. */
-const TOKEN_OUTPUTS = ["last_hidden_state", "token_embeddings", "output"];
+/**
+ * Token-vector outputs by preference: a ColBERT model's projected vectors
+ * (the space it was trained to score in) before the raw encoder states. With
+ * none of these names, any other [B, T, D] output wins over
+ * `last_hidden_state`, which is the last resort before the first output.
+ */
+const TOKEN_OUTPUTS = ["colbert_vecs", "token_embeddings", "embeddings", "contextual_embeddings", "output"];
+
+/** The output holding the token vectors (see {@link TOKEN_OUTPUTS}). */
+export function pickTokenOutput(names: readonly string[], rank: (name: string) => number): string {
+  const named = TOKEN_OUTPUTS.find((n) => names.includes(n));
+  if (named) return named;
+  const projected = names.find((n) => n !== "last_hidden_state" && rank(n) === 3);
+  if (projected) return projected;
+  return names.includes("last_hidden_state") ? "last_hidden_state" : names[0]!;
+}
 
 const sigmoid = (x: number): number => 1 / (1 + Math.exp(-x));
 
@@ -72,7 +86,7 @@ async function lateEncode(state: State, p: { texts: string[]; maxTokens: number 
   );
   const { result, length: t } = await run(state, batch);
   const names = state.session.outputNames;
-  const tensor = result[TOKEN_OUTPUTS.find((n) => names.includes(n)) ?? names[0]!]!;
+  const tensor = result[pickTokenOutput(names, (n) => result[n]?.dims.length ?? 0)]!;
   if (tensor.dims.length !== 3 || Number(tensor.dims[0]) !== batch.length || Number(tensor.dims[1]) !== t) {
     throw new Error(`expected token vectors [${batch.length}, ${t}, D], got [${tensor.dims.join(", ")}]`);
   }

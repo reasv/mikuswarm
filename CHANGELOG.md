@@ -60,14 +60,19 @@ Unreleased section; it is not part of any release's notes.
   provider chain with health and fallover) and **late interaction**
   (`[retrieval.late]`: background token-vector indexing; at query time an exhaustive
   scan of the newest blocks with a native TurboQuant kernel plus exact re-scoring of
-  older candidates; `scripts/bench-late.ts` sizes the window). Remote providers must be
+  older candidates; `scripts/bench-late.ts` sizes the window). The window is updated
+  incrementally in the background and vectors are decoded off the event loop; the
+  index is keyed by the model and its document-side settings, so changing one
+  re-indexes. Local models can be pinned (`revision`, `sha256`). Remote providers must be
   marked zero-data-retention or self-hosted.
 - **Primary embedder** (`[retrieval.embedding.primary]`, optional): a second vector
-  index served by a GPU or API embedder, used when it answers in time; the built-in
-  index keeps serving otherwise.
+  index served by a GPU or API embedder, used while it covers every block and answers
+  first; the built-in index keeps serving otherwise. Failed blocks are retried after a
+  backoff, never dropped.
 - Retrieval observability: a `memory_retrieval` log line per build, per-build rows
   with every candidate's fate (shown as a retrieval card in the console's session
-  view, with the items the fallback rule chose marked), the follow-up rate (sessions
+  view, with the items the fallback rule chose marked; kept for
+  `[retrieval].retrievals_retention_days`, 90 by default), the follow-up rate (sessions
   that open a cited memory), and memory-point calibration and a recall-ceiling audit
   in `scripts/calibrate-checks.ts`. Its `--point filter --filter <key>` mode calibrates
   a judged memory filter's threshold over the agent's diary blocks (every block

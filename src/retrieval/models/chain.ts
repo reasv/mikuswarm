@@ -50,6 +50,8 @@ interface HealthState {
   failures: number;
   retryAt: number | null;
   lastError: string | null;
+  /** An unhealthy member's probe is in flight: other callers skip it meanwhile. */
+  probing: boolean;
 }
 
 export class ProviderChain<P extends ProviderBase> {
@@ -60,7 +62,7 @@ export class ProviderChain<P extends ProviderBase> {
     readonly members: ChainMember<P>[],
     private readonly options: ProviderChainOptions = {},
   ) {
-    for (const m of members) this.health.set(m.provider.name, { failures: 0, retryAt: null, lastError: null });
+    for (const m of members) this.health.set(m.provider.name, { failures: 0, retryAt: null, lastError: null, probing: false });
   }
 
   private now(): number {
@@ -147,10 +149,13 @@ export class ProviderChain<P extends ProviderBase> {
       if (!member.enabled) continue;
       if (opts.signal?.aborted) throw abortError();
       const h = this.health.get(name)!;
-      if (h.retryAt !== null && h.retryAt > this.now()) {
+      // Past its backoff an unhealthy member is probed by one caller; the others skip it.
+      if (h.retryAt !== null && (h.retryAt > this.now() || h.probing)) {
         attempts.push({ name, outcome: "unhealthy" });
         continue;
       }
+      const probe = h.retryAt !== null;
+      if (probe) h.probing = true;
       const controller = new AbortController();
       const onAbort = () => controller.abort();
       opts.signal?.addEventListener("abort", onAbort, { once: true });
@@ -179,6 +184,7 @@ export class ProviderChain<P extends ProviderBase> {
         this.strike(name, message);
         attempts.push({ name, outcome: timedOut ? "timeout" : "error" });
       } finally {
+        if (probe) h.probing = false;
         clearTimeout(timer);
         opts.signal?.removeEventListener("abort", onAbort);
       }

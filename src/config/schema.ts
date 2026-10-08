@@ -316,6 +316,11 @@ const RetrievalModelProviderSchema = StrictObject({
   min_score: Type.Optional(Type.Number()),
   // local: a directory holding the model files instead of a download.
   model_dir: Type.Optional(Type.String({ minLength: 1 })),
+  // local: pin the Hugging Face download to this commit (40 hex chars); unset = main.
+  revision: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40}$" })),
+  // local: expected sha256 per model file, e.g. { "onnx/model.onnx" = "<64 hex>" };
+  // a download or model_dir file that does not match is refused.
+  sha256: Type.Optional(Type.Record(Type.String({ minLength: 1 }), Type.String({ pattern: "^[0-9a-f]{64}$" }))),
   // local: the ONNX file inside the repo / directory. Default "onnx/model.onnx".
   onnx_file: Type.Optional(Type.String({ minLength: 1 })),
   // local: input token limit (query + passage). Default 512.
@@ -423,6 +428,9 @@ const RetrievalSchema = StrictObject({
   // §8c — inject the small relevant-memory block inside each trigger's final user
   // turn. Independently disablable (cache-safe placement; risk is distraction).
   auto_retrieval: Type.Optional(Type.Boolean()),
+  // Days a per-build memory_retrievals row (and its report) is kept; pruned in
+  // the background. 0 = keep forever. Default 90.
+  retrievals_retention_days: Type.Optional(Type.Integer({ minimum: 0, maximum: 3650 })),
   // Numeric knobs carry both minimum AND maximum bounds (review issue #10): an
   // unbounded value degrades silently — e.g. a huge candidate_multiplier or
   // max_results blows the `getChunksByRowids` IN-list toward SQLite's bound-parameter

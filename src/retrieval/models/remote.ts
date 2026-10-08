@@ -8,6 +8,9 @@
  * `documents` (`{ model, query, documents, top_n }`, the default) and `texts`
  * (`{ query, texts }`, TEI). The response may be a bare array
  * `[{ index, score }]`, or `{ results | data: [{ index, relevance_score | score }] }`.
+ * Documents are trimmed client-side to the provider's `max_tokens` (a
+ * conservative character estimate, the query counted against it), since not
+ * every server truncates; TEI's `texts` format also asks it to.
  *
  * Late encoder: an embeddings-shaped endpoint returning one vector per token:
  * `{ model, input: [...], input_type: "query" | "document" }` →
@@ -23,8 +26,9 @@ const MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
 async function postJson(
   url: string,
   body: unknown,
-  opts: { apiKey?: string; signal: AbortSignal; dispatcher?: Dispatcher },
+  opts: { apiKey?: string; signal: AbortSignal; dispatcher?: Dispatcher; maxResponseBytes?: number },
 ): Promise<unknown> {
+  const maxBytes = opts.maxResponseBytes ?? MAX_RESPONSE_BYTES;
   const res = await fetch(url, {
     method: "POST",
     headers: {
@@ -40,8 +44,33 @@ async function postJson(
     throw new Error(`HTTP ${res.status}: ${text}`);
   }
   const declared = Number(res.headers.get("content-length"));
-  if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) throw new Error(`response too large: ${declared} bytes`);
-  return res.json();
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    await res.body?.cancel().catch(() => undefined);
+    throw new Error(`response too large: ${declared} bytes`);
+  }
+  // Enforced while streaming too: a missing or false content-length never buffers past the cap.
+  const chunks: Buffer[] = [];
+  let size = 0;
+  if (res.body) {
+    for await (const chunk of res.body as AsyncIterable<Uint8Array>) {
+      size += chunk.byteLength;
+      if (size > maxBytes) {
+        await res.body.cancel().catch(() => undefined);
+        throw new Error(`response too large: over ${maxBytes} bytes`);
+      }
+      chunks.push(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+    }
+  }
+  return JSON.parse(Buffer.concat(chunks, size).toString("utf8")) as unknown;
+}
+
+/** Characters per token assumed when trimming for a remote model (conservative: real text runs ~4). */
+const TRIM_CHARS_PER_TOKEN = 3;
+
+/** `doc` trimmed so query + document fit `maxTokens` (at least a short head of the document is kept). */
+export function trimForModel(query: string, doc: string, maxTokens: number): string {
+  const budget = Math.max(64 * TRIM_CHARS_PER_TOKEN, (maxTokens - 8) * TRIM_CHARS_PER_TOKEN - query.length);
+  return doc.length <= budget ? doc : doc.slice(0, budget);
 }
 
 /** Parse a `/rerank` response into scores aligned with the input documents. */
@@ -73,14 +102,16 @@ export class RemoteRerankProvider implements RerankProvider {
   readonly name: string;
   readonly model?: string;
   private readonly dispatcher?: Dispatcher;
+  private readonly maxResponseBytes?: number;
 
   constructor(
     private readonly cfg: ResolvedModelProvider,
-    opts: { httpProxyUrl?: string } = {},
+    opts: { httpProxyUrl?: string; maxResponseBytes?: number } = {},
   ) {
     this.name = cfg.name;
     this.model = cfg.model;
     this.dispatcher = opts.httpProxyUrl ? new ProxyAgent(opts.httpProxyUrl) : undefined;
+    this.maxResponseBytes = opts.maxResponseBytes;
   }
 
   async score(query: string, documents: string[], signal: AbortSignal): Promise<number[]> {
@@ -88,12 +119,12 @@ export class RemoteRerankProvider implements RerankProvider {
     const url = `${this.cfg.endpoint}${this.cfg.path ?? "/rerank"}`;
     const out: number[] = [];
     for (let i = 0; i < documents.length; i += this.cfg.batchSize) {
-      const batch = documents.slice(i, i + this.cfg.batchSize);
+      const batch = documents.slice(i, i + this.cfg.batchSize).map((d) => trimForModel(query, d, this.cfg.maxTokens));
       const body =
         this.cfg.requestFormat === "texts"
           ? { query, texts: batch, raw_scores: false, truncate: true }
           : { ...(this.model ? { model: this.model } : {}), query, documents: batch, top_n: batch.length, return_documents: false };
-      const json = await postJson(url, body, { apiKey: this.cfg.apiKey, signal, dispatcher: this.dispatcher });
+      const json = await postJson(url, body, { apiKey: this.cfg.apiKey, signal, dispatcher: this.dispatcher, maxResponseBytes: this.maxResponseBytes });
       out.push(...parseRerankResponse(json, batch.length));
     }
     return out;

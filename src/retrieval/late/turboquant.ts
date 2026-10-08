@@ -9,11 +9,16 @@
  * instance and scanned with the same kernel, so their scores are on the same
  * (approximate) scale as the window's. Re-rank candidates that need exact
  * scores belong to the exact backend.
+ *
+ * Windows are updated in place (`addToWindow` / `removeFromWindow`) from the
+ * stored fp16 / int8 rows, which the native side decodes off the event loop.
+ * A replaced, dropped or temporary native instance is freed explicitly, and
+ * the native side reports its codes to V8 as external memory.
  */
 import { createRequire } from "node:module";
 import type { Logger } from "../../observability/logger.js";
 import type { TokenMatrix } from "../models/types.js";
-import type { MaxSimScorer, ScoredDoc, ScoreTarget } from "./scorer.js";
+import { docDim, docTokens, type MaxSimScorer, type ScoredDoc, type ScoreTarget } from "./scorer.js";
 
 /** N-API surface of `TurboQuantMaxSim` (native/crates/matrix-core/src/turboquant). */
 export declare class NativeTurboQuantMaxSim {
@@ -24,10 +29,23 @@ export declare class NativeTurboQuantMaxSim {
   setBlocks(keys: string[], tokenCounts: Uint32Array | number[], vectors: Float32Array): Promise<void>;
   /** Add or replace (by key) blocks. */
   addBlocks(keys: string[], tokenCounts: Uint32Array | number[], vectors: Float32Array): Promise<void>;
+  /** Add or replace blocks from stored fp16 / int8 rows (decoded off the JS thread); `replace` replaces the set. */
+  addEncoded(
+    keys: string[],
+    tokenCounts: Uint32Array | number[],
+    dtype: "fp16" | "int8",
+    vectors: Uint8Array | Uint8Array[],
+    scales: Uint8Array | Uint8Array[] | null | undefined,
+    replace?: boolean,
+  ): Promise<void>;
   /** Remove blocks by key; returns how many were present. */
   removeBlocks(keys: string[]): number;
+  /** Release the codes now; later mutations are discarded. */
+  free(): void;
   blockCount(): number;
   memoryBytes(): number;
+  /** Bytes reported to V8 as external memory. */
+  externalBytes(): number;
   /** Best `topK` (0 = all) blocks by MaxSim / queryTokens, best first. */
   scan(query: Float32Array, queryTokens: number, topK: number): Promise<{ keys: string[]; scores: Float64Array }>;
 }
@@ -44,8 +62,8 @@ export interface TurboQuantScorerOptions {
   logger?: Logger;
 }
 
-/** Floats per native load call (~32 MB): bounds each main-thread concatenation. */
-const LOAD_CHUNK_FLOATS = 8 * 1024 * 1024;
+/** Bytes per native load call (~8 MB): bounds each main-thread concatenation to a short memcpy. */
+const LOAD_CHUNK_BYTES = 8 * 1024 * 1024;
 
 const require = createRequire(import.meta.url);
 
@@ -57,9 +75,10 @@ export function loadTurboQuantBinding(): typeof NativeTurboQuantMaxSim {
   } catch (error) {
     throw new Error(`TurboQuant native kernel unavailable: ${(error as Error).message}`);
   }
-  if (typeof binding.TurboQuantMaxSim !== "function") {
+  const proto = (binding.TurboQuantMaxSim as { prototype?: Record<string, unknown> } | undefined)?.prototype;
+  if (typeof binding.TurboQuantMaxSim !== "function" || typeof proto?.addEncoded !== "function" || typeof proto?.free !== "function") {
     throw new Error(
-      "TurboQuant native kernel unavailable: the native module does not export TurboQuantMaxSim " +
+      "TurboQuant native kernel unavailable: the native module does not export a current TurboQuantMaxSim " +
         "(rebuild it with `pnpm build:native`)",
     );
   }
@@ -101,9 +120,27 @@ function floatsOf(m: TokenMatrix): Float32Array {
   return m.data.length === n ? m.data : m.data.subarray(0, n);
 }
 
+/** Stored bytes of a doc's rows (for chunking). */
+function docBytes(d: ScoredDoc): number {
+  return d.matrix ? d.matrix.tokens * d.matrix.dim * 4 : d.encoded.vectors.byteLength;
+}
+
+/** A run of docs sharing one representation (f32, fp16 or int8). */
+function kindOf(d: ScoredDoc): string {
+  return d.matrix ? "f32" : d.encoded.dtype;
+}
+
 interface Window {
   native: NativeTurboQuantMaxSim | null;
   dim: number;
+}
+
+function safeFree(native: NativeTurboQuantMaxSim | null | undefined): void {
+  try {
+    native?.free();
+  } catch {
+    // an older module without free(): left to GC
+  }
 }
 
 class TurboQuantScorer implements MaxSimScorer {
@@ -112,6 +149,8 @@ class TurboQuantScorer implements MaxSimScorer {
   private readonly windows = new Map<string, Window>();
   /** Latest load per window id: a slower, older `setWindow` never overwrites a newer one. */
   private readonly generations = new Map<string, number>();
+  /** Per-window mutation chain: incremental updates apply in call order. */
+  private readonly chains = new Map<string, Promise<unknown>>();
   private nextGeneration = 1;
   private closed = false;
 
@@ -127,51 +166,84 @@ class TurboQuantScorer implements MaxSimScorer {
     return new this.Native({ dim, bits: this.opts.bits, seed: this.opts.seed, threads: this.opts.threads });
   }
 
-  /** Encode `docs` (non-empty, one dim) into `native`, in bounded chunks; the first chunk replaces. */
-  private async load(native: NativeTurboQuantMaxSim, docs: ScoredDoc[], dim: number): Promise<void> {
-    let first = true;
+  /**
+   * Encode `docs` (non-empty, one dim) into `native` in bounded chunks of one
+   * representation; with `replace` the first chunk replaces the set. Stored
+   * rows are passed as they are; decoding runs natively, off the event loop.
+   */
+  private async load(native: NativeTurboQuantMaxSim, docs: ScoredDoc[], dim: number, replace: boolean): Promise<void> {
+    let first = replace;
     for (let i = 0; i < docs.length; ) {
-      const keys: string[] = [];
-      const counts: number[] = [];
-      let floats = 0;
-      const start = i;
-      while (i < docs.length && (floats === 0 || floats + docs[i]!.matrix.tokens * dim <= LOAD_CHUNK_FLOATS)) {
-        const m = docs[i]!.matrix;
-        if (m.dim !== dim) throw new Error(`TurboQuant: doc ${docs[i]!.key} has dim ${m.dim}, expected ${dim}`);
-        keys.push(docs[i]!.key);
-        counts.push(m.tokens);
-        floats += m.tokens * dim;
+      const kind = kindOf(docs[i]!);
+      const chunk: ScoredDoc[] = [];
+      let bytes = 0;
+      while (i < docs.length && kindOf(docs[i]!) === kind && (bytes === 0 || bytes + docBytes(docs[i]!) <= LOAD_CHUNK_BYTES)) {
+        const d = docs[i]!;
+        const dDim = d.matrix ? d.matrix.dim : d.encoded.dim;
+        if (dDim !== dim) throw new Error(`TurboQuant: doc ${d.key} has dim ${dDim}, expected ${dim}`);
+        chunk.push(d);
+        bytes += docBytes(d);
         i++;
       }
-      const vectors = new Float32Array(floats);
-      let offset = 0;
-      for (let j = start; j < i; j++) {
-        const data = floatsOf(docs[j]!.matrix);
-        vectors.set(data, offset);
-        offset += data.length;
+      const keys = chunk.map((d) => d.key);
+      const counts = Uint32Array.from(chunk, (d) => (d.matrix ? d.matrix.tokens : d.encoded.tokenCount));
+      if (kind === "f32") {
+        const floats = chunk.reduce((n, d) => n + d.matrix!.tokens * dim, 0);
+        const vectors = new Float32Array(floats);
+        let offset = 0;
+        for (const d of chunk) {
+          const data = floatsOf(d.matrix!);
+          vectors.set(data, offset);
+          offset += data.length;
+        }
+        await (first ? native.setBlocks(keys, counts, vectors) : native.addBlocks(keys, counts, vectors));
+      } else {
+        // One buffer per block: the native side reads them in place (no JS-side copy).
+        const vectors = chunk.map((d) => d.encoded!.vectors);
+        const scales = kind === "int8" ? chunk.map((d) => d.encoded!.scales ?? new Uint8Array(0)) : null;
+        await native.addEncoded(keys, counts, kind as "fp16" | "int8", vectors, scales, first);
       }
-      const counts32 = Uint32Array.from(counts);
-      await (first ? native.setBlocks(keys, counts32, vectors) : native.addBlocks(keys, counts32, vectors));
       first = false;
     }
+  }
+
+  /** Run `fn` after the window's earlier mutations (failures do not break the chain). */
+  private serial<T>(windowId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.chains.get(windowId) ?? Promise.resolve();
+    const next = prev.catch(() => undefined).then(fn);
+    this.chains.set(windowId, next);
+    void next.finally(() => {
+      if (this.chains.get(windowId) === next) this.chains.delete(windowId);
+    }).catch(() => undefined);
+    return next;
   }
 
   async setWindow(windowId: string, docs: ScoredDoc[]): Promise<void> {
     this.assertOpen();
     const generation = this.nextGeneration++;
     this.generations.set(windowId, generation);
-    const kept = docs.filter((d) => d.matrix.tokens > 0);
+    const kept = docs.filter((d) => docTokens(d) > 0);
     const started = Date.now();
     let window: Window = { native: null, dim: this.opts.dim ?? 0 };
     if (kept.length > 0) {
-      const dim = kept[0]!.matrix.dim;
+      const dim = docDim(kept[0]!);
       const native = this.create(dim);
       // A fresh instance: scans keep using the previous window until this one is complete.
-      await this.load(native, kept, dim);
+      try {
+        await this.load(native, kept, dim, true);
+      } catch (error) {
+        safeFree(native);
+        throw error;
+      }
       window = { native, dim };
     }
-    if (this.closed || this.generations.get(windowId) !== generation) return;
+    if (this.closed || this.generations.get(windowId) !== generation) {
+      safeFree(window.native);
+      return;
+    }
+    const old = this.windows.get(windowId);
     this.windows.set(windowId, window);
+    if (old && old.native !== window.native) safeFree(old.native);
     this.opts.logger?.debug("turboquant_window_set", {
       window: windowId,
       blocks: kept.length,
@@ -180,9 +252,45 @@ class TurboQuantScorer implements MaxSimScorer {
     });
   }
 
+  addToWindow(windowId: string, docs: ScoredDoc[]): Promise<void> {
+    this.assertOpen();
+    const generation = this.generations.get(windowId);
+    return this.serial(windowId, async () => {
+      const kept = docs.filter((d) => docTokens(d) > 0);
+      if (this.closed || this.generations.get(windowId) !== generation) return;
+      let window = this.windows.get(windowId);
+      if (!window) {
+        window = { native: null, dim: this.opts.dim ?? 0 };
+        this.windows.set(windowId, window);
+      }
+      if (kept.length === 0) return;
+      const dim = docDim(kept[0]!);
+      if (!window.native) {
+        window.native = this.create(dim);
+        window.dim = dim;
+      } else if (dim !== window.dim) {
+        throw new Error(`TurboQuant: docs have dim ${dim}, window ${windowId} has dim ${window.dim}`);
+      }
+      await this.load(window.native, kept, dim, false);
+    });
+  }
+
+  removeFromWindow(windowId: string, keys: string[]): Promise<void> {
+    this.assertOpen();
+    return this.serial(windowId, async () => {
+      if (keys.length > 0) this.windows.get(windowId)?.native?.removeBlocks(keys);
+    });
+  }
+
+  hasWindow(windowId: string): boolean {
+    return this.windows.has(windowId);
+  }
+
   async dropWindow(windowId: string): Promise<void> {
     this.generations.set(windowId, this.nextGeneration++);
+    const old = this.windows.get(windowId);
     this.windows.delete(windowId);
+    safeFree(old?.native);
   }
 
   /**
@@ -210,10 +318,14 @@ class TurboQuantScorer implements MaxSimScorer {
       }
     }
 
-    const adHoc = (target.docs ?? []).filter((d) => d.matrix.tokens > 0);
+    const adHoc = (target.docs ?? []).filter((d) => docTokens(d) > 0);
     if (adHoc.length > 0) {
       const native = this.create(query.dim);
-      scans.push(this.load(native, adHoc, query.dim).then(() => native.scan(q, query.tokens, 0)));
+      scans.push(
+        this.load(native, adHoc, query.dim, true)
+          .then(() => native.scan(q, query.tokens, 0))
+          .finally(() => safeFree(native)),
+      );
     }
 
     const results = await withAbort(Promise.all(scans), signal);
@@ -225,6 +337,7 @@ class TurboQuantScorer implements MaxSimScorer {
 
   async close(): Promise<void> {
     this.closed = true;
+    for (const w of this.windows.values()) safeFree(w.native);
     this.windows.clear();
     this.generations.clear();
   }
@@ -248,12 +361,13 @@ export async function createTurboQuantScorer(opts: TurboQuantScorerOptions): Pro
     v[0] = 1;
     await probe.setBlocks(["probe"], [1], v);
     const r = await probe.scan(v, 1, 1);
+    probe.free();
     if (r.keys[0] !== "probe" || !(Math.abs(r.scores[0]! - 1) < 0.1)) {
       throw new Error(`TurboQuant native kernel failed its probe (score ${r.scores[0]})`);
     }
   } else {
     // Validates `bits` without waiting for the first window.
-    new Native({ dim: 8, bits: opts.bits, threads: 1 });
+    new Native({ dim: 8, bits: opts.bits, threads: 1 }).free();
   }
   opts.logger?.debug("turboquant_ready", { bits: opts.bits, dim: opts.dim ?? null });
   return new TurboQuantScorer(Native, opts);

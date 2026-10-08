@@ -125,20 +125,85 @@ export interface FollowUpStats {
 
 type ChunkRow = LexicalHit;
 
+/**
+ * Retry pacing of a failed block in an index without a status column
+ * (`memory_index_failures`): never excluded for good, only delayed. The n-th
+ * consecutive failure waits `base × 2^(n-1)`, capped at `max`.
+ */
+export interface IndexRetryPolicy {
+  now: number;
+  baseMs?: number;
+  maxMs?: number;
+}
+
+export const INDEX_RETRY_BASE_MS = 60_000;
+export const INDEX_RETRY_MAX_MS = 3_600_000;
+
+/** SQL predicate (alias `f` = memory_index_failures): no failure, or its backoff has elapsed. Binds 3 params. */
+const RETRY_DUE = `(f.content_hash is null or f.updated_at + min(?, ? * (1 << min(f.attempts - 1, 30))) <= ?)`;
+
+function retryParams(p: IndexRetryPolicy): number[] {
+  return [p.maxMs ?? INDEX_RETRY_MAX_MS, p.baseMs ?? INDEX_RETRY_BASE_MS, p.now];
+}
+
 const CHUNK_COLUMNS = `c.rowid as rowid, c.id as id, c.path as path, c.start_line as startLine,
   c.end_line as endLine, c.room as room, c.entry_ts as entryTs, c.text as text,
   c.content_hash as contentHash, c.token_count as tokenCount, c.agent as agent, 0 as bm25`;
 
-/** Newest messages of a sender scanned for its display-name history (bounds the query). */
-const NAME_HISTORY_SCAN = 5000;
-const NAME_HISTORY_CACHE_MS = 10 * 60_000;
-const NAME_HISTORY_CACHE_MAX = 1000;
+export interface MemoryRetrievalStoreOptions {
+  /** Days `memory_retrievals` rows are kept (0 = forever, default 90); pruned at most hourly, in the background. */
+  retrievalsRetentionDays?: number;
+}
+
+/** Report items kept in a stored `report_json` (the rest are counted in `itemsOmitted`). */
+export const REPORT_MAX_ITEMS = 120;
+/** Reports up to this size are stored as they are (no parse). */
+const REPORT_PARSE_ABOVE = 48 * 1024;
+const PRUNE_EVERY_MS = 3_600_000;
+/** `index_meta` key of the sender-name back-fill cursor (the next upper rowid; 0 = done). */
+const SENDER_BACKFILL_KEY = "memory_sender_names_backfill";
+/** Timeline rows per back-fill batch (a few ms of the writer each). */
+const SENDER_BACKFILL_ROWS = 500;
+const PRUNE_BATCH = 5000;
+/** Distinct display names kept per sender in the history read on every build. */
+const NAME_HISTORY_MAX = 6;
+
+/**
+ * Bound a build report before it is stored: the kept, hidden and judged items
+ * always, then the best-scored others up to {@link REPORT_MAX_ITEMS}; the
+ * number left out is recorded as `itemsOmitted`.
+ */
+export function capReportJson(json: string | null, maxItems = REPORT_MAX_ITEMS): string | null {
+  if (json === null || json.length <= REPORT_PARSE_ABOVE) return json;
+  let report: { items?: Array<Record<string, unknown>>; itemsOmitted?: number };
+  try {
+    report = JSON.parse(json) as typeof report;
+  } catch {
+    return json;
+  }
+  const items = report.items;
+  if (!Array.isArray(items) || items.length <= maxItems) return json;
+  const score = (i: Record<string, unknown>): number => {
+    const s = (i.scores ?? i) as Record<string, unknown>;
+    for (const k of ["rerank", "late", "hybrid"]) if (typeof s[k] === "number") return s[k] as number;
+    return -Infinity;
+  };
+  const must = items.filter((i) => i.stage === "kept" || i.stage === "hidden" || i.judged === true);
+  const rest = items.filter((i) => !must.includes(i)).sort((a, b) => score(b) - score(a));
+  const kept = [...must, ...rest.slice(0, Math.max(0, maxItems - must.length))];
+  const keep = new Set(kept);
+  report.items = items.filter((i) => keep.has(i));
+  report.itemsOmitted = (report.itemsOmitted ?? 0) + items.length - report.items.length;
+  return JSON.stringify(report);
+}
 
 export class MemoryRetrievalStore {
-  /** Display-name history per sender (read on every build): a bounded, short-lived cache. */
-  private readonly nameHistory = new Map<string, { at: number; names: string[] }>();
+  private lastPrune = 0;
 
-  constructor(readonly storage: Storage) {}
+  constructor(
+    readonly storage: Storage,
+    private readonly opts: MemoryRetrievalStoreOptions = {},
+  ) {}
 
   // ── Chunks ────────────────────────────────────────────────────────────────
 
@@ -203,6 +268,99 @@ export class MemoryRetrievalStore {
       }
       return rows;
     });
+  }
+
+  /**
+   * The late-interaction window's members: the newest `limit` blocks (one per
+   * content hash, newest entry first) of an agent that have vectors for
+   * `model`, outside `excludePaths`. Narrow rows only, read in keyset pages
+   * with a yield to the event loop between pages, so a large window never
+   * blocks it for long.
+   */
+  async newestLateWindow(
+    agent: string | null,
+    model: string,
+    limit: number,
+    excludePaths: ReadonlySet<string>,
+    page = 500,
+  ): Promise<Array<{ contentHash: string; rowid: number }>> {
+    // Walks idx_memory_chunks_entry_ts newest first (`+c.agent` keeps the planner off the agent index).
+    const agentClause = agent !== null && agent !== "__legacy__" ? "+c.agent = ? and " : "";
+    const agentParams: unknown[] = agentClause ? [agent] : [];
+    const sql = `select c.rowid as rowid, c.content_hash as contentHash, c.path as path, c.entry_ts as entryTs
+       from memory_chunks c
+       where ${agentClause}(c.entry_ts, c.rowid) < (?, ?)
+         and exists (select 1 from memory_late_vectors v where v.model = ? and v.content_hash = c.content_hash)
+       order by c.entry_ts desc, c.rowid desc limit ?`;
+    const out: Array<{ contentHash: string; rowid: number }> = [];
+    const seen = new Set<string>();
+    let cursor = { ts: Number.MAX_SAFE_INTEGER, rowid: Number.MAX_SAFE_INTEGER };
+    while (out.length < limit) {
+      const batch = this.storage.read(
+        (db) =>
+          db.prepare(sql).all(...agentParams, cursor.ts, cursor.rowid, model, page) as Array<{
+            rowid: number;
+            contentHash: string;
+            path: string;
+            entryTs: number;
+          }>,
+      );
+      if (batch.length === 0) break;
+      for (const row of batch) {
+        if (excludePaths.has(row.path) || seen.has(row.contentHash)) continue;
+        seen.add(row.contentHash);
+        out.push({ contentHash: row.contentHash, rowid: row.rowid });
+        if (out.length >= limit) break;
+      }
+      const last = batch[batch.length - 1]!;
+      cursor = { ts: last.entryTs, rowid: last.rowid };
+      if (batch.length < page) break;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    return out;
+  }
+
+  /**
+   * One batch of the `memory_sender_names` back-fill over `timeline_events`
+   * rows older than its triggers (newest first, `batchRows` rowids per call,
+   * its own short write). Returns true once done (or when there is nothing to fill).
+   */
+  backfillSenderNames(batchRows = SENDER_BACKFILL_ROWS): Promise<boolean> {
+    return this.storage.write((db) => {
+      const ready = db
+        .prepare(`select count(*) as n from sqlite_master where type = 'table' and name in ('timeline_events', 'memory_sender_names')`)
+        .get() as { n: number };
+      if (ready.n < 2) return true;
+      const stored = db.prepare(`select value from index_meta where key = ?`).get(SENDER_BACKFILL_KEY) as { value: string } | undefined;
+      const cursor = stored
+        ? Number(stored.value)
+        : (db.prepare(`select coalesce(max(rowid), 0) as m from timeline_events`).get() as { m: number }).m;
+      if (cursor > 0) {
+        const lo = Math.max(0, cursor - batchRows);
+        db.prepare(
+          `insert into memory_sender_names (provider, sender_id, display_name, last_ts)
+           select provider, sender_id, sender_display_name, max(timestamp) from timeline_events
+           where rowid > ? and rowid <= ? and sender_display_name is not null and sender_display_name != ''
+           group by provider, sender_id, sender_display_name
+           on conflict(provider, sender_id, display_name) do update set last_ts = max(last_ts, excluded.last_ts)`,
+        ).run(lo, cursor);
+        db.prepare(`insert into index_meta (key, value) values (?, ?) on conflict(key) do update set value = excluded.value`).run(
+          SENDER_BACKFILL_KEY,
+          String(lo),
+        );
+        return lo === 0;
+      }
+      if (!stored) db.prepare(`insert into index_meta (key, value) values (?, '0')`).run(SENDER_BACKFILL_KEY);
+      return true;
+    });
+  }
+
+  /** Run {@link backfillSenderNames} to completion in the background, pausing between batches. */
+  async runSenderNamesBackfill(opts: { signal?: AbortSignal; pauseMs?: number } = {}): Promise<void> {
+    while (!opts.signal?.aborted) {
+      if (await this.backfillSenderNames()) return;
+      await new Promise((resolve) => setTimeout(resolve, opts.pauseMs ?? 20).unref());
+    }
   }
 
   /** Distinct content hashes of every chunk (any agent). */
@@ -416,30 +574,19 @@ export class MemoryRetrievalStore {
   }
 
   /**
-   * A sender's distinct display names, newest first (up to 6), from its newest
-   * {@link NAME_HISTORY_SCAN} messages; cached for a few minutes.
+   * A sender's distinct display names (case-insensitively), newest first, up to
+   * {@link NAME_HISTORY_MAX}: a primary-key read of its `memory_sender_names` rows.
    */
   private displayNames(provider: string, senderId: string): string[] {
-    const key = `${provider}\0${senderId}`;
-    const now = Date.now();
-    const hit = this.nameHistory.get(key);
-    if (hit && now - hit.at < NAME_HISTORY_CACHE_MS) return hit.names;
-    const names = this.storage.read((db) => {
+    return this.storage.read((db) => {
       const rows = db
         .prepare(
-          `select name, max(ts) as last from (
-             select sender_display_name as name, timestamp as ts
-             from timeline_events
-             where provider = ? and sender_id = ? and sender_display_name is not null
-               and sender_display_name != ''
-             order by timestamp desc
-             limit ?
-           )
-           group by name
-           order by last desc
-           limit 12`,
+          `select display_name as name from memory_sender_names
+           where provider = ? and sender_id = ?
+           order by last_ts desc
+           limit ?`,
         )
-        .all(provider, senderId, NAME_HISTORY_SCAN) as Array<{ name: string; last: number }>;
+        .all(provider, senderId, NAME_HISTORY_MAX * 2) as Array<{ name: string }>;
       const seen = new Set<string>();
       const out: string[] = [];
       for (const r of rows) {
@@ -447,18 +594,15 @@ export class MemoryRetrievalStore {
         if (!k || seen.has(k)) continue;
         seen.add(k);
         out.push(r.name.trim());
-        if (out.length >= 6) break;
+        if (out.length >= NAME_HISTORY_MAX) break;
       }
       return out;
     });
-    if (this.nameHistory.size >= NAME_HISTORY_CACHE_MAX) this.nameHistory.delete(this.nameHistory.keys().next().value!);
-    this.nameHistory.set(key, { at: now, names });
-    return names;
   }
 
   /**
-   * Senders that have used this display name (case-insensitive), via the
-   * `sender_display_name` index; at most `limit`.
+   * Senders that have used this display name (case-insensitive), via
+   * `idx_memory_sender_names_name`; at most `limit`.
    */
   sendersByDisplayName(name: string, limit: number): Array<{ provider: string; senderId: string }> {
     const needle = name.trim();
@@ -467,8 +611,8 @@ export class MemoryRetrievalStore {
       db
         .prepare(
           `select distinct provider, sender_id as senderId
-           from timeline_events
-           where sender_display_name = ? collate nocase
+           from memory_sender_names
+           where display_name = ? collate nocase
            limit ?`,
         )
         .all(needle, limit) as Array<{ provider: string; senderId: string }>,
@@ -596,11 +740,12 @@ export class MemoryRetrievalStore {
   }
 
   /**
-   * Blocks (one per content hash) with no late vectors for `model` and fewer
-   * than `maxAttempts` recorded failures, newest entry first: a block leaves the
-   * recency layer oldest-first, but new blocks are what keeps the window fresh.
+   * Blocks (one per content hash) with no late vectors for `model` whose last
+   * failure, if any, has served its backoff ({@link IndexRetryPolicy}), newest
+   * entry first: a block leaves the recency layer oldest-first, but new blocks
+   * are what keeps the window fresh.
    */
-  blocksMissingLateVectors(model: string, indexName: string, maxAttempts: number, limit: number): Array<{
+  blocksMissingLateVectors(model: string, indexName: string, retry: IndexRetryPolicy, limit: number): Array<{
     contentHash: string;
     text: string;
   }> {
@@ -611,12 +756,12 @@ export class MemoryRetrievalStore {
            from memory_chunks c
            left join memory_late_vectors v on v.model = ? and v.content_hash = c.content_hash
            left join memory_index_failures f on f.index_name = ? and f.content_hash = c.content_hash
-           where v.content_hash is null and coalesce(f.attempts, 0) < ?
+           where v.content_hash is null and ${RETRY_DUE}
            group by c.content_hash
            order by max(c.entry_ts) desc
            limit ?`,
         )
-        .all(model, indexName, maxAttempts, limit) as Array<{ contentHash: string; text: string }>,
+        .all(model, indexName, ...retryParams(retry), limit) as Array<{ contentHash: string; text: string }>,
     );
   }
 
@@ -634,9 +779,13 @@ export class MemoryRetrievalStore {
     );
   }
 
-  /** Drop vectors of other models (the index belongs to one model) and of vanished blocks. */
+  /**
+   * Drop vectors of other models (the index belongs to one model) and of
+   * vanished blocks, and the failure rows of other late indexes.
+   */
   pruneLateVectors(model: string): Promise<number> {
     return this.storage.write((db) => {
+      db.prepare(`delete from memory_index_failures where index_name like 'late:%' and index_name != ?`).run(`late:${model}`);
       const a = db.prepare(`delete from memory_late_vectors where model != ?`).run(model).changes;
       const b = db
         .prepare(
@@ -667,11 +816,27 @@ export class MemoryRetrievalStore {
     });
   }
 
+  /** Forget the failures of blocks that have now been indexed. */
+  clearIndexFailuresFor(indexName: string, hashes: string[]): Promise<void> {
+    if (hashes.length === 0) return Promise.resolve();
+    return this.storage.write((db) => {
+      const stmt = db.prepare(`delete from memory_index_failures where index_name = ? and content_hash = ?`);
+      for (const h of new Set(hashes)) stmt.run(indexName, h);
+    });
+  }
+
+  /** Failure rows of an index (diagnostics and tests). */
+  indexFailureCount(indexName: string): number {
+    return this.storage.read(
+      (db) => (db.prepare(`select count(*) as n from memory_index_failures where index_name = ?`).get(indexName) as { n: number }).n,
+    );
+  }
+
   /**
    * Chunks with no row in the vector table `table` (a `memory_vec_*` vec0 table)
-   * and fewer than `maxAttempts` failures under `indexName`.
+   * whose last failure under `indexName`, if any, has served its backoff.
    */
-  chunksMissingFromVectorTable(table: string, indexName: string, maxAttempts: number, limit: number): Array<{
+  chunksMissingFromVectorTable(table: string, indexName: string, retry: IndexRetryPolicy, limit: number): Array<{
     rowid: number;
     contentHash: string;
     text: string;
@@ -685,26 +850,65 @@ export class MemoryRetrievalStore {
            from memory_chunks c
            left join memory_index_failures f on f.index_name = ? and f.content_hash = c.content_hash
            where c.rowid not in (select chunk_id from ${table})
-             and coalesce(f.attempts, 0) < ?
+             and ${RETRY_DUE}
            order by c.rowid
            limit ?`,
         )
-        .all(indexName, maxAttempts, limit) as Array<{ rowid: number; contentHash: string; text: string; source: string }>,
+        .all(indexName, ...retryParams(retry), limit) as Array<{ rowid: number; contentHash: string; text: string; source: string }>,
+    );
+  }
+
+  /** Chunks with no row in the vector table `table`, failed or not (0 = the index covers every chunk). */
+  countMissingFromVectorTable(table: string): number {
+    if (!/^memory_vec_[a-z0-9_]+$/.test(table)) throw new Error(`invalid vector table name ${table}`);
+    return this.storage.read(
+      (db) =>
+        (db.prepare(`select count(*) as n from memory_chunks c where c.rowid not in (select chunk_id from ${table})`).get() as { n: number })
+          .n,
     );
   }
 
   // ── Per-build retrieval rows (§9d "Observability") ────────────────────────
 
+  /** Store one build row (its report bounded by {@link capReportJson}); prunes expired rows at most hourly. */
   insertRetrieval(row: MemoryRetrievalRowInput): Promise<void> {
-    return this.storage.write((db) => {
+    const stored = { ...row, reportJson: capReportJson(row.reportJson) };
+    const done = this.storage.write((db) => {
       db.prepare(
         `insert into memory_retrievals (id, agent_session_id, agent, timeline_key, ts, source, decision_group,
            candidates, judged, kept, hidden, tokens, ms, report_json)
          values (@id, @agentSessionId, @agent, @timelineKey, @ts, @source, @decisionGroup,
            @candidates, @judged, @kept, @hidden, @tokens, @ms, @reportJson)
          on conflict(id) do nothing`,
-      ).run(row);
+      ).run(stored);
     });
+    if (row.ts - this.lastPrune >= PRUNE_EVERY_MS) {
+      this.lastPrune = row.ts;
+      void this.pruneRetrievals(row.ts).catch(() => undefined);
+    }
+    return done;
+  }
+
+  /**
+   * Delete `memory_retrievals` rows older than the retention (in bounded
+   * batches, each its own write, so the writer queue is never held for long).
+   * Returns the number deleted.
+   */
+  async pruneRetrievals(now: number): Promise<number> {
+    const days = this.opts.retrievalsRetentionDays ?? 90;
+    if (days <= 0) return 0;
+    const cutoff = now - days * 86_400_000;
+    let total = 0;
+    for (;;) {
+      const n = await this.storage.write(
+        (db) =>
+          db
+            .prepare(`delete from memory_retrievals where rowid in (select rowid from memory_retrievals where ts < ? limit ?)`)
+            .run(cutoff, PRUNE_BATCH).changes,
+      );
+      total += n;
+      if (n < PRUNE_BATCH) return total;
+    }
   }
 
   retrievalsForSession(sessionId: string): MemoryRetrievalRow[] {

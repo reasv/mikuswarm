@@ -132,6 +132,24 @@ test("display-name history: newest first, the current name excluded", async () =
   });
 });
 
+test("display-name history: rows older than the triggers are back-filled in small background batches", async () => {
+  await withFixture(async ({ storage, store }) => {
+    // As on an upgraded database: the history table starts empty, the rows already exist.
+    await storage.write((db) => db.exec(`delete from memory_sender_names; delete from index_meta where key = 'memory_sender_names_backfill'`));
+    assert.deepEqual(store.senderDisplayNameHistory("matrix", "@alice:x", 4), []);
+    let batches = 0;
+    while (!(await store.backfillSenderNames(2))) batches++;
+    assert.ok(batches >= 2, "several bounded batches");
+    assert.deepEqual(store.senderDisplayNameHistory("matrix", "@alice:x", 4), ["Alice", "Alice Old"]);
+    assert.equal(await store.backfillSenderNames(2), true, "done stays done");
+    assert.equal(
+      storage.read((db) => (db.prepare(`select count(*) as n from sqlite_master where type = 'index' and tbl_name = 'timeline_events' and name like 'idx_timeline_events_sender%'`).get() as { n: number }).n),
+      0,
+      "no multi-second index build on timeline_events",
+    );
+  });
+});
+
 test("user scope: by sender id or a (former) display name, plus entries naming them", async () => {
   await withFixture(async ({ storage, store }) => {
     await new ParticipantTagger({ store }).run();
@@ -144,21 +162,38 @@ test("user scope: by sender id or a (former) display name, plus entries naming t
   });
 });
 
-test("user scope by display name is one indexed lookup; name history is a bounded, cached query", async () => {
+test("user scope by display name is one indexed lookup; name history is a bounded primary-key read, current at once", async () => {
   await withFixture(async ({ storage, store }) => {
     const plan = (sql: string, ...args: unknown[]) =>
       storage.read((db) => (db.prepare(`explain query plan ${sql}`).all(...args) as Array<{ detail: string }>).map((r) => r.detail).join(" | "));
     const byName = plan(
-      "select distinct provider, sender_id from timeline_events where sender_display_name = ? collate nocase limit ?",
+      "select distinct provider, sender_id from memory_sender_names where display_name = ? collate nocase limit ?",
       "alice old",
       20,
     );
-    assert.match(byName, /idx_timeline_events_sender_name/);
-    assert.doesNotMatch(byName, /SCAN timeline_events/);
+    assert.match(byName, /idx_memory_sender_names_name/);
+    assert.doesNotMatch(byName, /SCAN/);
+    const history = plan(
+      "select display_name from memory_sender_names where provider = ? and sender_id = ? order by last_ts desc limit ?",
+      "matrix",
+      "@alice:x",
+      12,
+    );
+    assert.match(history, /SEARCH memory_sender_names/);
+    assert.doesNotMatch(history, /timeline_events/);
     assert.deepEqual(store.sendersByDisplayName("ALICE OLD", 20), [{ provider: "matrix", senderId: "@alice:x" }]);
-    // Cached: a rename seen within the cache window does not re-query per build.
-    const before = store.senderDisplayNameHistory("matrix", "@alice:x", 4);
+    // A rename is in the history as soon as it is stored (the update trigger).
     await storage.write((db) => db.exec("update timeline_events set sender_display_name = 'Renamed' where sender_id = '@alice:x'"));
-    assert.deepEqual(store.senderDisplayNameHistory("matrix", "@alice:x", 4), before);
+    assert.ok(store.senderDisplayNameHistory("matrix", "@alice:x", 4).includes("Renamed"));
+    assert.deepEqual(store.sendersByDisplayName("renamed", 20), [{ provider: "matrix", senderId: "@alice:x" }]);
+    // Bounded: at most 6 distinct names per sender, case variants counted once.
+    await storage.write((db) => {
+      const ins = db.prepare(`insert or replace into memory_sender_names (provider, sender_id, display_name, last_ts) values ('matrix', '@alice:x', ?, ?)`);
+      for (let i = 0; i < 10; i++) ins.run(`Name ${i}`, 9_000_000_000_000 + i);
+      ins.run("NAME 9", 9_000_000_000_100);
+    });
+    const names = store.senderDisplayNameHistory("matrix", "@alice:x", 20);
+    assert.equal(names.length, 6);
+    assert.deepEqual(names.slice(0, 2), ["NAME 9", "Name 8"]);
   });
 });
