@@ -3,7 +3,7 @@ import type { ExaResearchRequest, ExaRun } from "../exa/types.js";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "../observability/index.js";
-import type { AttachmentMeta, CanonicalChatEvent, TimelineState } from "../types.js";
+import type { AttachmentMeta, CanonicalChatEvent, MentionInfo, TimelineState } from "../types.js";
 import { nanoid } from "nanoid";
 import type { RawTokenUsage, SessionUsageTotals } from "../agent/usage.js";
 import { buildTimelineKey, parseTimelineKey, roomIdFromTimelineKeyOpt, threadKeyLikePattern } from "./timeline-key.js";
@@ -76,13 +76,16 @@ function clearOfflineAudit(db: Database.Database, sessionId: string): void {
 
 /**
  * The resolved replacement content an edit carries: the post-edit body and the
- * serialized attachments. Mirrors `EditReplacement` in `src/timeline/edits.ts`
- * but lives here so the storage layer (pending-edit persistence, issue #12) does
- * not depend on the timeline layer. Kept structurally identical.
+ * serialized attachments (and the post-edit mentions, applied by the updater).
+ * Mirrors `EditReplacement` in `src/timeline/edits.ts` but lives here so the
+ * storage layer (pending-edit persistence, issue #12) does not depend on the
+ * timeline layer. Kept structurally identical. A parked edit stores body and
+ * attachments only: replayed, the target keeps its own mentions.
  */
 export interface EditReplacementContent {
   body: string;
   attachments: AttachmentMeta[];
+  mentions?: MentionInfo;
 }
 
 export interface StorageOptions {

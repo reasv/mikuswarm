@@ -3521,6 +3521,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     const replacement = {
       body: inbound.event.body,
       attachments: inbound.event.attachments ?? [],
+      // The edit's own mentions (late input reads mention changes off the stored row).
+      ...(inbound.event.mentions !== undefined ? { mentions: inbound.event.mentions } : {}),
     };
     const result = await timeline.applyEdit(
       inbound.provider,
