@@ -38,8 +38,11 @@ Unreleased section; it is not part of any release's notes.
   hybrid selection (at most 2 items) when the decision chain is down, or for the
   passages it did not answer in time (never silently dropped). At most
   `[retrieval.auto].max_judged` (default 12) passages are judged per build, and the
-  requests queue below routing, records and checks, so they never delay those; the
-  build waits for the block at most the point's timeout plus a short grace.
+  requests queue below routing, records and checks and hold at most
+  `[retrieval.auto].judge_slot_share` (default half) of a decision group's slots, so
+  those always find a free one; the build waits for the block at most the point's
+  timeout plus a short grace, then shows what is ready (the passages judged so far
+  plus the fallback selection over the rest).
 - **Readable memory excerpts**: a kept diary block is shown whole up to 400 tokens,
   else its heading plus a window around the best-matching part; citations are compact
   (`[memory/<file>.md:<lines> · room]`, the date only when the file name lacks it) and
@@ -67,12 +70,16 @@ Unreleased section; it is not part of any release's notes.
   marked zero-data-retention or self-hosted.
 - **Primary embedder** (`[retrieval.embedding.primary]`, optional): a second vector
   index served by a GPU or API embedder, used while it covers every block and answers
-  first; the built-in index keeps serving otherwise. Failed blocks are retried after a
-  backoff, never dropped.
+  first; the built-in index keeps serving otherwise. A failed batch is bisected so one
+  bad block never holds its neighbours back, an outage blames no block, and a block
+  that keeps failing on its own is given up for that model (it stays findable through
+  the built-in index). The late-interaction index handles failures the same way.
 - Retrieval observability: a `memory_retrieval` log line per build, per-build rows
   with every candidate's fate (shown as a retrieval card in the console's session
-  view, with the items the fallback rule chose marked; kept for
-  `[retrieval].retrievals_retention_days`, 90 by default), the follow-up rate (sessions
+  view, with the items the fallback rule chose marked; written once the build's kickoff
+  is sent, or as aborted when the build was cancelled or redone first, and only shown
+  builds count in the stats; kept for `[retrieval].retrievals_retention_days`, 90 by
+  default, pruned in small batches), the follow-up rate (sessions
   that open a cited memory), and memory-point calibration and a recall-ceiling audit
   in `scripts/calibrate-checks.ts`. Its `--point filter --filter <key>` mode calibrates
   a judged memory filter's threshold over the agent's diary blocks (every block
