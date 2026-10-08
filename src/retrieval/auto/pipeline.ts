@@ -462,6 +462,8 @@ export class MemoryRetrievalPipeline {
     // newest tagged entries they took part in, outside the recency layer. No text
     // match needed; they skip the re-rank cuts and go straight to the judge.
     const personCued: Candidate[] = [];
+    /** A person-cued candidate's place among that person's entries (0 = newest). */
+    const cuedRank = new Map<Candidate, number>();
     t0 = clock();
     if (auto.personRecent > 0 && auto.personRecentMax > 0) {
       const taken = new Set<string>();
@@ -497,6 +499,7 @@ export class MemoryRetrievalPipeline {
           }
           kept[0]!.personCued = true;
           personCued.push(kept[0]!);
+          cuedRank.set(kept[0]!, n);
           n += 1;
           return n >= auto.personRecent || personCued.length >= auto.personRecentMax ? "stop" : "next";
         });
@@ -587,15 +590,24 @@ export class MemoryRetrievalPipeline {
     }
     // Person-cued candidates join after the cuts.
     const ranked = pool;
-    const cued = personCued.filter((c) => !ranked.includes(c));
+    // Each person's newest entry before anyone's second one, so a cut keeps
+    // every active person's latest.
+    const cued = personCued
+      .filter((c) => !ranked.includes(c))
+      .map((c, i) => ({ c, i, rank: cuedRank.get(c) ?? 0 }))
+      .sort((a, b) => a.rank - b.rank || a.i - b.i)
+      .map((x) => x.c);
     pool = [...ranked, ...cued];
     markPresence(pool);
     // At most `max_judged` passages go to the judge, person-cued included (a
-    // third of the cap is theirs when the ranked passages would fill it); the
-    // rest go through the fallback rule, never dropped.
+    // third of the cap is theirs when the ranked passages would fill it, more
+    // when those are fewer). The cap is a policy cut, not a failure: the passages
+    // over it (the lowest-ranked ones and the latest-cued ones) are not judged
+    // and not shown (stage `over_cap`), unless the whole chain fails (below).
     const maxJudged = Math.max(0, auto.maxJudged);
     const cuedSlots = Math.min(cued.length, Math.max(Math.ceil(maxJudged / 3), maxJudged - ranked.length));
     const toJudge = [...ranked.slice(0, maxJudged - cuedSlots), ...cued.slice(0, cuedSlots)];
+    const sent = new Set(toJudge);
 
     // ── 5. The decision model as the final filter ─────────────────────────
     let selected: Candidate[] = [];
@@ -656,37 +668,46 @@ export class MemoryRetrievalPipeline {
       );
       report.stages.judgeMs = this.now() - t0;
       const byCandidate = new Map(toJudge.map((c, i) => [c, judgedOutcomes[i]]));
-      const outcomes = pool.map((c) => byCandidate.get(c));
       let modelVerdicts = 0;
-      outcomes.forEach((o, i) => {
-        const c = pool[i]!;
-        if (o?.source === "model") {
-          modelVerdicts += 1;
-          verdicts.set(c.chunk.contentHash, o.verdict);
-          if (Object.keys(o.verdict.filters).length > 0) {
-            void this.deps.filters?.storeVerdicts(agent, c.chunk.contentHash, o.verdict.filters, { model: o.servedModel ?? null, version: null });
-            for (const [key, r] of Object.entries(o.verdict.filters)) {
-              if (r.hidden && !c.hiddenBy) c.hiddenBy = { key, kind: "judged", probability: r.probability };
-            }
+      for (const c of toJudge) {
+        const o = byCandidate.get(c);
+        if (o?.source !== "model") continue;
+        modelVerdicts += 1;
+        verdicts.set(c.chunk.contentHash, o.verdict);
+        if (Object.keys(o.verdict.filters).length > 0) {
+          void this.deps.filters?.storeVerdicts(agent, c.chunk.contentHash, o.verdict.filters, { model: o.servedModel ?? null, version: null });
+          for (const [key, r] of Object.entries(o.verdict.filters)) {
+            if (r.hidden && !c.hiddenBy) c.hiddenBy = { key, kind: "judged", probability: r.probability };
           }
-        } else if (c.pendingFilters.length > 0 && this.deps.filters?.pendingPolicy(agent) === "hide") {
-          c.hiddenBy = { key: c.pendingFilters[0]!.key, kind: "judged", pending: true };
         }
-      });
+      }
+      // Pending judged filters (`pending = "hide"`) on what may still be shown:
+      // the sent passages without a verdict, and every passage when none was judged.
+      const hidePending = this.deps.filters?.pendingPolicy(agent) === "hide";
+      for (const c of pool) {
+        if (verdicts.has(c.chunk.contentHash) || c.pendingFilters.length === 0 || !hidePending) continue;
+        if (modelVerdicts > 0 && !sent.has(c)) continue;
+        c.hiddenBy = { key: c.pendingFilters[0]!.key, kind: "judged", pending: true };
+      }
       report.judged = modelVerdicts;
       if (modelVerdicts > 0) {
         source = "model";
         const keptList = pool.filter((c) => verdicts.get(c.chunk.contentHash)?.keep && !c.hiddenBy);
         for (const c of pool) {
-          if (c.hiddenBy) itemStage.set(c.chunk.contentHash, "hidden");
+          if (!sent.has(c)) itemStage.set(c.chunk.contentHash, "over_cap");
+          else if (c.hiddenBy) itemStage.set(c.chunk.contentHash, "hidden");
           else if (!verdicts.has(c.chunk.contentHash)) itemStage.set(c.chunk.contentHash, "not_judged");
           else if (!verdicts.get(c.chunk.contentHash)!.keep) itemStage.set(c.chunk.contentHash, "dropped");
         }
-        // Passages the judge never answered (group capacity, the point's timeout,
-        // a failed request) are not dropped: they go through the fallback rule
-        // (the last scorer's calibrated cutoff, else the hybrid floor), at most
-        // `fallback_max_results` of them, after the judged keepers.
-        const unjudged = pool.filter((c) => !verdicts.has(c.chunk.contentHash) && !c.hiddenBy);
+        const overCap = pool.length - sent.size;
+        if (overCap > 0) report.overCap = overCap;
+        // Passages sent to the judge that got no verdict (group capacity, the
+        // point's timeout, a failed request, the build's wait expiring) are not
+        // dropped: they go through the fallback rule (the last scorer's
+        // calibrated cutoff, else the hybrid floor), at most
+        // `fallback_max_results` of them, after the judged keepers. Passages
+        // over the cap were never sent and are not shown.
+        const unjudged = toJudge.filter((c) => !verdicts.has(c.chunk.contentHash) && !c.hiddenBy);
         const rescued = this.selectWithoutJudge(unjudged, {
           cap: auto.fallbackMaxResults,
           rerankRan,
@@ -855,6 +876,7 @@ export class MemoryRetrievalPipeline {
       candidates: report.candidates,
       judged: report.judged,
       ...(report.unjudged ? { unjudged: report.unjudged } : {}),
+      ...(report.overCap ? { overCap: report.overCap } : {}),
       fellBack: report.fellBack ?? 0,
       kept: report.kept,
       hidden: report.hidden,

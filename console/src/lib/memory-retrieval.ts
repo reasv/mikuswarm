@@ -18,6 +18,7 @@ export const ITEM_STAGES = [
 	'recency',
 	'cut_late',
 	'cut_rerank',
+	'over_cap',
 	'not_judged',
 	'not_selected',
 	'budget',
@@ -75,7 +76,7 @@ export interface RetrievalReport {
 	reason?: string;
 	candidates: number;
 	judged: number;
-	/** Passages that got no model verdict (they went through the fallback rule). */
+	/** Passages sent to the judge that got no model verdict (they went through the fallback rule). */
 	unjudged?: number;
 	/** Shown items the fallback rule chose. */
 	fellBack?: number;
@@ -244,6 +245,7 @@ const STAGE_LABELS: Record<string, string> = {
 	recency: 'in recency layer',
 	cut_late: 'cut at late stage',
 	cut_rerank: 'cut at rerank',
+	over_cap: 'over max_judged, not sent',
 	not_judged: 'not judged',
 	not_selected: 'not selected',
 	budget: 'over token budget',
@@ -252,7 +254,7 @@ const STAGE_LABELS: Record<string, string> = {
 
 /**
  * The badge of a kept item chosen without a model verdict: "fallback" (the
- * decision chain did not answer for it, or it was over `max_judged`) or
+ * decision chain did not answer for it) or
  * "unjudged" (no decision model); null for a judge's pick.
  */
 export function selectionLabel(item: Pick<ReportItem, 'stage' | 'selectedBy'>): string | null {

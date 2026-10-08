@@ -90,6 +90,8 @@ export type ItemStage =
   | "hidden"
   | "cut_late"
   | "cut_rerank"
+  /** Over `auto.max_judged`: never sent to the judge, not shown (a policy cut). */
+  | "over_cap"
   | "not_judged"
   | "dropped"
   | "not_selected"
@@ -127,10 +129,12 @@ export interface RetrievalReport {
   candidates: number;
   judged: number;
   /**
-   * Passages that got no model verdict (the chain did not answer, or they were
-   * over `auto.max_judged`); they went through the fallback rule.
+   * Passages sent to the judge that got no model verdict (the chain did not
+   * answer for them); they went through the fallback rule.
    */
   unjudged?: number;
+  /** Passages over `auto.max_judged` when some were judged: not sent, not shown. */
+  overCap?: number;
   /** Shown items the fallback rule chose (the decision chain did not answer for them). */
   fellBack?: number;
   kept: number;

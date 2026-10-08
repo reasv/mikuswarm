@@ -723,7 +723,7 @@ export interface RecallCeilingOptions {
 const UNREACHABLE_STAGES = new Set(["recency", "hidden"]);
 
 /** The order stages are reported in: the pipeline's, recall to selection. */
-const STAGE_ORDER = ["recency", "cut_late", "cut_rerank", "not_judged", "hidden", "dropped", "not_selected", "budget", "kept"];
+const STAGE_ORDER = ["recency", "cut_late", "cut_rerank", "over_cap", "not_judged", "hidden", "dropped", "not_selected", "budget", "kept"];
 
 /** Label every item of the sampled builds' recall sets and aggregate. Never returns content. */
 export async function runRecallCeiling(opts: RecallCeilingOptions): Promise<RecallCeilingReport> {

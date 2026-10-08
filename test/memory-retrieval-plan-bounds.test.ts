@@ -124,7 +124,7 @@ test("the presence lane pages past the recency layer", async () => {
   assert.ok(item.lanes.includes("presence"));
 });
 
-test("max_judged caps the judge requests per build (person-cued included); the rest fall back, at memory priority", async () => {
+test("max_judged caps the judge requests per build (person-cued included); the rest are not shown, at memory priority", async () => {
   const hits = Array.from({ length: 30 }, (_, i) => scored(hit(`Topic block ${i} about pancakes and syrup ${i}`, NOW - (40 + i) * DAY), 0.9 - i * 0.01));
   const people = ["@a:x", "@b:x", "@c:x", "@d:x"];
   const tagged = new Map(people.map((p, k) => [p, [hit(`Person ${k} entry one`, NOW - (5 + k) * DAY), hit(`Person ${k} entry two`, NOW - (6 + k) * DAY)]]));
@@ -135,7 +135,7 @@ test("max_judged caps the judge requests per build (person-cued included); the r
     search: { searchScored: async () => ({ scored: hits, mode: "hybrid" }), userLaneScored: async () => [], unitScorer: undefined } as any,
     store: stubStore(tagged),
     config,
-    // Only the topical blocks are relevant: the over-cap ones can only come back through the fallback.
+    // Only the topical blocks are relevant.
     engine: () => stubEngine(calls, { relevant: (t) => (/pancakes/.test(t) ? 0.9 : 0.1) }),
   });
   const plan = await pipeline.plan(
@@ -147,13 +147,69 @@ test("max_judged caps the judge requests per build (person-cued included); the r
   assert.notEqual(MEMORY_PRIORITY, "interactive");
   const cuedHashes = new Set([...tagged.values()].flat().map((h) => h.contentHash));
   assert.equal(calls.filter((c) => cuedHashes.has(c.hash)).length, 4, "a third of the cap goes to person-cued candidates");
-  // Over the cap: 4 ranked (the hybrid cut keeps 12) + 4 person-cued, through the fallback rule.
-  assert.equal(plan.report.unjudged, 8);
-  const overCap = plan.report.items.filter((i) => i.stage === "not_judged" || i.selectedBy === "fallback");
+  // Each active person's newest entry is judged before anyone's second one.
+  const newest = new Set([...tagged.values()].map((rows) => rows[0]!.contentHash));
+  assert.deepEqual(new Set(calls.filter((c) => cuedHashes.has(c.hash)).map((c) => c.hash)), newest);
+  // Over the cap: the 4 lowest-ranked of the hybrid 12 + 4 person-cued. A policy
+  // cut, not a failure: never judged, never shown, never through the fallback.
+  assert.equal(plan.report.overCap, 8);
+  assert.equal(plan.report.unjudged, undefined);
+  assert.equal(plan.report.fellBack, undefined);
+  const overCap = plan.report.items.filter((i) => i.stage === "over_cap");
   assert.equal(overCap.length, 8);
-  assert.ok(overCap.every((i) => i.judged === false));
-  assert.equal(plan.report.fellBack, 2, "the fallback rule shows the best over-cap passages");
+  assert.ok(overCap.every((i) => i.judged === false && i.selectedBy === undefined));
+  const rankedOver = overCap.filter((i) => !cuedHashes.has(i.contentHash)).map((i) => i.contentHash);
+  assert.deepEqual(new Set(rankedOver), new Set(hits.slice(8, 12).map((h) => h.contentHash)), "the overflow is the lowest-ranked");
+  assert.ok(plan.report.items.filter((i) => i.stage === "kept").every((i) => i.selectedBy === "judge"));
   assert.ok(judgedPerBuildMax(config) <= 12);
+});
+
+test("max_judged: the fallback rule covers only sent passages without a verdict, never the over-cap ones", async () => {
+  const hits = Array.from({ length: 20 }, (_, i) => scored(hit(`Topic block ${i} about pancakes and syrup ${i}`, NOW - (40 + i) * DAY), 0.95 - i * 0.01));
+  const calls: Array<{ hash: string }> = [];
+  const config = resolveRetrievalConfig({ enabled: true, auto: { max_judged: 6, max_results: 20, max_tokens: 20000, person_recent: 0 } } as any);
+  const failing = new Set(hits.slice(4, 6).map((h) => h.contentHash));
+  const judged = stubEngine(calls, { relevant: () => 0.1 });
+  const engine = {
+    ...judged,
+    // The judge rejects every passage it answers; two sent passages get no answer.
+    evaluate: async (p: unknown, inp: any, ctx: any) => {
+      if (failing.has(inp.meta.contentHash)) throw new Error("timeout");
+      return judged.evaluate(p, inp, ctx);
+    },
+  };
+  const pipeline = new MemoryRetrievalPipeline({
+    search: { searchScored: async () => ({ scored: hits, mode: "hybrid" }), userLaneScored: async () => [], unitScorer: undefined } as any,
+    store: stubStore(new Map()),
+    config,
+    engine: () => engine,
+  });
+  const plan = await pipeline.plan(baseInput({ request: { from: "a", text: "pancakes syrup" } }));
+  assert.equal(plan.report.source, "model");
+  assert.equal(plan.report.judged, 4);
+  assert.equal(plan.report.unjudged, 2, "sent without a verdict");
+  assert.equal(plan.report.overCap, 6, "the hybrid 12 less the 6 sent");
+  const kept = plan.report.items.filter((i) => i.stage === "kept");
+  assert.ok(kept.length > 0 && kept.every((i) => i.selectedBy === "fallback" && failing.has(i.contentHash)));
+  assert.ok(plan.report.items.filter((i) => i.stage === "over_cap").every((i) => !failing.has(i.contentHash)));
+});
+
+test("max_judged: with the whole chain down the full fallback is unchanged (no over-cap cut)", async () => {
+  const hits = Array.from({ length: 20 }, (_, i) => scored(hit(`Topic block ${i} about pancakes and syrup ${i}`, NOW - (40 + i) * DAY), 0.95 - i * 0.01));
+  const config = resolveRetrievalConfig({ enabled: true, auto: { max_judged: 6, person_recent: 0 } } as any);
+  const engine = { ...stubEngine([]), evaluate: async () => { throw new Error("chain down"); } };
+  const pipeline = new MemoryRetrievalPipeline({
+    search: { searchScored: async () => ({ scored: hits, mode: "hybrid" }), userLaneScored: async () => [], unitScorer: undefined } as any,
+    store: stubStore(new Map()),
+    config,
+    engine: () => engine,
+  });
+  const plan = await pipeline.plan(baseInput({ request: { from: "a", text: "pancakes syrup" } }));
+  assert.equal(plan.report.source, "fallback");
+  assert.equal(plan.report.judged, 0);
+  assert.equal(plan.report.overCap, undefined);
+  assert.equal(plan.report.items.filter((i) => i.stage === "over_cap").length, 0);
+  assert.equal(plan.report.fellBack, 2);
 });
 
 test("an aborted plan stops: a hung excerpt embed cannot hold it, and nothing is shown or recorded as shown", async () => {
