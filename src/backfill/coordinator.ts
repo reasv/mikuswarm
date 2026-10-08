@@ -448,6 +448,12 @@ export class GapBackfetchCoordinator {
    * the buffered copy, so the message is stored already marked (§6 "Message
    * edits"). Matched by provider, external id and the room of one of
    * `timelineKeys` (threads included). True when a buffered copy was found.
+   *
+   * The buffered event object is marked in place, never replaced: a commit in
+   * progress appends from a snapshot of the same objects (and a write reads its
+   * event when it runs), so a deletion that lands while the commit awaits its
+   * appends is still stored. One already appended was found in the store
+   * before this is asked (the caller's lookup runs inside the same write queue).
    */
   markBufferedDeleted(
     provider: string,
@@ -464,12 +470,12 @@ export class GapBackfetchCoordinator {
       for (const inbound of room.liveBuf) {
         if (!matches(inbound.event)) continue;
         found = true;
-        if (!inbound.event.deleted) inbound.event = { ...inbound.event, deleted: marker };
+        inbound.event.deleted ??= marker;
       }
       for (const item of room.backfillBuf) {
         if (item.kind !== "event" || !matches(item.event)) continue;
         found = true;
-        if (!item.event.deleted) item.event = { ...item.event, deleted: marker };
+        item.event.deleted ??= marker;
       }
     }
     return found;

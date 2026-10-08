@@ -393,6 +393,36 @@ test("a deletion of a message the freeze still holds marks the buffered copy (li
   h.storage.close();
 });
 
+test("a deletion that arrives while the commit is appending is never lost: the buffered copy is stored marked", async () => {
+  let h!: Harness;
+  let result: unknown;
+  const store = {
+    async appendIfMissing(event: CanonicalChatEvent, status?: string) {
+      // While the oldest gap message is appended, a later one ($d, already in
+      // the commit's snapshot) is deleted, the way the app routes a deletion.
+      if (event.externalId === "$b") {
+        result = await h.timeline.markDeleted("matrix", "$d", ROOM_TK, { at: 9_000 }, {
+          markElsewhere: () => h.coordinator.markBufferedDeleted("matrix", "$d", [ROOM_TK], { at: 9_000 }),
+        });
+      }
+      return h.timeline.appendIfMissing(event, status);
+    },
+  };
+  h = await makeHarness(
+    [page([summary({ externalId: "$d", timestamp: 4000 }), summary({ externalId: "$c", timestamp: 3000 }), summary({ externalId: "$b", timestamp: 2000 }), summary({ externalId: "$a", timestamp: 1000 })], null)],
+    {},
+    { timeline: store as unknown as TimelineStore },
+  );
+  await seedFloor(h.timeline, h.storage, "$a", 1000);
+  h.coordinator.prepare();
+  await h.coordinator.run();
+  assert.deepEqual(result, { parked: false }, "marked in the buffer, not parked");
+  assert.deepEqual(h.storage.getTimelineEventById(`matrix:${ACCOUNT}:$d`)?.deleted, { at: 9_000 });
+  assert.equal(h.storage.getTimelineEventById(`matrix:${ACCOUNT}:$d`)?.body, "hello", "content kept");
+  assert.equal(h.storage.getTimelineEventById(`matrix:${ACCOUNT}:$c`)?.deleted, undefined);
+  h.storage.close();
+});
+
 test("cap leaves a hole below the oldest committed gap message and logs capped", async () => {
   const h = await makeHarness(
     [

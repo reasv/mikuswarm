@@ -78,7 +78,7 @@ Unreleased section; it is not part of any release's notes.
   not deleted), and schema v32 removes the markers the first v31 step wrongly
   put on such bot and webhook messages and marks the bot's own wiped messages.
   A deletion that arrives before its message is stored (still held by the startup
-  gap backfetch or the Discord trigger hold, or simply overtaking it) is applied
+  gap backfetch, even while it commits, or the Discord trigger hold, or simply overtaking it) is applied
   when the message lands, the bot's own sent messages included, and a deleted Discord trigger still in its hold starts
   no session. A Discord bulk deletion (a purge) marks every purged message.
   See ARCHITECTURE.md §6 "Message edits" and §9 "Deleted messages".
