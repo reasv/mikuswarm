@@ -14,7 +14,10 @@
  * model called, reads tool calls through {@link modelToolCalls} (or skips
  * {@link isHarnessMade} messages), so the rule cannot drift between call sites.
  * Only the model's own calls count; a `read_session_record` the model chose to
- * call is work like any other read.
+ * call is work like any other read. Why: the decision model chose the
+ * injection (at a lower bar than the agent's own), so it is not work the agent
+ * did; a record turn over an injected record would only re-summarize it; and
+ * counting injections lets too many sessions through the work gate.
  */
 
 /** The harness marker of a message, or undefined for a message the model (or a user) wrote. */
