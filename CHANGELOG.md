@@ -26,16 +26,20 @@ Unreleased section; it is not part of any release's notes.
 ### Added
 
 - **Judged memory retrieval** (spec MEMORY-RETRIEVAL): the `<retrieved_memory>` block
-  is now chosen for the conversation instead of filled by similarity. Recall widens
+  is now chosen by a judge that reads the conversation. Recall widens
   (the trigger, the trigger with its reply target and the conversation window as
   queries; user lanes with display-name history; ~60 candidates), and the new
   **`memory` decision point** judges each surviving passage in its own request, with
   the conversation, the request and the participants in view: only passages judged
   relevant are shown, and "none" means no block. It is on by default whenever
   `[decisions]` is on (`[decisions.memory]`, `[retrieval.auto].judge`), starts at
-  session launch in parallel with routing, covers proactive sessions, and falls back
-  to a stricter hybrid selection (at most 2 items) when the decision chain is down, or
-  for the passages it did not answer in time (never silently dropped).
+  session launch in parallel with routing, covers every session (proactive,
+  bot-triggered and any session type; a redo replans), and falls back to a stricter
+  hybrid selection (at most 2 items) when the decision chain is down, or for the
+  passages it did not answer in time (never silently dropped). At most
+  `[retrieval.auto].max_judged` (default 12) passages are judged per build, and the
+  requests queue below routing, records and checks, so they never delay those; the
+  build waits for the block at most the point's timeout plus a short grace.
 - **Readable memory excerpts**: a kept diary block is shown whole up to 400 tokens,
   else its heading plus a window around the best-matching part; citations are compact
   (`[memory/<file>.md:<lines> · room]`, the date only when the file name lacks it) and
@@ -63,8 +67,13 @@ Unreleased section; it is not part of any release's notes.
   index keeps serving otherwise.
 - Retrieval observability: a `memory_retrieval` log line per build, per-build rows
   with every candidate's fate (shown as a retrieval card in the console's session
-  view), the follow-up rate (sessions that open a cited memory), and memory-point
-  calibration in `scripts/calibrate-checks.ts`.
+  view, with the items the fallback rule chose marked), the follow-up rate (sessions
+  that open a cited memory), and memory-point calibration and a recall-ceiling audit
+  in `scripts/calibrate-checks.ts`. A new **`/memory` console page** shows the
+  follow-up rate, the source mix (judged, judged plus fallback, fallback, unjudged)
+  and the filters audit, read through three new agent routes:
+  `GET /api/sessions/:id/memory-retrievals`, `GET /api/memory/filter-hits` and
+  `GET /api/memory/stats`.
 
 - **Late input** (`[agent.sessions.late_input]`, on by default): a person's request can be
   corrected after its chat session started. While the session has done nothing
@@ -409,10 +418,16 @@ Unreleased section; it is not part of any release's notes.
 
 ### Changed
 
+- **Upgrade note: memory judging sends diary text to the decision chain.** The
+  `memory` decision point is on by default whenever `[decisions]` is on, and each
+  request carries one diary entry with the conversation, the same class of data the
+  routing, records and check points already send there. `[decisions.memory].enabled =
+  false` turns the point off entirely; `[retrieval.auto].judge = false` stops
+  auto-retrieval from using it (judged memory filters, when configured, still do).
 - `[retrieval.auto]` defaults: `max_results` 3 → 4, `max_tokens` 600 → 2000; the
   `<retrieved_memory>` note now says whether the items were judged relevant.
-- Schema v34 (v33 reserved): memory-retrieval tables and a sender display-name index on
-  `timeline_events`.
+- Schema v34 (v33 reserved): memory-retrieval tables and two sender indexes on
+  `timeline_events` (by sender, and by display name).
 
 - **The local embedder uses each model's trained prefixes.** fastembed added the e5
   prefixes `query: ` and `passage: ` for every model. bge-small-en-v1.5, the default,
