@@ -3,9 +3,12 @@
  * ARCHITECTURE.md §9d "Late interaction"): owns one ONNX session running the
  * batched MaxSim graph and the resident windows' vectors, so the q×t×d product
  * never runs on the event loop. A cancelled score stops at its next batch.
+ * Documents may arrive as stored fp16 / int8 rows; they are decoded here, never
+ * in the parent. Windows are updated in place (`windowAdd` / `windowRemove`).
  */
 import * as ort from "onnxruntime-node";
 import { isWorkerChild, serveWorker, type HandlerContext } from "../onnx/worker-rpc.js";
+import { decodeTokenMatrix } from "./codec.js";
 import { buildMaxSimModel, MAXSIM_MASK_PAD } from "./maxsim-graph.js";
 
 export interface WireMatrix {
@@ -13,6 +16,38 @@ export interface WireMatrix {
   tokens: number;
   dim: number;
   data: Float32Array;
+}
+
+/** A document as stored (`memory_late_vectors`), decoded in the worker. */
+export interface WireEncoded {
+  key: string;
+  tokens: number;
+  dim: number;
+  dtype: "fp16" | "int8";
+  vectors: Uint8Array;
+  scales: Uint8Array | null;
+}
+
+export type WireDoc = WireMatrix | WireEncoded;
+
+/** Decode a wire document to float32 rows (a corrupt blob throws). */
+export function decodeWire(doc: WireDoc): WireMatrix {
+  if ("data" in doc) return doc;
+  const m = decodeTokenMatrix({ dtype: doc.dtype, dim: doc.dim, tokenCount: doc.tokens, vectors: doc.vectors, scales: doc.scales });
+  return { key: doc.key, tokens: m.tokens, dim: m.dim, data: m.data };
+}
+
+/** Decode what decodes; a corrupt document is skipped (no score, it bypasses as vector-less). */
+function decodeAll(docs: WireDoc[]): WireMatrix[] {
+  const out: WireMatrix[] = [];
+  for (const d of docs) {
+    try {
+      out.push(decodeWire(d));
+    } catch {
+      // skipped
+    }
+  }
+  return out;
 }
 
 export interface WireQuery {
@@ -70,11 +105,23 @@ export function packBatches(docs: WireMatrix[], maxBatchTokens: number): PackedB
   return batches;
 }
 
+interface ResidentWindow {
+  docs: Map<string, WireMatrix>;
+  batches: PackedBatch[];
+}
+
 interface State {
   init: WorkerInit;
   session: ort.InferenceSession;
-  windows: Map<string, PackedBatch[]>;
+  windows: Map<string, ResidentWindow>;
   staging: Map<string, WireMatrix[]>;
+  /** Ad-hoc documents of a score sent ahead in bounded messages. */
+  staged: Map<string, WireMatrix[]>;
+}
+
+function repack(state: State, w: ResidentWindow): void {
+  w.batches = [];
+  w.batches = packBatches([...w.docs.values()], state.init.maxBatchTokens);
 }
 
 /** Score batches into `out`; false when cancelled midway. */
@@ -117,37 +164,66 @@ if (isWorkerChild("maxsim")) {
         interOpNumThreads: 1,
         executionMode: "sequential",
       });
-      return { state: { init, session, windows: new Map(), staging: new Map() }, info: null };
+      return { state: { init, session, windows: new Map(), staging: new Map(), staged: new Map() }, info: null };
     },
     (state) => ({
       windowBegin: (p: { windowId: string }) => {
         state.staging.set(p.windowId, []);
       },
-      windowAppend: (p: { windowId: string; docs: WireMatrix[] }) => {
+      windowAppend: (p: { windowId: string; docs: WireDoc[] }) => {
         const list = state.staging.get(p.windowId);
         if (!list) throw new Error(`MaxSim: window ${p.windowId} was not begun`);
-        for (const d of p.docs) list.push(d);
+        for (const d of decodeAll(p.docs)) list.push(d);
       },
       windowCommit: (p: { windowId: string }) => {
         const list = state.staging.get(p.windowId) ?? [];
         state.staging.delete(p.windowId);
         state.windows.delete(p.windowId); // free the old one before packing the new
-        state.windows.set(p.windowId, packBatches(list, state.init.maxBatchTokens));
+        const w: ResidentWindow = { docs: new Map(list.map((d) => [d.key, d])), batches: [] };
+        repack(state, w);
+        state.windows.set(p.windowId, w);
+      },
+      windowAdd: (p: { windowId: string; docs: WireDoc[] }) => {
+        let w = state.windows.get(p.windowId);
+        if (!w) {
+          w = { docs: new Map(), batches: [] };
+          state.windows.set(p.windowId, w);
+        }
+        for (const d of decodeAll(p.docs)) w.docs.set(d.key, d);
+        repack(state, w);
+      },
+      windowRemove: (p: { windowId: string; keys: string[] }) => {
+        const w = state.windows.get(p.windowId);
+        if (!w) return;
+        let removed = 0;
+        for (const k of p.keys) if (w.docs.delete(k)) removed++;
+        if (removed > 0) repack(state, w);
       },
       dropWindow: (p: { windowId: string }) => {
         state.windows.delete(p.windowId);
         state.staging.delete(p.windowId);
       },
-      score: async (p: { query: WireQuery; windowId?: string; docs?: WireMatrix[] }, ctx: HandlerContext) => {
+      stageDocs: (p: { stageId: string; docs: WireDoc[] }) => {
+        const list = state.staged.get(p.stageId) ?? [];
+        for (const d of decodeAll(p.docs)) list.push(d);
+        state.staged.set(p.stageId, list);
+      },
+      unstage: (p: { stageId: string }) => {
+        state.staged.delete(p.stageId);
+      },
+      score: async (p: { query: WireQuery; windowId?: string; stageId?: string; docs?: WireDoc[] }, ctx: HandlerContext) => {
+        const staged = p.stageId !== undefined ? (state.staged.get(p.stageId) ?? []) : [];
+        if (p.stageId !== undefined) state.staged.delete(p.stageId);
         if (p.query.tokens <= 0) throw new Error("MaxSim: empty query");
         const out = { keys: [] as string[], scores: [] as number[] };
         if (p.windowId !== undefined) {
           const window = state.windows.get(p.windowId);
           if (!window) throw new Error(`MaxSim: unknown window ${p.windowId}`);
-          if (!(await scoreBatches(state, p.query, window, out, ctx))) return null;
+          if (!(await scoreBatches(state, p.query, window.batches, out, ctx))) return null;
         }
-        if (p.docs && p.docs.length > 0) {
-          const adhoc = packBatches(p.docs, state.init.maxBatchTokens);
+        const adhocDocs = [...staged, ...decodeAll(p.docs ?? [])];
+        if (adhocDocs.length > 0) {
+          const adhoc = packBatches(adhocDocs, state.init.maxBatchTokens);
           if (!(await scoreBatches(state, p.query, adhoc, out, ctx))) return null;
         }
         return { keys: out.keys, scores: Float32Array.from(out.scores) };

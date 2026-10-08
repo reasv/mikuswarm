@@ -411,3 +411,48 @@ test("model workers are isolated: concurrent models and a main-thread session ke
     await main.release();
   });
 });
+
+test("resolveModelFiles: a pinned revision has its own cache dir, sha256 is enforced, concurrent resolves share downloads", async () => {
+  const { createHash } = await import("node:crypto");
+  await withTemp(async (root) => {
+    const commit = "0123456789abcdef0123456789abcdef01234567";
+    const onnx = Buffer.from(crossEncoderModel("pinned"));
+    const tok = Buffer.from(tokenizerJson());
+    const served: Record<string, Buffer> = {
+      [`/org/pinned/resolve/${commit}/tokenizer.json`]: tok,
+      [`/org/pinned/resolve/${commit}/onnx/model.onnx`]: onnx,
+    };
+    const hits: string[] = [];
+    const server: Server = createServer((req, res) => {
+      hits.push(req.url ?? "");
+      const body = served[req.url ?? ""];
+      if (!body) {
+        res.statusCode = 404;
+        res.end("not found");
+        return;
+      }
+      setTimeout(() => res.end(body), 30);
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const sha = (b: Buffer) => createHash("sha256").update(b).digest("hex");
+    try {
+      const cacheRoot = join(root, "cache");
+      const opts = { model: "org/pinned", revision: commit, onnxFile: "onnx/model.onnx", cacheRoot, baseUrl, sha256: { "onnx/model.onnx": sha(onnx) } };
+      const [a, b] = await Promise.all([resolveModelFiles(opts), resolveModelFiles(opts)]);
+      assert.equal(a.dir, b.dir);
+      assert.equal(a.dir, join(cacheRoot, `${repoSlug("org/pinned")}@${commit.slice(0, 12)}`));
+      assert.equal(hits.filter((h) => h.endsWith("model.onnx")).length, 1, "one download for two concurrent resolves");
+      assert.ok(hits.every((h) => h.includes(`/resolve/${commit}/`)), "every file comes from the pinned commit");
+      // A wrong digest refuses the download (and leaves nothing behind that later looks complete).
+      const bad = { ...opts, cacheRoot: join(root, "cache2"), sha256: { "onnx/model.onnx": "0".repeat(64) } };
+      await assert.rejects(resolveModelFiles(bad), /checksum mismatch/);
+      await assert.rejects(resolveModelFiles(bad), /checksum mismatch/);
+      // A model_dir file is checked too.
+      await assert.rejects(resolveModelFiles({ modelDir: a.dir, onnxFile: "onnx/model.onnx", cacheRoot, sha256: { "tokenizer.json": "1".repeat(64) } }), /checksum mismatch/);
+      await resolveModelFiles({ modelDir: a.dir, onnxFile: "onnx/model.onnx", cacheRoot, sha256: { "tokenizer.json": sha(tok) } });
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+});

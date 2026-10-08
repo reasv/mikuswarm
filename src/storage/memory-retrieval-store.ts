@@ -125,6 +125,27 @@ export interface FollowUpStats {
 
 type ChunkRow = LexicalHit;
 
+/**
+ * Retry pacing of a failed block in an index without a status column
+ * (`memory_index_failures`): never excluded for good, only delayed. The n-th
+ * consecutive failure waits `base × 2^(n-1)`, capped at `max`.
+ */
+export interface IndexRetryPolicy {
+  now: number;
+  baseMs?: number;
+  maxMs?: number;
+}
+
+export const INDEX_RETRY_BASE_MS = 60_000;
+export const INDEX_RETRY_MAX_MS = 3_600_000;
+
+/** SQL predicate (alias `f` = memory_index_failures): no failure, or its backoff has elapsed. Binds 3 params. */
+const RETRY_DUE = `(f.content_hash is null or f.updated_at + min(?, ? * (1 << min(f.attempts - 1, 30))) <= ?)`;
+
+function retryParams(p: IndexRetryPolicy): number[] {
+  return [p.maxMs ?? INDEX_RETRY_MAX_MS, p.baseMs ?? INDEX_RETRY_BASE_MS, p.now];
+}
+
 const CHUNK_COLUMNS = `c.rowid as rowid, c.id as id, c.path as path, c.start_line as startLine,
   c.end_line as endLine, c.room as room, c.entry_ts as entryTs, c.text as text,
   c.content_hash as contentHash, c.token_count as tokenCount, c.agent as agent, 0 as bm25`;
@@ -195,6 +216,56 @@ export class MemoryRetrievalStore {
       }
       return rows;
     });
+  }
+
+  /**
+   * The late-interaction window's members: the newest `limit` blocks (one per
+   * content hash, newest entry first) of an agent that have vectors for
+   * `model`, outside `excludePaths`. Narrow rows only, read in keyset pages
+   * with a yield to the event loop between pages, so a large window never
+   * blocks it for long.
+   */
+  async newestLateWindow(
+    agent: string | null,
+    model: string,
+    limit: number,
+    excludePaths: ReadonlySet<string>,
+    page = 500,
+  ): Promise<Array<{ contentHash: string; rowid: number }>> {
+    // Walks idx_memory_chunks_entry_ts newest first (`+c.agent` keeps the planner off the agent index).
+    const agentClause = agent !== null && agent !== "__legacy__" ? "+c.agent = ? and " : "";
+    const agentParams: unknown[] = agentClause ? [agent] : [];
+    const sql = `select c.rowid as rowid, c.content_hash as contentHash, c.path as path, c.entry_ts as entryTs
+       from memory_chunks c
+       where ${agentClause}(c.entry_ts, c.rowid) < (?, ?)
+         and exists (select 1 from memory_late_vectors v where v.model = ? and v.content_hash = c.content_hash)
+       order by c.entry_ts desc, c.rowid desc limit ?`;
+    const out: Array<{ contentHash: string; rowid: number }> = [];
+    const seen = new Set<string>();
+    let cursor = { ts: Number.MAX_SAFE_INTEGER, rowid: Number.MAX_SAFE_INTEGER };
+    while (out.length < limit) {
+      const batch = this.storage.read(
+        (db) =>
+          db.prepare(sql).all(...agentParams, cursor.ts, cursor.rowid, model, page) as Array<{
+            rowid: number;
+            contentHash: string;
+            path: string;
+            entryTs: number;
+          }>,
+      );
+      if (batch.length === 0) break;
+      for (const row of batch) {
+        if (excludePaths.has(row.path) || seen.has(row.contentHash)) continue;
+        seen.add(row.contentHash);
+        out.push({ contentHash: row.contentHash, rowid: row.rowid });
+        if (out.length >= limit) break;
+      }
+      const last = batch[batch.length - 1]!;
+      cursor = { ts: last.entryTs, rowid: last.rowid };
+      if (batch.length < page) break;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    return out;
   }
 
   /** Distinct content hashes of every chunk (any agent). */
@@ -545,11 +616,12 @@ export class MemoryRetrievalStore {
   }
 
   /**
-   * Blocks (one per content hash) with no late vectors for `model` and fewer
-   * than `maxAttempts` recorded failures, newest entry first: a block leaves the
-   * recency layer oldest-first, but new blocks are what keeps the window fresh.
+   * Blocks (one per content hash) with no late vectors for `model` whose last
+   * failure, if any, has served its backoff ({@link IndexRetryPolicy}), newest
+   * entry first: a block leaves the recency layer oldest-first, but new blocks
+   * are what keeps the window fresh.
    */
-  blocksMissingLateVectors(model: string, indexName: string, maxAttempts: number, limit: number): Array<{
+  blocksMissingLateVectors(model: string, indexName: string, retry: IndexRetryPolicy, limit: number): Array<{
     contentHash: string;
     text: string;
   }> {
@@ -560,12 +632,12 @@ export class MemoryRetrievalStore {
            from memory_chunks c
            left join memory_late_vectors v on v.model = ? and v.content_hash = c.content_hash
            left join memory_index_failures f on f.index_name = ? and f.content_hash = c.content_hash
-           where v.content_hash is null and coalesce(f.attempts, 0) < ?
+           where v.content_hash is null and ${RETRY_DUE}
            group by c.content_hash
            order by max(c.entry_ts) desc
            limit ?`,
         )
-        .all(model, indexName, maxAttempts, limit) as Array<{ contentHash: string; text: string }>,
+        .all(model, indexName, ...retryParams(retry), limit) as Array<{ contentHash: string; text: string }>,
     );
   }
 
@@ -583,9 +655,13 @@ export class MemoryRetrievalStore {
     );
   }
 
-  /** Drop vectors of other models (the index belongs to one model) and of vanished blocks. */
+  /**
+   * Drop vectors of other models (the index belongs to one model) and of
+   * vanished blocks, and the failure rows of other late indexes.
+   */
   pruneLateVectors(model: string): Promise<number> {
     return this.storage.write((db) => {
+      db.prepare(`delete from memory_index_failures where index_name like 'late:%' and index_name != ?`).run(`late:${model}`);
       const a = db.prepare(`delete from memory_late_vectors where model != ?`).run(model).changes;
       const b = db
         .prepare(
@@ -616,11 +692,27 @@ export class MemoryRetrievalStore {
     });
   }
 
+  /** Forget the failures of blocks that have now been indexed. */
+  clearIndexFailuresFor(indexName: string, hashes: string[]): Promise<void> {
+    if (hashes.length === 0) return Promise.resolve();
+    return this.storage.write((db) => {
+      const stmt = db.prepare(`delete from memory_index_failures where index_name = ? and content_hash = ?`);
+      for (const h of new Set(hashes)) stmt.run(indexName, h);
+    });
+  }
+
+  /** Failure rows of an index (diagnostics and tests). */
+  indexFailureCount(indexName: string): number {
+    return this.storage.read(
+      (db) => (db.prepare(`select count(*) as n from memory_index_failures where index_name = ?`).get(indexName) as { n: number }).n,
+    );
+  }
+
   /**
    * Chunks with no row in the vector table `table` (a `memory_vec_*` vec0 table)
-   * and fewer than `maxAttempts` failures under `indexName`.
+   * whose last failure under `indexName`, if any, has served its backoff.
    */
-  chunksMissingFromVectorTable(table: string, indexName: string, maxAttempts: number, limit: number): Array<{
+  chunksMissingFromVectorTable(table: string, indexName: string, retry: IndexRetryPolicy, limit: number): Array<{
     rowid: number;
     contentHash: string;
     text: string;
@@ -634,11 +726,21 @@ export class MemoryRetrievalStore {
            from memory_chunks c
            left join memory_index_failures f on f.index_name = ? and f.content_hash = c.content_hash
            where c.rowid not in (select chunk_id from ${table})
-             and coalesce(f.attempts, 0) < ?
+             and ${RETRY_DUE}
            order by c.rowid
            limit ?`,
         )
-        .all(indexName, maxAttempts, limit) as Array<{ rowid: number; contentHash: string; text: string; source: string }>,
+        .all(indexName, ...retryParams(retry), limit) as Array<{ rowid: number; contentHash: string; text: string; source: string }>,
+    );
+  }
+
+  /** Chunks with no row in the vector table `table`, failed or not (0 = the index covers every chunk). */
+  countMissingFromVectorTable(table: string): number {
+    if (!/^memory_vec_[a-z0-9_]+$/.test(table)) throw new Error(`invalid vector table name ${table}`);
+    return this.storage.read(
+      (db) =>
+        (db.prepare(`select count(*) as n from memory_chunks c where c.rowid not in (select chunk_id from ${table})`).get() as { n: number })
+          .n,
     );
   }
 

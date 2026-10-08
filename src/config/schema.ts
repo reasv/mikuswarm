@@ -316,6 +316,11 @@ const RetrievalModelProviderSchema = StrictObject({
   min_score: Type.Optional(Type.Number()),
   // local: a directory holding the model files instead of a download.
   model_dir: Type.Optional(Type.String({ minLength: 1 })),
+  // local: pin the Hugging Face download to this commit (40 hex chars); unset = main.
+  revision: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40}$" })),
+  // local: expected sha256 per model file, e.g. { "onnx/model.onnx" = "<64 hex>" };
+  // a download or model_dir file that does not match is refused.
+  sha256: Type.Optional(Type.Record(Type.String({ minLength: 1 }), Type.String({ pattern: "^[0-9a-f]{64}$" }))),
   // local: the ONNX file inside the repo / directory. Default "onnx/model.onnx".
   onnx_file: Type.Optional(Type.String({ minLength: 1 })),
   // local: input token limit (query + passage). Default 512.

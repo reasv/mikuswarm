@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use super::kernel::{self, block_score_scalar, Block, QueryLuts};
 use super::quant::{scale_slot, Quantizer, CHUNK};
-use super::{top_indices, BlockSet};
+use super::{decode_rows, half_to_f32, top_indices, BlockSet};
 
 /// splitmix64 + Box-Muller: deterministic, dependency-free test data.
 struct Rng(u64);
@@ -288,4 +288,23 @@ fn turboquant_bench() {
             single
         );
     }
+}
+
+#[test]
+fn turboquant_decodes_stored_rows() {
+    // fp16: 1.0, -2.0, 0.5, 65504 (max half), a subnormal, -0.
+    let halves: [u16; 6] = [0x3c00, 0xc000, 0x3800, 0x7bff, 0x0001, 0x8000];
+    let bytes: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
+    let got = decode_rows(&bytes, None, 3, 2).unwrap();
+    assert_eq!(&got[..4], &[1.0, -2.0, 0.5, 65504.0]);
+    assert!((got[4] - 2f32.powi(-24)).abs() < 1e-12);
+    assert_eq!(got[5], 0.0);
+    assert!(half_to_f32(0x7c00).is_infinite() && half_to_f32(0x7e00).is_nan());
+    assert!(decode_rows(&bytes, None, 4, 2).is_err(), "short blob rejected");
+    // int8: two rows of dim 2, one scale per row.
+    let codes: Vec<u8> = [127i8, -127, 64, 0].iter().map(|&b| b as u8).collect();
+    let scales: Vec<u8> = [0.5f32, 0.25].iter().flat_map(|f| f.to_le_bytes()).collect();
+    let got = decode_rows(&codes, Some(&scales), 2, 2).unwrap();
+    assert_eq!(got, vec![63.5, -63.5, 16.0, 0.0]);
+    assert!(decode_rows(&codes, Some(&scales[..4]), 2, 2).is_err());
 }

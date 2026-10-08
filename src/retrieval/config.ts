@@ -143,6 +143,10 @@ export interface ResolvedModelProvider {
   timeoutMs?: number;
   minScore?: number;
   modelDir?: string;
+  /** local: the pinned Hugging Face revision (a commit) of a downloaded model. */
+  revision?: string;
+  /** local: expected sha256 per model file (relative path → hex digest). */
+  sha256?: Record<string, string>;
   onnxFile: string;
   maxTokens: number;
   batchSize: number;
@@ -261,6 +265,8 @@ function resolveProviders(
       timeoutMs: p.timeout_ms,
       minScore: p.min_score,
       modelDir: p.model_dir,
+      revision: p.revision,
+      sha256: p.sha256,
       onnxFile: p.onnx_file ?? "onnx/model.onnx",
       maxTokens: p.max_tokens ?? 512,
       batchSize: p.batch_size ?? 16,
@@ -310,10 +316,21 @@ function resolveLate(raw: RetrievalConfig["late"]): ResolvedRetrievalConfig["lat
     checkChain("late", chain, providers);
     checkChain("late", queryChain, providers);
     if (chain.length === 0) throw new Error("[retrieval.late] is enabled but its chain names no provider");
-    // Every provider must serve the index's model or its shared-space family.
+    // Every provider names the model it serves (a model_dir-only provider too):
+    // document encoders exactly the index's model (the stored vectors are one
+    // model's), query encoders the index model or its shared-space family.
     for (const name of new Set([...chain, ...queryChain])) {
       const served = providers[name]!.model;
-      if (served && !family.includes(served)) {
+      if (!served) {
+        throw new Error(`[retrieval.late.providers.${name}]: set \`model\` to the model it serves (with model_dir, the id of the files)`);
+      }
+      if (chain.includes(name) && served !== model) {
+        throw new Error(
+          `[retrieval.late.providers.${name}] encodes documents with "${served}", but the index model is "${model}" ` +
+            `(family models may only encode queries: list them in query_chain only)`,
+        );
+      }
+      if (!family.includes(served)) {
         throw new Error(
           `[retrieval.late.providers.${name}] serves "${served}", which is not the index model "${model}" or of its family`,
         );

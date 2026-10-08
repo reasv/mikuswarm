@@ -184,7 +184,7 @@ test("config: remote providers need zdr or self_hosted; local needs a model; cha
         enabled: true,
         late: { enabled: true, model: "big", chain: ["a"], providers: { a: { kind: "remote", endpoint: "http://x", zdr: true, model: "other" } } },
       } as any),
-    /not the index model "big" or of its family/,
+    /the index model is "big"/,
   );
   const ok = resolveRetrievalConfig({
     enabled: true,

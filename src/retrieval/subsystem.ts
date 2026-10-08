@@ -396,7 +396,7 @@ export async function createRetrievalSubsystem(
         recencyPaths,
         logger,
         onIndexed: () => {
-          for (const idx of indexers) void late?.refreshWindow(idx.agentName);
+          for (const idx of indexers) late?.requestRefresh(idx.agentName);
         },
       });
       lateWorker = worker;

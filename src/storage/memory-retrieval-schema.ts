@@ -27,6 +27,9 @@
  *   bounded number of times instead of every poll.
  * - `memory_retrievals`: one row per auto-retrieval build (counts, source,
  *   timings, the per-candidate report) and the session's follow-up, if any.
+ * - `idx_memory_chunks_content_hash` / `idx_memory_chunks_entry_ts`: lookups of
+ *   blocks by content hash (candidate rows, the late-vector joins and prunes)
+ *   and the newest-first walk of the late-interaction window.
  * - `idx_timeline_events_sender`: the display-name history lookup of the user
  *   lanes (distinct `sender_display_name` values of one sender id).
  */
@@ -128,6 +131,11 @@ create index if not exists idx_memory_retrievals_session
   on memory_retrievals(agent_session_id);
 create index if not exists idx_memory_retrievals_ts
   on memory_retrievals(ts);
+
+create index if not exists idx_memory_chunks_content_hash
+  on memory_chunks(content_hash);
+create index if not exists idx_memory_chunks_entry_ts
+  on memory_chunks(entry_ts);
 `;
 
 /** Index on `timeline_events`, created only where that table exists. */

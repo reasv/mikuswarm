@@ -28,6 +28,10 @@ export interface LazyOnnxModelOptions {
   /** Hugging Face repo id (when `modelDir` is unset). */
   model?: string;
   modelDir?: string;
+  /** Pinned Hugging Face commit (default main). */
+  revision?: string;
+  /** Expected sha256 per model file. */
+  sha256?: Record<string, string>;
   onnxFile: string;
   /** Download cache root (`<cacheRoot>/<repo slug>/`). */
   cacheRoot: string;
@@ -163,6 +167,8 @@ export class LazyOnnxModel {
     const files = await resolveModelFiles({
       model: this.opts.model,
       modelDir: this.opts.modelDir,
+      revision: this.opts.revision,
+      sha256: this.opts.sha256,
       onnxFile: this.opts.onnxFile,
       cacheRoot: this.opts.cacheRoot,
       httpProxyUrl: this.opts.httpProxyUrl,
@@ -220,6 +226,8 @@ export function lazyModelFor(
     name: provider.name,
     model: provider.model,
     modelDir: provider.modelDir,
+    revision: provider.revision,
+    sha256: provider.sha256,
     onnxFile: provider.onnxFile,
     cacheRoot: opts.cacheRoot,
     httpProxyUrl: opts.httpProxyUrl,

@@ -7,21 +7,23 @@
  * Indexing is not latency-critical: the recency layer shows the newest blocks
  * in full, so a block only has to be retrievable once it leaves that layer.
  * Newest blocks are encoded first. The index belongs to one model: vectors of
- * any other model and of vanished blocks are pruned at start. A block whose
- * encoding keeps failing is retried a bounded number of times
- * (`memory_index_failures`), never every poll.
+ * any other model and of vanished blocks are pruned at start. The index is
+ * keyed by {@link lateIndexKey}: the model plus every document-side setting
+ * that shapes the vectors, so changing one re-indexes instead of mixing
+ * spaces. A block whose encoding fails is retried after a doubling backoff
+ * (`memory_index_failures`, capped at an hour), never every poll and never
+ * dropped for good; its failure row is cleared once it is indexed.
  *
  * Index lag is a metric: the worker logs `late_index_lag` at start and hourly
  * (and warns when a block has left the recency layer without vectors).
  */
 import type { Logger } from "../../observability/logger.js";
-import type { MemoryRetrievalStore } from "../../storage/memory-retrieval-store.js";
+import { INDEX_RETRY_BASE_MS, INDEX_RETRY_MAX_MS, type MemoryRetrievalStore } from "../../storage/memory-retrieval-store.js";
 import type { ResolvedRetrievalConfig } from "../config.js";
 import { ChainUnavailableError, type ProviderChain } from "../models/chain.js";
 import type { LateEncoder } from "../models/types.js";
 import { encodeTokenMatrix } from "./codec.js";
-
-export const LATE_MAX_ATTEMPTS = 3;
+import { lateIndexKey } from "./index-key.js";
 
 export interface LateLag {
   /** Blocks (by content hash) without vectors. */
@@ -44,8 +46,11 @@ export interface LateIndexWorkerOptions {
   pauseMs?: number;
   /** Lag report interval. Default 1 h. */
   lagEveryMs?: number;
-  /** Called after vectors were stored (resident windows rebuild). */
+  /** Called after vectors were stored (resident windows update). */
   onIndexed?: () => void;
+  /** First retry delay of a failed block (default 1 min), doubling up to `retryMaxMs` (default 1 h). */
+  retryBaseMs?: number;
+  retryMaxMs?: number;
 }
 
 export class LateIndexWorker {
@@ -58,9 +63,12 @@ export class LateIndexWorker {
   /** Bumps whenever vectors are added or pruned (resident windows key on it). */
   version = 0;
   private readonly indexName: string;
+  /** The vector index key (`memory_late_vectors.model`). */
+  readonly indexKey: string;
 
   constructor(private readonly options: LateIndexWorkerOptions) {
-    this.indexName = `late:${options.config.model}`;
+    this.indexKey = lateIndexKey(options.config);
+    this.indexName = `late:${this.indexKey}`;
   }
 
   private now(): number {
@@ -71,10 +79,10 @@ export class LateIndexWorker {
     if (this.running) return;
     this.running = true;
     this.stopController = new AbortController();
-    const pruned = await this.options.store.pruneLateVectors(this.options.config.model);
+    const pruned = await this.options.store.pruneLateVectors(this.indexKey);
     if (pruned > 0) {
       this.version += 1;
-      this.options.logger?.info("late_index_pruned", { model: this.options.config.model, pruned });
+      this.options.logger?.info("late_index_pruned", { model: this.options.config.model, index: this.indexKey, pruned });
     }
     this.options.chain.warmAll();
     await this.reportLag().catch(() => undefined);
@@ -96,7 +104,7 @@ export class LateIndexWorker {
 
   /** Blocks without vectors, and how many of them left the recency layer. */
   async lag(): Promise<LateLag> {
-    const rows = this.options.store.lateIndexLag(this.options.config.model);
+    const rows = this.options.store.lateIndexLag(this.indexKey);
     const byHash = new Map<string, { path: string; agent: string | null }[]>();
     for (const r of rows) {
       const list = byHash.get(r.contentHash) ?? [];
@@ -160,7 +168,8 @@ export class LateIndexWorker {
   /** Encode and store one batch; returns the number of blocks stored. */
   async batch(): Promise<number> {
     const { store, config } = this.options;
-    const blocks = store.blocksMissingLateVectors(config.model, this.indexName, LATE_MAX_ATTEMPTS, config.indexBatchSize);
+    const retry = { now: this.now(), baseMs: this.options.retryBaseMs ?? INDEX_RETRY_BASE_MS, maxMs: this.options.retryMaxMs ?? INDEX_RETRY_MAX_MS };
+    const blocks = store.blocksMissingLateVectors(this.indexKey, this.indexName, retry, config.indexBatchSize);
     if (blocks.length === 0) return 0;
     let matrices;
     try {
@@ -186,7 +195,8 @@ export class LateIndexWorker {
       const enc = encodeTokenMatrix(matrices[i]!, config.dtype);
       return { contentHash: b.contentHash, ...enc };
     });
-    await store.putLateVectors(config.model, rows, this.now());
+    await store.putLateVectors(this.indexKey, rows, this.now());
+    await store.clearIndexFailuresFor(this.indexName, rows.map((r) => r.contentHash));
     this.version += 1;
     this.options.onIndexed?.();
     this.options.logger?.debug("late_index_batch", { model: config.model, blocks: rows.length });

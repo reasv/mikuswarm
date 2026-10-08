@@ -175,3 +175,53 @@ test("turboquant: native class rejects bad shapes", { skip }, async () => {
   const r = await n.scan(new Float32Array(8).fill(Math.SQRT1_2 / 2), 1, 1);
   assert.deepEqual(r.keys, ["b"]);
 });
+
+test("turboquant: stored fp16 / int8 rows load natively and match the decoded floats; windows update in place", { skip }, async () => {
+  const { encodeTokenMatrix, decodeTokenMatrix } = await import("../src/retrieval/late/codec.js");
+  const dim = 32;
+  const { query, docs } = corpus(11, dim, 30);
+  const scorer = await createTurboQuantScorer({ bits: 4 });
+  const encoded = docs.map((d, i) => ({ key: d.key, encoded: encodeTokenMatrix(d.matrix, i % 3 === 0 ? "int8" : "fp16") }));
+  const decoded = docs.map((d, i) => ({ key: d.key, matrix: decodeTokenMatrix(encoded[i]!.encoded) }));
+  await scorer.setWindow("f32", decoded);
+  await scorer.addToWindow("enc", encoded.slice(0, 20));
+  await scorer.addToWindow("enc", encoded.slice(20));
+  const a = await scorer.score(query, { windowId: "f32" });
+  const b = await scorer.score(query, { windowId: "enc" });
+  assert.equal(b.size, docs.length);
+  for (const [k, v] of a) assert.ok(Math.abs(b.get(k)! - v) < 1e-9, `${k}: same codes either way`);
+  await scorer.removeFromWindow("enc", ["d0", "d1", "missing"]);
+  const c = await scorer.score(query, { windowId: "enc" });
+  assert.equal(c.size, docs.length - 2);
+  assert.ok(!c.has("d0") && !c.has("d1"));
+  assert.equal(scorer.hasWindow("enc"), true);
+  await scorer.dropWindow("enc");
+  assert.equal(scorer.hasWindow("enc"), false);
+  await scorer.close();
+});
+
+test("turboquant: codes are reported to V8 as external memory and free() releases them at once", { skip }, async () => {
+  const Native = loadTurboQuantBinding();
+  const dim = 64;
+  const { docs } = corpus(5, dim, 50);
+  const n = new Native({ dim, bits: 4, threads: 1 });
+  const floats = docs.reduce((s, d) => s + d.matrix.tokens * dim, 0);
+  const v = new Float32Array(floats);
+  let o = 0;
+  for (const d of docs) {
+    v.set(d.matrix.data, o);
+    o += d.matrix.tokens * dim;
+  }
+  await n.setBlocks(docs.map((d) => d.key), docs.map((d) => d.matrix.tokens), v);
+  assert.ok(n.memoryBytes() > 0);
+  assert.equal(n.externalBytes(), n.memoryBytes(), "the resident codes are counted by V8");
+  n.removeBlocks(["d0"]);
+  assert.equal(n.externalBytes(), n.memoryBytes());
+  n.free();
+  assert.equal(n.blockCount(), 0);
+  assert.equal(n.externalBytes(), 0);
+  await n.addBlocks(["late"], [1], v.subarray(0, dim));
+  assert.equal(n.blockCount(), 0, "a mutation after free() is discarded");
+  assert.equal((await n.scan(v.subarray(0, dim), 1, 0)).keys.length, 0);
+  n.free();
+});
