@@ -31,6 +31,7 @@ import {
 } from "../checks/duplicate.js";
 import { postedText } from "../checks/state.js";
 import { buildTimelineKey, parseTimelineKey } from "../storage/timeline-key.js";
+import { dmTimelineKeysForPeerIn } from "../storage/database.js";
 import { isPostingTool } from "../tools/side-effects.js";
 import type { AttachmentMeta, CanonicalChatEvent } from "../types.js";
 import type { CalibrationItem, SampleResult } from "./calibration.js";
@@ -136,18 +137,8 @@ function postingCalls(transcript: readonly unknown[]): Array<{ index: number; id
 function dmTimeline(db: Database.Database, ownTimelineKey: string, userId: string): string | undefined {
   const parsed = parseTimelineKey(ownTimelineKey);
   if (!parsed) return undefined;
-  const peer = db
-    .prepare(`select dm_channel_id from dm_peers where provider = ? and account_id = ? and peer_user_id = ? limit 1`)
-    .get(parsed.provider, parsed.accountId, userId) as { dm_channel_id: string } | undefined;
-  if (peer) return buildTimelineKey({ provider: parsed.provider, accountId: parsed.accountId, kind: "dm", channelId: peer.dm_channel_id });
-  const prefix = `${parsed.provider}:${parsed.accountId}:dm:`;
-  const row = db
-    .prepare(
-      `select timeline_key from timeline_events where sender_id = ? and substr(timeline_key, 1, ?) = ?
-        order by timestamp desc limit 1`,
-    )
-    .get(userId, prefix.length, prefix) as { timeline_key: string } | undefined;
-  return row?.timeline_key;
+  // The same target the live check resolves (the newest DM with that user on this account).
+  return dmTimelineKeysForPeerIn(db, parsed.provider, parsed.accountId, userId)[0];
 }
 
 /**

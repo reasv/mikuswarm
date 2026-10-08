@@ -23,6 +23,7 @@ import { estimateTokens } from "../src/context/tokens.js";
 import { assignItemIds, checksPoint, planDuplicateCalls, type ChecksCallInput } from "../src/decisions/points/checks.js";
 import type { PointSettings } from "../src/decisions/config.js";
 import type { CanonicalChatEvent } from "../src/types.js";
+import { Storage } from "../src/storage/index.js";
 
 // ---------------------------------------------------------------------------
 // The duplicate-send check's mechanics (DECISION-MODEL §5.4, ARCHITECTURE.md
@@ -321,4 +322,54 @@ test("unseen: a message deleted by the evaluation time does not count; a later d
   ];
   const unseen = selectUnseen(rows, seenFromMessages([]), { selfSessionId: "s-self", max: 5, asOf: 6000 });
   assert.deepEqual(unseen.map((m) => m.text), ["deleted later", "part one", "part three"], "a deleted chunk breaks the message");
+});
+
+test("send_dm target: the account's DM with the user with the newest activity, through indexed reads only", async () => {
+  const storage = await Storage.open({ databasePath: ":memory:" });
+  try {
+    const row = (id: string, timelineKey: string, sender: string, timestamp: number) =>
+      storage.appendTimelineEvent({
+        id,
+        externalId: `$${id}`,
+        timelineKey,
+        provider: "matrix",
+        role: sender === "@bot:x" ? "assistant" : "user",
+        sender: { id: sender },
+        body: "hi",
+        timestamp,
+        receivedAt: timestamp,
+      });
+    const old = "matrix:acct:dm:!old:x"; // a DM from before peers were recorded: carol posted in it
+    const peer = "matrix:acct:dm:!peer:x"; // a recorded peer DM, newer activity (the bot's own message)
+    const quiet = "matrix:acct:dm:!quiet:x"; // a recorded peer DM with nothing stored
+    await row("o1", old, "@carol:x", 1_000);
+    await row("o2", old, "@carol:x", 2_000);
+    await row("p1", peer, "@bot:x", 3_000);
+    await row("x1", "matrix:other:dm:!elsewhere:x", "@carol:x", 9_000); // another account
+    await row("r1", "matrix:acct:room:!room:x", "@carol:x", 8_000); // not a DM
+    await storage.setDmPeer("matrix", "acct", "!peer:x", "@carol:x");
+    await storage.setDmPeer("matrix", "acct", "!quiet:x", "@carol:x");
+    assert.deepEqual(storage.dmTimelineKeysForPeer("matrix", "acct", "@carol:x"), [peer, old, quiet]);
+    await row("o3", old, "@carol:x", 4_000);
+    assert.equal(storage.dmTimelineKeysForPeer("matrix", "acct", "@carol:x")[0], old, "newest activity wins");
+    assert.deepEqual(storage.dmTimelineKeysForPeer("matrix", "acct", "@nobody:x"), []);
+
+    // Every read is an index search: no scan of timeline_events or dm_peers.
+    const plans = storage.read((db) =>
+      [
+        [`select dm_channel_id from dm_peers where provider = ? and account_id = ? and peer_user_id = ?`, ["matrix", "acct", "@carol:x"]],
+        [`select distinct timeline_key from timeline_events where sender_id = ? and instr(timeline_key, ':dm:') > 0 and substr(timeline_key, 1, ?) = ?`, ["@carol:x", 15, "matrix:acct:dm:"]],
+        [`select max(timestamp) as last from timeline_events where timeline_key = ?`, [old]],
+        [`select distinct timeline_key from timeline_events where sender_id = ? and instr(timeline_key, ':dm:') > 0 order by max(timestamp) over (partition by timeline_key) desc limit ?`, ["@carol:x", 5]],
+      ].map(([sql, params]) =>
+        (db.prepare(`explain query plan ${sql as string}`).all(...(params as unknown[])) as Array<{ detail: string }>).map((p) => p.detail).join(" | "),
+      ),
+    );
+    for (const plan of plans) {
+      assert.ok(!/SCAN (timeline_events|dm_peers)\b(?! USING)/.test(plan), `no full scan: ${plan}`);
+      assert.ok(/USING (COVERING )?INDEX|PRIMARY KEY/.test(plan), `indexed: ${plan}`);
+    }
+  } finally {
+    storage.close();
+  }
 });

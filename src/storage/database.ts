@@ -10076,20 +10076,14 @@ export class Storage {
   }
 
   /**
-   * The DM timelines of one account with `userId`: the recorded DM peers
-   * (`dm_peers`) and the DMs the user posted in.
+   * The DM timelines of one account with `userId`, newest activity first: the
+   * recorded DM peers (`dm_peers`) and the DMs the user posted in (DMs stored
+   * before peers were recorded). Indexed reads only (`idx_dm_peers_peer`,
+   * `idx_timeline_events_dm_sender`, `idx_timeline_events_timeline_time`): it
+   * runs on every judged `send_dm` (the duplicate check's target, §8j).
    */
   dmTimelineKeysForPeer(provider: string, accountId: string, userId: string): string[] {
-    const keys = new Set<string>();
-    this.read((db) => {
-      const rows = db
-        .prepare(`select dm_channel_id from dm_peers where provider = ? and account_id = ? and peer_user_id = ?`)
-        .all(provider, accountId, userId) as Array<{ dm_channel_id: string }>;
-      for (const row of rows) keys.add(buildTimelineKey({ provider, accountId, kind: "dm", channelId: row.dm_channel_id }));
-    });
-    const prefix = `${provider}:${accountId}:dm:`;
-    for (const key of this.findDmTimelineKeysForUser(userId, { limit: 20 })) if (key.startsWith(prefix)) keys.add(key);
-    return [...keys];
+    return this.read((db) => dmTimelineKeysForPeerIn(db, provider, accountId, userId));
   }
 
   // ── Workspace seed ledger (spec WORKSPACE-TEMPLATE-RECONCILIATION §6) ────────
@@ -11789,6 +11783,10 @@ create table if not exists dm_peers (
   peer_user_id   text not null,
   primary key (provider, account_id, dm_channel_id)
 ) without rowid;
+
+-- The DMs of one account with a user (send_dm's duplicate-check target, §8j).
+create index if not exists idx_dm_peers_peer
+  on dm_peers(provider, account_id, peer_user_id);
 `;
 
 /**
@@ -12307,6 +12305,12 @@ create table if not exists timeline_events (
 
 create index if not exists idx_timeline_events_timeline_time
   on timeline_events(timeline_key, timestamp, received_at, id);
+
+-- The DM timelines a user posted in, newest first (findDmTimelineKeysForUser,
+-- dmTimelineKeysForPeer): DM rows only, so it stays small.
+create index if not exists idx_timeline_events_dm_sender
+  on timeline_events(sender_id, timeline_key, timestamp)
+  where instr(timeline_key, ':dm:') > 0;
 
 -- Partial index over the is_undecryptable generated column so the re-decryption
 -- sweeper finds stored UTD events cheaply (O(matches), no full JSON scan).
@@ -13924,6 +13928,37 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
 //
 // `create table/index if not exists` in SCHEMA makes re-running open() on an
 // up-to-date database harmless.
+/**
+ * {@link Storage.dmTimelineKeysForPeer} over a database handle (also the
+ * duplicate check's calibration replay, `src/audit/duplicate-calibration.ts`).
+ */
+export function dmTimelineKeysForPeerIn(
+  db: Database.Database,
+  provider: string,
+  accountId: string,
+  userId: string,
+): string[] {
+  const prefix = `${provider}:${accountId}:dm:`;
+  const keys = new Set<string>();
+  const peers = db
+    .prepare(`select dm_channel_id from dm_peers where provider = ? and account_id = ? and peer_user_id = ?`)
+    .all(provider, accountId, userId) as Array<{ dm_channel_id: string }>;
+  for (const row of peers) keys.add(buildTimelineKey({ provider, accountId, kind: "dm", channelId: row.dm_channel_id }));
+  const posted = db
+    .prepare(
+      `select distinct timeline_key from timeline_events
+        where sender_id = ? and instr(timeline_key, ':dm:') > 0 and substr(timeline_key, 1, ?) = ?`,
+    )
+    .all(userId, prefix.length, prefix) as Array<{ timeline_key: string }>;
+  for (const row of posted) keys.add(row.timeline_key);
+  // Newest by the DM's last stored message (either side); one with none is oldest.
+  const lastIn = db.prepare(`select max(timestamp) as last from timeline_events where timeline_key = ?`);
+  return [...keys]
+    .map((key) => ({ key, last: (lastIn.get(key) as { last: number | null } | undefined)?.last ?? 0 }))
+    .sort((a, b) => b.last - a.last || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+    .map((entry) => entry.key);
+}
+
 function runMigrations(db: Database.Database, isFresh: boolean): void {
   const current = Number((db.pragma("user_version", { simple: true }) as number) ?? 0);
 

@@ -324,7 +324,8 @@ Unreleased section; it is not part of any release's notes.
   about to post what another session of the same agent already posted to the
   same channel after this session last saw it. At every send (every posting
   tool but `edit_message`, which corrects a message already posted; every
-  session type; judged against the tool's target channel) the output gate
+  session type; judged against the tool's target channel, for `send_dm` the
+  DM with that user with the newest message) the output gate
   collects those unseen messages, and when there are any it asks the
   decision model three questions: does the draft answer what one of them already
   answered, repeat most of it, or contradict it. A yes blocks the send with an
