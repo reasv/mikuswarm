@@ -1,8 +1,10 @@
 /**
- * Discord deletions before the message is stored (ARCHITECTURE.md §6 "Message
- * edits", §6c "Deletes"): a trigger deleted during the provider's trigger hold
- * is flushed at once, without its trigger and already marked deleted, so it is
- * stored marked and starts no session.
+ * Discord deletions and the trigger hold (ARCHITECTURE.md §6 "Message edits",
+ * §6c "Deletes", "Trigger hold"): the hold emits every message at once,
+ * untriggered (stored as it arrives), and delivers the trigger once at its end,
+ * grouping the sender's held messages, one hold per timeline and sender (the
+ * Matrix provider's semantics). A deleted held message leaves the held group;
+ * the first remaining part becomes the root; a hold left empty starts nothing.
  */
 
 import { describe, it } from "node:test";
@@ -40,16 +42,16 @@ function makeRuntime(): unknown {
 }
 
 /** A DM (auto-triggers, so it takes the trigger hold). */
-function makeDm(id: string): unknown {
+function makeDm(id: string, content = "please answer this", authorId = "400000000000000001"): unknown {
   return {
     id,
-    content: "please answer this",
+    content,
     channelId: CHANNEL,
     guildId: null,
     guild: null,
     channel: { type: 1, messages: { cache: { get: () => undefined } } },
     reference: null,
-    author: { id: "400000000000000001", username: "alice", displayName: "Alice", bot: false },
+    author: { id: authorId, username: "alice", displayName: "Alice", bot: false },
     mentions: {
       users: { map: () => [] },
       roles: { map: () => [] },
@@ -73,59 +75,115 @@ const callbacks: DiscordProviderCallbacks = {
 
 type Handlers = Record<string, (...args: unknown[]) => Promise<void>>;
 
-describe("Discord deletion of a held trigger", () => {
-  it("flushes the held message at once, untriggered and marked deleted; the trigger never fires", async () => {
+describe("Discord trigger hold", () => {
+  const holdHarness = async (holdMs: number) => {
     const storage = await Storage.open({ databasePath: ":memory:" });
+    const timeline = new TimelineStore(storage);
+    const router = new TimelineRouter(timeline);
+    const provider = new DiscordProvider(makeDiscordConfig({ trigger_hold_ms: holdMs }), callbacks);
+    const emitted: InboundChatEvent[] = [];
+    (provider as unknown as Record<string, unknown>).host = {
+      onEvent(inbound: InboundChatEvent) {
+        emitted.push(inbound);
+        if (inbound.edit?.deleted) void timeline.markDeleted("discord", inbound.edit.targetExternalId, inbound.timelineKey, { at: inbound.event.timestamp });
+        else if (!inbound.edit) void router.route(inbound, "skipped");
+      },
+      resolveReplyTrigger: () => undefined,
+    };
+    const handlers = provider as unknown as Handlers;
+    const triggers = () => emitted.filter((i) => !i.edit && i.trigger);
+    const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+    return { storage, provider, emitted, handlers, triggers, wait };
+  };
+
+  it("stores every held message as it arrives and delivers one trigger grouping the sender's messages", async () => {
+    const t = await holdHarness(150);
     try {
-      const timeline = new TimelineStore(storage);
-      const router = new TimelineRouter(timeline);
-      const provider = new DiscordProvider(makeDiscordConfig({ trigger_hold_ms: 150 }), callbacks);
-      const emitted: InboundChatEvent[] = [];
-      (provider as unknown as Record<string, unknown>).host = {
-        onEvent(inbound: InboundChatEvent) {
-          emitted.push(inbound);
-          if (!inbound.edit) void router.route(inbound, "skipped");
-        },
-        resolveReplyTrigger: () => undefined,
-      };
-      const handlers = provider as unknown as Handlers;
-      await handlers.handleMessageCreate!(makeRuntime(), makeDm("111111111111111111"));
-      assert.equal(emitted.length, 0, "held, not emitted yet");
-      await handlers.handleMessageDelete!(makeRuntime(), { id: "111111111111111111", channelId: CHANNEL });
-      await new Promise<void>((resolve) => setTimeout(resolve, 300));
-
-      const flushed = emitted.filter((i) => !i.edit);
-      assert.equal(flushed.length, 1, "the held message is flushed once, never again at the hold's end");
-      assert.equal(flushed[0]!.trigger, undefined);
-      assert.equal(flushed[0]!.event.trigger, undefined);
-      assert.ok(flushed[0]!.event.deleted, "flushed already marked deleted");
-      const deletions = emitted.filter((i) => i.edit?.deleted === true);
-      assert.equal(deletions.length, 1);
-      assert.equal(deletions[0]!.edit!.targetExternalId, "111111111111111111");
-
-      const stored = storage.getTimelineEventById("discord:main:111111111111111111");
-      assert.ok(stored?.deleted, "stored marked");
-      assert.equal(stored?.body, "please answer this", "content kept");
+      await t.handlers.handleMessageCreate!(makeRuntime(), makeDm("111111111111111101", "first part"));
+      await t.handlers.handleMessageCreate!(makeRuntime(), makeDm("111111111111111102", "second part"));
+      assert.equal(t.triggers().length, 0, "the trigger is held");
+      assert.deepEqual(t.emitted.map((i) => [i.event.externalId, i.trigger]), [["111111111111111101", undefined], ["111111111111111102", undefined]]);
+      await t.wait(300);
+      assert.equal(t.triggers().length, 1, "one grouped trigger");
+      const [held] = t.triggers();
+      assert.equal(held!.event.externalId, "111111111111111101", "rooted on the first message");
+      assert.deepEqual(held!.trigger!.groupedEventIds, ["discord:main:111111111111111101", "discord:main:111111111111111102"]);
+      assert.equal(held!.event.trigger, held!.trigger);
+      // Both held messages are stored, not only the last one.
+      assert.equal(t.storage.getTimelineEventById("discord:main:111111111111111101")?.body, "first part");
+      assert.equal(t.storage.getTimelineEventById("discord:main:111111111111111102")?.body, "second part");
     } finally {
-      storage.close();
+      t.storage.close();
+    }
+  });
+
+  it("holds each sender separately: another sender's trigger never replaces a held one", async () => {
+    const t = await holdHarness(150);
+    try {
+      await t.handlers.handleMessageCreate!(makeRuntime(), makeDm("111111111111111111", "alice asks", "400000000000000001"));
+      await t.handlers.handleMessageCreate!(makeRuntime(), makeDm("111111111111111112", "bob asks", "400000000000000002"));
+      await t.wait(300);
+      assert.deepEqual(t.triggers().map((i) => i.event.externalId).sort(), ["111111111111111111", "111111111111111112"]);
+      assert.ok(t.triggers().every((i) => i.trigger!.groupedEventIds!.length === 1));
+    } finally {
+      t.storage.close();
+    }
+  });
+
+  it("a deleted held root re-roots the trigger on the next held part; a deleted later part leaves the group", async () => {
+    const t = await holdHarness(150);
+    try {
+      await t.handlers.handleMessageCreate!(makeRuntime(), makeDm("111111111111111121", "typo"));
+      await t.handlers.handleMessageCreate!(makeRuntime(), makeDm("111111111111111122", "corrected"));
+      await t.handlers.handleMessageCreate!(makeRuntime(), makeDm("111111111111111123", "an afterthought"));
+      await t.handlers.handleMessageDelete!(makeRuntime(), { id: "111111111111111121", channelId: CHANNEL });
+      await t.handlers.handleMessageDelete!(makeRuntime(), { id: "111111111111111123", channelId: CHANNEL });
+      await t.wait(300);
+      assert.equal(t.triggers().length, 1);
+      const [held] = t.triggers();
+      assert.equal(held!.event.externalId, "111111111111111122");
+      assert.equal(held!.event.body, "corrected");
+      assert.deepEqual(held!.trigger!.groupedEventIds, ["discord:main:111111111111111122"]);
+      // Every deleted held message is stored, marked, with its content.
+      for (const id of ["111111111111111121", "111111111111111123"]) {
+        const stored = t.storage.getTimelineEventById(`discord:main:${id}`);
+        assert.ok(stored?.deleted, `${id} marked`);
+      }
+      assert.equal(t.storage.getTimelineEventById("discord:main:111111111111111121")?.body, "typo", "content kept");
+      assert.equal(t.storage.getTimelineEventById("discord:main:111111111111111122")?.deleted, undefined);
+    } finally {
+      t.storage.close();
+    }
+  });
+
+  it("every held part deleted: the trigger is never delivered", async () => {
+    const t = await holdHarness(150);
+    try {
+      await t.handlers.handleMessageCreate!(makeRuntime(), makeDm("111111111111111131"));
+      await t.handlers.handleMessageCreate!(makeRuntime(), makeDm("111111111111111132", "more"));
+      await t.handlers.handleMessageDelete!(makeRuntime(), { id: "111111111111111132", channelId: CHANNEL });
+      await t.handlers.handleMessageDelete!(makeRuntime(), { id: "111111111111111131", channelId: CHANNEL });
+      await t.wait(300);
+      assert.equal(t.triggers().length, 0, "no trigger for a withdrawn hold");
+      assert.equal(t.emitted.filter((i) => i.edit?.deleted === true).length, 2);
+      assert.ok(t.storage.getTimelineEventById("discord:main:111111111111111131")?.deleted);
+      assert.equal(t.storage.getTimelineEventById("discord:main:111111111111111131")?.body, "please answer this", "content kept");
+    } finally {
+      t.storage.close();
     }
   });
 
   it("a deletion of another message leaves the held trigger alone", async () => {
-    const provider = new DiscordProvider(makeDiscordConfig({ trigger_hold_ms: 100 }), callbacks);
-    const emitted: InboundChatEvent[] = [];
-    (provider as unknown as Record<string, unknown>).host = {
-      onEvent: (inbound: InboundChatEvent) => emitted.push(inbound),
-      resolveReplyTrigger: () => undefined,
-    };
-    const handlers = provider as unknown as Handlers;
-    await handlers.handleMessageCreate!(makeRuntime(), makeDm("111111111111111112"));
-    await handlers.handleMessageDelete!(makeRuntime(), { id: "111111111111111999", channelId: CHANNEL });
-    await new Promise<void>((resolve) => setTimeout(resolve, 250));
-    const flushed = emitted.filter((i) => !i.edit);
-    assert.equal(flushed.length, 1);
-    assert.ok(flushed[0]!.trigger, "still a trigger");
-    assert.equal(flushed[0]!.event.deleted, undefined);
+    const t = await holdHarness(100);
+    try {
+      await t.handlers.handleMessageCreate!(makeRuntime(), makeDm("111111111111111141"));
+      await t.handlers.handleMessageDelete!(makeRuntime(), { id: "111111111111111999", channelId: CHANNEL });
+      await t.wait(250);
+      assert.equal(t.triggers().length, 1);
+      assert.deepEqual(t.triggers()[0]!.trigger!.groupedEventIds, ["discord:main:111111111111111141"]);
+    } finally {
+      t.storage.close();
+    }
   });
 });
 

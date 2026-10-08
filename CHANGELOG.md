@@ -85,9 +85,11 @@ Unreleased section; it is not part of any release's notes.
   wiped message stays unmarked, since nothing stored tells it from an edited
   embed-only one.
   A deletion that arrives before its message is stored (still held by the startup
-  gap backfetch, even while it commits, or the Discord trigger hold, or simply overtaking it) is applied
-  when the message lands, the bot's own sent messages included, and a deleted Discord trigger still in its hold starts
-  no session. A Discord bulk deletion (a purge) marks every purged message.
+  gap backfetch, even while it commits, or simply overtaking it) is applied when the
+  message lands, the bot's own sent messages included. A message deleted while it
+  waits in a Discord trigger hold leaves the held request, and a hold left with no
+  message starts no session. A Discord bulk deletion (a purge) marks every purged
+  message.
   See ARCHITECTURE.md §6 "Message edits" and §9 "Deleted messages".
 - **Tool effect classes.** Every tool is classified as `redo_safe` (no external
   effect), `repeatable` (no visible effect, but repeating it costs money or time),
@@ -452,6 +454,12 @@ Unreleased section; it is not part of any release's notes.
 
 ### Fixed
 
+- **Discord: with `trigger_hold_ms` set, held messages were lost.** The hold was kept
+  per channel and replaced the held message with any newer trigger, from any sender, so
+  the earlier held messages were never stored and their senders never answered. The
+  Discord hold now works like the Matrix one: every message is stored as it arrives,
+  each sender has their own hold, and the trigger is delivered once with that sender's
+  held messages grouped. Discord ships with `trigger_hold_ms = 0`.
 - **A fresh install could not download the local embedding model.** fastembed 2.1.0
   fetched models from a Google Cloud Storage bucket that now returns HTTP 403, so a new
   data directory got no semantic memory search. The bge v1.5 English models now download

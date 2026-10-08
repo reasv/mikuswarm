@@ -121,8 +121,15 @@ interface AccountRuntime {
   emojiCatalog: EmojiCatalog;
 }
 
+/**
+ * One open trigger hold (one per timeline and sender, as on Matrix): the held
+ * trigger delivery (its root message carrying the grouped trigger) and every
+ * held part by external id, in arrival order, each already emitted untriggered
+ * (stored); a deletion takes a part out of the group.
+ */
 interface PendingTrigger {
   event: import("../types.js").InboundChatEvent;
+  parts: Map<string, import("../types.js").InboundChatEvent>;
   timer: NodeJS.Timeout;
 }
 
@@ -1025,12 +1032,6 @@ export class DiscordProvider implements IChatProvider {
       return;
     }
 
-    // Trigger-hold mechanism (mirrors Matrix provider, spec §8.4).
-    if (inbound.trigger && this.config.trigger_hold_ms) {
-      this.applyTriggerHold(runtime, inbound);
-      return;
-    }
-
     // Check for reply-to-bot trigger (spec §8.2). In "never" mode sibling bot
     // accounts are excluded here in parallel with detectDiscordTrigger (spec
     // MULTI-AGENT-SUPPORT §9). In "capped" mode siblings are allowed through
@@ -1052,6 +1053,13 @@ export class DiscordProvider implements IChatProvider {
         inbound.trigger = replyTrigger;
         inbound.event.trigger = replyTrigger;
       }
+    }
+
+    // Trigger-hold mechanism (mirrors the Matrix provider, spec §8.4): a reply
+    // to the bot resolved above takes the same hold.
+    if (this.config.trigger_hold_ms) {
+      this.applyTriggerHold(runtime, inbound);
+      return;
     }
 
     this.host!.onEvent(inbound);
@@ -1143,16 +1151,10 @@ export class DiscordProvider implements IChatProvider {
     const canonicalId = buildDiscordEventId(runtime.accountId, externalId);
 
     const now = Date.now();
-    // A trigger still in its hold was never stored (the Discord hold emits the
-    // message only at its flush): it is flushed now, without its trigger (so it
-    // starts no session) and already marked deleted (§6 "Message edits").
-    const held = this.pendingTriggers.get(timelineKey);
-    if (held && held.event.event.externalId === externalId) {
-      clearTimeout(held.timer);
-      this.pendingTriggers.delete(timelineKey);
-      const { trigger: _dropped, ...event } = held.event.event;
-      this.host!.onEvent({ ...held.event, trigger: undefined, event: { ...event, deleted: { at: now } } });
-    }
+    // A message still in a trigger hold (stored already: the hold emits every
+    // message at once, untriggered) leaves its held group, so the held trigger
+    // never carries it; a hold left with no part is dropped (§6c "Deletes").
+    this.dropFromTriggerHold(timelineKey, externalId);
 
     // Route as a delete — the same path Matrix redactions use: an inbound event
     // with a delete marker, so the timeline store marks the target deleted.
@@ -1306,8 +1308,17 @@ export class DiscordProvider implements IChatProvider {
 
   // ── Trigger hold (mirrors Matrix provider) ────────────────────────────────
 
+  /**
+   * The trigger hold, with the Matrix provider's same-sender semantics: every
+   * message is emitted at once without its trigger (so it is stored as it
+   * arrives), and the trigger is delivered once, at the hold's end, grouping the
+   * sender's messages that arrived meanwhile (`groupedEventIds`). One hold per
+   * timeline and sender; a trigger-bearing follow-up extends it (capped at
+   * TRIGGER_HOLD_MAX_MULTIPLIER × `trigger_hold_ms` from its start), a
+   * non-triggering one joins without extending it.
+   */
   private applyTriggerHold(
-    runtime: AccountRuntime,
+    _runtime: AccountRuntime,
     inbound: import("../types.js").InboundChatEvent,
   ): void {
     const holdMs = this.config.trigger_hold_ms ?? 0;
@@ -1316,45 +1327,71 @@ export class DiscordProvider implements IChatProvider {
       return;
     }
 
-    const key = inbound.timelineKey;
+    this.host!.onEvent({ ...inbound, trigger: undefined, event: { ...inbound.event, trigger: undefined } });
+
+    const key = `${inbound.timelineKey}:${inbound.event.sender.id}`;
     const existing = this.pendingTriggers.get(key);
 
     if (existing) {
-      // Extend hold — reset timer, but cap total hold at MULTIPLIER × holdMs.
-      // Read holdStartedAt from the EXISTING held trigger (not the incoming event)
-      // so a steady drip of triggers cannot extend the hold beyond 4× from the
-      // FIRST trigger (mirrors Matrix provider logic, src/matrix/provider.ts:~347).
-      // Only the final merged event is flushed to host.onEvent; its ingest embeds
-      // travel on `event.linkPreviews`, so they are stored with it at flush.
-      const now = Date.now();
-      const startedAt = existing.event.trigger?.holdStartedAt ?? now;
-      const maxEnd = startedAt + holdMs * TRIGGER_HOLD_MAX_MULTIPLIER;
-      const remaining = Math.max(0, Math.min(holdMs, maxEnd - now));
-      clearTimeout(existing.timer);
-      existing.event = inbound;
-      existing.timer = setTimeout(() => {
-        this.pendingTriggers.delete(key);
-        if (!this.stopped) {
-          this.host!.onEvent(existing.event);
-        }
-      }, remaining);
+      const heldTrigger = existing.event.trigger!;
+      const grouped = { ...heldTrigger, groupedEventIds: [...(heldTrigger.groupedEventIds ?? []), inbound.event.id] };
+      existing.event.trigger = grouped;
+      existing.event.event.trigger = grouped;
+      if (inbound.event.externalId) existing.parts.set(inbound.event.externalId, inbound);
+      if (inbound.trigger) {
+        const now = Date.now();
+        const startedAt = heldTrigger.holdStartedAt ?? now;
+        const maxEnd = startedAt + holdMs * TRIGGER_HOLD_MAX_MULTIPLIER;
+        clearTimeout(existing.timer);
+        existing.timer = setTimeout(() => this.flushTriggerHold(key), Math.max(0, Math.min(now + holdMs, maxEnd) - now));
+      }
       return;
     }
 
-    // New hold
-    if (inbound.trigger) {
-      inbound.trigger.holdStartedAt = Date.now();
-    }
-    // Build pending structure first so the flush closure references it by identity;
-    // subsequent merges that update pending.event are visible when the timer fires.
-    const pending: PendingTrigger = { event: inbound, timer: undefined! };
-    pending.timer = setTimeout(() => {
-      this.pendingTriggers.delete(key);
-      if (!this.stopped) {
-        this.host!.onEvent(pending.event);
-      }
-    }, holdMs);
+    // No open hold: only a trigger opens one.
+    if (!inbound.trigger) return;
+    const trigger = { ...inbound.trigger, holdStartedAt: Date.now(), groupedEventIds: [inbound.event.id] };
+    const pending: PendingTrigger = {
+      event: { ...inbound, trigger, event: { ...inbound.event, trigger } },
+      parts: new Map(inbound.event.externalId ? [[inbound.event.externalId, inbound]] : []),
+      timer: setTimeout(() => this.flushTriggerHold(key), holdMs),
+    };
     this.pendingTriggers.set(key, pending);
+  }
+
+  private flushTriggerHold(key: string): void {
+    const pending = this.pendingTriggers.get(key);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pendingTriggers.delete(key);
+    if (this.stopped) return;
+    const trigger = { ...pending.event.trigger!, holdEndedAt: Date.now() };
+    this.host!.onEvent({ ...pending.event, trigger, event: { ...pending.event.event, trigger } });
+  }
+
+  /**
+   * A deleted message leaves every open hold of its timeline that holds it: its
+   * id leaves the held group; when it was the held trigger's root message, the
+   * first remaining part becomes the root (the group keeps its trigger); a hold
+   * left with no part is dropped, so a deleted trigger never starts a session.
+   */
+  private dropFromTriggerHold(timelineKey: string, externalId: string): void {
+    for (const [key, pending] of this.pendingTriggers) {
+      if (pending.event.timelineKey !== timelineKey) continue;
+      const part = pending.parts.get(externalId);
+      if (!part) continue;
+      pending.parts.delete(externalId);
+      const [nextRoot] = pending.parts.values();
+      if (!nextRoot) {
+        clearTimeout(pending.timer);
+        this.pendingTriggers.delete(key);
+        continue;
+      }
+      const held = pending.event.trigger!;
+      const trigger = { ...held, groupedEventIds: (held.groupedEventIds ?? []).filter((id) => id !== part.event.id) };
+      const root = pending.event.event.externalId === externalId ? nextRoot : pending.event;
+      pending.event = { ...root, trigger, event: { ...root.event, trigger } };
+    }
   }
 
   // ── Channel resolution helpers ────────────────────────────────────────────
