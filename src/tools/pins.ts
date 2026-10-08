@@ -7,6 +7,8 @@ import { formatAgentTimestamp } from "../time/index.js";
 export interface PinsToolContext {
   channelClient: ChannelClient;
   terminology?: ProviderTerminology;
+  /** Bound on the pin-list read of the no-op check (default {@link PIN_STATE_TIMEOUT_MS}). */
+  stateTimeoutMs?: number;
 }
 
 export function createPinsTool(context: PinsToolContext): AgentTool {
@@ -63,7 +65,7 @@ export function createPinsTool(context: PinsToolContext): AgentTool {
 
         // Already in the requested state: the call is a no-op, which late input
         // must not "undo" (unpinning a pin that existed before, §8 "Late input").
-        const unchanged = await alreadyInState(context.channelClient, args.message_id!.trim(), args.action);
+        const unchanged = await alreadyInState(context.channelClient, args.message_id!.trim(), args.action, context.stateTimeoutMs ?? PIN_STATE_TIMEOUT_MS);
         if (args.action === "pin") {
           const result = await context.channelClient.pinMessage(args.message_id!.trim());
           const pinCount = (result as { pinCount?: number } | null | void)?.pinCount;
@@ -92,12 +94,29 @@ export function createPinsTool(context: PinsToolContext): AgentTool {
   };
 }
 
-/** True when the message is already pinned (pin) or not pinned (unpin); false when unknown. */
-async function alreadyInState(client: ChannelClient, messageId: string, action: "pin" | "unpin"): Promise<boolean> {
+/** How long the no-op check waits for the pin list before treating the state as unknown. */
+export const PIN_STATE_TIMEOUT_MS = 3000;
+
+/**
+ * True only when the message is known to be pinned already (a pin is a no-op);
+ * false when unknown. The pin list can be incomplete (a provider returns at
+ * most a page of pins, or omits a pinned message it cannot fetch), so a
+ * message missing from it is never proof that it is not pinned: an unpin is
+ * always taken as a change, which late input may compensate.
+ */
+async function alreadyInState(client: ChannelClient, messageId: string, action: "pin" | "unpin", timeoutMs: number): Promise<boolean> {
+  if (action !== "pin") return false;
+  let timer: NodeJS.Timeout | undefined;
   try {
-    const pinned = (await client.pins()).some((p) => p.externalId === messageId);
-    return action === "pin" ? pinned : !pinned;
+    const timeout = new Promise<undefined>((resolve) => {
+      timer = setTimeout(() => resolve(undefined), timeoutMs);
+      timer.unref?.();
+    });
+    const pins = await Promise.race([client.pins(), timeout]);
+    return pins?.some((p) => p.externalId === messageId) ?? false;
   } catch {
     return false;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }

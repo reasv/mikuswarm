@@ -250,9 +250,24 @@ test("undoable tools report a no-op as details.changed = false (late input never
     ((await tool.execute("t", args as never, undefined)) as { details?: { changed?: boolean } | null }).details ?? null;
   assert.deepEqual(await details(react, { message_id: "$m", emoji: "x", remove: true }), { changed: false });
   assert.deepEqual(await details(pins, { action: "pin", message_id: "$pinned" }), { changed: false });
-  assert.deepEqual(await details(pins, { action: "unpin", message_id: "$other" }), { changed: false });
   assert.equal(await details(pins, { action: "pin", message_id: "$other" }), null, "a real pin changed state");
   assert.equal(await details(pins, { action: "unpin", message_id: "$pinned" }), null, "a real unpin changed state");
+  // The pin list can be incomplete (a page of pins, unfetchable events): a
+  // message missing from it may still be pinned, so its unpin is compensable.
+  assert.equal(await details(pins, { action: "unpin", message_id: "$other" }), null, "not in the list = unknown");
+});
+
+test("pins: a pin-list read that does not answer in time leaves the state unknown", async () => {
+  const client = {
+    pins: () => new Promise(() => undefined),
+    pinMessage: async () => undefined,
+  } as unknown as ChannelClient;
+  const pins = createPinsTool({ channelClient: client, stateTimeoutMs: 50 });
+  const started = Date.now();
+  const result = (await pins.execute("t", { action: "pin", message_id: "$m" } as never, undefined)) as { details?: unknown; content: Array<{ text?: string }> };
+  assert.ok(Date.now() - started < 1000, "bounded");
+  assert.equal(result.details ?? null, null, "unknown is never a no-op");
+  assert.match(result.content[0]!.text ?? "", /^pinned/);
 });
 
 test("compensationFor: undefined for anything that is not a well-formed undoable call", () => {
