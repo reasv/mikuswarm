@@ -7472,6 +7472,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // — steerReplyToActiveSession already ran for running sessions; either way this
     // is not a completed-session fork.
     if (sessions.get(sessionId)) return false;
+    // A completed session that is still revivable (§8 "Late input") keeps its
+    // in-memory agent: a late message may revive it at any moment, and a resume
+    // from the DB beside it would run two agents on one session. Fresh instead.
+    if (lateInputEntries.has(sessionId)) {
+      logger.info("reply_resume_revivable", { sessionId, timelineKey: inbound.timelineKey });
+      return false;
+    }
     // Synchronous single-flight (§15): only the first reply resumes a given state.
     // A concurrent second reply degrades to FRESH; once the first markRunning's,
     // later replies steer via the running-session path instead.
@@ -7487,6 +7494,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         logger.warn("reply_resume_record_unsettled", { sessionId, timelineKey: inbound.timelineKey });
         return false;
       }
+      // Revived while we waited: the steer path's business now.
+      if (sessions.get(sessionId) || lateInputEntries.has(sessionId)) return false;
       // ── Pre-CAS gate (§7 steps 2–8) ────────────────────────────────────────
       // Delegated to the throw-safe `evaluateResumeGate` (review issue #2): every
       // ineligible reply — and any UNEXPECTED throw inside the gate (DB read,
@@ -8563,7 +8572,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         });
       }
       reviving = (async () => {
-        if (finalized || draining || lateCtl?.phase !== "ended") {
+        // A reply-resume that claimed this session continues it from the DB:
+        // never a second agent on the same session.
+        if (finalized || draining || lateCtl?.phase !== "ended" || resumeClaims.has(session.id)) {
           revivalRequested = false;
           return false;
         }

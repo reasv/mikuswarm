@@ -491,6 +491,30 @@ user_gap_ms = 7000
 wall_clock_ms = 15000
 `;
 
+test("app: a reply never resumes a session that is still revivable (no second agent beside a revival)", async () => {
+  const h = await startHarness({
+    script: chatScript({ recordTurn: () => finalize("the record") }),
+    toml: `
+[agent.sessions.resume]
+enabled = { group = true }
+
+[agent.sessions.late_input]
+enabled = true
+`,
+  });
+  try {
+    h.say("[work] first", { mention: true });
+    const [a] = await settled(h, 1);
+    h.say("and then?", { mention: true, replyTo: h.sends.at(-1)!.externalId });
+    const rows = await settled(h, 2);
+    assert.ok(hasLog(h, "reply_resume_revivable", { sessionId: a!.id }));
+    assert.equal(hasLog(h, "session_resume_started"), false, "no resume from the DB while the in-memory session can be revived");
+    assert.notEqual(rows[1]!.id, a!.id, "a fresh session answered the reply");
+  } finally {
+    await h.stop();
+  }
+});
+
 test("app: opt-in reply-resume waits for production past the reply wait deadline (Z3)", async () => {
   const h = await startHarness({
     script: chatScript({ recordTurn: () => ({ ...finalize("late record"), delayMs: 2500 }) }),
