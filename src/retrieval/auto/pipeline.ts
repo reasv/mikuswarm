@@ -64,7 +64,12 @@ export interface MemoryRetrievalPipelineDeps {
   late?: LateStage;
   rerank?: ProviderChain<RerankProvider>;
   /** The recency layer's text for an agent at `now` (blocks shown there are excluded). */
-  recencyContent?: (agent: string | null, timelineKey: string, now: number) => Promise<string | null>;
+  recencyContent?: (
+    agent: string | null,
+    timelineKey: string,
+    now: number,
+    attribution: PlanInput["attribution"],
+  ) => Promise<string | null>;
   /** Earlier names of a participant (Discord username aliases); display-name history is built in. */
   usernameAliases?: (provider: string, senderId: string, limit: number) => string[];
   logger?: Logger;
@@ -151,7 +156,7 @@ export class MemoryRetrievalPipeline {
     // The recency layer's text (its blocks are already in context): started now,
     // in parallel with recall.
     const recencyPromise = auto.dedupAgainstRecency && this.deps.recencyContent
-      ? this.deps.recencyContent(agent, input.timelineKey, input.now).catch(() => null)
+      ? this.deps.recencyContent(agent, input.timelineKey, input.now, input.attribution).catch(() => null)
       : Promise.resolve(null);
     const participants = input.participants;
     const laneNames = [...new Set(participants.flatMap((p) => this.namesOf(p)))];

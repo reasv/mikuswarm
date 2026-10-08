@@ -120,6 +120,7 @@ export function toQuestion(f: ResolvedMemoryFilter): MemoryFilterQuestion {
 export class MemoryFilterService {
   private readonly lastHit = new Map<string, number>();
   private readonly resolved = new Map<string, ResolvedMemoryFilters>();
+  private readonly inflight = new Map<string, Promise<Record<string, { probability: number; hidden: boolean }> | null>>();
 
   constructor(private readonly options: MemoryFilterServiceOptions) {}
 
@@ -264,34 +265,45 @@ export class MemoryFilterService {
         toJudge.map(async (b) => {
           const state = states.get(b.contentHash)!;
           const clean = cleanBlockText(b.text).lines.join("\n");
-          const outcome = await engine
-            .evaluate(
-              memoryFilterPoint,
-              {
-                entry: {
-                  date: b.entryTs !== null ? agentDateStamp(b.entryTs) : "unknown",
-                  room: b.room,
-                  text: clean,
+          // One request per block and filter set at a time: concurrent surfaces
+          // (the recency layer of two builds) share it instead of paying twice.
+          const flightKey = `${agent ?? ""}\0${b.contentHash}\0${state.pendingJudged.map((q) => q.key).sort().join(",")}`;
+          let flight = this.inflight.get(flightKey);
+          if (!flight) {
+            flight = engine
+              .evaluate(
+                memoryFilterPoint,
+                {
+                  entry: {
+                    date: b.entryTs !== null ? agentDateStamp(b.entryTs) : "unknown",
+                    room: b.room,
+                    text: clean,
+                  },
+                  filters: state.pendingJudged,
+                  meta: { citation: formatCitation({ ...b, entryTs: b.entryTs ?? 0 }), contentHash: b.contentHash, surface: ctx.surface },
                 },
-                filters: state.pendingJudged,
-                meta: { citation: formatCitation({ ...b, entryTs: b.entryTs ?? 0 }), contentHash: b.contentHash, surface: ctx.surface },
-              },
-              {
-                agentName: agent,
-                attribution: ctx.attribution,
-                priority: ctx.priority ?? "background",
-                signal: ctx.signal,
-                ...(ctx.timeoutMs !== undefined ? { timeoutMs: ctx.timeoutMs } : {}),
-                ...(this.chainHead(agent) ? { chainHead: this.chainHead(agent) } : {}),
-              },
-            )
-            .catch(() => undefined);
-          const filters = outcome?.source === "model" ? outcome.verdict.filters : null;
+                {
+                  agentName: agent,
+                  attribution: ctx.attribution,
+                  priority: ctx.priority ?? "background",
+                  signal: ctx.signal,
+                  ...(ctx.timeoutMs !== undefined ? { timeoutMs: ctx.timeoutMs } : {}),
+                  ...(this.chainHead(agent) ? { chainHead: this.chainHead(agent) } : {}),
+                },
+              )
+              .then(async (outcome) => {
+                const judged = outcome.source === "model" ? outcome.verdict.filters : null;
+                if (judged) {
+                  await this.storeVerdicts(agent, b.contentHash, judged, { model: outcome.servedModel ?? null, version: null });
+                }
+                return judged;
+              })
+              .catch(() => null)
+              .finally(() => this.inflight.delete(flightKey));
+            this.inflight.set(flightKey, flight);
+          }
+          const filters = await flight;
           if (filters) {
-            await this.storeVerdicts(agent, b.contentHash, filters, {
-              model: outcome?.servedModel ?? null,
-              version: null,
-            });
             this.applyJudged(state, filters);
           } else {
             this.applyPending(agent, state);

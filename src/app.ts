@@ -1278,13 +1278,17 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           engine: () => decisionEngine,
           late: retrieval.late,
           rerank: retrieval.rerank,
-          recencyContent: async (agent, timelineKey, now) =>
+          recencyContent: async (agent, timelineKey, now, attribution) =>
             buildRecentDiaryContent({
               workspaceRoot: workspaceRootForAgent(agent),
               anchorDay: agentDateStamp(now),
               ceilingTokens: config.diary?.recency_max_tokens ?? 6000,
               fileCount: config.diary?.recency_file_count ?? 2,
-              filterFile: filterMemoryFile(agent, "recency_layer", { timelineKey }),
+              filterFile: filterMemoryFile(agent, "recency_layer", {
+                timelineKey,
+                agentSessionId: attribution.agentSessionId ?? null,
+                sessionType: attribution.sessionType ?? null,
+              }),
             }),
           usernameAliases: (provider, senderId, limit) => storage.getUserIdentityAliases(provider, senderId, limit),
           logger: logger.child("memory_retrieval"),
