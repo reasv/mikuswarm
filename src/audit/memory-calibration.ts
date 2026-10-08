@@ -84,7 +84,8 @@ export interface MemoryState {
   conversation: MemoryChatMessage[];
   request?: MemoryRequest;
   participants: string[];
-  passage: { date: string; room?: string; text: string };
+  /** The diary block judged (rows written before the rename name it `passage`; read as this). */
+  entry: { date: string; room?: string; text: string };
 }
 
 export type ParsedMemoryState =
@@ -103,9 +104,10 @@ function chatMessage(value: unknown): MemoryChatMessage | undefined {
 }
 
 /**
- * A memory decision row's `state_json`: a passage state, a filter-only state
- * (`entry`, no `passage`), or unreadable (absent, cut by the row cap, or not
- * the point's shape).
+ * A memory decision row's `state_json`: a relevance state (`conversation`
+ * plus the judged `entry`; older rows name it `passage`), a filter-only state
+ * (`entry`, no `conversation`), or unreadable (absent, cut by the row cap, or
+ * not the point's shape).
  */
 export function parseMemoryState(json: string | null): ParsedMemoryState {
   if (!json) return { kind: "unreadable" };
@@ -117,8 +119,8 @@ export function parseMemoryState(json: string | null): ParsedMemoryState {
   }
   const o = asObj(raw);
   if (!o) return { kind: "unreadable" };
-  if (o["passage"] === undefined && o["entry"] !== undefined) return { kind: "filter" };
-  const passage = asObj(o["passage"]);
+  if (o["passage"] === undefined && o["entry"] !== undefined && o["conversation"] === undefined) return { kind: "filter" };
+  const passage = asObj(o["entry"] ?? o["passage"]);
   if (!passage || typeof passage["text"] !== "string" || typeof passage["date"] !== "string") return { kind: "unreadable" };
   if (!Array.isArray(o["conversation"])) return { kind: "unreadable" };
   const conversation: MemoryChatMessage[] = [];
@@ -143,7 +145,7 @@ export function parseMemoryState(json: string | null): ParsedMemoryState {
       conversation,
       ...(request ? { request } : {}),
       participants,
-      passage: {
+      entry: {
         date: passage["date"],
         ...(typeof passage["room"] === "string" ? { room: passage["room"] } : {}),
         text: passage["text"],
@@ -158,7 +160,7 @@ export function memoryInputOf(state: MemoryState, passage?: MemoryPassage): Memo
     conversation: state.conversation,
     ...(state.request ? { request: state.request } : {}),
     participants: state.participants,
-    passage: passage ?? { date: state.passage.date, room: state.passage.room ?? null, text: state.passage.text },
+    passage: passage ?? { date: state.entry.date, room: state.entry.room ?? null, text: state.entry.text },
     filters: [],
     meta: { citation: "", contentHash: "", scores: {} },
   };
@@ -188,14 +190,14 @@ export function memoryLabelRequest(itemId: string, state: MemoryState): LabelReq
   const relevant = memoryPoint.questions(memoryInputOf(state), memorySettings("labeller"))["relevant"]!;
   const target = state.request ? "what `request` needs" : "what the conversation is about";
   const prompt =
-    "Check: memory_relevance (memory). Whether a passage from the assistant's own earlier notes would help it " +
+    "Check: memory_relevance (memory). Whether an entry from the assistant's own earlier notes would help it " +
     "respond in a conversation.\n\n" +
     `Statement about the item:\n${relevant.instructions}\n\n` +
     "Criteria:\n" +
-    `- true: knowing \`passage\` would help the assistant respond: it answers or supplies ${target}, or it gives ` +
+    `- true: knowing \`entry\` would help the assistant respond: it answers or supplies ${target}, or it gives ` +
     "earlier interactions or facts about the people in `conversation`, or earlier facts or events about the topic " +
     "being discussed, that bear on the response.\n" +
-    "- false: `passage` would not help: it is about other people or topics, or it shares only a word, a name or a " +
+    "- false: `entry` would not help: it is about other people or topics, or it shares only a word, a name or a " +
     "generic theme with the conversation.\n\n" +
     `Reasons: when true, answers_request (it answers or directly supplies ${target}), same_people_history ` +
     "(earlier interactions or facts about the people in the conversation), same_topic_history (earlier facts or " +
@@ -290,7 +292,7 @@ export interface MemorySample {
   rows: number;
   /** Rows with a passage state (the sampled population). */
   eligible: number;
-  /** Filter-only rows (`entry`, no `passage`): skipped. */
+  /** Filter-only rows (`entry`, no `conversation`): skipped. */
   filterOnly: number;
   /** States cut by the row cap or not of the point's shape: skipped. */
   unreadable: number;

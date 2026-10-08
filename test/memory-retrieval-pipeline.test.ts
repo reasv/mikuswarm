@@ -222,12 +222,12 @@ test("judged: one passage per request; state carries conversation, request, part
   };
   await withStack(files, {}, async ({ pipeline, calls }) => {
     await pipeline.plan(input({ participants: [{ provider: "matrix", senderId: "@a:x", name: "alice", role: "requester" }] }));
-    const memoryCalls = calls.filter((c) => c.state.passage);
+    const memoryCalls = calls.filter((c) => c.state.entry && c.state.conversation);
     assert.equal(memoryCalls.length, 2);
     for (const c of memoryCalls) {
       assert.ok(c.state.conversation && c.state.request && c.state.participants);
       assert.deepEqual(c.state.participants, ["alice"]);
-      assert.ok(typeof c.state.passage.text === "string" && !c.state.passage.text.includes("→"), "header line stripped");
+      assert.ok(typeof c.state.entry.text === "string" && !c.state.entry.text.includes("→"), "header line stripped");
       assert.deepEqual(Object.keys(c.questions).sort(), ["about_participant", "relevant"]);
     }
   });
@@ -418,7 +418,7 @@ test("proactive: the conversation stands in for the request (no request in state
       input({ proactive: true, request: undefined, conversation: [{ from: "bob", text: "breakfast pancakes anyone" }] }),
     );
     assert.equal(plan.report.source, "model");
-    const memoryCalls = calls.filter((c) => c.state.passage);
+    const memoryCalls = calls.filter((c) => c.state.entry && c.state.conversation);
     assert.ok(memoryCalls.length > 0);
     assert.ok(memoryCalls.every((c) => !("request" in c.state)));
     assert.match(String(memoryCalls[0].questions.relevant.instructions), /respond in this `conversation`/);
@@ -460,7 +460,7 @@ test("person-cued recall: newest tagged entries of active people go straight to 
     assert.equal(plan.report.kept, 1);
     const item = plan.report.items.find((i) => i.lanes.includes("person"));
     assert.ok(item, "person-cued lane");
-    assert.ok(calls.some((c) => c.state.passage?.text.includes("garden")));
+    assert.ok(calls.some((c) => c.state.entry?.text.includes("garden")));
   });
 });
 

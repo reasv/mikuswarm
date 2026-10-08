@@ -36,18 +36,18 @@ test("questions: relevant + about_participant (only with participants) + one per
     input({ filters: [{ key: "habit", description: "The entry shows X.", examplesHide: ["x"], examplesKeep: [], threshold: 0.8 }] }),
     settings,
   );
-  assert.equal((withFilter["filter__habit"] as any).instructions, "`passage` matches: The entry shows X.");
+  assert.equal((withFilter["filter__habit"] as any).instructions, "`entry` matches: The entry shows X.");
   assert.ok((withFilter["filter__habit"] as any).criteria.true.includes('"x"'));
 });
 
 test("state: the passage first, then the newest conversation that fits; one passage only", () => {
   const s = memoryPoint.state(input(), 8000) as any;
-  assert.deepEqual(Object.keys(s), ["conversation", "request", "participants", "passage"]);
-  assert.equal(s.passage.room, "general");
+  assert.deepEqual(Object.keys(s), ["conversation", "request", "participants", "entry"]);
+  assert.equal(s.entry.room, "general");
   assert.equal(s.conversation.length, 2);
   const tight = memoryPoint.state(input(), jsonTokens(memoryPoint.state(input({ conversation: [] }), 8000)) + 5) as any;
   assert.ok(tight.conversation.length < 2, "conversation is packed newest-first under the budget");
-  assert.equal(tight.passage.text, "We decided the launch is in October.");
+  assert.equal(tight.entry.text, "We decided the launch is in October.");
   const proactive = memoryPoint.state(input({ request: undefined }), 8000) as any;
   assert.ok(!("request" in proactive));
 });

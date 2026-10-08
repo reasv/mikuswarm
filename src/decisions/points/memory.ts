@@ -29,7 +29,7 @@ export const DEFAULT_MEMORY_CONVERSATION_MESSAGES = 8;
 
 const REQUEST_TEXT_CLIP = 1200;
 const CHAT_TEXT_CLIP = 400;
-const PASSAGE_CLIP_SUFFIX = "…[passage truncated]";
+const PASSAGE_CLIP_SUFFIX = "…[entry truncated]";
 
 export interface MemoryChatMessage {
   from: string;
@@ -89,13 +89,18 @@ export function filterQuestionId(key: string): string {
   return `filter__${key}`;
 }
 
-function filterQuestion(subject: "passage" | "entry", f: MemoryFilterQuestion): DecisionQuestion {
+/**
+ * One judged filter's question, worded the same on every surface (the state
+ * names the diary block `entry` on both points), so a filter's calibration
+ * holds wherever it is asked.
+ */
+function filterQuestion(f: MemoryFilterQuestion): DecisionQuestion {
   const criteria: { true?: string; false?: string } = {};
   if (f.examplesHide.length > 0) criteria.true = `For example: ${f.examplesHide.map((e) => JSON.stringify(e)).join("; ")}`;
   if (f.examplesKeep.length > 0) criteria.false = `For example: ${f.examplesKeep.map((e) => JSON.stringify(e)).join("; ")}`;
   return {
     type: "noul",
-    instructions: `\`${subject}\` matches: ${f.description}`,
+    instructions: `\`entry\` matches: ${f.description}`,
     ...(criteria.true || criteria.false ? { criteria } : {}),
   };
 }
@@ -140,19 +145,19 @@ export const memoryPoint: DecisionPoint<MemoryPassageInput, MemoryPassageVerdict
       relevant: {
         type: "noul",
         instructions: input.request
-          ? "`passage` contains information that would help respond to `request` in this `conversation`: " +
+          ? "`entry` contains information that would help respond to `request` in this `conversation`: " +
             "facts, history or earlier events about the people, things or topics being discussed."
-          : "`passage` contains information that would help respond in this `conversation`: " +
+          : "`entry` contains information that would help respond in this `conversation`: " +
             "facts, history or earlier events about the people, things or topics being discussed.",
       },
     };
     if (input.participants.length > 0) {
       questions["about_participant"] = {
         type: "noul",
-        instructions: "`passage` describes one of `participants` or an interaction with them.",
+        instructions: "`entry` describes one of `participants` or an interaction with them.",
       };
     }
-    for (const f of input.filters) questions[filterQuestionId(f.key)] = filterQuestion("passage", f);
+    for (const f of input.filters) questions[filterQuestionId(f.key)] = filterQuestion(f);
     return questions;
   },
 
@@ -175,7 +180,7 @@ export const memoryPoint: DecisionPoint<MemoryPassageInput, MemoryPassageVerdict
       conversation: chat,
       ...(request ? { request } : {}),
       participants: input.participants,
-      passage: { date: passage.date, ...(passage.room ? { room: passage.room } : {}), text: passage.text },
+      entry: { date: passage.date, ...(passage.room ? { room: passage.room } : {}), text: passage.text },
     });
     // The passage is the subject: fit it first (clipped only if it alone overflows),
     // then the newest conversation that still fits.
@@ -242,7 +247,7 @@ export const memoryFilterPoint: DecisionPoint<MemoryFilterInput, MemoryFilterVer
 
   questions(input: MemoryFilterInput): Record<string, DecisionQuestion> {
     const questions: Record<string, DecisionQuestion> = {};
-    for (const f of input.filters) questions[filterQuestionId(f.key)] = filterQuestion("entry", f);
+    for (const f of input.filters) questions[filterQuestionId(f.key)] = filterQuestion(f);
     return questions;
   },
 

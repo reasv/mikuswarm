@@ -224,10 +224,10 @@ const QUESTIONS = JSON.stringify({
 	relevant: {
 		type: 'noul',
 		instructions:
-			'`passage` contains information that would help respond to `request` in this `conversation`: facts, history or earlier events about the people, things or topics being discussed.'
+			'`entry` contains information that would help respond to `request` in this `conversation`: facts, history or earlier events about the people, things or topics being discussed.'
 	},
-	about_participant: { type: 'noul', instructions: '`passage` describes one of `participants` or an interaction with them.' },
-	filter__old_running_joke: { type: 'noul', instructions: '`passage` matches: The entry is about the old running joke.' }
+	about_participant: { type: 'noul', instructions: '`entry` describes one of `participants` or an interaction with them.' },
+	filter__old_running_joke: { type: 'noul', instructions: '`entry` matches: The entry is about the old running joke.' }
 });
 
 /** The featured session's `memory` decision rows: one per judged passage, one group. */
@@ -266,7 +266,7 @@ export function memoryDecisionRows(opts: { sessionId: string; timelineKey: strin
 				conversation: [{ from: 'Grace', text: 'Ada, did you ask Miku about the poster yet?' }],
 				request: REQUEST,
 				participants: ['Ada', 'Grace'],
-				passage: { date: j.date, room: j.room, text: j.text }
+				entry: { date: j.date, room: j.room, text: j.text }
 			}),
 			questionsJson: QUESTIONS,
 			servedModel: 'demo/decision-model',

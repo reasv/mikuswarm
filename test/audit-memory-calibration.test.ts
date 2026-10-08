@@ -44,7 +44,7 @@ function passageState(passageText: string, opts: { request?: boolean; participan
     ],
     ...(opts.request === false ? {} : { request: { from: "alice", text: `${SECRET} the request` } }),
     participants: opts.participants ?? ["alice"],
-    passage: { date: "2026-01-02", room: "general", text: passageText },
+    entry: { date: "2026-01-02", room: "general", text: passageText },
   };
 }
 
@@ -155,7 +155,7 @@ async function withDb(fn: (dbPath: string) => Promise<void>): Promise<void> {
 function fakeLabeller(prompts: LabelRequest[]): Labeller {
   return async (request) => {
     prompts.push(request);
-    const passage = /"passage":\{[^}]*"text":"([^"]*)"/.exec(request.prompt)?.[1] ?? "";
+    const passage = /"entry":\{[^}]*"text":"([^"]*)"/.exec(request.prompt)?.[1] ?? "";
     const [label, reason] = passage.includes("ZZREL")
       ? ["true", "same_topic_history"]
       : passage.includes("ZZUNS")
@@ -167,7 +167,7 @@ function fakeLabeller(prompts: LabelRequest[]): Labeller {
 
 /** A fake scorer: the probability from the passage's pNN marker. */
 const fakeScorer: MemoryScorer = async (state) => {
-  const m = /p(\d\d)/.exec(state.passage.text);
+  const m = /p(\d\d)/.exec(state.entry.text);
   return m ? Number(m[1]) / 100 : undefined;
 };
 
@@ -178,6 +178,9 @@ test("parseMemoryState: passage, filter-only, unreadable", () => {
   assert.equal(parseMemoryState(`{"passage":{"text":"…[truncated]`).kind, "unreadable");
   assert.equal(parseMemoryState(null).kind, "unreadable");
   assert.equal(parseMemoryState(JSON.stringify({ conversation: [], passage: { text: "t" } })).kind, "unreadable", "no date");
+  // Rows written before the state named the block `entry` still parse.
+  const { entry, ...rest } = state;
+  assert.deepEqual(parseMemoryState(JSON.stringify({ ...rest, passage: entry })), { kind: "passage", state });
   const proactive = passageState("x", { request: false, participants: [] });
   assert.deepEqual(parseMemoryState(JSON.stringify(proactive)), { kind: "passage", state: proactive });
 });
@@ -267,7 +270,7 @@ test("runMemoryCalibration: threshold table, suggestion, calibration key; never 
       // Only the six threshold items (the build rows carry no probability marker: unscored).
       const report = await runMemoryCalibration({
         db, sample: 100, seed: 1,
-        sampled: { ...sampled, items: sampled.items.filter((i) => /p\d\d/.test(i.state.passage.text)) },
+        sampled: { ...sampled, items: sampled.items.filter((i) => /p\d\d/.test(i.state.entry.text)) },
         configuredThreshold: 0.7,
         thresholds: [0.5, 0.85],
         targetPrecision: 0.9,
@@ -339,7 +342,7 @@ test("runRecallCeiling: ceiling, judged and kept shares, per-stage counts; never
       assert.deepEqual(report.items, { listed: 11, capped: 0, missingText: 1, labelled: 10, true: 4, false: 5, unsure: 1, invalid: 0 });
       assert.equal(prompts.length, 10);
       // Labelled against the build's conversation, with the block's text as the passage.
-      assert.ok(prompts.every((p) => p.prompt.includes(`${SECRET} earlier chat`) && /"passage":\{"date":"2026-01-02","room":"general","text":"ZQX-PRIVATE-MARKER block ZZ/.test(p.prompt)));
+      assert.ok(prompts.every((p) => p.prompt.includes(`${SECRET} earlier chat`) && /"entry":\{"date":"2026-01-02","room":"general","text":"ZQX-PRIVATE-MARKER block ZZ/.test(p.prompt)));
       // Ceiling: b1, b3, b4; reached the judge: b1 (h2), b3 (h7); kept: b3.
       assert.deepEqual(report.ceiling, { builds: 3, share: 0.75 });
       assert.deepEqual(report.judged, { builds: 2, share: 0.5 });
