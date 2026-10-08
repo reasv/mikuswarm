@@ -1,6 +1,6 @@
 # Memory retrieval: judged candidates, readable excerpts, operator filters
 
-**Status**: PROPOSAL, draft rev 6 (2026-10-08: owner answers, §12; filters, §7; cross-encoder and embedder provider chains, §5.0a–c; late interaction, §5.0d; one passage per judgement, §5). Not implemented.
+**Status**: PROPOSAL, draft rev 7 (2026-10-08: owner answers, §12; filters, §7; cross-encoder and embedder provider chains, §5.0a–c; late interaction, §5.0d; one passage per judgement, §5). Not implemented.
 **Supersedes**: spec/DECISION-MODEL.md §5.5, first half (re-ranking and richer excerpts). Summary pre-expansion (the second half of §5.5) stays out of scope.
 **Builds on**: ARCHITECTURE.md §9c (diary memory, recency layer), §9d (hybrid search, `recall_memory`, auto-retrieval), §8h (decision engine, chains, calibration), spec/DECISION-MODEL.md §3 (client, fits, billing).
 **Target ARCHITECTURE.md home once implemented**: §9d (auto-retrieval, `recall_memory`), §9c (recency layer filtering), §8h (the `memory` decision point).
@@ -52,7 +52,7 @@ query set ─► wide candidate recall (hybrid + participant tags + late-interac
 
 - The block may be empty, and then it is omitted entirely.
 - The same filters apply to every surface that shows diary text to the agent (§7.3).
-- The decision call starts at launch, in parallel with routing, so it adds little or no latency (§8).
+- Recall and the re-rank stages start at launch, in parallel with routing; the decision filter follows them (§8).
 
 ## 4. Candidate recall (wider, cheaper to be wrong)
 
@@ -112,14 +112,14 @@ Methods built to repair segmentation (contextual chunk embeddings, parent-docume
 **The pipeline** (owner, 2026-10-08):
 
 ```
-wide recall (§4, ~60 blocks) ─► late interaction scores and cuts (§5.0d) ─► cross-encoder ranks and eliminates (§5.0a)
+wide recall (§4, ~60 blocks) + exhaustive late interaction over recent blocks ─► late interaction scores and cuts (§5.0d) ─► cross-encoder ranks and eliminates (§5.0a)
    ─► the few survivors ─► decision model as the FINAL FILTER, one passage per request (§5) ─► excerpts (§6)
 ```
 
 - **The cross-encoder ranks and eliminates.** It reads each query–passage pair together, so it is far better at "does this passage answer this" than vector or BM25 similarity. Because each pair is cheap, recall can widen to ~60 candidates, and most are cut here.
 - **The decision model is the final filter, not a re-ranker.** It only sees the cross-encoder's survivors, one passage per request, with the conversation, the reply target and the participants in view. It keeps or drops each, and "none" is a valid outcome.
 - **The fallback improves too.** When the decision chain is down, the cross-encoder's calibrated cutoff selects the items in place of hybrid similarity.
-- **Late interaction is a cheap first re-ranker** (owner, 2026-10-08). Passage token vectors are computed at index time, so scoring all ~60 candidates (or the whole corpus, as a recall lane) costs one short query encode plus arithmetic. It cuts the list before the cross-encoder, which is the expensive per-pair stage, and it is a strong rung on its own when no cross-encoder is available.
+- **Late interaction: exhaustive over recent blocks, a re-ranker beyond** (owner, 2026-10-08, §5.0d). Passage token vectors are computed in the background, where latency does not matter. At query time it costs one short query encode plus a native matrix product, so the newest blocks are scored exhaustively and older recall candidates are re-scored. It cuts the list before the cross-encoder, the expensive per-pair stage, and is a strong rung on its own when no cross-encoder is available.
 - **Every stage is optional and degrades in order:**
   - no late interaction → the cross-encoder sees the recall set;
   - no cross-encoder → the late-interaction top ~8, or the hybrid top ~12, go to the decision model;
@@ -196,33 +196,60 @@ The embedder has the same three kinds of provider and the same decision rule. On
 - **Quality.** Today's built-in model is small, English-only and capped at 512 tokens. Choose the built-in by measured quality per CPU-millisecond and language coverage, and the primary by the same decision rule as the re-ranker (§5.0c).
 - **With a cross-encoder in the pipeline,** the embedder's job is recall, not precision. A stronger embedder matters less than before, but still sets the ceiling on what the cross-encoder can see.
 
-### 5.0d Late interaction: a precomputed re-ranker
+### 5.0d Late interaction: exhaustive over recent blocks, a re-ranker beyond
 
 A late-interaction model encodes text into one small vector per token (e.g. 128 dimensions). The score of a passage for a query is the sum, over query tokens, of each one's best match among the passage's tokens (MaxSim). The passage side does not depend on the query, so it is computed once at index time and stored.
 
-- **Index.** The indexer keeps a token-vector store (`memory_late_<model>`, one blob per chunk, keyed by chunk hash like the vector index) and maintains it incrementally as blocks are written.
-  - **Size** for a corpus of ~4k blocks of ~340 tokens: about 350 MB at fp16, half at int8, and less again with token pooling.
+**Indexing is not latency-critical; query time is the whole budget** (owner, 2026-10-08). The recency layer (ARCHITECTURE.md §9c) shows the newest diary files in full at all times, so a block only needs to be retrievable once it leaves that layer, days after it is written. That is a very long buffer.
+- **Indexing runs in the background, on CPU by default, even for a large document model.** It uses a low-priority worker, so it never competes with query-time work.
+  - Rough scale: a 9B document model on CPU is on the order of seconds per block, so a few blocks a day is nothing. A full rebuild of ~4k blocks takes hours, run once.
+  - A GPU is optional, only to shorten a one-off rebuild. It is never needed to keep up.
+- **Index lag is a metric.** Startup and the indexer warn if a block has left the recency layer without vectors.
+- **The index** is a token-vector store (`memory_late_<model>`, one blob per chunk, keyed by chunk hash like the vector index).
+  - Size: about 350 MB at fp16 for ~4k blocks of ~340 tokens, half at int8, less again with token pooling.
   - **The index is tied to one model,** as for embedders (§5.0b). A family that shares one space counts as one model: pplx-embed-v2-late's 0.6B model can query an index built by its 9B model.
-- **Query time.**
-  - Encode the query, a few dozen tokens. This is cheap enough in process on CPU, so the query side never needs a GPU.
-  - Then compute MaxSim over the candidates' stored vectors. That is arithmetic only: milliseconds for ~60 candidates, and still fast exhaustively over a corpus this size.
-- **Two uses.**
-  1. **The first re-ranker:** score the recall set and pass the top `late.top_n` (default 20) to the cross-encoder.
-  2. **Optionally, a recall lane:** exhaustive MaxSim over every indexed block, fused with the hybrid lanes (§4). This finds blocks that neither BM25 nor the single vector surfaced.
-- **Indexing compute** (the GPU trade-off of §5.0a, moved off the hot path):
-  - Document encoding goes through a provider chain like the embedder's: a GPU inference server, a ZDR API, or the built-in CPU encoder. Every provider must serve the index's model (or its shared-space family).
-  - A one-off (re)index can run on a GPU that is released afterwards. Daily increments (a few blocks) are cheap on CPU. VRAM is therefore never held permanently for this stage.
-- **Coverage gaps never hide memories.** A candidate whose token vectors are missing (written since the last index pass, or the index is mid-rebuild) bypasses the cut and goes on to the next stage. A missing or stale index degrades to "no late interaction", never to dropping blocks.
-- **Calibration** is per model, like the cross-encoder's, when its score is the last cutoff.
+
+**Query-time cost has two parts, and both must fit the latency budget:**
+1. **Query encoding,** in proportion to the query model's size times the query's tokens.
+   - A model of a few hundred million active parameters over a few dozen tokens is expected to take tens of milliseconds on CPU (to be measured). A multi-billion model needs a GPU at query time.
+   - So the useful shape is a large document model with a small query model in the same space, with no GPU on the hot path. Whether the small query model loses quality against the large one's index is a measurement (small/small, small-query/large-doc, large/large).
+2. **MaxSim,** in proportion to query tokens × document tokens scored × dimensions.
+   - Exhaustive over ~1.4M document tokens with a 32-token query is about 11 GFLOP. That is tens of milliseconds as a vectorised native matrix product across cores, and seconds in plain JavaScript.
+   - So scoring runs **off the event loop (a worker thread) on a native matrix path** (the ONNX runtime the embedder already uses, or equivalent), with the window's vectors resident in memory.
+
+**Two branches, one score** (owner, 2026-10-08):
+- **Exhaustive window.** The newest `late.exhaustive_blocks` indexed blocks outside the recency layer are all scored on every query, newest first.
+  - Recent memory matters more.
+  - Exhaustive late interaction is expected to be a stronger first stage than single-vector retrieval over the same blocks: it matches at the token level and has no recall cut-off. Within the window it replaces the dense lane as the semantic signal.
+  - BM25 and the user lanes (§4, §4a) still run there. They are structural and lexical signals, not a competing similarity.
+- **Beyond the window,** recall is the hybrid of §4 as before, and its candidates are re-scored by MaxSim (late interaction as a re-ranker).
+- **Merging.** Both branches produce MaxSim scores for the same query, so they merge directly into one list. The top `late.top_n` (default 20) go on to the cross-encoder.
+- **Sizing the window.**
+  - Cost is linear in the document tokens scored. A bench command measures throughput on the host for the configured query length and model, and prints the window that fits a target (default 100 ms for MaxSim).
+  - The setting is a block count, or `"all"` when the whole corpus fits.
+  - Token pooling and int8 vectors widen the window for the same budget; their quality cost is measured on the §9 set.
+  - A scoring pass that overruns `late.timeout_ms` is abandoned for that query, and the hybrid lanes alone carry recall.
+- **Not assumed strictly better.** Late interaction usually beats single-vector retrieval at similar scale, but not on every query type, and a small late model can lose to a strong dense one. The §9 harness compares exhaustive late interaction with dense recall over the same window. The dense index stays maintained either way: it is the fallback when the late query encoder is unavailable, and the signal beyond the window.
+
+**Queries.** MaxSim sums over query tokens, so a long query costs more and dilutes the request's own terms. The late query is the trigger plus its reply target, capped at `late.query_max_tokens`. The conversation-window query (§4) stays on the hybrid lanes. Whether a short conversation tail helps the late query is measured, not assumed.
+
+**Coverage gaps never hide memories.** A candidate with no vectors (not yet indexed, or the index is mid-rebuild) bypasses the cut and goes on to the next stage. A missing or stale index degrades to "no late interaction", never to dropping blocks.
+
+**Calibration** is per model, like the cross-encoder's, when its score is the last cutoff.
+
+**Latency placement (§8).** The rerank stages now sit between recall and the decision filter. Query encoding and MaxSim start at launch, in parallel with routing, and the filter starts when the stages before it finish. Every stage has its own timeout, and skipping one is the degrade path (§5.0).
 
 ```toml
 [retrieval.late]
 enabled = false
 model = "..."                 # the document-side model; the index belongs to it
 query_model = ""              # default: model; may be a smaller model sharing its space
+query_max_tokens = 64
+exhaustive_blocks = 0         # newest N indexed blocks outside the recency layer, scored exhaustively; "all"; 0 = re-rank only
 top_n = 20                    # candidates passed on to the cross-encoder
-recall_lane = false           # also run exhaustive MaxSim as a recall lane (§4)
-chain = ["gpu", "builtin"]    # document encoding providers, all serving `model`
+timeout_ms = 300              # query encode + MaxSim; past it, the hybrid lanes alone carry recall
+resident = true               # keep the exhaustive window's vectors in memory
+chain = ["builtin"]           # document encoding providers, all serving `model`; background, low priority
 ```
 
 ### 5.0c Model survey and measurements (to do before implementation)
@@ -367,7 +394,12 @@ There is **no corpus pass and no backfill**.
 
 ## 8. Placement, latency and cost
 
-- **Latency.** Candidate recall is local: a query embed on the local model plus FTS, tens of milliseconds. The decision call takes about 1–1.5 s through a gateway and starts at launch alongside routing. The build waits for it only when assembling the final user turn, bounded by the point's timeout (default the global `[decisions].timeout_ms`). Today the auto-retrieval block is built inside the build too, so the added wall time is the part of the decision call that outlasts routing and the build, usually little or none.
+- **Latency.** Query time is the whole budget; indexing is background work (§5.0d).
+  - Candidate recall is local: a query embed plus FTS, tens of milliseconds.
+  - Late interaction adds a query encode plus MaxSim, bounded by `late.timeout_ms`.
+  - The cross-encoder is bounded by its per-member timeout.
+  - The decision calls take about 1–1.5 s through a gateway, one passage per request in parallel, and start when the re-rank stages finish.
+  - All of this starts at launch, alongside routing. The build waits for it only when assembling the final user turn, bounded by the point's timeout (default the global `[decisions].timeout_ms`). Today the auto-retrieval block is built inside the build too, so the added wall time is the part of the decision call that outlasts routing and the build, usually little or none.
 - **Cost.** About $0.0005 per session on Jev; around $0.10/day at a few hundred interactive sessions. Filters add a few questions to calls that happen anyway, plus a handful of small calls per day for the recency layer.
 - **Prompt cache.** Unchanged: the block stays in the volatile final user turn. Filtering the recency layer changes that layer only when a verdict changes, like a diary write does today.
 
@@ -436,9 +468,17 @@ Also decided (rev 5):
    - an always-available CPU rung keeps working when the GPU's memory is needed elsewhere.
 
 10. **The re-ranker stage is implemented regardless** (owner): the pipeline always has it, and a deployment that finds no worthwhile re-ranker disables it. Model choices (re-ranker and embedder) therefore do NOT block implementing any of the code. The built-in CPU re-ranker may be added later, once a model is chosen.
-11. **Late interaction is a re-ranking stage** (owner, 2026-10-08, §5.0d): it uses precomputed token vectors, sits before the cross-encoder, and can also be a recall lane. As with the cross-encoder, its code is implemented regardless of the model choice.
+11. **Late interaction** (owner, 2026-10-08, §5.0d):
+    - Indexing is background and CPU-capable (the recency layer buffers new blocks), and query time is the whole budget.
+    - The newest `exhaustive_blocks` are scored exhaustively, sized by a host bench. Older blocks come through hybrid recall and are re-scored by MaxSim.
+    - It sits before the cross-encoder. Its code is implemented regardless of the model choice.
 12. **Segmentation is not a problem here** (owner): memories are discrete blocks, so every stage scores whole blocks (§5.0).
 
 Remaining:
 - **The survey and measurements of §5.0c,** which choose the models: GPU primary, API fallback (or primary), and the built-in CPU models. These run in parallel with the implementation.
 - **Whether the built-in CPU re-ranker ships enabled by default,** like the embedder. Proposed yes (§5.0a), pending its measured quality.
+- **Late interaction details to settle with measurements (§5.0d):**
+  - the exhaustive window's default budget (proposed 100 ms of MaxSim);
+  - the late query's content (trigger plus reply target, or a short conversation tail too);
+  - whether a small query model holds quality against a large-model index;
+  - whether the dense lane still adds anything inside the window.
