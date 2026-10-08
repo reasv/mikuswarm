@@ -436,7 +436,7 @@ export class MemoryRetrievalPipeline {
                       },
                     }
                   : {}),
-                participants: participants.map((p) => p.name),
+                participants: laneNames,
                 passage: {
                   date: agentDateStamp(c.chunk.entryTs),
                   room: c.chunk.room,
