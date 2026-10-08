@@ -9290,6 +9290,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       binding.created.gate?.dispose();
       binding.costWarnUnsub();
       if (lateCtl) unregisterLateInputEntry(session.id);
+      // The session ended: an outstanding memory plan stops (a confirmed one keeps its row).
+      memoryPlan?.abandon();
     };
 
     // Redo from scratch (§8 "Late input"): discard the rollout into a branch,
@@ -9331,24 +9333,30 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       if (absorbed) request = mergeRestart(request, absorbed);
       let next: CreatedAgent;
       let unapplied: RestartRequest | undefined;
-      for (;;) {
-        lateCtl!.redoCount += 1;
-        void storage.bumpAgentSessionRedoCount(session.id).catch(() => undefined);
-        refreshTriggerFromStore(inbound);
-        replanMemory();
-        await awaitTriggerReadiness(inbound);
-        lateCtl!.markBuildStarted();
-        next = await factory.create(session, sessionTools, createOpts!(firstPin));
-        if (!next.kickoff) throw new Error("redo build produced no final user turn");
-        if (lateCtl!.peekPending()?.kind === "cancel") break;
-        const again = lateCtl!.takeRebuildBeforeStart();
-        if (!again) break;
-        if (lateCtl!.redoCount >= lateInputSettings.maxRedos) {
-          unapplied = again;
-          break;
+      try {
+        for (;;) {
+          lateCtl!.redoCount += 1;
+          void storage.bumpAgentSessionRedoCount(session.id).catch(() => undefined);
+          refreshTriggerFromStore(inbound);
+          replanMemory();
+          await awaitTriggerReadiness(inbound);
+          lateCtl!.markBuildStarted();
+          next = await factory.create(session, sessionTools, createOpts!(firstPin));
+          if (!next.kickoff) throw new Error("redo build produced no final user turn");
+          if (lateCtl!.peekPending()?.kind === "cancel") break;
+          const again = lateCtl!.takeRebuildBeforeStart();
+          if (!again) break;
+          if (lateCtl!.redoCount >= lateInputSettings.maxRedos) {
+            unapplied = again;
+            break;
+          }
+          next.gate?.dispose();
+          logger.info("late_input_redo", { sessionId: session.id, reason: again.reason, phase: "building", causes: again.causeEventIds });
         }
-        next.gate?.dispose();
-        logger.info("late_input_redo", { sessionId: session.id, reason: again.reason, phase: "building", causes: again.causeEventIds });
+      } catch (error) {
+        // The rebuild failed: its plan is never shown.
+        memoryPlan?.abandon();
+        throw error;
       }
       attachBinding(next, next.snapshot, next.tokenEstimate);
       sessions.attachAgent(session.id, next.agent);
