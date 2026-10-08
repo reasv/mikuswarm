@@ -344,8 +344,9 @@ Unreleased section; it is not part of any release's notes.
   in are never compared, and what another session was answering in an isolated
   channel is never shown. If
   another session posts while the send waits for its verdict, the draft is
-  judged once more, new messages included, within the same deadline, unless a
-  check that blocks the send already fired; a recheck that misses the deadline
+  judged once more, new messages included, within the same deadline, unless the
+  verdict already in hand blocks the send (a flag the call overrides, one past the
+  revise bounds, or a refusal no rule acts on does not); a recheck that misses the deadline
   leaves the verdict already in hand in force. Its chain is
   `[decisions.checks.duplicate].model` (default `[decisions].model`); per-question
   thresholds (default 0.8) go in `[checks.duplicate].thresholds`, and

@@ -20,6 +20,12 @@ export interface RevisePolicyPart {
   decide(info: GateCallInfo, verdict: GateVerdict):
     | { kind: "block"; message: string; consequence: "revise" }
     | { kind: "pass"; consequence?: Extract<CheckConsequence, "overridden" | "sent"> };
+  /**
+   * Whether {@link decide} would block this verdict now, deciding nothing (the
+   * counters do not move): a fired revisable check the call's override does not
+   * cover, with no bound exhausted.
+   */
+  wouldBlock(info: GateCallInfo, verdict: GateVerdict): boolean;
   /** A message was delivered: the consecutive-rejection counter restarts. */
   onDelivered(): void;
 }

@@ -107,6 +107,25 @@ export function createActingPolicy(deps: ActingPolicyDeps): ActingGatePolicy {
     return act;
   };
 
+  /**
+   * The refusal decision {@link decideRefusal} would take on an in-time verdict,
+   * without advancing the walk: `blocks` (a rule acts and, redo or exhausted,
+   * withholds), `maybe` (a `send_last` rule: a redo blocks, its exhaustion lets
+   * the output through), `none` (no fired redo refusal, or no rule matches it).
+   */
+  const previewRefusal = (verdict: GateVerdict): "blocks" | "maybe" | "none" => {
+    const fired = strongestOf(verdict.fired.filter((f) => f.kind === "refusal" && f.remedy === "redo"));
+    if (!fired) return "none";
+    const rule = refusal.matchRule({
+      reason: fired.reason ?? "unclear",
+      detectedReasons: verdict.fired.filter((f) => f.kind === "refusal").map((f) => f.reason ?? "unclear"),
+      kind: "soft",
+      fromModel: refusal.servingModel(),
+    });
+    if (!rule) return "none";
+    return exhaustedOutcome(rule, refusal.site) === "exhausted_send_last" ? "maybe" : "blocks";
+  };
+
   const decideRevise = (info: GateCallInfo, verdict: GateVerdict): ReviseDecision | undefined => {
     if (!revise) return undefined;
     if (reviseDecisions.has(info)) return reviseDecisions.get(info) ?? undefined;
@@ -152,6 +171,21 @@ export function createActingPolicy(deps: ActingPolicyDeps): ActingGatePolicy {
       const decision = decideRevise(info, verdict);
       if (decision?.kind === "block") return { kind: "block", message: decision.message };
       return { kind: "proceed" };
+    },
+
+    wouldBlock(info, verdict) {
+      // Decided already (the verdict was recorded): what was decided.
+      if (refusalActs.has(info)) {
+        const act = refusalActs.get(info);
+        if (act) return act.kind === "redo" || act.outcome !== "exhausted_send_last";
+      } else {
+        const preview = previewRefusal(verdict);
+        if (preview === "blocks") return true;
+        // A rule that may still let the last attempt through (send_last): it
+        // blocks only while it has a try left, which only advancing can tell.
+        if (preview === "maybe") return false;
+      }
+      return revise?.wouldBlock(info, verdict) ?? false;
     },
 
     onDelivered() {

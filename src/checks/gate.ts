@@ -117,6 +117,13 @@ export interface GatePolicy {
   /** Act on a held verdict (after it is recorded). */
   act(info: GateCallInfo, verdict: GateVerdict): GateAction | Promise<GateAction>;
   /**
+   * Whether acting on this verdict now would surely block the output, without
+   * deciding anything (no counter moves, no refusal walk advances). The
+   * duplicate recheck is skipped only then. Absent = the gate assumes any
+   * fired `revise` or `redo` check blocks.
+   */
+  wouldBlock?(info: GateCallInfo, verdict: GateVerdict): boolean;
+  /**
    * A gated call went through and its tool succeeded (a delivered message, an
    * accepted `no_reply`): per-message counters restart (the revise part's
    * consecutive bound, §6.4).
@@ -134,6 +141,7 @@ export const OBSERVE_POLICY: GatePolicy = {
   },
   refusalOutcome: () => ({ outcome: "observed" }),
   act: () => ({ kind: "proceed" }),
+  wouldBlock: () => false,
 };
 
 /** The checkpoint of a gated tool: posting tools → send, `no_reply` → ending. */
@@ -441,10 +449,12 @@ export class OutputGate implements SessionEndingHook {
   /**
    * After the verdict of a held send (called once, from {@link settle}): when
    * other sessions of the same agent posted to the target timeline while the
-   * call waited and no check that blocks (a `revise` or `redo` remedy, the
-   * duplicate check included) has fired, judge the draft once more against
-   * every unseen message, new ones included, in the same evaluation (its
-   * deadline unchanged). True = the evaluation was extended.
+   * call waited and the verdict in hand will not block the output (the
+   * policy's {@link GatePolicy.wouldBlock}: a fired check that is overridden,
+   * past a revise bound, or a refusal no rule acts on does not block), judge
+   * the draft once more against every unseen message, new ones included, in
+   * the same evaluation (its deadline unchanged). True = the evaluation was
+   * extended.
    */
   private recheckDuplicate(
     toolName: string,
@@ -452,9 +462,21 @@ export class OutputGate implements SessionEndingHook {
     args: Record<string, unknown> | undefined,
     entry: Entry,
   ): boolean {
-    const fired = entry.evaluation.result?.fired ?? [];
+    const inHand = entry.evaluation.result;
+    const fired = inHand?.fired ?? [];
+    const verdict: GateVerdict = {
+      evaluationIds: [],
+      fired: [...fired],
+      ...strongest(fired),
+      unjudged: inHand?.unjudgedReason !== undefined,
+      late: false,
+      latencyMs: inHand?.latencyMs ?? 0,
+    };
     // A blocking verdict is already in hand: the output is not sent as is anyway.
-    if (fired.some((f) => f.kind === "duplicate" || f.remedy === "revise" || f.remedy === "redo")) return false;
+    const blocks = this.policy.wouldBlock
+      ? this.policy.wouldBlock(entry.info, verdict)
+      : fired.some((f) => f.kind === "duplicate" || f.remedy === "revise" || f.remedy === "redo");
+    if (blocks) return false;
     return this.duplicateStage(toolName, toolCallId, args, entry, true);
   }
 

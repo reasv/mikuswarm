@@ -241,8 +241,8 @@ export function createRevisePolicyPart(options: RevisePolicyPartOptions): Revise
     if (fired.length === 0) return { kind: "pass" };
     const agent = info.scope.agent;
     const rejected = unheld?.lastRejected ?? lastRejected;
+    const honoured = honouredOverrides(info, fired, rejected);
     const requested = new Set(info.overrideChecks ?? []);
-    const honoured = new Set(fired.filter((f) => requested.has(f.code) && rejected.includes(f.code)).map((f) => f.code));
     const blocking = fired.filter((f) => !honoured.has(f.code));
     if (blocking.length === 0) {
       logger?.info("check_revise_overridden", { ...logFields(info), codes: [...honoured] });
@@ -305,6 +305,16 @@ export function createRevisePolicyPart(options: RevisePolicyPartOptions): Revise
       decided.set(info.toolCallId, decision);
       return decision;
     },
+    wouldBlock(info, verdict) {
+      if (!info.toolCallId) return false;
+      const prior = decided.get(info.toolCallId);
+      if (prior) return "kind" in prior && prior.kind === "block";
+      const fired = verdict.revise.filter((f) => f.remedy === "revise");
+      if (fired.length === 0) return false;
+      const honoured = honouredOverrides(info, fired, lastRejected);
+      if (fired.every((f) => honoured.has(f.code))) return false;
+      return exhausted(info.scope.agent) === undefined;
+    },
     onDelivered() {
       consecutive = 0;
       lastRejected = [];
@@ -317,6 +327,12 @@ export function createRevisePolicyPart(options: RevisePolicyPartOptions): Revise
 interface Unheld {
   bound: "session" | "consecutive";
   lastRejected: readonly string[];
+}
+
+/** The fired codes the call's override honours: named in it and fired in the immediately preceding rejection. */
+function honouredOverrides(info: GateCallInfo, fired: readonly FiredCheck[], rejected: readonly string[]): Set<string> {
+  const requested = new Set(info.overrideChecks ?? []);
+  return new Set(fired.filter((f) => requested.has(f.code) && rejected.includes(f.code)).map((f) => f.code));
 }
 
 function uniqueByCode(fired: readonly FiredCheck[]): FiredCheck[] {

@@ -126,6 +126,7 @@ function revisePolicy(revise: ReturnType<typeof createRevisePolicyPart>): GatePo
       const decision = revise.decide(info, verdict);
       return decision.kind === "block" ? { kind: "block", message: decision.message } : { kind: "proceed" };
     },
+    wouldBlock: (info, verdict) => revise.wouldBlock(info, verdict),
     onDelivered: () => revise.onDelivered(),
   };
 }
@@ -582,6 +583,29 @@ test("a blocking verdict in hand is never rechecked: a style flag judged in time
   assert.equal(t.decisions.length, 1, "no recheck once a blocking check fired");
   assert.ok(!t.lines.some(([e]) => e === "check_duplicate_rechecked"));
   assert.deepEqual((await t.consequences()).map(([, c]) => c), ["revise"]);
+  storage.close();
+});
+
+test("a fired check that will not block (overridden) does not skip the recheck: a message posted meanwhile is judged", async () => {
+  const storage = await newStorage();
+  await botMessage(storage, "e1", "Let me check.", CUTOFF + 1000);
+  const t = await setup({
+    storage,
+    knobs: { send_deadline_ms: 3000 },
+    checks: { duplicate: { enabled: true }, style_q: { kind: "style", min_chars: 0, questions: [styleQuestion] } },
+    otherAnswer: (id) => (id.startsWith("style_q") ? 0.95 : 0.01),
+    answer: (q, state) => (q === "repeats" && JSON.stringify(state.earlier ?? state).includes("The answer is 42") ? 0.95 : 0.1),
+    onDuplicateCall: async (n) => {
+      if (n === 2) await botMessage(storage, "e2", "The answer is 42.", Date.now());
+    },
+  });
+  assert.match(await t.call({ message: "The answer is 42." }), /style_q/);
+  // The style flag fires again but is overridden: the send will not be blocked by it, so the recheck runs.
+  const out = await t.call({ message: "The answer is 42.", override_checks: ["style_q"] });
+  assert.ok(t.lines.some(([e]) => e === "check_duplicate_rechecked"), `no recheck; outcome=${out}`);
+  assert.match(out, /^Not sent\. Other sessions of yours/);
+  assert.match(out, /0 s ago: «The answer is 42\.»/);
+  assert.deepEqual(t.sent, []);
   storage.close();
 });
 

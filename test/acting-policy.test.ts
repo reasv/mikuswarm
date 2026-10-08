@@ -255,3 +255,54 @@ test("claim guard before evaluation (§6.2): a send the tool refuses is never he
   assert.deepEqual(await t.rows(), []);
   t.storage.close();
 });
+
+test("wouldBlock: only a verdict that will block counts; overrides, exhausted bounds and unmatched refusals do not; nothing is decided", async () => {
+  const style = { code: "style_em_dash", kind: "style", remedy: "revise", method: "pattern", probability: 1 } as FiredCheck;
+  const refusal = { code: "refusal_canned", kind: "refusal", remedy: "redo", reason: "capability", method: "pattern", probability: 1 } as FiredCheck;
+  const verdict = (fired: FiredCheck[]): GateVerdict => ({
+    evaluationIds: [],
+    fired,
+    ...(fired.some((f) => f.kind === "refusal") ? { refusal: fired.find((f) => f.kind === "refusal")! } : {}),
+    revise: fired.filter((f) => f.remedy === "revise"),
+    unjudged: false,
+    late: false,
+    latencyMs: 1,
+  });
+  const info = (id: string, overrideChecks?: string[]) =>
+    ({
+      checkpoint: "send",
+      action: "send_message",
+      toolCallId: id,
+      scope: { agent: null, site: "default", sessionId: SESSION, sessionType: "default", timelineKey: TIMELINE, tasks: null },
+      ...(overrideChecks ? { overrideChecks } : {}),
+    }) as GateCallInfo;
+
+  // No rule: an observed refusal alone never blocks; a style flag does.
+  const t = await setup();
+  assert.equal(t.policy.wouldBlock!(info("c1"), verdict([refusal])), false, "observed refusal, no rule");
+  assert.equal(t.policy.wouldBlock!(info("c1"), verdict([refusal, style])), true, "style flag with an observed refusal");
+  assert.deepEqual(t.revise.state(), { consecutive: 0, sessionTotal: 0, lastRejected: [] }, "nothing decided");
+  // A rejection, then the same flag overridden: it will not block.
+  assert.equal(t.policy.consequence(info("c2"), verdict([style]), { held: true, late: false }), "revise");
+  assert.equal(t.policy.wouldBlock!(info("c3", ["style_em_dash"]), verdict([style])), false, "overridden");
+  assert.equal(t.policy.wouldBlock!(info("c3"), verdict([style])), true, "not overridden");
+  // The consecutive bound exhausted: the next flag goes through.
+  assert.equal(t.policy.consequence(info("c4"), verdict([style]), { held: true, late: false }), "revise");
+  assert.equal(t.policy.wouldBlock!(info("c5"), verdict([style])), false, "revise bound exhausted");
+  assert.equal(t.revise.state().consecutive, 2);
+  // A call decided already answers what was decided.
+  assert.equal(t.policy.wouldBlock!(info("c4"), verdict([style])), true);
+  t.storage.close();
+
+  // A rule acts: withhold blocks; send_last may let the last attempt through, so it is not sure to block.
+  const withhold = await setup({ rule: { ...RULE, onExhausted: "withhold" } });
+  assert.equal(withhold.policy.wouldBlock!(info("w1"), verdict([refusal])), true);
+  assert.deepEqual(withhold.refusal.advanced, [], "the walk never advances");
+  withhold.storage.close();
+  const sendLast = await setup({ rule: RULE });
+  assert.equal(sendLast.policy.wouldBlock!(info("s1"), verdict([refusal])), false);
+  // The refusal wins over the style flag either way: a redo blocks, an exhausted send_last sends.
+  assert.equal(sendLast.policy.wouldBlock!(info("s1"), verdict([refusal, style])), false);
+  assert.deepEqual(sendLast.refusal.advanced, []);
+  sendLast.storage.close();
+});
