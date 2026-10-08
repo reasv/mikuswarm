@@ -38,7 +38,7 @@ export interface AppHarness {
   /** Deliver a user message; `mention` makes it a trigger. Returns its external id. */
   say(body: string, opts?: { mention?: boolean; replyTo?: string; id?: string; attachments?: AttachmentMeta[]; sender?: { id: string; displayName: string; username?: string }; timestamp?: number }): string;
   /** Edit a stored message (`m.replace`); `mention` = the new content mentions the bot. */
-  edit(targetExternalId: string, body: string, opts?: { mention?: boolean; sender?: { id: string; displayName: string; username?: string } }): void;
+  edit(targetExternalId: string, body: string, opts?: { mention?: boolean; sender?: { id: string; displayName: string; username?: string }; timestamp?: number }): void;
   /** Delete a stored message (a tombstone through the edit path). */
   remove(targetExternalId: string): void;
   /** Poll until `predicate` holds (default 10 s). */
@@ -123,6 +123,8 @@ export async function startHarness(opts: {
    * `on === false` holds the session in that window.
    */
   onTyping?: (on: boolean) => Promise<void> | void;
+  /** Awaited after a send was delivered (recorded), before the provider returns. */
+  onSend?: (msg: OutboundMessage) => Promise<void> | void;
 }): Promise<AppHarness> {
   const llm = await startFakeLlm(opts.script, opts.decideNoul);
   const root = await mkdtemp(path.join(os.tmpdir(), "miku-app-harness-"));
@@ -154,6 +156,7 @@ export async function startHarness(opts: {
       sendSeq += 1;
       const externalId = `$bot${sendSeq}`;
       sends.push({ target, msg, externalId });
+      await opts.onSend?.(msg);
       return { provider: "matrix", target, externalId, deliveredAt: Date.now() };
     },
     async setTyping(_target: OutboundTarget, on: boolean) {
@@ -222,7 +225,7 @@ export async function startHarness(opts: {
           body,
           timestamp: sentAt,
           receivedAt: now,
-          ...(sayOpts.mention ? { mentions: { mentionedSelf: true, userIds: [BOT_ID] } } : {}),
+          ...(sayOpts.mention ? { mentions: { mentionedSelf: true, mentionedUserIds: [BOT_ID] } } : {}),
           ...(sayOpts.replyTo ? { replyTo: { externalId: sayOpts.replyTo } } : {}),
           ...(sayOpts.attachments ? { attachments: sayOpts.attachments } : {}),
         },
@@ -250,9 +253,10 @@ export async function startHarness(opts: {
           role: "user",
           sender,
           body,
-          timestamp: now,
+          timestamp: editOpts.timestamp ?? now,
           receivedAt: now,
-          ...(editOpts.mention ? { mentions: { mentionedSelf: true, userIds: [BOT_ID] } } : {}),
+          // Like the real providers, an edit carries its new content's mentions.
+          mentions: editOpts.mention ? { mentionedSelf: true, mentionedUserIds: [BOT_ID] } : { mentionedSelf: false, mentionedUserIds: [] },
         },
         edit: { targetExternalId },
         outboundTarget: { provider: "matrix", timelineKey: HARNESS_TK, accountId: "test", roomId: "!room" },

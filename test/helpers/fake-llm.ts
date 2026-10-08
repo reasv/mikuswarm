@@ -42,8 +42,8 @@ export interface FakeLlm {
   close(): Promise<void>;
 }
 
-/** Probability a `noul` question gets, per decision request (default 0.9). */
-export type DecideNoul = (body: { state: unknown; questions: Record<string, unknown> }) => number;
+/** Probability a `noul` question gets, per decision request (default 0.9); a promise delays the answer. */
+export type DecideNoul = (body: { state: unknown; questions: Record<string, unknown> }) => number | Promise<number>;
 
 let callSeq = 0;
 
@@ -71,7 +71,7 @@ export async function startFakeLlm(
           decisions.push({ state: decision.state, questions: decision.questions });
           const answers: Record<string, unknown> = {};
           for (const [id, q] of Object.entries(decision.questions)) {
-            if (q.type === "noul") answers[id] = { noul: decideNoul(decision as { state: unknown; questions: Record<string, unknown> }) };
+            if (q.type === "noul") answers[id] = { noul: await decideNoul(decision as { state: unknown; questions: Record<string, unknown> }) };
             else if (q.type === "choice") {
               answers[id] = { choice: Object.keys(q.criteria as Record<string, unknown>)[0], confidence: 0.95 };
             } else answers[id] = { score: 0, confidence: 0.95 };
