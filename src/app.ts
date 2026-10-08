@@ -93,6 +93,7 @@ import { createActingPolicy } from "./checks/acting-policy.js";
 import { createRevisePolicyPart, priorRejections } from "./checks/revise.js";
 import { ContractReconciler, persistSessionContract } from "./agent/contract-store.js";
 import type { CreatedAgent } from "./agent/factory.js";
+import type { SummaryCoveragePin } from "./context/builder.js";
 import type { LateInputStep, SessionRunnerOptions } from "./agent/runner.js";
 import type { Agent, AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import {
@@ -8298,9 +8299,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // created once and threaded into the tools so the record turn can drive them.
     const recordHandles: SessionRecordHandles = { gate: { active: false }, draft: new SummaryDraft() };
     let created: Awaited<ReturnType<typeof factory.create>> | undefined;
-    let createOpts: ((cutoff?: number) => CreateAgentOptions) | undefined;
+    let createOpts: ((pin?: { cutoff?: number; coverage?: SummaryCoveragePin }) => CreateAgentOptions) | undefined;
     let sessionTools: AgentTool[] = [];
-    let firstCutoff: number | undefined;
+    // A redo rebuild renders what the first build read: its timeline cutoff and
+    // its summary coverage (§8 "Late input"), so the prefix stays byte-identical.
+    let firstPin: { cutoff?: number; coverage?: SummaryCoveragePin } | undefined;
     let agent: Awaited<ReturnType<typeof factory.create>>["agent"] | undefined;
     let kickoff: Awaited<ReturnType<typeof factory.create>>["kickoff"];
     let snapshot: ContextMessage[] | undefined;
@@ -8332,7 +8335,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // whose catalog lacks read_session_record (session-type tools allowlist,
       // disabled_tools) could not execute an injection, so it plans none and
       // waits for nothing.
-      createOpts = (cutoff?: number): CreateAgentOptions => ({
+      createOpts = (pin?: { cutoff?: number; coverage?: SummaryCoveragePin }): CreateAgentOptions => ({
         // Decision-model routing (ARCHITECTURE.md §8h): human-triggered chat-lane
         // sessions of an agent with routing on. Evaluated inside create(), after
         // the readiness wait above, so the trigger's captions are in the state.
@@ -8361,15 +8364,16 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         abortSignal: drainAbort.signal,
         // Late input (§8 "Late input"): replay, hold, request progress.
         ...(lateCtl ? { lateInput: lateCtl } : {}),
-        ...(cutoff !== undefined ? { timelineCutoff: cutoff } : {}),
+        ...(pin?.cutoff !== undefined ? { timelineCutoff: pin.cutoff } : {}),
+        ...(pin?.coverage !== undefined ? { summaryCoverage: pin.coverage } : {}),
       });
       sessionTools = tools;
       // A correction that lands while the context is built redoes the build in
       // place before the first request (nothing was generated, no branch).
       for (;;) {
         lateCtl?.markBuildStarted();
-        created = await factory.create(session, tools, createOpts(firstCutoff));
-        firstCutoff ??= created.timelineCutoff;
+        created = await factory.create(session, tools, createOpts(firstPin));
+        firstPin ??= { cutoff: created.timelineCutoff, coverage: created.summaryCoverage };
         if (!lateCtl) break;
         const cancelled = lateCtl.takeCancelBeforeStart();
         if (cancelled) {
@@ -8541,7 +8545,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         refreshTriggerFromStore(inbound);
         await awaitTriggerReadiness(inbound);
         lateCtl!.markBuildStarted();
-        next = await factory.create(session, sessionTools, createOpts!(firstCutoff));
+        next = await factory.create(session, sessionTools, createOpts!(firstPin));
         if (!next.kickoff) throw new Error("redo build produced no final user turn");
         if (lateCtl!.peekPending()?.kind === "cancel") break;
         const again = lateCtl!.takeRebuildBeforeStart();

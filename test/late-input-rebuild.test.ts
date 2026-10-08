@@ -122,3 +122,36 @@ test("rebuild after a late addition: the addition joins the trigger turn, the pr
     storage.close();
   }
 });
+
+test("rebuild after a summary job advanced coverage: the first build's coverage keeps the prefix", async () => {
+  const { storage, timeline, builder, trigger } = await setup();
+  try {
+    const first = await builder.build({ timelineKey: TK, trigger, activeSessions: [], workspace, selfSessionId: "s1" });
+    assert.ok(first.summaryCoverage, "a chat build reports its coverage");
+    // Between the builds a summary of the oldest messages completes.
+    const covered = ["old0", "old1", "old2"];
+    await storage.insertSummarizationJob({
+      id: "job1", timelineKey: TK, level: 1, inputStartId: "old0", inputEndId: "old2",
+      inputTokenCount: 10, targetTokenCount: 100, maxRetries: 0,
+    });
+    await storage.insertSummaryWithLineage({
+      id: "sum1", timelineKey: TK, level: 1, content: "summary of the older chat",
+      earliestTimestamp: 1000, latestTimestamp: 1200, latestEventId: "old2", eventCount: 3,
+      tokenCount: 10, modelId: "m", status: "complete", generatedAt: 1300, eventIds: covered, jobId: "job1",
+    });
+    const rebuild = (pinned: boolean) =>
+      builder.build({
+        timelineKey: TK,
+        trigger,
+        activeSessions: [],
+        workspace,
+        selfSessionId: "s1",
+        timelineCutoff: first.timelineCutoff,
+        ...(pinned ? { summaryCoverage: first.summaryCoverage } : {}),
+      });
+    assert.notEqual(wirePrefix(await rebuild(false)), wirePrefix(first), "a fresh selection would render the new summary");
+    assert.equal(wirePrefix(await rebuild(true)), wirePrefix(first), "the pinned coverage keeps the prefix byte-identical");
+  } finally {
+    storage.close();
+  }
+});

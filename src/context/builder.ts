@@ -8,6 +8,7 @@ import type { PriorityClass } from "../agent/scheduler.js";
 import type { AttachmentMeta, CanonicalChatEvent, ReactionAggregate } from "../types.js";
 import type { TimelineStore } from "../timeline/index.js";
 import { parseTimelineKey } from "../storage/timeline-key.js";
+import type { TimelineCompactionState } from "../storage/database.js";
 import type {
   Storage,
   MediaAssetRow,
@@ -103,6 +104,12 @@ export interface BuildContextOptions {
    * arrived, so the rebuilt prefix matches the first build byte for byte.
    */
   timelineCutoff?: number;
+  /**
+   * Redo rebuild: the first build's {@link BuiltContext.summaryCoverage}, reused
+   * as is (no new selection, no wait), so a summary job that advanced coverage
+   * (and the compaction cursor) between the builds cannot change the prefix.
+   */
+  summaryCoverage?: SummaryCoveragePin;
   timelineKey: string;
   trigger: CanonicalChatEvent;
   activeSessions: AgentSessionRecord[];
@@ -246,6 +253,17 @@ export interface BuiltContext {
    * {@link BuildContextOptions.timelineCutoff}. Undefined for generation builds.
    */
   timelineCutoff?: number;
+  /** Live chat builds: the summary coverage it rendered (a redo rebuild reuses it). */
+  summaryCoverage?: SummaryCoveragePin;
+}
+
+/**
+ * What a chat build's history was cut from: its final summary selection and the
+ * compaction state it read (the tier boundaries a summary job moves).
+ */
+export interface SummaryCoveragePin {
+  selection: SummarySelection;
+  compactionState: TimelineCompactionState | undefined;
 }
 
 /**
@@ -372,7 +390,8 @@ export class ContextBuilder {
     const proactive = options.proactive === true;
     const now = options.trigger.timestamp;
     const triggerGroupIds = generation || proactive ? new Set<string>() : this.resolveTriggerGroupIds(options.trigger);
-    const compactionState = this.store.getCompactionState(options.timelineKey);
+    const pinned = !generation ? options.summaryCoverage : undefined;
+    const compactionState = pinned ? pinned.compactionState : this.store.getCompactionState(options.timelineKey);
 
     // 1. Select summaries and derive the event-ID coverage cursor (§4). The
     //    selection includes synthesized failure placeholders for terminally
@@ -393,7 +412,7 @@ export class ContextBuilder {
       selection = { summaries: condenseInputs.summaries, coverageEndEventId: null };
       events = [];
     } else {
-      selection = selectSummaryCoverage(this.storage, options.timelineKey);
+      selection = pinned?.selection ?? selectSummaryCoverage(this.storage, options.timelineKey);
 
       // 2. Query events starting strictly after the coverage cursor.
       events = selection.coverageEndEventId
@@ -487,7 +506,8 @@ export class ContextBuilder {
     //    prior chunks' summaries are normally complete because jobs process
     //    oldest-first; a gap simply renders raw — never wait, never fake).
     let compactionInput = timelineEvents;
-    if (!generation) {
+    // A redo rebuild with the first build's coverage: that build already waited.
+    if (!generation && !pinned) {
       const resolved = await this.resolveCompactionOverflow(
         options.timelineKey,
         timelineEvents,
@@ -607,7 +627,8 @@ export class ContextBuilder {
         discreteOtherHorizonMessages: rx.discrete_other_horizon_messages,
       },
     );
-    if (!generation && compacted.stateChanged && compacted.state) {
+    // A pinned rebuild replays an older state: never persist it over a newer one.
+    if (!generation && !pinned && compacted.stateChanged && compacted.state) {
       await this.store.saveCompactionState(compacted.state);
     }
 
@@ -880,6 +901,7 @@ export class ContextBuilder {
       systemPromptSegments,
       toolBlock,
       ...(timelineCutoff !== undefined ? { timelineCutoff } : {}),
+      ...(!generation ? { summaryCoverage: { selection, compactionState } } : {}),
     };
   }
 
