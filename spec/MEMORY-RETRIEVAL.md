@@ -518,7 +518,7 @@ pending = "show"              # unevaluated blocks on non-judged surfaces
 ```
 
 - **Without `[decisions]`, or with `judge = false`,** auto-retrieval keeps today's behaviour with the match-centred excerpt fix (§6), so a deployment without a decision model still benefits.
-- **Filters require a decision model.** Without one, no filter applies, and startup warns if filters are configured.
+- **Without a decision model,** keyword and pattern filters still apply (§7.2) but judged filters do not, and startup warns if judged filters are configured.
 
 ## 11. Out of scope
 
