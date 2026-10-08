@@ -24,6 +24,7 @@ export const DEFAULT_REMEDY: Record<CheckKind, CheckRemedy> = {
   refusal: "redo",
   style: "revise",
   contract: "observe",
+  duplicate: "revise",
 };
 
 /** Checkpoints of a check whose config sets none. */
@@ -31,6 +32,7 @@ export const DEFAULT_CHECKPOINTS: Record<CheckKind, readonly Checkpoint[]> = {
   refusal: CHECKPOINTS,
   style: ["send"],
   contract: ["ending"],
+  duplicate: ["send"],
 };
 
 /**
@@ -157,12 +159,16 @@ function applyCheckConfig(
             throw new Error(`${at}: criteria needs non-empty true and false texts`);
           }
           return {
+            ...(q.name !== undefined ? { name: q.name } : {}),
             source: oneOf(q.source, CHECK_SOURCES, "source", at),
             instructions: q.instructions,
             criteria: { true: q.criteria.true, false: q.criteria.false },
             threshold: q.threshold,
           };
         });
+  // Per-question thresholds by question name (or source, for an unnamed one),
+  // over whichever question list applies (the base's or the config's).
+  const thresholded = raw.thresholds === undefined ? questions : applyThresholds(questions, raw.thresholds, where);
   const def: CheckDefinition = {
     code,
     kind,
@@ -185,7 +191,7 @@ function applyCheckConfig(
     ...(prefilter && prefilter.length > 0 ? { prefilter } : {}),
     words: raw.words ?? base?.words ?? [],
     minChars: raw.min_chars ?? base?.minChars,
-    questions,
+    questions: thresholded,
     builtin: base?.builtin ?? false,
   };
   if (def.agentExplanation === undefined) delete def.agentExplanation;
@@ -193,6 +199,27 @@ function applyCheckConfig(
   if (def.minChars === undefined) delete def.minChars;
   validateCheck(def, where);
   return def;
+}
+
+/** `[checks.<code>].thresholds`: question name (or source) → threshold; an unknown key is an error. */
+function applyThresholds(
+  questions: readonly CheckDefinition["questions"][number][],
+  thresholds: Record<string, number>,
+  where: string,
+): CheckDefinition["questions"] {
+  const out = questions.map((q) => ({ ...q, criteria: { ...q.criteria } }));
+  for (const [key, value] of Object.entries(thresholds)) {
+    if (!(value >= 0 && value <= 1)) throw new Error(`${where}.thresholds.${key}: threshold must be in 0..1`);
+    const matching = out.filter((q) => (q.name ?? q.source) === key);
+    if (matching.length === 0) {
+      const names = [...new Set(out.map((q) => q.name ?? q.source))];
+      throw new Error(
+        `${where}.thresholds.${key}: the check has no question named "${key}" (questions: ${names.join(", ") || "none"})`,
+      );
+    }
+    for (const q of matching) q.threshold = value;
+  }
+  return out;
 }
 
 function validateCheck(def: CheckDefinition, where: string): void {
@@ -216,6 +243,28 @@ function validateCheck(def: CheckDefinition, where: string): void {
   }
   if (def.checkpoints.length === 0) {
     throw new Error(`${where}: checkpoints must not be empty (set enabled = false to turn the check off)`);
+  }
+  if (def.kind === "duplicate") {
+    // Judged against the same agent's unseen messages in the send's target
+    // channel (ARCHITECTURE.md §8j "Duplicate sends"): only a model can see them.
+    if (def.remedy === "redo") {
+      throw new Error(`${where}: remedy "redo" is not allowed on a duplicate check (use "revise" or "observe")`);
+    }
+    if (def.patterns.length > 0 || def.words.length > 0) {
+      throw new Error(`${where}: a duplicate check is judged against unseen messages; patterns and words do not apply`);
+    }
+    if (def.checkpoints.some((c) => c !== "send")) {
+      throw new Error(`${where}: a duplicate check judges sends only (checkpoints = ["send"])`);
+    }
+    if (def.questions.some((q) => q.source !== "message")) {
+      throw new Error(`${where}: a duplicate check's questions judge the draft (source = "message")`);
+    }
+  }
+  const ids = new Set<string>();
+  for (const q of def.questions) {
+    if (q.name === undefined) continue;
+    if (ids.has(q.name)) throw new Error(`${where}: two questions are named "${q.name}"`);
+    ids.add(q.name);
   }
 }
 

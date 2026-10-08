@@ -60,7 +60,8 @@ test("built-ins: the eight refusal checks, enabled, redo, all checkpoints", () =
   }
   assert.equal(
     BUILTIN_CHECKS.length,
-    BUILTIN_REFUSAL_CHECKS.length + BUILTIN_STYLE_CHECKS.length + BUILTIN_CONTRACT_CHECKS.length,
+    BUILTIN_REFUSAL_CHECKS.length + BUILTIN_STYLE_CHECKS.length + BUILTIN_CONTRACT_CHECKS.length + 1,
+    "plus the duplicate-send check",
   );
   assert.equal(BUILTIN_STYLE_CHECKS.length, 9, "the starter style catalogue (§4.5)");
 });
@@ -185,6 +186,12 @@ test("validation: startup errors name the table", () => {
     [{ x: { kind: "style", prefilter: ["(unclosed"], questions: [question()] } }, /\[checks\.x\]\.prefilter\[0\]: invalid regular expression/],
     [{ x: { kind: "style", prefilter: ["ok"] } }, /prefilter gates questions; a check without questions cannot have one/],
     [{ style_load_bearing: { questions: [] } }, /\[checks\.style_load_bearing\]: prefilter gates questions/],
+    [{ duplicate: { remedy: "redo" } }, /remedy "redo" is not allowed on a duplicate check/],
+    [{ duplicate: { patterns: ["x"] } }, /patterns and words do not apply/],
+    [{ duplicate: { checkpoints: ["send", "ending"] } }, /judges sends only/],
+    [{ duplicate: { questions: [question({ source: "text" })] } }, /questions judge the draft \(source = "message"\)/],
+    [{ duplicate: { thresholds: { nope: 0.5 } } }, /\[checks\.duplicate\]\.thresholds\.nope: the check has no question named "nope" \(questions: answered_already, repeats, contradicts\)/],
+    [{ x: { kind: "style", questions: [question({ name: "a" }), question({ name: "a" })] } }, /two questions are named "a"/],
   ];
   for (const [checks, re] of cases) {
     assert.throws(() => build({ checks }), re, JSON.stringify(checks));
@@ -257,4 +264,50 @@ test("prefilter: compiled like patterns, overridden wholesale, gates without dec
   assert.deepEqual(catalogue.get("style_load_bearing")!.prefilter!.map((p) => p.source), ["structural"]);
   assert.equal(prefilterAllows(catalogue.get("style_not_x_but_y")!, "anything"), true);
   assert.equal(build({}).get("style_load_bearing")!.prefilter!.length, 1, "the built-in module is untouched");
+});
+
+test("duplicate: a built-in, disabled, revise at sends, three named questions at 0.8", () => {
+  const check = build({}).get("duplicate")!;
+  assert.equal(check.kind, "duplicate");
+  assert.equal(check.enabled, false, "off upstream; a deployment enables it");
+  assert.equal(check.remedy, "revise");
+  assert.deepEqual(check.checkpoints, ["send"]);
+  assert.deepEqual(
+    check.questions.map((q) => [q.name, q.source, q.threshold]),
+    [
+      ["answered_already", "message", 0.8],
+      ["repeats", "message", 0.8],
+      ["contradicts", "message", 0.8],
+    ],
+  );
+  assert.equal(
+    check.questions[0]!.instructions,
+    "`draft.text` answers a question or request that one of `earlier[*].text` already answered.",
+  );
+  assert.equal(check.questions[1]!.instructions, "Most of the information in `draft.text` already appears in one of `earlier[*].text`.");
+  assert.equal(
+    check.questions[2]!.instructions,
+    "`draft.text` states something that conflicts with a statement in one of `earlier[*].text`.",
+  );
+});
+
+test("thresholds: per question by name (or source), per agent too; enabling keeps the questions", () => {
+  const catalogue = build({
+    checks: { duplicate: { enabled: true, thresholds: { repeats: 0.9 } } },
+    agents: { agent_a: { workspace_root: "/a", checks: { duplicate: { thresholds: { contradicts: 0.7 } } } } },
+  });
+  const global = catalogue.get("duplicate")!;
+  assert.equal(global.enabled, true);
+  assert.deepEqual(global.questions.map((q) => q.threshold), [0.8, 0.9, 0.8]);
+  assert.deepEqual(catalogue.get("duplicate", "agent_a")!.questions.map((q) => q.threshold), [0.8, 0.9, 0.7]);
+  // An unnamed question is keyed by its source.
+  const styled = build({ checks: { style_moralizing: { thresholds: { message: 0.5 } } } }).get("style_moralizing")!;
+  assert.deepEqual(styled.questions.map((q) => q.threshold), [0.5]);
+  // Config questions may carry a name.
+  const custom = build({
+    checks: { x: { kind: "duplicate", questions: [question({ name: "same_link" })] } },
+  }).get("x")!;
+  assert.equal(custom.questions[0]!.name, "same_link");
+  assert.equal(custom.remedy, "revise", "a duplicate check revises by default");
+  assert.deepEqual(custom.checkpoints, ["send"]);
 });
