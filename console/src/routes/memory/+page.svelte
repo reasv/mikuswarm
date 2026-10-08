@@ -6,6 +6,7 @@
 		groupFilterHits,
 		hitCitation,
 		hitMatchLabel,
+		sourceLabel,
 		sourceMix
 	} from '$lib/memory-retrieval';
 
@@ -23,6 +24,7 @@
 
 	const SOURCE_CLASSES: Record<string, string> = {
 		model: 'bg-sky-500',
+		model_fallback: 'bg-sky-300',
 		fallback: 'bg-amber-500',
 		unjudged: 'bg-amber-300',
 		none: 'bg-muted-foreground/40'
@@ -66,7 +68,7 @@
 												<div
 													class={SOURCE_CLASSES[m.source] ?? 'bg-violet-400'}
 													style="width: {((m.share ?? 0) * 100).toFixed(2)}%"
-													title={`${m.source} ${m.count}`}
+													title={`${sourceLabel(m.source)} ${m.count}`}
 												></div>
 											{/if}
 										{/each}
@@ -76,7 +78,7 @@
 									{#each mix as m (m.source)}
 										<span class="flex items-center gap-1">
 											<span class="inline-block size-2 rounded-sm {SOURCE_CLASSES[m.source] ?? 'bg-violet-400'}"></span>
-											{m.source}
+											{sourceLabel(m.source)}
 											<span class="text-muted-foreground">{m.count}{m.share != null ? ` (${formatRate(m.share)})` : ''}</span>
 										</span>
 									{/each}

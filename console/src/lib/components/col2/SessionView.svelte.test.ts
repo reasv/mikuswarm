@@ -141,4 +141,9 @@ test('SessionView renders a fallback memory build that has no decision rows', as
 	await expect.element(card).toHaveTextContent(/fallback/);
 	await expect.element(card).toHaveTextContent(/timeout/);
 	await expect.element(card).toHaveTextContent(/kept 1 of 3/);
+	// Fallback-selected items are marked: on the header and on the item.
+	await expect.element(page.getByTestId('memory-fell-back')).toHaveTextContent(/1 fell back/);
+	await card.getByRole('button').first().click();
+	await expect.element(page.getByTestId('memory-selected-by')).toHaveTextContent(/fallback/);
+	await expect.element(card).toHaveTextContent(/3 unjudged/);
 });

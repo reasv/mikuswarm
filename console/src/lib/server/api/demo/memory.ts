@@ -312,7 +312,9 @@ export function fallbackRetrievalFixture(opts: { sessionId: string; timelineKey:
 		lanes: p.lanes,
 		hybrid: r3(p.hybrid),
 		presence: p.presence,
-		stage: i === 0 ? 'kept' : 'not_judged'
+		stage: i === 0 ? 'kept' : 'not_judged',
+		judged: false,
+		...(i === 0 ? { selectedBy: 'fallback' } : {})
 	}));
 	return {
 		retrievals: [
@@ -335,6 +337,8 @@ export function fallbackRetrievalFixture(opts: { sessionId: string; timelineKey:
 					reason: 'timeout',
 					candidates: 3,
 					judged: 0,
+					unjudged: 3,
+					fellBack: 1,
 					kept: 1,
 					hidden: 0,
 					tokens: 120,
@@ -395,7 +399,7 @@ export function memoryStatsFixture(now: number): unknown {
 				followedUp: 23,
 				rate: 23 / 184,
 				builds: 412,
-				sources: { model: 371, fallback: 12, unjudged: 4, none: 25 }
+				sources: { model: 362, model_fallback: 9, fallback: 12, unjudged: 4, none: 25 }
 			},
 			{
 				days: 30,
@@ -404,7 +408,7 @@ export function memoryStatsFixture(now: number): unknown {
 				followedUp: 71,
 				rate: 71 / 690,
 				builds: 1530,
-				sources: { model: 1322, fallback: 61, unjudged: 19, none: 128 }
+				sources: { model: 1290, model_fallback: 32, fallback: 61, unjudged: 19, none: 128 }
 			}
 		]
 	};

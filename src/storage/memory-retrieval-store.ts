@@ -733,11 +733,20 @@ export class MemoryRetrievalStore {
     );
   }
 
-  /** Builds since `sinceTs` counted by source (model / fallback / unjudged / none). */
+  /**
+   * Builds since `sinceTs` counted by source (model / fallback / unjudged /
+   * none); a `model` build that also showed fallback-selected items counts as
+   * `model_fallback`.
+   */
   sourceCounts(sinceTs: number): Record<string, number> {
     return this.storage.read((db) => {
       const rows = db
-        .prepare(`select source, count(*) as n from memory_retrievals where ts >= ? group by source`)
+        .prepare(
+          `select case when source = 'model' and json_valid(report_json) and coalesce(json_extract(report_json, '$.fellBack'), 0) > 0
+                       then 'model_fallback' else source end as source,
+                  count(*) as n
+           from memory_retrievals where ts >= ? group by 1`,
+        )
         .all(sinceTs) as Array<{ source: string; n: number }>;
       return Object.fromEntries(rows.map((r) => [r.source, r.n]));
     });

@@ -10,6 +10,7 @@
 		parseRetrievalReport,
 		retrievalCountsLabel,
 		scoresLabel,
+		selectionLabel,
 		stageLabel,
 		stageTimings,
 		type ReportItem
@@ -84,6 +85,13 @@
 		{#if reason}
 			<span class="text-[10px] text-amber-600 italic dark:text-amber-400">{reason}</span>
 		{/if}
+		{#if report?.fellBack}
+			<span
+				data-testid="memory-fell-back"
+				class="rounded bg-amber-500/20 px-1 py-0.5 font-mono text-[10px] text-amber-700 dark:text-amber-300"
+				title="shown items the fallback rule chose (the judge did not answer for them)">{report.fellBack} fell back</span
+			>
+		{/if}
 		<span class="rounded bg-muted px-1 py-0.5 font-mono text-[10px] text-muted-foreground"
 			>{retrievalCountsLabel(retrieval)}</span
 		>
@@ -111,6 +119,9 @@
 			<div class="flex flex-wrap gap-x-3 font-mono text-[10px] text-muted-foreground">
 				<span>{retrieval.candidates} candidates</span>
 				<span>{retrieval.judged} judged</span>
+				{#if report?.unjudged}
+					<span title="passages without a model verdict (fallback rule)">{report.unjudged} unjudged</span>
+				{/if}
 				<span>{retrieval.kept} kept</span>
 				<span>{retrieval.hidden} hidden</span>
 				{#each timings as t (t)}
@@ -137,10 +148,18 @@
 							<ul class="space-y-0.5">
 								{#each section.items as item, i (itemKey(item, i))}
 									{@const judge = judgeLabel(item)}
+									{@const selection = selectionLabel(item)}
 									<li class="flex flex-wrap items-baseline gap-x-2 font-mono text-[11px]">
 										<span class="text-foreground">{item.citation}</span>
 										{#if section.name === 'Cut'}
 											<span class="rounded bg-muted px-1 text-[10px] text-muted-foreground">{stageLabel(item.stage)}</span>
+										{/if}
+										{#if selection}
+											<span
+												data-testid="memory-selected-by"
+												class="rounded bg-amber-500/20 px-1 text-[10px] text-amber-700 dark:text-amber-300"
+												title="chosen without a model verdict">{selection}</span
+											>
 										{/if}
 										{#if item.hiddenBy}
 											<span class="text-[10px] text-amber-700 dark:text-amber-300">{hiddenByLabel(item.hiddenBy)}</span>

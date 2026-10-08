@@ -20,6 +20,8 @@ import {
 	parseRetrievalReport,
 	retrievalCountsLabel,
 	scoresLabel,
+	selectionLabel,
+	sourceLabel,
 	sourceMix,
 	stageLabel,
 	stageTimings
@@ -105,6 +107,40 @@ describe('parseRetrievalReport', () => {
 				stage: 'future_stage'
 			}
 		]);
+	});
+});
+
+describe('fallback markers', () => {
+	it('reads judged, selectedBy, unjudged, fellBack and aborted', () => {
+		const r = parseRetrievalReport(
+			JSON.stringify({
+				source: 'model',
+				candidates: 3,
+				judged: 1,
+				unjudged: 2,
+				fellBack: 1,
+				aborted: true,
+				kept: 2,
+				hidden: 0,
+				tokens: 10,
+				ms: 1,
+				stages: { recallMs: 1 },
+				items: [
+					{ contentHash: 'a', citation: 'c', lanes: [], hybrid: 0.7, presence: false, stage: 'kept', judged: false, selectedBy: 'fallback' },
+					{ contentHash: 'b', citation: 'd', lanes: [], hybrid: 0.7, presence: false, stage: 'kept', judged: true, selectedBy: 'judge' },
+					{ contentHash: 'e', citation: 'f', lanes: [], hybrid: 0.7, presence: false, stage: 'aborted' }
+				]
+			})
+		)!;
+		expect([r.unjudged, r.fellBack, r.aborted]).toEqual([2, 1, true]);
+		expect(r.items[0]).toMatchObject({ judged: false, selectedBy: 'fallback' });
+		expect(r.items[1]).toMatchObject({ judged: true, selectedBy: 'judge' });
+		expect(r.items.map(selectionLabel)).toEqual(['fallback', null, null]);
+		expect(selectionLabel({ stage: 'kept', selectedBy: 'unjudged' })).toBe('unjudged');
+		expect(stageLabel('aborted')).toBe('plan aborted, not shown');
+		const old = parseRetrievalReport(JSON.stringify({ source: 'model', items: [{ contentHash: 'a', citation: 'c', stage: 'kept' }] }))!;
+		expect(old.fellBack).toBeUndefined();
+		expect(old.items[0]!.judged).toBeUndefined();
 	});
 });
 
@@ -202,22 +238,25 @@ describe('filters audit', () => {
 });
 
 describe('stats', () => {
-	it('source mix lists the four sources first, with shares', () => {
+	it('source mix lists the known sources first, with shares', () => {
 		const { windows } = Schema.decodeUnknownSync(MemoryStatsResponse)(
 			resolveFixture('/api/memory/stats', new URLSearchParams())
 		);
 		expect(windows.map((w) => w.days)).toEqual([7, 30]);
 		const mix = sourceMix(windows[0]!);
-		expect(mix.map((m) => m.source)).toEqual(['model', 'fallback', 'unjudged', 'none']);
+		expect(mix.map((m) => m.source)).toEqual(['model', 'model_fallback', 'fallback', 'unjudged', 'none']);
 		expect(mix.reduce((a, m) => a + m.count, 0)).toBe(windows[0]!.builds);
 		expect(sourceMix({ sources: { none: 2, experimental: 2 } })).toEqual([
 			{ source: 'model', count: 0, share: 0 },
+			{ source: 'model_fallback', count: 0, share: 0 },
 			{ source: 'fallback', count: 0, share: 0 },
 			{ source: 'unjudged', count: 0, share: 0 },
 			{ source: 'none', count: 2, share: 0.5 },
 			{ source: 'experimental', count: 2, share: 0.5 }
 		]);
 		expect(sourceMix({ sources: {} }).every((m) => m.share === null)).toBe(true);
+		expect(sourceLabel('model_fallback')).toBe('model + fallback');
+		expect(sourceLabel('model')).toBe('model');
 	});
 
 	it('formats the rate', () => {

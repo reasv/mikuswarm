@@ -20,7 +20,8 @@ export const ITEM_STAGES = [
 	'cut_rerank',
 	'not_judged',
 	'not_selected',
-	'budget'
+	'budget',
+	'aborted'
 ] as const;
 export type ItemStage = (typeof ITEM_STAGES)[number];
 
@@ -48,6 +49,10 @@ export interface ReportItem {
 	/** One of ITEM_STAGES, or an unknown stage from a newer backend, kept verbatim. */
 	stage: string;
 	hiddenBy?: HiddenBy;
+	/** True when the memory point answered for this passage; false when it did not (absent on older reports). */
+	judged?: boolean;
+	/** A kept item's chooser: `judge`, `fallback` (the decision chain did not answer for it) or `unjudged` (no decision model). */
+	selectedBy?: string;
 }
 
 export interface LateStage {
@@ -70,6 +75,12 @@ export interface RetrievalReport {
 	reason?: string;
 	candidates: number;
 	judged: number;
+	/** Passages that got no model verdict (they went through the fallback rule). */
+	unjudged?: number;
+	/** Shown items the fallback rule chose. */
+	fellBack?: number;
+	/** The plan was aborted before the build used it: nothing was shown. */
+	aborted?: boolean;
 	kept: number;
 	hidden: number;
 	tokens: number;
@@ -133,7 +144,9 @@ function parseItem(v: unknown): ReportItem | null {
 		aboutParticipant: num(v.aboutParticipant),
 		presence: v.presence === true,
 		stage: v.stage,
-		...(hiddenBy ? { hiddenBy } : {})
+		...(hiddenBy ? { hiddenBy } : {}),
+		...(typeof v.judged === 'boolean' ? { judged: v.judged } : {}),
+		...(typeof v.selectedBy === 'string' ? { selectedBy: v.selectedBy } : {})
 	};
 }
 
@@ -168,11 +181,16 @@ export function parseRetrievalReport(json: string | null | undefined): Retrieval
 	const judgeMs = num(stages.judgeMs);
 	const reason = str(v.reason);
 	const decisionGroup = str(v.decisionGroup);
+	const unjudged = num(v.unjudged);
+	const fellBack = num(v.fellBack);
 	return {
 		source: str(v.source) ?? '?',
 		...(reason !== null ? { reason } : {}),
 		candidates: num(v.candidates) ?? 0,
 		judged: num(v.judged) ?? 0,
+		...(unjudged !== null ? { unjudged } : {}),
+		...(fellBack !== null ? { fellBack } : {}),
+		...(v.aborted === true ? { aborted: true } : {}),
 		kept: num(v.kept) ?? 0,
 		hidden: num(v.hidden) ?? 0,
 		tokens: num(v.tokens) ?? 0,
@@ -228,8 +246,21 @@ const STAGE_LABELS: Record<string, string> = {
 	cut_rerank: 'cut at rerank',
 	not_judged: 'not judged',
 	not_selected: 'not selected',
-	budget: 'over token budget'
+	budget: 'over token budget',
+	aborted: 'plan aborted, not shown'
 };
+
+/**
+ * The badge of a kept item chosen without a model verdict: "fallback" (the
+ * decision chain did not answer for it, or it was over `max_judged`) or
+ * "unjudged" (no decision model); null for a judge's pick.
+ */
+export function selectionLabel(item: Pick<ReportItem, 'stage' | 'selectedBy'>): string | null {
+	if (item.stage !== 'kept') return null;
+	if (item.selectedBy === 'fallback') return 'fallback';
+	if (item.selectedBy === 'unjudged') return 'unjudged';
+	return null;
+}
 
 export function stageLabel(stage: string): string {
 	return STAGE_LABELS[stage] ?? stage;
@@ -359,13 +390,23 @@ export function groupFilterHits(hits: readonly MemoryFilterHit[]): FilterHitGrou
 
 // ── Stats (spec §9 follow-up rate) ──────────────────────────────────────────
 
-export const RETRIEVAL_SOURCES = ['model', 'fallback', 'unjudged', 'none'] as const;
+/**
+ * Build sources in the mix. `model_fallback` is a `model` build that also
+ * showed fallback-selected items (some passages got no verdict).
+ */
+export const RETRIEVAL_SOURCES = ['model', 'model_fallback', 'fallback', 'unjudged', 'none'] as const;
+
+const SOURCE_LABELS: Record<string, string> = { model_fallback: 'model + fallback' };
+
+export function sourceLabel(source: string): string {
+	return SOURCE_LABELS[source] ?? source;
+}
 
 export function formatRate(rate: number | null | undefined): string {
 	return rate == null || !Number.isFinite(rate) ? '—' : `${(rate * 100).toFixed(1)}%`;
 }
 
-/** The source mix of a window: the four known sources first (zero when absent), then any others. */
+/** The source mix of a window: the known sources first (zero when absent), then any others. */
 export function sourceMix(window: Pick<MemoryStatsWindow, 'sources'>): Array<{ source: string; count: number; share: number | null }> {
 	const counts = new Map<string, number>();
 	for (const s of RETRIEVAL_SOURCES) counts.set(s, 0);
