@@ -1493,3 +1493,21 @@ test("list_channels: isolated DM is excluded even when include_dms=true", async 
     assert.ok(text.includes(roomKey), `non-isolated room should appear, got: ${text}`);
   });
 });
+
+test("send_dm: a failed DM is reported as an error (late input does not count it as delivered)", async () => {
+  await withStorage(async (storage, timeline) => {
+    await storage.upsertUserIdentity({ provider: "matrix", userId: "@bob:example.org", username: "bob", observedAt: Date.now() });
+    const provider: IChatProvider = {
+      ...stubProvider("matrix"),
+      openDm: async () => {
+        throw new Error("homeserver unreachable");
+      },
+    };
+    const ctx = makeCcCtx({ storage, timeline, provider, providers: new Map([["matrix", provider]]) });
+    const sendDmTool = createCrossChannelTools(ctx).find((t) => t.name === "send_dm")!;
+    const result = await sendDmTool.execute("call1", { user: "@bob:example.org", message: "hi", context_note: "n" }, undefined as never);
+    const text = result.content[0]!.text as string;
+    assert.match(text, /^error: failed to open DM with @bob:example\.org: homeserver unreachable/);
+    assert.ok(text.includes("message_ref"), "the retry handle is kept");
+  });
+});

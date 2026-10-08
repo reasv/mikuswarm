@@ -547,7 +547,7 @@ function createSendDmTool(
           const ref = stash.store(body, mediaRefs, asVoice);
           const msg = err instanceof Error ? err.message : String(err);
           return {
-            content: [{ type: "text", text: `Failed to resolve media: ${msg}\n(message_ref: "${ref}" to retry)` }],
+            content: [{ type: "text", text: `error: failed to resolve media: ${msg}\n(message_ref: "${ref}" to retry)` }],
             details: null,
           };
         }
@@ -564,7 +564,7 @@ function createSendDmTool(
         return {
           content: [{
             type: "text",
-            text: `Failed to open DM with ${userId}: ${msg}\n(message_ref: "${ref}" to retry once the issue is resolved)`,
+            text: `error: failed to open DM with ${userId}: ${msg}\n(message_ref: "${ref}" to retry once the issue is resolved)`,
           }],
           details: null,
         };
@@ -604,7 +604,7 @@ function createSendDmTool(
         return {
           content: [{
             type: "text",
-            text: `Failed to send DM to ${userId}: ${msg}\n(message_ref: "${ref}" to retry)`,
+            text: `error: failed to send DM to ${userId}: ${msg}\n(message_ref: "${ref}" to retry)`,
           }],
           details: null,
         };
@@ -850,7 +850,7 @@ function createSendToChannelTool(
           const ref = stash.store(body, mediaRefs, asVoice);
           const msg = err instanceof Error ? err.message : String(err);
           return {
-            content: [{ type: "text", text: `Failed to resolve media: ${msg}\n(message_ref: "${ref}" to retry)` }],
+            content: [{ type: "text", text: `error: failed to resolve media: ${msg}\n(message_ref: "${ref}" to retry)` }],
             details: null,
           };
         }
@@ -874,8 +874,8 @@ function createSendToChannelTool(
         // N1(b): translate "not in room" send failures into an actionable error.
         const isUnjoinedError = /not a member|forbidden|not joined|M_FORBIDDEN|not in the room|left the room/i.test(msg);
         const friendlyMsg = isUnjoinedError
-          ? `Failed to send to ${channelKey}: the bot may no longer be in that room — use list_channels for current valid targets. (${msg})`
-          : `Failed to send to ${channelKey}: ${msg}`;
+          ? `error: failed to send to ${channelKey}: the bot may no longer be in that room — use list_channels for current valid targets. (${msg})`
+          : `error: failed to send to ${channelKey}: ${msg}`;
         return {
           content: [{
             type: "text",
