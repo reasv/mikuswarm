@@ -1106,6 +1106,10 @@ export class DiscordProvider implements IChatProvider {
       trigger: undefined, // edits never re-trigger
     };
     editInbound.event.trigger = undefined;
+    // The edit's own time, not the message's creation time: it orders edits
+    // (latest wins) and is the edit's send time for late input (an edit made
+    // after the bot's reply must not count as sent before it).
+    if (typeof message.editedTimestamp === "number") editInbound.event.timestamp = message.editedTimestamp;
 
     this.host!.onEvent(editInbound);
   }
