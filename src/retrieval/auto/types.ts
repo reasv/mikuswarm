@@ -94,6 +94,13 @@ export interface ReportItem {
   presence: boolean;
   stage: ItemStage;
   hiddenBy?: HiddenBy;
+  /** True when the memory point answered for this passage. */
+  judged?: boolean;
+  /**
+   * For a kept item: chosen by the judge, by the fallback rule (the decision
+   * chain did not answer for it), or by the unjudged selection (no decision model).
+   */
+  selectedBy?: "judge" | "fallback" | "unjudged";
 }
 
 export type RetrievalSource = "model" | "fallback" | "unjudged" | "none";
@@ -104,6 +111,10 @@ export interface RetrievalReport {
   reason?: string;
   candidates: number;
   judged: number;
+  /** Passages sent to the judge that got no model verdict (they went through the fallback rule). */
+  unjudged?: number;
+  /** Shown items the fallback rule chose (the decision chain did not answer for them). */
+  fellBack?: number;
   kept: number;
   hidden: number;
   tokens: number;

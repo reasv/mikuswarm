@@ -138,6 +138,8 @@ export class MemoryRetrievalPipeline {
       items: [],
     };
     const itemStage = new Map<string, ItemStage>();
+    /** Items the fallback rule selected (never a model verdict). */
+    const fallbackSelected = new Set<string>();
     const verdicts = new Map<string, MemoryPassageVerdict>();
 
     // ── 1. Wide recall ────────────────────────────────────────────────────
@@ -487,7 +489,22 @@ export class MemoryRetrievalPipeline {
           else if (!verdicts.has(c.chunk.contentHash)) itemStage.set(c.chunk.contentHash, "not_judged");
           else if (!verdicts.get(c.chunk.contentHash)!.keep) itemStage.set(c.chunk.contentHash, "dropped");
         }
-        selected = orderJudged(keptList, verdicts);
+        // Passages the judge never answered (group capacity, the point's timeout,
+        // a failed request) are not dropped: they go through the fallback rule
+        // (the last scorer's calibrated cutoff, else the hybrid floor), at most
+        // `fallback_max_results` of them, after the judged keepers.
+        const unjudged = pool.filter((c) => !verdicts.has(c.chunk.contentHash) && !c.hiddenBy);
+        const rescued = this.selectWithoutJudge(unjudged, {
+          cap: auto.fallbackMaxResults,
+          rerankRan,
+          rerankCutoff,
+          lateRan,
+          lateQueryModel,
+          legacy: false,
+        });
+        for (const c of rescued) fallbackSelected.add(c.chunk.contentHash);
+        if (unjudged.length > 0) report.unjudged = unjudged.length;
+        selected = [...orderJudged(keptList, verdicts), ...rescued];
       } else {
         source = "fallback";
         const reasons = outcomes.map((o) => o?.reason).filter(Boolean);
@@ -501,6 +518,7 @@ export class MemoryRetrievalPipeline {
           lateQueryModel,
           legacy: false,
         });
+        for (const c of selected) fallbackSelected.add(c.chunk.contentHash);
       }
     } else {
       source = pool.length > 0 ? "unjudged" : "none";
@@ -538,7 +556,8 @@ export class MemoryRetrievalPipeline {
     for (const c of pool) if (!itemStage.has(c.chunk.contentHash) && !selected.includes(c)) itemStage.set(c.chunk.contentHash, "not_selected");
 
     // ── 6. Excerpts and packing ───────────────────────────────────────────
-    const note = source === "model" ? JUDGED_NOTE : UNJUDGED_NOTE;
+    // The judged note only when every shown item was judged.
+    const note = source === "model" && !selected.some((c) => fallbackSelected.has(c.chunk.contentHash)) ? JUDGED_NOTE : UNJUDGED_NOTE;
     const wrapper = `<retrieved_memory note="${note}">\n</retrieved_memory>`;
     let budget = auto.maxTokens - estimateTokens(wrapper);
     const lines: string[] = [];
@@ -584,14 +603,18 @@ export class MemoryRetrievalPipeline {
       };
       if (c.late !== undefined) item.late = c.late === null ? null : round3(c.late);
       if (c.rerank !== undefined) item.rerank = round3(c.rerank);
+      item.judged = v !== undefined;
       if (v) {
         item.relevant = v.relevant;
         item.aboutParticipant = v.aboutParticipant;
       }
+      if (item.stage === "kept") item.selectedBy = fallbackSelected.has(c.chunk.contentHash) ? "fallback" : v ? "judge" : "unjudged";
       if (c.hiddenBy) item.hiddenBy = c.hiddenBy;
       return item;
     });
     report.hidden = report.items.filter((i) => i.stage === "hidden").length;
+    const fellBack = report.items.filter((i) => i.selectedBy === "fallback").length;
+    if (fellBack > 0) report.fellBack = fellBack;
     report.ms = this.now() - started;
     this.deps.logger?.info("memory_retrieval", {
       agent: agent ?? undefined,
@@ -599,6 +622,8 @@ export class MemoryRetrievalPipeline {
       sessionId: input.attribution.agentSessionId ?? undefined,
       candidates: report.candidates,
       judged: report.judged,
+      ...(report.unjudged ? { unjudged: report.unjudged } : {}),
+      fellBack: report.fellBack ?? 0,
       kept: report.kept,
       hidden: report.hidden,
       tokens: report.tokens,

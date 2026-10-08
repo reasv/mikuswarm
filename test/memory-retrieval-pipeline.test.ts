@@ -21,6 +21,8 @@ import type { PlanInput } from "../src/retrieval/auto/types.js";
 import { DecisionClient, DecisionEngine, type DecisionEvaluationRow } from "../src/decisions/index.js";
 import { MemoryFilterService } from "../src/retrieval/filters/index.js";
 import type { AppConfig } from "../src/config/index.js";
+import { ProviderChain } from "../src/retrieval/models/chain.js";
+import type { RerankProvider } from "../src/retrieval/models/types.js";
 
 const TZ = "UTC";
 const DAY = 86_400_000;
@@ -40,12 +42,20 @@ function decider(): any {
 }
 
 /** The fake decisions endpoint: answers from the passage text (or fails). */
-function decisionsFetch(opts: { fail?: boolean; calls: any[] }) {
+function decisionsFetch(opts: { fail?: boolean; hang?: RegExp; calls: any[] }) {
   return (async (_url: string, init: RequestInit) => {
     const body = JSON.parse(String(init.body));
     opts.calls.push(body);
     if (opts.fail) return new Response("upstream down", { status: 503 });
     const text: string = body.state?.passage?.text ?? body.state?.entry?.text ?? "";
+    // A passage matching `hang` never gets an answer: the point's timeout ends it.
+    if (opts.hang?.test(text)) {
+      return new Promise<Response>((_resolve, reject) => {
+        const abort = () => reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+        if (init.signal?.aborted) abort();
+        else init.signal?.addEventListener("abort", abort, { once: true });
+      });
+    }
     const answers: Record<string, unknown> = {};
     for (const id of Object.keys(body.questions)) {
       if (id === "relevant") answers[id] = { noul: /KEEP-HIGH/.test(text) ? 0.95 : /KEEP/.test(text) ? 0.8 : 0.1 };
@@ -71,7 +81,15 @@ interface Stack {
 
 async function withStack(
   files: Record<string, string>,
-  opts: { decisions?: boolean; fail?: boolean; filters?: Record<string, unknown>; auto?: Record<string, unknown> },
+  opts: {
+    decisions?: boolean;
+    fail?: boolean;
+    hang?: RegExp;
+    decisionsConfig?: Record<string, unknown>;
+    filters?: Record<string, unknown>;
+    auto?: Record<string, unknown>;
+    rerank?: { minScore: number; score: (doc: string) => number };
+  },
   run: (s: Stack) => Promise<void>,
 ): Promise<void> {
   configureAgentTimezone(TZ);
@@ -85,7 +103,13 @@ async function withStack(
   topics.forEach((t, i) => (filler += block("2026-01-15", `${String(8 + i).padStart(2, "0")}`, "lobby", `Chatter about ${t} and ${t} plans.`)));
   await writeFile(path.join(workspaceRoot, "memory", "2026-01-15.md"), filler);
   const storage = await Storage.open({ databasePath: path.join(dir, "t.db") });
-  const config = resolveRetrievalConfig({ enabled: true, auto: { ...(opts.auto ?? {}) } as any });
+  const config = resolveRetrievalConfig({
+    enabled: true,
+    auto: { ...(opts.auto ?? {}) },
+    ...(opts.rerank
+      ? { rerank: { enabled: true, chain: ["fake"], providers: { fake: { kind: "remote", endpoint: "http://rerank.invalid", zdr: true, min_score: opts.rerank.minScore } } } }
+      : {}),
+  } as any);
   const indexer = new MemoryIndexer({ storage, workspaceRoot, config, tokenizer: new GptTokenizer() });
   await indexer.reconcileAll();
   const search = new MemorySearch(storage, indexer, config);
@@ -104,7 +128,7 @@ async function withStack(
   };
   const appConfig = {
     models: { decider: decider() },
-    decisions: opts.decisions === false ? undefined : { enabled: true, model: "decider" },
+    decisions: opts.decisions === false ? undefined : { enabled: true, model: "decider", ...(opts.decisionsConfig ?? {}) },
     retrieval: { enabled: true, ...(opts.filters ? { filters: opts.filters } : {}) },
   } as unknown as AppConfig;
   const engine =
@@ -112,12 +136,22 @@ async function withStack(
       ? undefined
       : new DecisionEngine({
           config: appConfig,
-          client: new DecisionClient({ models: appConfig.models, fetchImpl: decisionsFetch({ fail: opts.fail, calls }), logger }),
+          client: new DecisionClient({ models: appConfig.models, fetchImpl: decisionsFetch({ fail: opts.fail, hang: opts.hang, calls }), logger }),
           onEvaluation: (row) => rows.push(row),
           logger,
         });
   const filters = new MemoryFilterService({ config: appConfig, store, engine: () => engine, logger });
-  const pipeline = new MemoryRetrievalPipeline({ search, store, config, filters, engine: () => engine, logger });
+  const rerankScore = opts.rerank?.score;
+  const rerank = rerankScore
+    ? new ProviderChain<RerankProvider>("rerank", [
+        {
+          provider: { name: "fake", kind: "remote", score: async (_q: string, docs: string[]) => docs.map(rerankScore), close: async () => {} } as unknown as RerankProvider,
+          enabled: true,
+          timeoutMs: 1000,
+        },
+      ])
+    : undefined;
+  const pipeline = new MemoryRetrievalPipeline({ search, store, config, filters, engine: () => engine, logger, ...(rerank ? { rerank } : {}) });
   try {
     await run({ storage, store, pipeline, workspaceRoot, rows, calls, logs });
   } finally {
@@ -212,6 +246,91 @@ test("fallback: chain down → hybrid ranking above fallback_min_score, at most 
     assert.equal(plan.report.source, "fallback");
     assert.ok(plan.report.kept <= 2);
     assert.ok(plan.block === null || plan.block.includes(UNJUDGED_NOTE));
+  });
+});
+
+test("partial judgement: timed-out passages fall back (capped) after the judged keepers, never dropped", async () => {
+  const files = {
+    "2026-05-06.md":
+      block("2026-05-06", "09:00", "kitchen", "KEEP the pancake recipe needs buttermilk, we decided.") +
+      block("2026-05-06", "10:00", "kitchen", "SLOW pancake recipe decided pancake recipe one") +
+      block("2026-05-06", "11:00", "kitchen", "SLOW pancake recipe decided pancake recipe two") +
+      block("2026-05-06", "12:00", "kitchen", "SLOW pancake recipe decided pancake recipe three") +
+      block("2026-05-06", "13:00", "kitchen", "SLOW pancake recipe decided pancake recipe four"),
+  };
+  const opts = { hang: /SLOW/, decisionsConfig: { timeout_ms: 150 }, auto: { fallback_min_score: 0, fallback_max_results: 2 } };
+  await withStack(files, opts, async ({ pipeline, logs }) => {
+    const plan = await pipeline.plan(input());
+    const r = plan.report;
+    assert.equal(r.source, "model");
+    assert.ok(r.judged >= 1);
+    assert.equal(r.unjudged, 4);
+    assert.equal(r.fellBack, 2, "capped at fallback_max_results");
+    assert.equal(r.kept, 3);
+    const kept = r.items.filter((i) => i.stage === "kept");
+    const byJudge = kept.filter((i) => i.selectedBy === "judge");
+    const byFallback = kept.filter((i) => i.selectedBy === "fallback");
+    assert.equal(byJudge.length, 1);
+    assert.ok(byJudge.every((i) => i.judged === true));
+    assert.equal(byFallback.length, 2);
+    assert.ok(byFallback.every((i) => i.judged === false));
+    // The rest of the unjudged passages are reported, not silently gone.
+    assert.equal(r.items.filter((i) => i.stage === "not_judged").length, 2);
+    // Judged keepers come first; the note is the unjudged one (not every item was judged).
+    assert.ok(plan.block!.includes(UNJUDGED_NOTE));
+    assert.ok(plan.block!.indexOf("buttermilk") < plan.block!.indexOf("SLOW"));
+    const line = logs.find(([e]) => e === "memory_retrieval")![1];
+    assert.equal(line.fellBack, 2);
+    assert.equal(line.unjudged, 4);
+  });
+  // The overall max_results still bounds the judged keepers plus the fallback picks.
+  await withStack(files, { ...opts, auto: { ...opts.auto, max_results: 2 } }, async ({ pipeline }) => {
+    const plan = await pipeline.plan(input());
+    assert.equal(plan.report.kept, 2);
+    assert.equal(plan.report.items.filter((i) => i.selectedBy === "judge").length, 1);
+    assert.equal(plan.report.fellBack, 1);
+    assert.equal(plan.report.items.filter((i) => i.stage === "budget").length, 1);
+  });
+});
+
+test("all unjudged: the full fallback is unchanged and marks every shown item as fallen back", async () => {
+  const files = {
+    "2026-05-07.md":
+      block("2026-05-07", "10:00", "kitchen", "pancake recipe decided pancake recipe one") +
+      block("2026-05-07", "11:00", "kitchen", "pancake recipe decided pancake recipe two") +
+      block("2026-05-07", "12:00", "kitchen", "pancake recipe decided pancake recipe three"),
+  };
+  await withStack(files, { fail: true, auto: { fallback_min_score: 0, fallback_max_results: 2 } }, async ({ pipeline }) => {
+    const plan = await pipeline.plan(input());
+    assert.equal(plan.report.source, "fallback");
+    assert.equal(plan.report.judged, 0);
+    assert.equal(plan.report.unjudged, undefined);
+    assert.equal(plan.report.kept, 2);
+    assert.equal(plan.report.fellBack, 2);
+    assert.ok(plan.report.items.filter((i) => i.stage === "kept").every((i) => i.selectedBy === "fallback" && i.judged === false));
+    assert.ok(plan.block!.includes(UNJUDGED_NOTE));
+  });
+});
+
+test("partial judgement with a cross-encoder: the fallback uses its calibrated cutoff, not the hybrid floor", async () => {
+  const files = {
+    "2026-05-08.md":
+      block("2026-05-08", "09:00", "kitchen", "KEEP the pancake recipe needs buttermilk, we decided.") +
+      block("2026-05-08", "10:00", "kitchen", "SLOW ALPHA pancake recipe decided pancake recipe") +
+      block("2026-05-08", "11:00", "kitchen", "SLOW OMEGA pancake recipe decided pancake recipe again"),
+  };
+  // The hybrid floor would admit both slow passages (0); the cross-encoder cutoff admits only ALPHA.
+  const rerank = { minScore: 0.5, score: (doc: string) => (/ALPHA|KEEP/.test(doc) ? 0.9 : 0.2) };
+  await withStack(files, { hang: /SLOW/, decisionsConfig: { timeout_ms: 150 }, auto: { fallback_min_score: 0, fallback_max_results: 2 }, rerank }, async ({ pipeline }) => {
+    const plan = await pipeline.plan(input());
+    assert.equal(plan.report.stages.rerank?.status, "ok");
+    assert.equal(plan.report.source, "model");
+    assert.equal(plan.report.fellBack, 1);
+    const fellBack = plan.report.items.filter((i) => i.selectedBy === "fallback");
+    assert.equal(fellBack.length, 1);
+    assert.equal(fellBack[0]!.rerank, 0.9);
+    assert.ok(plan.block!.includes("ALPHA"));
+    assert.ok(!plan.block!.includes("OMEGA"));
   });
 });
 

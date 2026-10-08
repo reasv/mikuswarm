@@ -213,6 +213,8 @@ export const memoryPoint: DecisionPoint<MemoryPassageInput, MemoryPassageVerdict
     return {
       citation: verdict.meta.citation,
       contentHash: verdict.meta.contentHash,
+      // false on a fallback row: the passage then goes through the fallback rule.
+      judged: verdict.judged,
       keep: verdict.keep,
       relevant: r3(verdict.relevant),
       aboutParticipant: r3(verdict.aboutParticipant),

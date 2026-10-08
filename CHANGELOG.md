@@ -34,7 +34,8 @@ Unreleased section; it is not part of any release's notes.
   relevant are shown, and "none" means no block. It is on by default whenever
   `[decisions]` is on (`[decisions.memory]`, `[retrieval.auto].judge`), starts at
   session launch in parallel with routing, covers proactive sessions, and falls back
-  to a stricter hybrid selection (at most 2 items) when the decision chain is down.
+  to a stricter hybrid selection (at most 2 items) when the decision chain is down, or
+  for the passages it did not answer in time (never silently dropped).
 - **Readable memory excerpts**: a kept diary block is shown whole up to 400 tokens,
   else its heading plus a window around the best-matching part; citations are compact
   (`[memory/<file>.md:<lines> · room]`, the date only when the file name lacks it) and
