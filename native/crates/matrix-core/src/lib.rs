@@ -11,6 +11,7 @@ mod reactions;
 mod state;
 mod sync;
 mod tokenizer;
+mod turboquant;
 
 use std::sync::Mutex;
 

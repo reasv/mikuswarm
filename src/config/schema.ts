@@ -253,6 +253,24 @@ const RetrievalEmbeddingRemoteSchema = StrictObject({
   chars_per_token: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),
 });
 
+// Primary embedder (ARCHITECTURE.md §9d "Two vector indexes"): an optional
+// second vector index served by a GPU or API embedder; the built-in index
+// keeps being maintained and serves whenever the primary does not answer in
+// time. `model` names a [models.*] block with an OpenAI-compatible
+// /embeddings endpoint; its fallback members must serve the SAME model.
+const RetrievalEmbeddingPrimarySchema = StrictObject({
+  enabled: Type.Optional(Type.Boolean()),
+  model: Type.String({ minLength: 1 }),
+  dim: Type.Integer({ minimum: 1 }),
+  // Query-embed deadline; past it the query uses the built-in index. Default 1000.
+  timeout_ms: Type.Optional(Type.Integer({ minimum: 50, maximum: 60_000 })),
+  // Diary text derives from user messages: a remote embedder must be ZDR or
+  // self-hosted, and the operator says which (one of the two is required).
+  zdr: Type.Optional(Type.Boolean()),
+  self_hosted: Type.Optional(Type.Boolean()),
+  chars_per_token: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),
+});
+
 const RetrievalEmbeddingSchema = StrictObject({
   // Active-model resolution (§5a): 'remote' if the [remote] block is set, else the
   // bundled 'local' ONNX model (the zero-config default + safety net).
@@ -268,7 +286,137 @@ const RetrievalEmbeddingSchema = StrictObject({
     }),
   ),
   remote: Type.Optional(RetrievalEmbeddingRemoteSchema),
+  primary: Type.Optional(RetrievalEmbeddingPrimarySchema),
 });
+
+// One provider of a re-ranking or late-interaction chain (ARCHITECTURE.md §9d).
+// `remote`: an HTTP inference server or API; `local`: in process on the ONNX
+// runtime the built-in embedder uses.
+const RetrievalModelProviderSchema = StrictObject({
+  kind: Type.Union([Type.Literal("remote"), Type.Literal("local")]),
+  // false = skipped without waiting for a failure (reload the config to apply).
+  enabled: Type.Optional(Type.Boolean()),
+  // remote: base URL; the provider POSTs to `${endpoint}${path}`.
+  endpoint: Type.Optional(Type.String({ minLength: 1 })),
+  path: Type.Optional(Type.String()),
+  api_key: Type.Optional(Type.String()),
+  // remote: the model id sent on the wire; local: a Hugging Face repo id whose
+  // files are downloaded once into the data dir. Late interaction: the model
+  // this provider serves (must be the index's model or of its family).
+  model: Type.Optional(Type.String({ minLength: 1 })),
+  // Required for every remote provider: one of the two must be true.
+  zdr: Type.Optional(Type.Boolean()),
+  self_hosted: Type.Optional(Type.Boolean()),
+  // remote re-rankers: "documents" ({ model, query, documents }, the Cohere/Jina
+  // /vLLM/Infinity/llama.cpp shape, default) or "texts" ({ query, texts }, TEI).
+  request_format: Type.Optional(Type.Union([Type.Literal("documents"), Type.Literal("texts")])),
+  // Per-member call deadline; unset = the stage's timeout_ms.
+  timeout_ms: Type.Optional(Type.Integer({ minimum: 50, maximum: 120_000 })),
+  // Calibrated cutoff of THIS provider's scores (scores differ across models).
+  min_score: Type.Optional(Type.Number()),
+  // local: a directory holding the model files instead of a download.
+  model_dir: Type.Optional(Type.String({ minLength: 1 })),
+  // local: the ONNX file inside the repo / directory. Default "onnx/model.onnx".
+  onnx_file: Type.Optional(Type.String({ minLength: 1 })),
+  // local: input token limit (query + passage). Default 512.
+  max_tokens: Type.Optional(Type.Integer({ minimum: 16, maximum: 32_768 })),
+  // Texts per request / forward pass. Default 16.
+  batch_size: Type.Optional(Type.Integer({ minimum: 1, maximum: 1024 })),
+  // Late interaction, local: prefixes the model was trained with (e.g. ColBERT's markers).
+  query_prefix: Type.Optional(Type.String()),
+  document_prefix: Type.Optional(Type.String()),
+  // Late interaction, remote: the request field naming the input side
+  // ("input_type" with values "query"/"document" by default; "" to omit).
+  input_type_field: Type.Optional(Type.String()),
+});
+
+const RetrievalRerankSchema = StrictObject({
+  enabled: Type.Optional(Type.Boolean()),
+  // Providers tried in order; health and fallover as for chat models.
+  chain: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  // Survivors passed to the decision model. Default 8.
+  top_n: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+  // Per-member deadline; a slow member falls over to the next. Default 1500.
+  timeout_ms: Type.Optional(Type.Integer({ minimum: 50, maximum: 120_000 })),
+  // The query (request + a short conversation tail) is clipped to this. Default 1200.
+  query_max_chars: Type.Optional(Type.Integer({ minimum: 50, maximum: 20_000 })),
+  providers: Type.Optional(Type.Record(Type.String({ minLength: 1 }), RetrievalModelProviderSchema)),
+});
+
+const RetrievalLateSchema = StrictObject({
+  enabled: Type.Optional(Type.Boolean()),
+  // The document-side model; the token-vector index belongs to it.
+  model: Type.Optional(Type.String({ minLength: 1 })),
+  // Other model ids that share the index model's space (e.g. a family's sizes):
+  // any of them may encode queries (or documents) against the one index.
+  family: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  // The late query (trigger + reply target) is capped at this many tokens. Default 64.
+  query_max_tokens: Type.Optional(Type.Integer({ minimum: 4, maximum: 1024 })),
+  // The newest N indexed blocks outside the recency layer are scored exhaustively
+  // on every query; "all" for the whole corpus; 0 (default) = re-rank only.
+  exhaustive_blocks: Type.Optional(Type.Union([Type.Integer({ minimum: 0 }), Type.Literal("all")])),
+  // Candidates passed on to the cross-encoder. Default 20.
+  top_n: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })),
+  // Query encode + MaxSim deadline; past it the stage is skipped. Default 300.
+  timeout_ms: Type.Optional(Type.Integer({ minimum: 10, maximum: 120_000 })),
+  // Keep the exhaustive window's scan codes in memory. Default true.
+  resident: Type.Optional(Type.Boolean()),
+  // Scan codes: "turboquant" (native fused kernel, default) or "none" (exact fp32
+  // path on the ONNX runtime in a worker). TurboQuant falls back to exact when the
+  // native kernel is unavailable.
+  quantization: Type.Optional(Type.Union([Type.Literal("turboquant"), Type.Literal("none")])),
+  // TurboQuant bits per coordinate. Default 4.
+  bits: Type.Optional(Type.Integer({ minimum: 2, maximum: 4 })),
+  // Blocks re-scored exactly from the stored vectors after a quantised scan. Default 60.
+  rescore: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_000 })),
+  // Document encoding providers (all serving `model` or its family), in order.
+  // Background, low priority.
+  chain: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  // Query encoders, tried in order with health and fallover; default `chain`
+  // (the providers serving `model`). Any shared-space member is valid against
+  // the index, e.g. a large model on a GPU endpoint first, then a small one on
+  // CPU; moving between them, or one going down, never touches the index.
+  query_chain: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  // Stored precision of the on-disk vectors (exact rescoring and the exact path):
+  // "fp16" (default) or "int8" (per-token scale, half the size).
+  dtype: Type.Optional(Type.Union([Type.Literal("fp16"), Type.Literal("int8")])),
+  // Blocks encoded per indexing batch. Default 4.
+  index_batch_size: Type.Optional(Type.Integer({ minimum: 1, maximum: 512 })),
+  // Calibrated cutoff of MaxSim scores (mean best-match cosine), per query
+  // encoder model id (the model of the member that encoded the query).
+  calibration: Type.Optional(Type.Record(Type.String({ minLength: 1 }), Type.Number())),
+  providers: Type.Optional(Type.Record(Type.String({ minLength: 1 }), RetrievalModelProviderSchema)),
+});
+
+// One operator memory filter (ARCHITECTURE.md §9c "Memory filters"). Judged
+// (`description`), keyword, pattern, or a judged filter with a mechanical
+// pre-gate; any of them scoped to a time range.
+const RetrievalFilterSchema = StrictObject({
+  enabled: Type.Optional(Type.Boolean()),
+  description: Type.Optional(Type.String({ minLength: 1 })),
+  examples: Type.Optional(
+    StrictObject({
+      hide: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+      keep: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+    }),
+  ),
+  // Hide at or above this probability. Default 0.8.
+  threshold: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+  keywords: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  patterns: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  // Date (start of day, agent timezone) or datetime (with a zone, else the
+  // agent timezone). `after` inclusive, `before` exclusive; either alone is fine.
+  after: Type.Optional(Type.String({ minLength: 1 })),
+  before: Type.Optional(Type.String({ minLength: 1 })),
+});
+
+// `[retrieval.filters]`: two settings plus any number of named filter tables.
+// TypeBox cannot mix fixed and dynamic keys, so the values are checked by
+// resolveFilterConfig (src/retrieval/filters/config.ts).
+const RetrievalFiltersSchema = Type.Record(
+  Type.String({ minLength: 1 }),
+  Type.Union([Type.String(), RetrievalFilterSchema]),
+);
 
 const RetrievalSchema = StrictObject({
   enabled: Type.Optional(Type.Boolean()),
@@ -307,6 +455,8 @@ const RetrievalSchema = StrictObject({
       mmr_lambda: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
       temporal_decay_enabled: Type.Optional(Type.Boolean()),
       temporal_decay_half_life_days: Type.Optional(Type.Number({ minimum: 1, maximum: 36500 })),
+      // recall_memory excerpt length (characters, match-centred). Default 600.
+      excerpt_max_chars: Type.Optional(Type.Integer({ minimum: 80, maximum: 20_000 })),
     }),
   ),
   auto: Type.Optional(
@@ -330,9 +480,32 @@ const RetrievalSchema = StrictObject({
       // Prefix stem length AND the min token length to attempt a prefix at all. Larger
       // = fewer false positives, less tolerance for short nicknames (the FP/recall knob).
       user_lane_prefix_min_chars: Type.Optional(Type.Integer({ minimum: 2, maximum: 64 })),
+      // Judged retrieval (§9d): use the `memory` decision point when [decisions] is on.
+      judge: Type.Optional(Type.Boolean()),
+      // Wide recall: candidates kept after fusing every query and lane. Default 60.
+      candidates: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })),
+      // Pre-decay relevance floor of the recall lanes. Default 0.25.
+      candidate_min_score: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+      // Candidate slots reserved for user-lane hits. Default 8.
+      user_lane_candidates: Type.Optional(Type.Integer({ minimum: 0, maximum: 500 })),
+      // Messages of the conversation-window query. Default 6.
+      query_messages: Type.Optional(Type.Integer({ minimum: 0, maximum: 50 })),
+      // A kept block up to this many tokens is shown whole. Default 400.
+      excerpt_max_tokens: Type.Optional(Type.Integer({ minimum: 20, maximum: 8192 })),
+      // Person-cued recall: per human active in the conversation, the newest N
+      // provenance-tagged entries they took part in (outside the recency layer),
+      // straight to the judge. Defaults 2 per person, 8 in total.
+      person_recent: Type.Optional(Type.Integer({ minimum: 0, maximum: 50 })),
+      person_recent_max: Type.Optional(Type.Integer({ minimum: 0, maximum: 200 })),
+      // Decision chain down: the floor and cap of the fallback selection. Defaults 0.6 / 2.
+      fallback_min_score: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+      fallback_max_results: Type.Optional(Type.Integer({ minimum: 0, maximum: 100 })),
     }),
   ),
   embedding: Type.Optional(RetrievalEmbeddingSchema),
+  rerank: Type.Optional(RetrievalRerankSchema),
+  late: Type.Optional(RetrievalLateSchema),
+  filters: Type.Optional(RetrievalFiltersSchema),
 });
 
 // Proactive posting (ARCHITECTURE.md §9g). Opt-in only: inert unless `enabled =
@@ -1131,6 +1304,18 @@ const DecisionLateAdditionSchema = StrictObject({
   recent_messages: Type.Optional(Type.Integer({ minimum: 0, maximum: 30 })),
 });
 
+// Memory relevance (ARCHITECTURE.md §8h "Memory", §9d "Judged retrieval"): one
+// request per surviving memory passage, asking whether it would help respond
+// in this conversation. Unlike the other points it is ON by default whenever
+// `[decisions]` is on (set `enabled = false` to turn judged retrieval off).
+const DecisionMemorySchema = StrictObject({
+  ...DecisionPointCommonFields,
+  // `relevant` probability at or above which a passage is kept. Default 0.7.
+  relevance_threshold: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+  // Messages of the conversation window in the state, newest last. Default 8.
+  conversation_messages: Type.Optional(Type.Integer({ minimum: 0, maximum: 50 })),
+});
+
 // Implicit replies (ARCHITECTURE.md §8 "Late input"): does a bare group message
 // reply to a specific recent bot message without the reply function or a
 // mention? A yes is handled exactly as an explicit reply to it.
@@ -1343,6 +1528,7 @@ const DecisionsSchema = StrictObject({
   audit: Type.Optional(DecisionAuditSchema),
   late_addition: Type.Optional(DecisionLateAdditionSchema),
   implicit_reply: Type.Optional(DecisionImplicitReplySchema),
+  memory: Type.Optional(DecisionMemorySchema),
 });
 
 const AgentModelsSchema = StrictObject({
@@ -1456,6 +1642,15 @@ const AgentBlockSchema = StrictObject({
    * existing codes may be overridden.
    */
   checks: Type.Optional(Type.Record(Type.String({ minLength: 1 }), CheckSchema)),
+  /**
+   * Per-agent memory filters (ARCHITECTURE.md §9c "Memory filters"): each table
+   * deep-merges over the global `[retrieval.filters.<key>]` of the same key
+   * (`enabled = false` turns a global filter off for this agent); new keys add
+   * filters; `pending` and `model` override the global settings.
+   */
+  retrieval: Type.Optional(StrictObject({
+    filters: Type.Optional(RetrievalFiltersSchema),
+  })),
 });
 
 /**

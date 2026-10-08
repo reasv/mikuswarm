@@ -30,12 +30,34 @@ export interface ResolvedRetrievalConfig {
     mmrLambda: number;
     temporalDecayEnabled: boolean;
     temporalDecayHalfLifeDays: number;
+    /** recall_memory excerpt length in characters (match-centred). */
+    excerptMaxChars: number;
   };
   auto: {
+    /** Pack cap (judged and unjudged selections alike). */
     maxResults: number;
+    /** Unjudged selection floor (today's topical floor). */
     minScore: number;
     maxTokens: number;
     dedupAgainstRecency: boolean;
+    /** Use the `memory` decision point when [decisions] is on (§9d "Judged retrieval"). */
+    judge: boolean;
+    /** Wide recall: candidates kept after fusing every query and lane. */
+    candidates: number;
+    /** Pre-decay relevance floor of the recall lanes. */
+    candidateMinScore: number;
+    /** Candidate slots reserved for user-lane hits. */
+    userLaneCandidates: number;
+    /** Messages of the conversation-window query. */
+    queryMessages: number;
+    /** A kept block up to this many tokens is shown whole. */
+    excerptMaxTokens: number;
+    /** Person-cued recall: newest tagged entries per active person, and the total cap. */
+    personRecent: number;
+    personRecentMax: number;
+    /** Decision chain down: floor and cap of the fallback selection. */
+    fallbackMinScore: number;
+    fallbackMaxResults: number;
     /** User lane (§9d): lexical "history with this person" sub-search, by display name. */
     userLane: {
       enabled: boolean;
@@ -62,7 +84,71 @@ export interface ResolvedRetrievalConfig {
       /** Chars-per-token estimate when the response omits a token count (§9). */
       charsPerToken?: number;
     } | null;
+    /**
+     * Optional primary embedder with its own vector index (§9d "Two vector
+     * indexes"); null when not configured or disabled.
+     */
+    primary: {
+      model: string;
+      dim: number;
+      timeoutMs: number;
+      charsPerToken?: number;
+    } | null;
   };
+  /** Cross-encoder re-rank stage (§9d "Re-rank stages"). */
+  rerank: {
+    enabled: boolean;
+    chain: string[];
+    topN: number;
+    timeoutMs: number;
+    queryMaxChars: number;
+    providers: Record<string, ResolvedModelProvider>;
+  };
+  /** Late-interaction stage (§9d "Late interaction"). */
+  late: {
+    enabled: boolean;
+    model: string;
+    /** Every model id sharing the index's space (the index model and its family). */
+    family: string[];
+    queryMaxTokens: number;
+    /** Newest indexed blocks outside the recency layer scored exhaustively; Infinity = all. */
+    exhaustiveBlocks: number;
+    topN: number;
+    timeoutMs: number;
+    resident: boolean;
+    quantization: "turboquant" | "none";
+    bits: 2 | 3 | 4;
+    rescore: number;
+    chain: string[];
+    queryChain: string[];
+    dtype: "fp16" | "int8";
+    indexBatchSize: number;
+    calibration: Record<string, number>;
+    providers: Record<string, ResolvedModelProvider>;
+  };
+}
+
+/** One resolved re-rank / late-interaction provider (§9d). */
+export interface ResolvedModelProvider {
+  name: string;
+  kind: "remote" | "local";
+  enabled: boolean;
+  endpoint?: string;
+  path?: string;
+  apiKey?: string;
+  model?: string;
+  zdr: boolean;
+  selfHosted: boolean;
+  requestFormat: "documents" | "texts";
+  timeoutMs?: number;
+  minScore?: number;
+  modelDir?: string;
+  onnxFile: string;
+  maxTokens: number;
+  batchSize: number;
+  queryPrefix: string;
+  documentPrefix: string;
+  inputTypeField: string;
 }
 
 const DEFAULT_LOCAL_MODEL = "bge-small-en-v1.5";
@@ -94,10 +180,20 @@ export function resolveRetrievalConfig(config: RetrievalConfig | undefined): Res
     index: resolveIndex(index),
     query: resolveQuery(query),
     auto: {
-      maxResults: auto.max_results ?? 3,
+      maxResults: auto.max_results ?? 4,
       minScore: auto.min_score ?? 0.45,
-      maxTokens: auto.max_tokens ?? 600,
+      maxTokens: auto.max_tokens ?? 2000,
       dedupAgainstRecency: auto.dedup_against_recency ?? true,
+      judge: auto.judge ?? true,
+      candidates: auto.candidates ?? 60,
+      candidateMinScore: auto.candidate_min_score ?? 0.25,
+      userLaneCandidates: auto.user_lane_candidates ?? 8,
+      queryMessages: auto.query_messages ?? 6,
+      excerptMaxTokens: auto.excerpt_max_tokens ?? 400,
+      personRecent: auto.person_recent ?? 2,
+      personRecentMax: auto.person_recent_max ?? 8,
+      fallbackMinScore: auto.fallback_min_score ?? 0.6,
+      fallbackMaxResults: auto.fallback_max_results ?? 2,
       userLane: {
         enabled: auto.user_lane_enabled ?? true,
         maxResults: auto.user_lane_max_results ?? 2,
@@ -123,7 +219,141 @@ export function resolveRetrievalConfig(config: RetrievalConfig | undefined): Res
             charsPerToken: remoteBlock.chars_per_token,
           }
         : null,
+      primary: resolvePrimary(embedding.primary),
     },
+    rerank: resolveRerank(config?.rerank),
+    late: resolveLate(config?.late),
+  };
+}
+
+type RawProvider = NonNullable<NonNullable<RetrievalConfig["rerank"]>["providers"]>[string];
+
+function resolveProviders(
+  section: string,
+  raw: Record<string, RawProvider> | undefined,
+): Record<string, ResolvedModelProvider> {
+  const out: Record<string, ResolvedModelProvider> = {};
+  for (const [name, p] of Object.entries(raw ?? {})) {
+    const where = `[retrieval.${section}.providers.${name}]`;
+    if (p.kind === "remote") {
+      if (!p.endpoint) throw new Error(`${where}: a remote provider needs an endpoint`);
+      // Diary text derives from user messages: a remote provider must be
+      // self-hosted or a zero-data-retention route, and the operator says which.
+      if (p.zdr !== true && p.self_hosted !== true) {
+        throw new Error(`${where}: a remote provider must set zdr = true or self_hosted = true`);
+      }
+    } else if (!p.model && !p.model_dir) {
+      throw new Error(
+        `${where}: a local provider needs \`model\` (a Hugging Face repo id) or \`model_dir\`; no built-in default model is shipped yet`,
+      );
+    }
+    out[name] = {
+      name,
+      kind: p.kind,
+      enabled: p.enabled ?? true,
+      endpoint: p.endpoint?.replace(/\/$/, ""),
+      path: p.path,
+      apiKey: p.api_key || undefined,
+      model: p.model,
+      zdr: p.zdr === true,
+      selfHosted: p.self_hosted === true,
+      requestFormat: p.request_format ?? "documents",
+      timeoutMs: p.timeout_ms,
+      minScore: p.min_score,
+      modelDir: p.model_dir,
+      onnxFile: p.onnx_file ?? "onnx/model.onnx",
+      maxTokens: p.max_tokens ?? 512,
+      batchSize: p.batch_size ?? 16,
+      queryPrefix: p.query_prefix ?? "",
+      documentPrefix: p.document_prefix ?? "",
+      inputTypeField: p.input_type_field ?? "input_type",
+    };
+  }
+  return out;
+}
+
+function checkChain(section: string, chain: string[], providers: Record<string, ResolvedModelProvider>): void {
+  for (const name of chain) {
+    if (!providers[name]) {
+      throw new Error(`[retrieval.${section}].chain names "${name}", which is not a [retrieval.${section}.providers.*] block`);
+    }
+  }
+}
+
+function resolveRerank(raw: RetrievalConfig["rerank"]): ResolvedRetrievalConfig["rerank"] {
+  const providers = resolveProviders("rerank", raw?.providers);
+  const chain = raw?.chain ?? Object.keys(providers);
+  const enabled = raw?.enabled ?? false;
+  if (enabled) {
+    checkChain("rerank", chain, providers);
+    if (chain.length === 0) throw new Error("[retrieval.rerank] is enabled but its chain names no provider");
+  }
+  return {
+    enabled,
+    chain,
+    topN: raw?.top_n ?? 8,
+    timeoutMs: raw?.timeout_ms ?? 1500,
+    queryMaxChars: raw?.query_max_chars ?? 1200,
+    providers,
+  };
+}
+
+function resolveLate(raw: RetrievalConfig["late"]): ResolvedRetrievalConfig["late"] {
+  const providers = resolveProviders("late", raw?.providers);
+  const enabled = raw?.enabled ?? false;
+  const model = raw?.model ?? "";
+  const family = Array.from(new Set([model, ...(raw?.family ?? [])].filter((m) => m.length > 0)));
+  const chain = raw?.chain ?? Object.keys(providers);
+  const queryChain = raw?.query_chain ?? chain;
+  if (enabled) {
+    if (!model) throw new Error("[retrieval.late] is enabled but names no model");
+    checkChain("late", chain, providers);
+    checkChain("late", queryChain, providers);
+    if (chain.length === 0) throw new Error("[retrieval.late] is enabled but its chain names no provider");
+    // Every provider must serve the index's model or its shared-space family.
+    for (const name of new Set([...chain, ...queryChain])) {
+      const served = providers[name]!.model;
+      if (served && !family.includes(served)) {
+        throw new Error(
+          `[retrieval.late.providers.${name}] serves "${served}", which is not the index model "${model}" or of its family`,
+        );
+      }
+    }
+  }
+  const exhaustive = raw?.exhaustive_blocks ?? 0;
+  return {
+    enabled,
+    model,
+    family,
+    queryMaxTokens: raw?.query_max_tokens ?? 64,
+    exhaustiveBlocks: exhaustive === "all" ? Number.POSITIVE_INFINITY : exhaustive,
+    topN: raw?.top_n ?? 20,
+    timeoutMs: raw?.timeout_ms ?? 300,
+    resident: raw?.resident ?? true,
+    quantization: raw?.quantization ?? "turboquant",
+    bits: (raw?.bits ?? 4) as 2 | 3 | 4,
+    rescore: raw?.rescore ?? 60,
+    chain,
+    queryChain,
+    dtype: raw?.dtype ?? "fp16",
+    indexBatchSize: raw?.index_batch_size ?? 4,
+    calibration: raw?.calibration ?? {},
+    providers,
+  };
+}
+
+function resolvePrimary(
+  raw: NonNullable<RetrievalConfig["embedding"]>["primary"],
+): ResolvedRetrievalConfig["embedding"]["primary"] {
+  if (!raw || raw.enabled === false) return null;
+  if (raw.zdr !== true && raw.self_hosted !== true) {
+    throw new Error("[retrieval.embedding.primary]: set zdr = true or self_hosted = true (diary text derives from user messages)");
+  }
+  return {
+    model: raw.model,
+    dim: raw.dim,
+    timeoutMs: raw.timeout_ms ?? 1000,
+    charsPerToken: raw.chars_per_token,
   };
 }
 
@@ -188,6 +418,7 @@ function resolveQuery(
     mmrLambda: query.mmr_lambda ?? 0.7,
     temporalDecayEnabled: query.temporal_decay_enabled ?? true,
     temporalDecayHalfLifeDays: query.temporal_decay_half_life_days ?? 45,
+    excerptMaxChars: query.excerpt_max_chars ?? 600,
   };
 }
 
@@ -207,4 +438,17 @@ export function activeEmbeddingModelId(resolved: ResolvedRetrievalConfig): strin
   return resolved.embedding.provider === "remote" && resolved.embedding.remote
     ? resolved.embedding.remote.model
     : resolveLocalModel(resolved.embedding.local.model, resolved.embedding.local).modelId;
+}
+
+/**
+ * The most passages auto-retrieval sends to the decision model per build
+ * (§9d "Judged retrieval"): the cross-encoder's survivors when it runs, else
+ * the late-interaction top 8, else the hybrid top 12.
+ */
+export const JUDGED_AFTER_LATE = 8;
+export const JUDGED_AFTER_HYBRID = 12;
+export function judgedPassageCap(resolved: ResolvedRetrievalConfig): number {
+  if (resolved.rerank.enabled) return resolved.rerank.topN;
+  if (resolved.late.enabled) return Math.min(resolved.late.topN, JUDGED_AFTER_LATE);
+  return JUDGED_AFTER_HYBRID;
 }

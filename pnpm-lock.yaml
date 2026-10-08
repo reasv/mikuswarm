@@ -13,6 +13,9 @@ importers:
 
   .:
     dependencies:
+      '@anush008/tokenizers':
+        specifier: 0.0.0
+        version: 0.0.0
       '@earendil-works/pi-agent-core':
         specifier: 0.84.2
         version: 0.84.2(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))(ws@8.20.1)(zod@4.4.3)
@@ -52,6 +55,9 @@ importers:
       nanoid:
         specifier: 5.1.11
         version: 5.1.11
+      onnxruntime-node:
+        specifier: 1.21.0
+        version: 1.21.0
       playwright-core:
         specifier: 1.60.0
         version: 1.60.0

@@ -310,7 +310,7 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { MatrixCoreClient, NativeTokenizer } = nativeBinding
+const { MatrixCoreClient, NativeTokenizer, TurboQuantMaxSim } = nativeBinding
 
 module.exports.MatrixCoreClient = MatrixCoreClient
 // GLM-native tokenizer (spec/TOKENIZER-SWAP.md §5.2). This re-export list is
@@ -318,3 +318,6 @@ module.exports.MatrixCoreClient = MatrixCoreClient
 // crate does not enable napi's `typedef` feature, so `napi build` does not
 // regenerate this loader. Add new `#[napi]` exports here when the Rust surface grows.
 module.exports.NativeTokenizer = NativeTokenizer
+// TurboQuant MaxSim scan for late-interaction retrieval (spec/MEMORY-RETRIEVAL.md
+// §5.0d); TS declarations in src/retrieval/late/turboquant.ts.
+module.exports.TurboQuantMaxSim = TurboQuantMaxSim
