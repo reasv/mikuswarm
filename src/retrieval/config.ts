@@ -12,6 +12,8 @@ import { resolveLocalModel } from "./embedding/local-models.js";
 export interface ResolvedRetrievalConfig {
   enabled: boolean;
   autoRetrieval: boolean;
+  /** Days `memory_retrievals` rows are kept (0 = forever). */
+  retrievalsRetentionDays: number;
   index: {
     workerCount: number;
     maxRetries: number;
@@ -181,6 +183,7 @@ export function resolveRetrievalConfig(config: RetrievalConfig | undefined): Res
     // retrieval stays off); the shipped 00-defaults.toml turns it on explicitly.
     enabled: config?.enabled ?? false,
     autoRetrieval: config?.auto_retrieval ?? true,
+    retrievalsRetentionDays: config?.retrievals_retention_days ?? 90,
     index: resolveIndex(index),
     query: resolveQuery(query),
     auto: {

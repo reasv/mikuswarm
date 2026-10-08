@@ -1,0 +1,61 @@
+/**
+ * memory_retrievals growth (ARCHITECTURE.md §9d "Observability"): stored
+ * reports are bounded, and rows past the retention are pruned in the
+ * background. Synthetic rows only.
+ */
+import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { Storage } from "../src/storage/index.js";
+import { capReportJson, MemoryRetrievalStore, REPORT_MAX_ITEMS } from "../src/storage/memory-retrieval-store.js";
+
+test("report cap: kept, hidden and judged items stay, the best-scored rest fill the cap, the others are counted", () => {
+  const items = Array.from({ length: 4000 }, (_, i) => ({
+    contentHash: `h${i}`,
+    citation: `memory/x.md#L${i}`,
+    stage: i === 3999 ? "kept" : i === 3998 ? "hidden" : "cut_late",
+    judged: i === 3997,
+    hybrid: i / 4000,
+    late: i % 7 === 0 ? 0.99 : 0.1,
+  }));
+  const json = JSON.stringify({ source: "model", items });
+  const capped = JSON.parse(capReportJson(json)!) as { items: typeof items; itemsOmitted: number; source: string };
+  assert.equal(capped.items.length, REPORT_MAX_ITEMS);
+  assert.equal(capped.itemsOmitted, 4000 - REPORT_MAX_ITEMS);
+  assert.equal(capped.source, "model");
+  const hashes = new Set(capped.items.map((i) => i.contentHash));
+  for (const h of ["h3999", "h3998", "h3997"]) assert.ok(hashes.has(h), `${h} kept`);
+  assert.ok(capped.items.filter((i) => i.stage === "cut_late").every((i) => i.late === 0.99), "the best late scores fill the rest");
+  const small = JSON.stringify({ items: items.slice(0, 10) });
+  assert.equal(capReportJson(small), small, "a small report is stored as is");
+});
+
+test("retention: rows older than the configured days are pruned (in the background, at most hourly)", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "miku-retr-"));
+  const storage = await Storage.open({ databasePath: path.join(dir, "t.db") });
+  try {
+    const store = new MemoryRetrievalStore(storage, { retrievalsRetentionDays: 30 });
+    const day = 86_400_000;
+    const now = 400 * day;
+    const row = (id: string, ts: number) => ({
+      id, agentSessionId: "s", agent: null, timelineKey: null, ts, source: "none", decisionGroup: null,
+      candidates: 0, judged: 0, kept: 0, hidden: 0, tokens: 0, ms: 0, reportJson: null,
+    });
+    // Old rows, written while pruning is not yet due.
+    const old = new MemoryRetrievalStore(storage, { retrievalsRetentionDays: 0 });
+    for (let i = 0; i < 50; i++) await old.insertRetrieval(row(`old${i}`, now - (40 + i) * day));
+    await store.insertRetrieval(row("recent", now - 2 * day));
+    await store.insertRetrieval(row("new", now));
+    await storage.waitForIdle();
+    await new Promise((r) => setTimeout(r, 50));
+    const ids = storage.read((db) => (db.prepare(`select id from memory_retrievals order by id`).all() as Array<{ id: string }>).map((r) => r.id));
+    assert.deepEqual(ids, ["new", "recent"]);
+    assert.equal(await new MemoryRetrievalStore(storage, { retrievalsRetentionDays: 0 }).pruneRetrievals(now * 2), 0, "0 keeps forever");
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

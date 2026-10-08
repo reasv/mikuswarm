@@ -150,8 +150,54 @@ const CHUNK_COLUMNS = `c.rowid as rowid, c.id as id, c.path as path, c.start_lin
   c.end_line as endLine, c.room as room, c.entry_ts as entryTs, c.text as text,
   c.content_hash as contentHash, c.token_count as tokenCount, c.agent as agent, 0 as bm25`;
 
+export interface MemoryRetrievalStoreOptions {
+  /** Days `memory_retrievals` rows are kept (0 = forever, default 90); pruned at most hourly, in the background. */
+  retrievalsRetentionDays?: number;
+}
+
+/** Report items kept in a stored `report_json` (the rest are counted in `itemsOmitted`). */
+export const REPORT_MAX_ITEMS = 120;
+/** Reports up to this size are stored as they are (no parse). */
+const REPORT_PARSE_ABOVE = 48 * 1024;
+const PRUNE_EVERY_MS = 3_600_000;
+const PRUNE_BATCH = 5000;
+
+/**
+ * Bound a build report before it is stored: the kept, hidden and judged items
+ * always, then the best-scored others up to {@link REPORT_MAX_ITEMS}; the
+ * number left out is recorded as `itemsOmitted`.
+ */
+export function capReportJson(json: string | null, maxItems = REPORT_MAX_ITEMS): string | null {
+  if (json === null || json.length <= REPORT_PARSE_ABOVE) return json;
+  let report: { items?: Array<Record<string, unknown>>; itemsOmitted?: number };
+  try {
+    report = JSON.parse(json) as typeof report;
+  } catch {
+    return json;
+  }
+  const items = report.items;
+  if (!Array.isArray(items) || items.length <= maxItems) return json;
+  const score = (i: Record<string, unknown>): number => {
+    const s = (i.scores ?? i) as Record<string, unknown>;
+    for (const k of ["rerank", "late", "hybrid"]) if (typeof s[k] === "number") return s[k] as number;
+    return -Infinity;
+  };
+  const must = items.filter((i) => i.stage === "kept" || i.stage === "hidden" || i.judged === true);
+  const rest = items.filter((i) => !must.includes(i)).sort((a, b) => score(b) - score(a));
+  const kept = [...must, ...rest.slice(0, Math.max(0, maxItems - must.length))];
+  const keep = new Set(kept);
+  report.items = items.filter((i) => keep.has(i));
+  report.itemsOmitted = (report.itemsOmitted ?? 0) + items.length - report.items.length;
+  return JSON.stringify(report);
+}
+
 export class MemoryRetrievalStore {
-  constructor(readonly storage: Storage) {}
+  private lastPrune = 0;
+
+  constructor(
+    readonly storage: Storage,
+    private readonly opts: MemoryRetrievalStoreOptions = {},
+  ) {}
 
   // ── Chunks ────────────────────────────────────────────────────────────────
 
@@ -746,16 +792,45 @@ export class MemoryRetrievalStore {
 
   // ── Per-build retrieval rows (§9d "Observability") ────────────────────────
 
+  /** Store one build row (its report bounded by {@link capReportJson}); prunes expired rows at most hourly. */
   insertRetrieval(row: MemoryRetrievalRowInput): Promise<void> {
-    return this.storage.write((db) => {
+    const stored = { ...row, reportJson: capReportJson(row.reportJson) };
+    const done = this.storage.write((db) => {
       db.prepare(
         `insert into memory_retrievals (id, agent_session_id, agent, timeline_key, ts, source, decision_group,
            candidates, judged, kept, hidden, tokens, ms, report_json)
          values (@id, @agentSessionId, @agent, @timelineKey, @ts, @source, @decisionGroup,
            @candidates, @judged, @kept, @hidden, @tokens, @ms, @reportJson)
          on conflict(id) do nothing`,
-      ).run(row);
+      ).run(stored);
     });
+    if (row.ts - this.lastPrune >= PRUNE_EVERY_MS) {
+      this.lastPrune = row.ts;
+      void this.pruneRetrievals(row.ts).catch(() => undefined);
+    }
+    return done;
+  }
+
+  /**
+   * Delete `memory_retrievals` rows older than the retention (in bounded
+   * batches, each its own write, so the writer queue is never held for long).
+   * Returns the number deleted.
+   */
+  async pruneRetrievals(now: number): Promise<number> {
+    const days = this.opts.retrievalsRetentionDays ?? 90;
+    if (days <= 0) return 0;
+    const cutoff = now - days * 86_400_000;
+    let total = 0;
+    for (;;) {
+      const n = await this.storage.write(
+        (db) =>
+          db
+            .prepare(`delete from memory_retrievals where rowid in (select rowid from memory_retrievals where ts < ? limit ?)`)
+            .run(cutoff, PRUNE_BATCH).changes,
+      );
+      total += n;
+      if (n < PRUNE_BATCH) return total;
+    }
   }
 
   retrievalsForSession(sessionId: string): MemoryRetrievalRow[] {

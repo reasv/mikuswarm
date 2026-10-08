@@ -428,6 +428,9 @@ const RetrievalSchema = StrictObject({
   // §8c — inject the small relevant-memory block inside each trigger's final user
   // turn. Independently disablable (cache-safe placement; risk is distraction).
   auto_retrieval: Type.Optional(Type.Boolean()),
+  // Days a per-build memory_retrievals row (and its report) is kept; pruned in
+  // the background. 0 = keep forever. Default 90.
+  retrievals_retention_days: Type.Optional(Type.Integer({ minimum: 0, maximum: 3650 })),
   // Numeric knobs carry both minimum AND maximum bounds (review issue #10): an
   // unbounded value degrades silently — e.g. a huge candidate_multiplier or
   // max_results blows the `getChunksByRowids` IN-list toward SQLite's bound-parameter

@@ -135,7 +135,7 @@ export async function createRetrievalSubsystem(
       ? opts.agentWorkspaces.map((w) => ({ agentName: w.agentName, workspaceRoot: w.workspaceRoot }))
       : [{ agentName: null, workspaceRoot }];
 
-  const store = new MemoryRetrievalStore(storage);
+  const store = new MemoryRetrievalStore(storage, { retrievalsRetentionDays: config.retrievalsRetentionDays });
   let primary: PrimaryIndex | undefined;
   let lateWorker: LateIndexWorker | undefined;
   // Participant tags from provenance (§9d): tags every block without a
