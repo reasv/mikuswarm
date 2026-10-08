@@ -379,3 +379,32 @@ test("runRecallCeiling: ceiling, judged and kept shares, per-stage counts; never
     }
   });
 });
+
+test("runRecallCeiling: recency-layer and filter-hidden items are not in the ceiling; they get their own share", async () => {
+  const db = new Database(":memory:");
+  try {
+    db.exec(`create table memory_chunks (content_hash text, text text, entry_ts integer, room text)`);
+    db.prepare(
+      `insert into memory_chunks values ('hrec', 'ZZREL recency block', 1767312000000, 'r'), ('hhid', 'ZZREL hidden block', 1767312000000, 'r'), ('hdrop', 'plain dropped block', 1767312000000, 'r')`,
+    ).run();
+    const items: any[] = [
+      { contentHash: "hrec", citation: "c", lanes: [], hybrid: 0.9, presence: false, stage: "recency" },
+      { contentHash: "hhid", citation: "c", lanes: [], hybrid: 0.9, presence: false, stage: "hidden" },
+      { contentHash: "hdrop", citation: "c", lanes: [], hybrid: 0.5, presence: false, stage: "dropped", relevant: 0.1, judged: true },
+    ];
+    const report = await runRecallCeiling({
+      db: db as any,
+      sample: 1,
+      seed: 1,
+      labeller: fakeLabeller([]),
+      labellerInfo: { model: "l", host: "h" },
+      sampled: { builds: [{ id: "b1", source: "model", state: passageState("x"), items }], scanned: 1, noItems: 0, noState: 0, eligible: 1 },
+    });
+    assert.deepEqual(report.ceiling, { builds: 0, share: 0 });
+    assert.deepEqual(report.excluded, { builds: 1, share: 1 });
+    assert.equal(report.buildRows[0]!.relevantExcluded, 2);
+    assert.match(formatRecallCeilingReport(report), /not counted \(relevant, but in the recency layer or hidden\): 1\/1/);
+  } finally {
+    db.close();
+  }
+});

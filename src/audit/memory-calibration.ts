@@ -23,10 +23,12 @@
  *   set, whatever its stage, is labelled against that conversation with the
  *   block text from `memory_chunks` by content hash (items whose text is gone
  *   are skipped and counted). Report: the share of builds with a
- *   labelled-relevant item anywhere in the recall set (the ceiling a ranker
- *   cannot beat), among the items the judge scored, and among the kept items,
- *   plus label counts per stage (relevant items cut by late interaction or the
- *   re-ranker, dropped by the judge, hidden, not selected).
+ *   labelled-relevant item anywhere in the recall set that could have been
+ *   shown (the ceiling a ranker cannot beat; items already in context through
+ *   the recency layer, or hidden by a filter, are not reachable and are
+ *   reported as their own share), among the items the judge scored, and among
+ *   the kept items, plus label counts per stage (relevant items cut by late
+ *   interaction or the re-ranker, dropped by the judge, hidden, not selected).
  */
 import type Database from "better-sqlite3";
 import { jsonTokens, type DecisionClient } from "../decisions/client.js";
@@ -656,9 +658,12 @@ export interface RecallBuildRow {
   labelled: number;
   missingText: number;
   capped: number;
+  /** Relevant items that could have been shown (not in the recency layer, not filter-hidden). */
   relevant: number;
   relevantJudged: number;
   relevantKept: number;
+  /** Relevant items already in context (recency layer) or hidden by a filter: outside the ceiling. */
+  relevantExcluded: number;
 }
 
 export interface StageCounts {
@@ -685,8 +690,10 @@ export interface RecallCeilingReport {
   /** Builds with at least one item labelled true, false or unsure (the shares' denominator). */
   usableBuilds: number;
   items: { listed: number; capped: number; missingText: number; labelled: number; true: number; false: number; unsure: number; invalid: number };
-  /** Builds with a labelled-relevant item anywhere in the recall set: the ceiling. */
+  /** Builds with a labelled-relevant, showable item anywhere in the recall set: the ceiling. */
   ceiling: RecallShare;
+  /** Builds with a relevant item already in context (recency layer) or filter-hidden: not counted above. */
+  excluded: RecallShare;
   /** ... among the items the judge scored. */
   judged: RecallShare;
   /** ... among the kept items (in the memory block). */
@@ -712,6 +719,9 @@ export interface RecallCeilingOptions {
   sampled?: RecallSample;
 }
 
+/** Stages whose items could never be shown: already in context, or hidden by an operator filter. */
+const UNREACHABLE_STAGES = new Set(["recency", "hidden"]);
+
 /** The order stages are reported in: the pipeline's, recall to selection. */
 const STAGE_ORDER = ["recency", "cut_late", "cut_rerank", "not_judged", "hidden", "dropped", "not_selected", "budget", "kept"];
 
@@ -736,6 +746,7 @@ export async function runRecallCeiling(opts: RecallCeilingOptions): Promise<Reca
     relevant: 0,
     relevantJudged: 0,
     relevantKept: 0,
+    relevantExcluded: 0,
   }));
   const tasks: Array<{ b: number; item: ReportItem; state: MemoryState | null }> = [];
   chosen.forEach(({ build, items }, b) => {
@@ -786,7 +797,9 @@ export async function runRecallCeiling(opts: RecallCeilingOptions): Promise<Reca
       br.labelled += 1;
       usable.add(b);
     }
-    if (row.label === "true") {
+    if (row.label === "true" && UNREACHABLE_STAGES.has(row.stage)) {
+      br.relevantExcluded += 1;
+    } else if (row.label === "true") {
       br.relevant += 1;
       if (row.judged) br.relevantJudged += 1;
       if (row.stage === "kept") br.relevantKept += 1;
@@ -816,6 +829,7 @@ export async function runRecallCeiling(opts: RecallCeilingOptions): Promise<Reca
       ...itemCounts,
     },
     ceiling: share((r) => r.relevant),
+    excluded: share((r) => r.relevantExcluded),
     judged: share((r) => r.relevantJudged),
     kept: share((r) => r.relevantKept),
     stages: [...stageMap.values()].sort((a, b) => rank(a.stage) - rank(b.stage) || a.stage.localeCompare(b.stage)),
@@ -840,15 +854,18 @@ export function formatRecallCeilingReport(report: RecallCeilingReport): string {
   );
   lines.push("");
   lines.push(`ceiling (a relevant item anywhere in the recall set): ${report.ceiling.builds}/${report.usableBuilds} ${pct(report.ceiling.share)}`);
+  lines.push(`  not counted (relevant, but in the recency layer or hidden): ${report.excluded.builds}/${report.usableBuilds} ${pct(report.excluded.share)}`);
   lines.push(`reached the judge (a relevant item the judge scored):  ${report.judged.builds}/${report.usableBuilds} ${pct(report.judged.share)}`);
   lines.push(`kept (a relevant item in the memory block):            ${report.kept.builds}/${report.usableBuilds} ${pct(report.kept.share)}`);
   lines.push("");
   lines.push("stages (stage items true false unsure invalid)");
   for (const s of report.stages) lines.push(`  ${s.stage} ${s.items} ${s.true} ${s.false} ${s.unsure} ${s.invalid}`);
   lines.push("");
-  lines.push("builds (id source items labelled text-gone beyond-cap relevant relevant-judged relevant-kept)");
+  lines.push("builds (id source items labelled text-gone beyond-cap relevant relevant-judged relevant-kept relevant-excluded)");
   for (const b of report.buildRows) {
-    lines.push(`  ${b.id} ${b.source} ${b.items} ${b.labelled} ${b.missingText} ${b.capped} ${b.relevant} ${b.relevantJudged} ${b.relevantKept}`);
+    lines.push(
+      `  ${b.id} ${b.source} ${b.items} ${b.labelled} ${b.missingText} ${b.capped} ${b.relevant} ${b.relevantJudged} ${b.relevantKept} ${b.relevantExcluded}`,
+    );
   }
   return `${lines.join("\n")}\n`;
 }
