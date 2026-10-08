@@ -425,15 +425,6 @@ test("proactive: the conversation stands in for the request (no request in state
   });
 });
 
-test("preview builds never call the decision model (judge: false)", async () => {
-  const files = { "2026-05-08.md": block("2026-05-08", "10:00", "kitchen", "pancake recipe decide pancake recipe decided") };
-  await withStack(files, {}, async ({ pipeline, calls }) => {
-    const plan = await pipeline.plan({ ...input(), judge: false });
-    assert.equal(plan.report.source, "unjudged");
-    assert.equal(calls.length, 0);
-  });
-});
-
 test("person-cued recall: newest tagged entries of active people go straight to the judge", async () => {
   const files = {
     "2026-05-09.md": block("2026-05-09", "10:00", "kitchen", "KEEP unrelated garden talk with carol"),

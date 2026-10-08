@@ -1242,6 +1242,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     agent: string | null,
     surface: "recency_layer" | "diary_writer",
     attribution: { timelineKey?: string | null; agentSessionId?: string | null; sessionType?: string | null },
+    judge = true,
   ) =>
     (relPath: string, text: string): Promise<string> => {
       const run = () =>
@@ -1249,10 +1250,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           surface,
           attribution,
           priority: surface === "diary_writer" ? "background" : "interactive",
+          ...(judge ? {} : { judge: false }),
         });
       if (surface !== "recency_layer" || !memoryFilters?.hasFilters(agent)) return run();
       const now = Date.now();
-      const key = `${agent ?? ""}\0${relPath}\0${createHash("sha1").update(text).digest("hex")}`;
+      // The judging mode is part of the key: a preview's cached-verdicts-only
+      // text must never stand in for a live build's judged one.
+      const key = `${judge ? "j" : "c"}\0${agent ?? ""}\0${relPath}\0${createHash("sha1").update(text).digest("hex")}`;
       const hit = recencyFilterMemo.get(key);
       if (hit && now - hit.at < RECENCY_FILTER_MEMO_MS) return hit.text;
       for (const [k, v] of recencyFilterMemo) if (now - v.at >= RECENCY_FILTER_MEMO_MS) recencyFilterMemo.delete(k);
@@ -1340,13 +1344,15 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // Per-session agent name resolver (spec MULTI-AGENT-SUPPORT §7.1): scopes
   // auto-retrieval to the calling session's agent corpus. Returns null in legacy mode.
   // Memory filters on the recency layer (§9c): hidden blocks are dropped per day file.
-  // A build without a session is a room preview: its filter judging is attributed to it.
+  // A build without a session is a room preview: cached verdicts only, never a
+  // decision call (unevaluated blocks follow `pending`).
   contextBuilder.filterDiaryFile = (timelineKey, sessionId) =>
-    filterMemoryFile(agentNameForTimeline(timelineKey), "recency_layer", {
-      timelineKey,
-      agentSessionId: sessionId ?? null,
-      ...(sessionId ? {} : { sessionType: "preview" }),
-    });
+    filterMemoryFile(
+      agentNameForTimeline(timelineKey),
+      "recency_layer",
+      { timelineKey, agentSessionId: sessionId ?? null },
+      Boolean(sessionId),
+    );
   contextBuilder.resolveAgentName = (timelineKey) => {
     const entry = resolveWorkspaceForTimeline(timelineKey);
     if (!entry) return null;

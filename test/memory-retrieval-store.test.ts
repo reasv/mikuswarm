@@ -114,3 +114,25 @@ test("stats count only confirmed builds: a row recorded as aborted is left out",
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("the latest shown build of a timeline (the room preview's pointer) skips aborted rows and other timelines", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "miku-retr-"));
+  const storage = await Storage.open({ databasePath: path.join(dir, "t.db") });
+  try {
+    const store = new MemoryRetrievalStore(storage, { retrievalsRetentionDays: 0 });
+    const row = (id: string, timelineKey: string, ts: number, report: Record<string, unknown>) => ({
+      id, agentSessionId: id, agent: null, timelineKey, ts, source: "model", decisionGroup: null,
+      candidates: 3, judged: 3, kept: 2, hidden: 0, tokens: 20, ms: 1, reportJson: JSON.stringify(report),
+    });
+    assert.equal(store.latestRetrievalForTimeline("tk:a"), null);
+    await store.insertRetrieval(row("shown", "tk:a", 1000, { items: [] }));
+    await store.insertRetrieval(row("cancelled", "tk:a", 2000, { aborted: true, items: [] }));
+    await store.insertRetrieval(row("other", "tk:b", 3000, { items: [] }));
+    await storage.waitForIdle();
+    assert.deepEqual({ ...store.latestRetrievalForTimeline("tk:a") }, { ts: 1000, source: "model", kept: 2, tokens: 20 });
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

@@ -442,6 +442,13 @@ Unreleased section; it is not part of any release's notes.
 
 ### Changed
 
+- **The console's room preview no longer runs memory retrieval.** The
+  `<retrieved_memory>` block is chosen per trigger, so the preview showed a block the
+  agent would not see, at the cost of recall, a re-ranker call and judged filter
+  decisions billed to the preview. It now shows a placeholder naming the room's
+  latest recorded build (time, source, kept count, tokens), and its recency layer
+  uses cached filter verdicts only (unevaluated blocks follow
+  `[retrieval.filters].pending`). Live and proactive sessions are unchanged.
 - **Upgrade note: memory judging sends diary text to the decision chain.** The
   `memory` decision point is on by default whenever `[decisions]` is on, and each
   request carries one diary entry with the conversation, the same class of data the

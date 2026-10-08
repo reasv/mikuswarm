@@ -1,8 +1,7 @@
 /**
  * The pipeline input from timeline events (ARCHITECTURE.md §9d "Judged
  * retrieval"): built at session launch from the trigger group, its reply
- * target and the conversation before it, or by the context builder for a
- * build that was not planned at launch (room previews).
+ * target and the conversation before it.
  */
 import type { CanonicalChatEvent } from "../../types.js";
 import type { DecisionAttribution } from "../../decisions/registry.js";

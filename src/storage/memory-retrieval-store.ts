@@ -1003,6 +1003,24 @@ export class MemoryRetrievalStore {
     );
   }
 
+  /**
+   * The newest shown (not aborted) build of a timeline, counts only: what the
+   * room preview points at instead of running the pipeline itself.
+   */
+  latestRetrievalForTimeline(timelineKey: string): Pick<MemoryRetrievalRow, "ts" | "source" | "kept" | "tokens"> | null {
+    return this.storage.read(
+      (db) =>
+        (db
+          .prepare(
+            `select ts, source, kept, tokens from memory_retrievals
+             where timeline_key = ?
+               and not (json_valid(report_json) and coalesce(json_extract(report_json, '$.aborted'), 0) = 1)
+             order by ts desc limit 1`,
+          )
+          .get(timelineKey) as Pick<MemoryRetrievalRow, "ts" | "source" | "kept" | "tokens"> | undefined) ?? null,
+    );
+  }
+
   /** Record a session's first follow-up on its memory block (idempotent). */
   markFollowUp(sessionId: string, kind: string, at: number): Promise<number> {
     return this.storage.write(

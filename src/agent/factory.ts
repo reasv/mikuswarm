@@ -367,7 +367,7 @@ export interface CreateAgentOptions {
   /**
    * The session's auto-retrieval plan, started at launch in parallel with routing
    * (ARCHITECTURE.md §9d "Judged retrieval"); the build awaits it when assembling
-   * the final user turn. Absent = no retrieval block (a preview runs it inline).
+   * the final user turn. Absent = no retrieval block (a preview shows a placeholder).
    */
   memoryRetrieval?: MemoryPlanTicket;
   /**

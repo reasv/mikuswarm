@@ -185,7 +185,6 @@ test("recall stays bounded on a realistic-size database (4k chunks, 360k events,
         conversation: Array.from({ length: 12 }, (_, j) => ({ from: `User${j % 3}`, text: `message ${j} about music and coffee` })),
         participants,
         activePeople,
-        judge: false,
         deferRecord: true,
       });
       timings.push(performance.now() - t0);

@@ -66,6 +66,11 @@ export interface EnforceContext {
   signal?: AbortSignal;
   /** Deadline of the judging calls (default the memory point's timeout). */
   timeoutMs?: number;
+  /**
+   * false = cached verdicts only, no decision call: blocks without a fresh
+   * verdict follow `pending` (a room preview, which has no session to bill).
+   */
+  judge?: boolean;
 }
 
 export interface MemoryFilterServiceOptions {
@@ -262,7 +267,7 @@ export class MemoryFilterService {
       const s = states.get(b.contentHash)!;
       return !s.hidden && s.pendingJudged.length > 0;
     });
-    if (toJudge.length > 0 && engine) {
+    if (toJudge.length > 0 && engine && ctx.judge !== false) {
       await Promise.all(
         toJudge.map(async (b) => {
           const state = states.get(b.contentHash)!;

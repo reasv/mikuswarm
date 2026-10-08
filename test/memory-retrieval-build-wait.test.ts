@@ -2,7 +2,8 @@
  * The context build's side of auto-retrieval (ARCHITECTURE.md §9d "Judged
  * retrieval"): a live build waits for its launch-time plan within the ticket's
  * budget, then takes the plan's best effort and abandons it only when nothing
- * is ready; only a room preview runs the pipeline inline. Fake pipeline; synthetic fixtures only.
+ * is ready; a room preview never runs the pipeline and shows a placeholder.
+ * Fake pipeline; synthetic fixtures only.
  */
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -47,17 +48,24 @@ const plan = (block: string | null): RetrievalPlan => ({
   report: { source: "model", candidates: 1, judged: 1, kept: 1, hidden: 0, tokens: 10, ms: 1, stages: { recallMs: 1 }, items: [] },
 });
 
-async function withBuilder(run: (b: ContextBuilder, inline: PlanInput[]) => Promise<void>): Promise<void> {
+type Latest = { ts: number; source: string; kept: number; tokens: number } | null;
+
+async function withBuilder(
+  run: (b: ContextBuilder, inline: PlanInput[], setLatest: (l: Latest) => void) => Promise<void>,
+): Promise<void> {
   configureAgentTimezone("UTC");
   const storage = await Storage.open({ databasePath: ":memory:" });
   const timeline = new TimelineStore(storage);
   const inline: PlanInput[] = [];
+  let latest: Latest = null;
+  // Any recall or re-rank happens inside `plan`; counting its calls covers both.
   const pipeline = {
     plan: async (input: PlanInput) => {
       inline.push(input);
       return plan(BLOCK);
     },
     waitBudgetMs: () => 1000,
+    latestForTimeline: (key: string) => (key === TK ? latest : null),
   } as any;
   const builder = new ContextBuilder(timeline, minimalConfig(), storage, undefined, {
     pipeline,
@@ -65,7 +73,7 @@ async function withBuilder(run: (b: ContextBuilder, inline: PlanInput[]) => Prom
   });
   try {
     await timeline.append(ev("ev1", "hello there", 1000));
-    await run(builder, inline);
+    await run(builder, inline, (l) => (latest = l));
   } finally {
     storage.close();
     resetAgentTimezone();
@@ -131,14 +139,29 @@ test("a live build renders its ticket's block and does not abandon it", async ()
   });
 });
 
-test("only a room preview runs the pipeline inline (unjudged, attributed to the preview)", async () => {
-  await withBuilder(async (builder, inline) => {
-    await builder.build({ timelineKey: TK, trigger: ev("ev1", "hello there", 1000), activeSessions: [], workspace: emptyWorkspace, selfSessionId: "s1" });
-    assert.equal(inline.length, 0, "a live build without a ticket never runs the pipeline inline");
+test("a room preview never runs the pipeline: it shows a placeholder, with the room's latest build when recorded", async () => {
+  await withBuilder(async (builder, inline, setLatest) => {
     const preview = await builder.build({ timelineKey: TK, trigger: ev("ev1", "hello there", 1000), activeSessions: [], workspace: emptyWorkspace });
-    assert.equal(inline.length, 1);
-    assert.equal(inline[0]!.judge, false);
-    assert.equal(inline[0]!.attribution.sessionType, "preview");
-    assert.ok(finalContent(preview).includes("a memory"));
+    assert.equal(inline.length, 0, "no recall, re-rank or decision call");
+    const text = finalContent(preview);
+    assert.ok(text.includes("<retrieved_memory>(chosen per trigger by the memory pipeline; not computed for previews)</retrieved_memory>"));
+    assert.ok(!text.includes("a memory"));
+    setLatest({ ts: Date.UTC(2026, 4, 8, 12, 30), source: "model", kept: 3, tokens: 412 });
+    const pointed = finalContent(await builder.build({ timelineKey: TK, trigger: ev("ev1", "hello there", 1000), activeSessions: [], workspace: emptyWorkspace }));
+    assert.ok(pointed.includes("latest build in this room: 2026-05-08T12:30:00Z, source model, 3 kept, 412 tokens"));
+    assert.equal(inline.length, 0);
+  });
+});
+
+test("a live build without a ticket shows no block and never takes the preview path", async () => {
+  await withBuilder(async (builder, inline, setLatest) => {
+    setLatest({ ts: 1, source: "model", kept: 1, tokens: 1 });
+    const live = await builder.build({ timelineKey: TK, trigger: ev("ev1", "hello there", 1000), activeSessions: [], workspace: emptyWorkspace, selfSessionId: "s1" });
+    assert.equal(inline.length, 0);
+    assert.ok(!finalContent(live).includes("<retrieved_memory"));
+    const proactive = await builder.build({
+      timelineKey: TK, trigger: ev("ev1", "hello there", 1000), activeSessions: [], workspace: emptyWorkspace, selfSessionId: "s2", proactive: true,
+    });
+    assert.ok(!finalContent(proactive).includes("<retrieved_memory"));
   });
 });

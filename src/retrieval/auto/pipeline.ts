@@ -202,6 +202,15 @@ export class MemoryRetrievalPipeline {
     return timeout + PLAN_WAIT_GRACE_MS;
   }
 
+  /** The newest recorded build of a timeline (counts only), or null; never throws. */
+  latestForTimeline(timelineKey: string): { ts: number; source: string; kept: number; tokens: number } | null {
+    try {
+      return this.deps.store.latestRetrievalForTimeline(timelineKey);
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * Tagged rows of `senders`, newest first, paging past the rows `visit`
    * rejects (blocks in the recency layer) until it says stop or
@@ -612,7 +621,7 @@ export class MemoryRetrievalPipeline {
     // ── 5. The decision model as the final filter ─────────────────────────
     let selected: Candidate[] = [];
     let source: RetrievalSource;
-    const judge = input.judge !== false && this.judgeOn(agent);
+    const judge = this.judgeOn(agent);
     const engine = this.deps.engine?.();
     if (aborted()) {
       source = "none";
@@ -736,21 +745,11 @@ export class MemoryRetrievalPipeline {
       }
     } else {
       source = pool.length > 0 ? "unjudged" : "none";
-      report.reason = input.judge === false ? "preview" : !auto.judge ? "judge_off" : "no_decision_model";
+      report.reason = !auto.judge ? "judge_off" : "no_decision_model";
       selected = this.selectWithoutJudge(pool, { cap: auto.maxResults, rerankRan, rerankCutoff, lateRan, lateQueryModel, legacy: true });
       // Judged filters still apply to what is shown: judged now (bounded), or `pending`.
       const pending = selected.filter((c) => c.pendingFilters.length > 0);
-      if (pending.length > 0 && this.deps.filters && input.judge === false) {
-        for (const c of pending) {
-          const st = { hidden: false, pendingJudged: c.pendingFilters } as { hidden: boolean; hiddenBy?: Candidate["hiddenBy"]; pendingJudged: Candidate["pendingFilters"] };
-          this.deps.filters.applyPending(agent, st);
-          if (st.hidden) {
-            c.hiddenBy = st.hiddenBy;
-            itemStage.set(c.chunk.contentHash, "hidden");
-          }
-        }
-        selected = selected.filter((c) => !c.hiddenBy);
-      } else if (pending.length > 0 && this.deps.filters) {
+      if (pending.length > 0 && this.deps.filters) {
         const filters = this.deps.filters;
         const states = cut()
           ? null

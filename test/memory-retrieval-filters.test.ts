@@ -226,6 +226,26 @@ test("pending: an unavailable verdict shows by default, hides with pending = hid
   });
 });
 
+test("judge: false (room previews): cached verdicts only, unevaluated blocks follow pending, no decision call", async () => {
+  await withStore(async ({ store }) => {
+    const { engine, calls } = fakeEngine();
+    const svc = new MemoryFilterService({ config: cfg({ pending: "hide", j: { description: "d" } }), store, engine: () => engine });
+    // A live surface judged one block earlier: its verdict is cached.
+    await svc.enforce(null, [blockOf("BAD cached", 1, "cached")], { surface: "recency_layer", attribution: { agentSessionId: "s" } });
+    assert.equal(calls.length, 1);
+    const ctx = { surface: "recency_layer" as const, attribution: {}, judge: false };
+    const states = await svc.enforce(null, [blockOf("BAD cached", 1, "cached"), blockOf("fine new", 1, "new")], ctx);
+    assert.equal(calls.length, 1, "no decision call");
+    assert.equal(states.get("cached")!.hidden, true);
+    assert.equal(states.get("cached")!.hiddenBy?.pending, undefined, "the cached verdict applies");
+    assert.equal(states.get("new")!.hidden, true, "pending = hide");
+    assert.equal(states.get("new")!.hiddenBy?.pending, true);
+    // A live build still judges the unevaluated block lazily.
+    await svc.enforce(null, [blockOf("fine new", 1, "new")], { surface: "recency_layer", attribution: { agentSessionId: "s" } });
+    assert.equal(calls.length, 2);
+  });
+});
+
 test("judged filters without the memory decision point do not apply; startup warns", async () => {
   await withStore(async ({ store }) => {
     const { engine } = fakeEngine({ enabled: false });

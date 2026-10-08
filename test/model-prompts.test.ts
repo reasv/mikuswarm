@@ -475,7 +475,7 @@ const builderConfig = () =>
     workspace: { root_dir: "/tmp" },
     matrix: { enabled: false, trigger_hold_ms: 0, accounts: {} },
   }) as unknown as AppConfig;
-// A pipeline stub: the builder only needs a plan with a block (ARCHITECTURE.md §9d).
+// A pipeline stub: a live build's ticket carries its plan (ARCHITECTURE.md §9d).
 const memoryPipeline = {
   plan: async () => ({
     block: '<retrieved_memory note="n">\n- [memory/x.md:1-2 · R] An older decision.\n</retrieved_memory>',
@@ -502,6 +502,14 @@ test("builder: fresh build records the slot after TAIL.md, past the retrieved_me
       activeSessions: [],
       workspace: workspace("TAIL-MD"),
       sessionType: { session_instruction: "SI" },
+      selfSessionId: "s1",
+      memoryRetrieval: {
+        plan: (memoryPipeline as any).plan(),
+        waitMs: 1000,
+        bestEffort: async () => null,
+        confirm: () => undefined,
+        abandon: () => undefined,
+      },
     });
     const final = built.messages[built.messages.length - 1]!;
     assert.ok(final.content.startsWith("<retrieved_memory"), "the slot must account for the leading block");

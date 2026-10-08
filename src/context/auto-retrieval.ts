@@ -6,10 +6,8 @@ import type { RetrievalPlan } from "../retrieval/auto/types.js";
  * Auto-retrieval dependencies of the context builder (ARCHITECTURE.md §9d
  * "Judged retrieval"). A live session's plan is started at launch, in
  * parallel with routing, and handed to the build as a ticket
- * (`BuildContextOptions.memoryRetrieval`). A room preview runs the pipeline
- * inline without the memory point; judged filters it meets follow `pending`,
- * though the recency layer it renders may still judge filters (billed and
- * attributed to the preview).
+ * (`BuildContextOptions.memoryRetrieval`). A room preview never runs the
+ * pipeline; it shows a placeholder instead.
  */
 export interface AutoRetrievalDeps {
   pipeline: MemoryRetrievalPipeline;

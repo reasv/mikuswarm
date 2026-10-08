@@ -56,11 +56,6 @@ export interface PlanInput {
    * its fate is known, instead of the plan recording it when it resolves.
    */
   deferRecord?: boolean;
-  /**
-   * false = never call a decision model (a room preview): the selection is
-   * unjudged and judged filters fall back to `pending`.
-   */
-  judge?: boolean;
 }
 
 export type CandidateLane = "trigger" | "reply" | "window" | "user_name" | "presence" | "person" | "late_window";

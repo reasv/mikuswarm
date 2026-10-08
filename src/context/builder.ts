@@ -41,7 +41,6 @@ import type { ModelTailAt } from "../agent/model-prompts.js";
 import { renderToolBlock, type ToolDefinitionLike, type ToolBlockSummary } from "./tool-block.js";
 import { buildRecentDiaryContent } from "./diary-layer.js";
 import { awaitPlan, type AutoRetrievalDeps } from "./auto-retrieval.js";
-import { buildPlanInput } from "../retrieval/auto/input.js";
 import type { MemoryPlanTicket } from "../retrieval/auto/types.js";
 import { agentDateStamp, formatAgentTimestamp } from "../time/index.js";
 import type { Logger } from "../observability/index.js";
@@ -103,8 +102,8 @@ export interface BuildContextOptions {
   /**
    * The session's auto-retrieval plan, started at launch in parallel with routing
    * (ARCHITECTURE.md §9d "Judged retrieval"); a redo replans. Absent on a
-   * live build = no retrieval block; a room preview (no `selfSessionId`) runs
-   * the pipeline inline, without the memory point.
+   * live build = no retrieval block; a room preview (no `selfSessionId`) never
+   * runs the pipeline and shows a placeholder instead.
    */
   memoryRetrieval?: MemoryPlanTicket;
   /**
@@ -368,6 +367,8 @@ export class ContextBuilder {
    * Operator memory filters on the recency layer (ARCHITECTURE.md §9c "Memory
    * filters"): returns the per-day-file filter for a build, which drops blocks
    * hidden by the agent's filters. Injected by app wiring; absent = unfiltered.
+   * Without a session (a room preview) it uses cached verdicts only and never
+   * makes a decision call.
    */
   filterDiaryFile?: (timelineKey: string, sessionId?: string) => (relPath: string, text: string) => Promise<string>;
 
@@ -776,50 +777,22 @@ export class ContextBuilder {
     // keepers so far plus the fallback rule over the rest); only when nothing
     // is ready does the build show no block and abandon the plan (aborted,
     // never recorded as shown). The session confirms the plan once its
-    // kickoff is sent, and abandons it when the build is discarded. A room preview (no session) runs the pipeline
-    // inline without the memory point; judged filters it meets follow
-    // `pending`, though the recency layer it renders may still judge filters
-    // (billed, attributed to the preview).
-    const retrievalAgentName = this.resolveAgentName?.(options.timelineKey) ?? null;
+    // kickoff is sent, and abandons it when the build is discarded. A room
+    // preview (no session) never runs the pipeline: the block is chosen per
+    // trigger, so it shows a placeholder pointing at the room's latest
+    // recorded build instead (no recall, re-rank or decision call).
     let retrievedMemory: string | null = null;
     if (!generation && this.autoRetrieval) {
-      const onError = (error: unknown) =>
-        this.logger?.warn("auto_retrieval_failed", { error: error instanceof Error ? error.message : String(error) });
       const ticket = options.memoryRetrieval;
       if (ticket) {
+        const onError = (error: unknown) =>
+          this.logger?.warn("auto_retrieval_failed", { error: error instanceof Error ? error.message : String(error) });
         let plan = await awaitPlan(ticket.plan, ticket.waitMs, onError);
         if (!plan) plan = await ticket.bestEffort().catch(() => null);
         if (!plan) ticket.abandon();
         retrievedMemory = plan?.block ?? null;
       } else if (!options.selfSessionId) {
-        const maxWaitMs = this.autoRetrieval.pipeline.waitBudgetMs(retrievalAgentName);
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), maxWaitMs);
-        const onDrain = () => ctrl.abort();
-        if (options.abortSignal?.aborted) ctrl.abort();
-        else options.abortSignal?.addEventListener("abort", onDrain, { once: true });
-        const triggerIdSet = new Set(triggerEvents.map((e) => e.id));
-        const input = buildPlanInput({
-          agentName: retrievalAgentName,
-          timelineKey: options.timelineKey,
-          attribution: { timelineKey: options.timelineKey, agentSessionId: null, sessionType: "preview" },
-          proactive,
-          now,
-          triggerEvents,
-          recent: compactionInput.filter((e) => !triggerIdSet.has(e.id)),
-          signal: ctrl.signal,
-        });
-        retrievedMemory = await awaitPlan(
-          this.autoRetrieval.pipeline.plan({ ...input, judge: false }),
-          maxWaitMs,
-          onError,
-        )
-          .then((plan) => plan?.block ?? null)
-          .finally(() => {
-            clearTimeout(timer);
-            ctrl.abort();
-            options.abortSignal?.removeEventListener("abort", onDrain);
-          });
+        retrievedMemory = renderPreviewMemoryPlaceholder(this.autoRetrieval.pipeline.latestForTimeline(options.timelineKey));
       }
     }
 
@@ -1960,3 +1933,16 @@ export class BuildWaitTimeoutError extends Error {
   }
 }
 
+/**
+ * The room preview's stand-in for the `<retrieved_memory>` block (ARCHITECTURE.md
+ * §9d): the real block is chosen per trigger, so a preview never computes one.
+ * Names the room's latest recorded build (counts only; the record holds no text).
+ */
+export function renderPreviewMemoryPlaceholder(
+  latest: { ts: number; source: string; kept: number; tokens: number } | null,
+): string {
+  const head = "<retrieved_memory>(chosen per trigger by the memory pipeline; not computed for previews)";
+  if (!latest) return `${head}</retrieved_memory>`;
+  const at = new Date(latest.ts).toISOString().replace(/\.\d{3}Z$/, "Z");
+  return `${head}\nlatest build in this room: ${at}, source ${latest.source}, ${latest.kept} kept, ${latest.tokens} tokens\n</retrieved_memory>`;
+}
