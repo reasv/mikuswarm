@@ -17,6 +17,7 @@ import {
   takeQueuedSteers,
 } from "../src/agent/late-input.js";
 import { RequestProgress } from "../src/agent/request-progress.js";
+import { NotExecutedError } from "../src/tools/side-effects.js";
 
 function tool(name: string, onRun: (args: unknown) => void = () => undefined, text = "ok"): AgentTool {
   return {
@@ -197,6 +198,16 @@ test("effects: a visible call counts while it executes, and after it threw", asy
   release();
   await running;
   assert.equal(ctl.hasIrreversibleEffect(), true, "a throw may have delivered");
+});
+
+test("effects: a call a wrapper stopped before it ran (the gate's block) leaves no effect", async () => {
+  const ctl = session({ holdMs: 0 });
+  const blocked = { ...tool("send_message"), execute: async () => { throw new NotExecutedError("revise first"); } } as unknown as AgentTool;
+  const [send] = ctl.wrapHoldTools([blocked]);
+  await assert.rejects(send!.execute("c1", { message: "hi" }, undefined, undefined), /revise first/, "the agent sees the same error");
+  assert.equal(ctl.hasIrreversibleEffect(), false);
+  assert.equal(ctl.canRedo(), true);
+  assert.equal(ctl.holdActive(), true, "the next visible call is held again");
 });
 
 test("effects: a no-op undoable call is not compensated", async () => {

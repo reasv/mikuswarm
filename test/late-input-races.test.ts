@@ -466,3 +466,35 @@ test("late input races: an addition arriving after the trigger's hold bound stil
     await h.stop();
   }
 });
+
+test("late input races: a send the output gate blocked does not stop a later edit from redoing", async () => {
+  let n = 0;
+  const h = await startHarness({
+    toml: LATE({ hold_ms: 0, extend_ms: 0, max_hold_ms: 0 }) + `
+[checks.style_vocab]
+kind = "style"
+remedy = "revise"
+agent_explanation = "Uses stock vocabulary ({matched})."
+words = ["delve"]
+min_chars = 1
+`,
+    script: (req) => {
+      if (isRecordTurnRequest(req)) return { text: "NO_REPLY" };
+      n += 1;
+      if (req.body.messages.some((m) => messageText(m).includes("in Kyoto"))) return send("Kyoto answer");
+      if (n === 1) return send("let us delve into Tokyo time");
+      return { ...send("Tokyo answer"), delayMs: 1500 };
+    },
+  });
+  try {
+    const id = h.say("what time is it in Tokyo", { mention: true });
+    await h.until(() => h.llm.requests.filter((r) => !isRecordTurnRequest(r)).length >= 2, "blocked once, the revised request in flight");
+    h.edit(id, "what time is it in Kyoto", { mention: true });
+    await h.until(settledAll(h), "settled", 15_000);
+    assert.ok(hasLog(h, "late_input_redo"), "the edit redid the session");
+    assert.ok(!hasLog(h, "late_input_interjected"), "the blocked send is no effect to interject after");
+    assert.deepEqual(bodies(h), ["Kyoto answer"]);
+  } finally {
+    await h.stop();
+  }
+});

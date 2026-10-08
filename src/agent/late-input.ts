@@ -25,7 +25,7 @@ import type { Agent, AgentMessage, AgentTool, AgentToolResult } from "@earendil-
 import type { AppConfig } from "../config/index.js";
 import type { Logger } from "../observability/logger.js";
 import type { SessionBranchReason } from "../storage/database.js";
-import { compensationFor, isPostingTool, toolEffect } from "../tools/side-effects.js";
+import { compensationFor, isNotExecutedError, isPostingTool, toolEffect } from "../tools/side-effects.js";
 import type { RequestProgress } from "./request-progress.js";
 
 type LateInputRaw = NonNullable<NonNullable<AppConfig["agent"]["sessions"]>["late_input"]>;
@@ -229,7 +229,9 @@ export interface EffectRecord {
   /**
    * The call reported a failure cleanly (a posting call that failed delivered
    * nothing). An effect is recorded before its call executes, so a call still
-   * executing, or one that threw (an abort included), counts as having happened.
+   * executing, or one that threw (an abort included), counts as having
+   * happened; a call a wrapper stopped before it ran (`NotExecutedError`) is
+   * removed.
    */
   failed: boolean;
   /** An undoable effect the tool reported as a no-op (nothing to compensate). */
@@ -580,14 +582,27 @@ export class LateInputSession {
             this.emitChange();
           }
         }
+        const wasReleased = this.holdReleased;
         this.holdReleased = true;
         // Recorded before the call executes: a correction arriving while it runs
         // (a send on its way out) must not redo or cancel the session. Only a
-        // clean failure the tool reports downgrades it; a throw (an abort
-        // included) may have delivered, so it still counts.
+        // clean failure downgrades it: an error the tool reports. A call a
+        // wrapper stopped before it ran (the output gate's block) leaves no
+        // effect at all, and the hold applies again to the next visible call.
+        // Any other throw (an abort included) may have delivered, so it counts.
         const record: EffectRecord = { toolCallId, name: tool.name, args: params, effect, failed: false };
         this.effects.push(record);
-        const result = await original.call(tool, toolCallId, params, signal, onUpdate);
+        let result: Awaited<ReturnType<typeof original>>;
+        try {
+          result = await original.call(tool, toolCallId, params, signal, onUpdate);
+        } catch (error) {
+          if (isNotExecutedError(error)) {
+            const at = this.effects.indexOf(record);
+            if (at >= 0) this.effects.splice(at, 1);
+            this.holdReleased = wasReleased || this.effects.length > 0;
+          }
+          throw error;
+        }
         if (isErrorResult(result)) record.failed = true;
         else if ((result as { details?: { changed?: unknown } } | undefined)?.details?.changed === false) record.noop = true;
         if (!record.failed && isPostingTool(tool.name) && this.firstDeliveryAt === undefined) this.firstDeliveryAt = this.now();

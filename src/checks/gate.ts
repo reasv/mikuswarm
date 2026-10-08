@@ -29,7 +29,7 @@ import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
 import type { SessionEnding, SessionEndingHook } from "../agent/runner.js";
 import type { Logger } from "../observability/logger.js";
 import type { RefusalOutcome } from "../storage/database.js";
-import { isPostingTool } from "../tools/side-effects.js";
+import { isPostingTool, NotExecutedError } from "../tools/side-effects.js";
 import {
   addOverrideArgumentToSchema,
   overrideArgumentCodes,
@@ -650,7 +650,9 @@ export function wrapToolsWithOutputGate(tools: readonly AgentTool[], gate: Outpu
       } catch {
         // The gate never stops a send by failing (fail-open).
       }
-      if (action.kind === "block") throw new Error(action.message);
+      // Nothing was delivered: a typed throw, so late input does not count the
+      // blocked send as an effect (the agent sees the same message).
+      if (action.kind === "block") throw new NotExecutedError(action.message);
       const result = await original.call(tool, toolCallId, withoutOverrideArgument(params), signal, onUpdate);
       if (!isErrorResult(result)) gate.delivered(tool.name, toolCallId);
       return result;
