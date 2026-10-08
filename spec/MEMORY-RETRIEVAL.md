@@ -37,7 +37,7 @@ Collected from metadata and pattern counts only; no memory or message content wa
 Per interactive session build:
 
 ```
-query set ─► wide candidate recall (hybrid, low floor, ~24 blocks)
+query set ─► wide candidate recall (hybrid + participant tags, fused, low floor, ~24 blocks)
           ─► drop blocks hidden by operator filters (precomputed verdicts, §7)
           ─► optional cheap re-rank (local cross-encoder, §5.0)
           ─► one decision call judging the top candidates' relevance (§5)
