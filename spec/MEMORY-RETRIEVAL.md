@@ -1,6 +1,6 @@
 # Memory retrieval: judged candidates, readable excerpts, operator filters
 
-**Status**: PROPOSAL, draft rev 2 (2026-10-08: owner answers folded in, §12). Not implemented.
+**Status**: PROPOSAL, draft rev 3 (2026-10-08: owner answers folded in, §12; keyword/pattern filters and time-scoped filters, §7). Not implemented.
 **Supersedes**: spec/DECISION-MODEL.md §5.5, first half (re-ranking and richer excerpts). Summary pre-expansion (the second half of §5.5) stays out of scope.
 **Builds on**: ARCHITECTURE.md §9c (diary memory, recency layer), §9d (hybrid search, `recall_memory`, auto-retrieval), §8h (decision engine, chains, calibration), spec/DECISION-MODEL.md §3 (client, fits, billing).
 **Target ARCHITECTURE.md home once implemented**: §9d (auto-retrieval, `recall_memory`), §9c (recency layer filtering), §8h (the `memory` decision point).
@@ -173,30 +173,55 @@ Diary blocks are often lists of loosely related events. Whole, relevant blocks a
 
 It is **not an access control**. A memory that must never be reachable should be deleted. Filters keep unwanted memories out of what the harness *pushes* into context. They are also applied to the memory search tools because that is easy and consistent, but direct file reads (editor, bash) stay unfiltered by design.
 
-### 7.1 Configuration
+### 7.1 Filter kinds and configuration
+
+A filter hides a block when it matches. There are three kinds of match, and any filter can be limited to a time range.
 
 ```toml
-[retrieval.filters.unwanted_habit]           # any key
+[retrieval.filters.unwanted_habit]           # judged: a decision-model question
 description = "The entry describes the assistant <doing the unwanted thing>."
 examples = { hide = ["..."], keep = ["..."] } # optional, become criteria.true / criteria.false
 threshold = 0.8                               # hide at or above
-enabled = true
+
+[retrieval.filters.old_nickname]             # keyword: cheap, mechanical
+keywords = ["some phrase", "another"]         # case-insensitive, whole words/phrases
+
+[retrieval.filters.old_bit]                  # pattern: cheap, mechanical
+patterns = ['(?i)\bsome\s+regex\b']        # regular expressions over the block text
+
+[retrieval.filters.that_week_incident]       # any kind, scoped to a time range
+description = "The entry is about <a specific event>."
+after = "2026-05-10"                          # optional; date or datetime (with zone or agent tz)
+before = "2026-05-18T12:00"                   # optional; either bound alone is fine
 ```
 
-- Per-agent overrides go in `[agents.<name>.retrieval.filters]`.
-- A filter is one `noul` per block: "`entry` matches: <description>." The model is the `memory` point's chain, or `[retrieval.filters].model`.
+- **Kinds:**
+  - **Judged** (`description`): one `noul` per block, "`entry` matches: <description>", with the examples as `criteria.true` / `criteria.false`. The model is the `memory` point's chain, or `[retrieval.filters].model`.
+  - **Keyword** (`keywords`): a case-insensitive whole-word or whole-phrase match against the block text. No model, no cost, deterministic.
+  - **Pattern** (`patterns`): regular expressions against the block text. They are validated at startup, and an invalid pattern is a config error.
+- **Combining.** A filter with both `description` and `keywords`/`patterns` uses the mechanical match as a **pre-gate**: only blocks that match it are judged, so judgement runs only where it is needed. A filter with only `keywords`/`patterns` hides on the match alone.
+- **Time scope** (`after` / `before`, both optional, each a date or a datetime):
+  - It is compared with the block's entry time: the `entry_ts` the indexer derives from the block header, or the file date for legacy blocks.
+  - A block outside the range is never hidden by that filter and is never judged for it. A filter about a past event therefore costs nothing for, and never touches, memories written later.
+  - `after` is inclusive, `before` exclusive. A bare date means the start of that day in the agent's timezone.
+  - A block with no entry time is out of range for any filter that has a time bound.
+- `enabled = true|false` on every filter. Per-agent overrides go in `[agents.<name>.retrieval.filters]`.
 
-### 7.2 Evaluation: lazy, only where a block is about to be shown, cached
+### 7.2 Evaluation: mechanical first, judged lazily, cached
 
-There is **no corpus pass and no backfill**. A block is judged only when a surface is about to show it, and the verdict is cached.
+There is **no corpus pass and no backfill**.
 
-- **The cache.** `memory_filter_verdicts(agent, content_hash, filter_key, filter_hash, probability, hidden, model, served_version, evaluated_at)`.
-  - `filter_hash` covers the description, examples and threshold. Editing a filter makes its old verdicts stale. Blocks are re-judged lazily the next time they surface; nothing is re-run in bulk.
-  - Disabling a filter simply stops consulting its verdicts.
-- **Auto-retrieval:** a candidate without a fresh verdict has its filter questions ride in the same relevance call (§5). That costs nearly nothing extra on per-request members, and the verdict is stored.
-- **Recency diary layer and the diary writer's continuity window:** these show a handful of recent blocks, which change a few times a day. Each block is judged once when it first enters the layer, at layer build time, bounded by the point's timeout, and served from the cache afterwards.
-- **Memory search tools** (`recall_memory`, `search_memory`): results without a fresh verdict are judged in one call before the tool returns.
-- **Unavailable verdict** (timeout, decision-chain outage): `filters.pending` decides (`"show"`, default, or `"hide"`). Cached verdicts keep applying during an outage.
+- **Time scope first.** It costs nothing, and an out-of-range block skips the filter entirely.
+- **Keyword and pattern filters** run inline wherever a block is about to be shown. They are deterministic, cost microseconds per block, and need no cache.
+- **Judged filters** run only where a block is about to be shown, and only when it passed the filter's time scope and its pre-gate, if any. The verdict is cached:
+  - The cache is `memory_filter_verdicts(agent, content_hash, filter_key, filter_hash, probability, hidden, model, served_version, evaluated_at)`.
+  - `filter_hash` covers the description, examples, threshold, pre-gate and time range. Editing a filter makes its old verdicts stale. Blocks are re-judged lazily the next time they surface; nothing is re-run in bulk.
+  - Disabling a filter simply stops consulting it.
+- **Where judged verdicts come from:**
+  - **Auto-retrieval:** a candidate without a fresh verdict has its judged-filter questions ride in the same relevance call (§5), at nearly no extra cost on per-request members. The verdict is stored.
+  - **Recency diary layer and the diary writer's continuity window:** these show a handful of recent blocks that change a few times a day. Each block is judged once when it first enters the layer, at layer build time, bounded by the point's timeout, and served from the cache afterwards.
+  - **Memory search tools** (`recall_memory`, `search_memory`): results without a fresh verdict are judged in one call before the tool returns.
+- **Unavailable verdict** (timeout, decision-chain outage): `filters.pending` decides (`"show"`, default, or `"hide"`) for judged filters only. Mechanical filters always apply. Cached verdicts keep applying during an outage.
 
 ### 7.3 Enforcement
 
@@ -211,7 +236,7 @@ There is **no corpus pass and no backfill**. A block is judged only when a surfa
 
 ### 7.4 Audit
 
-- **Console.** A filters page lists, per filter, the blocks it has hidden so far, with probabilities and citations (the operator can read them there). Hidden blocks also appear in a session's retrieval card as "hidden by <filter>".
+- **Console.** A filters page lists, per filter, its kind, time scope and the blocks it has hidden so far, with probabilities (judged) or the matched keyword/pattern (mechanical) and citations (the operator can read them there). Hidden blocks also appear in a session's retrieval card as "hidden by <filter>".
 - **Logs.** `memory_filter_hidden` (per surface, counts only).
 - **Write-time filtering** (refusing to write such entries) is NOT part of this spec. Display-time filtering is reversible and auditable. A counterfactual entry that was never written is neither.
 
@@ -271,7 +296,7 @@ pending = "show"              # unevaluated blocks on non-judged surfaces
 Decided:
 1. **Fallback** when the decision chain is unavailable: today's ranking with a higher floor, at most 2 items, the §6 excerpts (§5).
 2. **Proactive sessions** run the judged retrieval, with the conversation window as the request (§5).
-3. **Filters** are about not pushing memories into context, not access control. They also apply to the memory search tools because that is easy. Direct file reads stay unfiltered. There is no backfill: blocks are judged lazily when they are about to be shown (§7).
+3. **Filters** are about not pushing memories into context, not access control. They also apply to the memory search tools because that is easy. Direct file reads stay unfiltered. There is no backfill: blocks are judged lazily when they are about to be shown. Keyword and pattern filters are cheap mechanical alternatives (or pre-gates) to judgement, and any filter can be scoped to a time range so it never touches later memories (§7).
 4. **Budgets:** up to 4 items and ~2k tokens when relevant, none otherwise (§10).
 5. **Participants** only break near-ties in the ordering (§5); no reserved slots.
 6. **Participant tags** come from provenance only (§4a). There are no model-assisted "about" tags.
