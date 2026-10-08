@@ -500,6 +500,9 @@ const RetrievalSchema = StrictObject({
       // Decision chain down: the floor and cap of the fallback selection. Defaults 0.6 / 2.
       fallback_min_score: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
       fallback_max_results: Type.Optional(Type.Integer({ minimum: 0, maximum: 100 })),
+      // Most passages one build sends to the memory decision point, person-cued
+      // included; the rest go through the fallback rule. Default 12.
+      max_judged: Type.Optional(Type.Integer({ minimum: 0, maximum: 100 })),
     }),
   ),
   embedding: Type.Optional(RetrievalEmbeddingSchema),

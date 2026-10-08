@@ -11,7 +11,7 @@ import { DEFAULT_MIN_STATE_TOKENS } from "./client.js";
 // The scheduler's per-group default: decision models get an implicit
 // `decision:<key>` group with no settings, so this is their real cap.
 import { DEFAULT_MAX_IN_FLIGHT } from "../agent/scheduler.js";
-import { judgedPassageCap, resolveRetrievalConfig } from "../retrieval/config.js";
+import { judgedPerBuildMax, resolveRetrievalConfig } from "../retrieval/config.js";
 
 type ModelConfig = AppConfig["models"]["default"];
 
@@ -397,6 +397,9 @@ function collectChatModelRefs(config: AppConfig, decisionKeys: Set<string>): Arr
   const refs: Array<{ key: string; path: string }> = [];
   const MODEL_FIELDS = new Set(["model", "deep_model", "image", "video", "audio", "pro", "flash"]);
   const walk = (value: unknown, path: string, field: string | undefined): void => {
+    // `[retrieval.filters].model` names the DECISION model that judges
+    // filters; it is checked by validateFilterModels.
+    if (/(^|\.)retrieval\.filters\.model$/.test(path)) return;
     if (typeof value === "string") {
       if (field !== undefined && (MODEL_FIELDS.has(field) || field === "models" || field === "session_types") && decisionKeys.has(value)) {
         refs.push({ key: value, path });
@@ -471,6 +474,7 @@ export function validateDecisionsConfig(config: AppConfig, opts: DecisionValidat
       `${ref.path} = "${ref.key}" names a system-one decision model; decision models can only be used from [decisions]`,
     );
   }
+  validateFilterModels(config, decisionKeys);
 
   const agentNames: Array<string | null> = [null, ...Object.keys(config.agents ?? {})];
   for (const agentName of agentNames) {
@@ -517,10 +521,13 @@ function warnRecordsCapacity(
 }
 
 /**
- * One auto-retrieval build sends up to `judgedPassageCap` memory requests at
- * once, one per passage (ARCHITECTURE.md §9d), alongside routing. Warn when the
- * memory chain head's group cannot carry them in parallel: the excess waits
- * for a slot inside the point's timeout and may fall back.
+ * One auto-retrieval build sends up to `judgedPerBuildMax` memory requests
+ * (ARCHITECTURE.md §9d: the re-rank survivors plus person-cued candidates,
+ * capped by `[retrieval.auto].max_judged`), on top of routing and records in
+ * the same group. Memory requests queue below those, so a short group delays
+ * only the memory block; warn when the group cannot carry one trigger's whole
+ * demand in parallel (the excess waits inside the point's timeout and may fall
+ * back). Skipped when auto-retrieval or its judge is off.
  */
 function warnMemoryCapacity(
   config: AppConfig,
@@ -530,13 +537,22 @@ function warnMemoryCapacity(
 ): void {
   const settings = pointSettings(decisions, "memory");
   if (!settings || !config.models[settings.model]) return;
-  let needed: number;
+  let resolved: ReturnType<typeof resolveRetrievalConfig>;
   try {
-    needed = judgedPassageCap(resolveRetrievalConfig(config.retrieval));
+    resolved = resolveRetrievalConfig(config.retrieval);
   } catch {
     return;
   }
-  const group = config.models[settings.model]!.rate_limit_group ?? `decision:${settings.model}`;
+  if (!resolved.enabled || !resolved.autoRetrieval || !resolved.auto.judge) return;
+  const memory = judgedPerBuildMax(resolved);
+  if (memory <= 0) return;
+  const groupOf = (key: string) => config.models[key]?.rate_limit_group ?? `decision:${key}`;
+  const group = groupOf(settings.model);
+  let needed = memory;
+  const routing = pointSettings(decisions, "routing");
+  if (routing && groupOf(routing.model) === group) needed += 1;
+  const records = pointSettings(decisions, "records");
+  if (records && groupOf(records.model) === group) needed += (decisions.records?.candidates ?? 3) + 1;
   const maxInFlight = config.rate_limits?.llm?.[group]?.max_in_flight ?? DEFAULT_MAX_IN_FLIGHT;
   if (maxInFlight >= needed) return;
   opts.warn?.("decisions_memory_capacity_low", {
@@ -544,8 +560,33 @@ function warnMemoryCapacity(
     group,
     maxInFlight,
     needed,
-    hint: `raise [rate_limits.llm.${group}].max_in_flight to at least ${needed} so a build's passages are judged in parallel`,
+    memory,
+    hint: `raise [rate_limits.llm.${group}].max_in_flight to at least ${needed} so a build's passages are judged in parallel, or lower [retrieval.auto].max_judged`,
   });
+}
+
+/**
+ * `[retrieval.filters].model` (global and per agent) names the decision model
+ * that judges memory filters: it must be a `[models.*]` block with
+ * `api = "system-one"`.
+ */
+function validateFilterModels(config: AppConfig, decisionKeys: Set<string>): void {
+  const check = (filters: unknown, path: string) => {
+    if (!isPlainObject(filters) || filters.model === undefined) return;
+    const key = filters.model;
+    if (typeof key !== "string" || !config.models[key]) {
+      throw new Error(`${path} = ${JSON.stringify(key)} does not name a [models.*] block; set it to a decision model (api = "system-one")`);
+    }
+    if (!decisionKeys.has(key)) {
+      throw new Error(`${path} = "${key}" is a chat model; memory filters are judged by a decision model (api = "system-one")`);
+    }
+  };
+  const retrieval = (config as { retrieval?: { filters?: unknown } }).retrieval;
+  check(retrieval?.filters, "retrieval.filters.model");
+  for (const [name, block] of Object.entries(config.agents ?? {})) {
+    const agentRetrieval = (block as { retrieval?: { filters?: unknown } } | undefined)?.retrieval;
+    check(agentRetrieval?.filters, `agents.${name}.retrieval.filters.model`);
+  }
 }
 
 function requireDecisionModel(

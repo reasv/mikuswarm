@@ -58,6 +58,8 @@ export interface ResolvedRetrievalConfig {
     /** Decision chain down: floor and cap of the fallback selection. */
     fallbackMinScore: number;
     fallbackMaxResults: number;
+    /** Most passages one build sends to the memory point (person-cued included); the rest fall back. */
+    maxJudged: number;
     /** User lane (§9d): lexical "history with this person" sub-search, by display name. */
     userLane: {
       enabled: boolean;
@@ -194,6 +196,7 @@ export function resolveRetrievalConfig(config: RetrievalConfig | undefined): Res
       personRecentMax: auto.person_recent_max ?? 8,
       fallbackMinScore: auto.fallback_min_score ?? 0.6,
       fallbackMaxResults: auto.fallback_max_results ?? 2,
+      maxJudged: auto.max_judged ?? 12,
       userLane: {
         enabled: auto.user_lane_enabled ?? true,
         maxResults: auto.user_lane_max_results ?? 2,
@@ -441,9 +444,10 @@ export function activeEmbeddingModelId(resolved: ResolvedRetrievalConfig): strin
 }
 
 /**
- * The most passages auto-retrieval sends to the decision model per build
- * (§9d "Judged retrieval"): the cross-encoder's survivors when it runs, else
- * the late-interaction top 8, else the hybrid top 12.
+ * The re-rank cut before the decision model (§9d "Judged retrieval"): the
+ * cross-encoder's `top_n` when it runs, else the late-interaction top 8
+ * (vector-less blocks bypass it, up to 12 in all), else the hybrid top 12.
+ * {@link judgedPerBuildMax} is the real per-build request count.
  */
 export const JUDGED_AFTER_LATE = 8;
 export const JUDGED_AFTER_HYBRID = 12;
@@ -451,4 +455,14 @@ export function judgedPassageCap(resolved: ResolvedRetrievalConfig): number {
   if (resolved.rerank.enabled) return resolved.rerank.topN;
   if (resolved.late.enabled) return Math.min(resolved.late.topN, JUDGED_AFTER_LATE);
   return JUDGED_AFTER_HYBRID;
+}
+/**
+ * The most memory-point requests one build can send: the re-rank survivors
+ * (the cross-encoder's `top_n`, or 12 when it is off or fails at runtime) plus
+ * the person-cued candidates, capped by `auto.max_judged`.
+ */
+export function judgedPerBuildMax(resolved: ResolvedRetrievalConfig): number {
+  const ranked = Math.max(resolved.rerank.enabled ? resolved.rerank.topN : 0, JUDGED_AFTER_HYBRID);
+  const person = resolved.auto.personRecent > 0 ? resolved.auto.personRecentMax : 0;
+  return Math.min(resolved.auto.maxJudged, ranked + person);
 }
