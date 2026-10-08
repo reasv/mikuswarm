@@ -160,6 +160,10 @@ export const REPORT_MAX_ITEMS = 120;
 /** Reports up to this size are stored as they are (no parse). */
 const REPORT_PARSE_ABOVE = 48 * 1024;
 const PRUNE_EVERY_MS = 3_600_000;
+/** `index_meta` key of the sender-name back-fill cursor (the next upper rowid; 0 = done). */
+const SENDER_BACKFILL_KEY = "memory_sender_names_backfill";
+/** Timeline rows per back-fill batch (a few ms of the writer each). */
+const SENDER_BACKFILL_ROWS = 500;
 const PRUNE_BATCH = 5000;
 
 /**
@@ -312,6 +316,49 @@ export class MemoryRetrievalStore {
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
     return out;
+  }
+
+  /**
+   * One batch of the `memory_sender_names` back-fill over `timeline_events`
+   * rows older than its triggers (newest first, `batchRows` rowids per call,
+   * its own short write). Returns true once done (or when there is nothing to fill).
+   */
+  backfillSenderNames(batchRows = SENDER_BACKFILL_ROWS): Promise<boolean> {
+    return this.storage.write((db) => {
+      const ready = db
+        .prepare(`select count(*) as n from sqlite_master where type = 'table' and name in ('timeline_events', 'memory_sender_names')`)
+        .get() as { n: number };
+      if (ready.n < 2) return true;
+      const stored = db.prepare(`select value from index_meta where key = ?`).get(SENDER_BACKFILL_KEY) as { value: string } | undefined;
+      const cursor = stored
+        ? Number(stored.value)
+        : (db.prepare(`select coalesce(max(rowid), 0) as m from timeline_events`).get() as { m: number }).m;
+      if (cursor > 0) {
+        const lo = Math.max(0, cursor - batchRows);
+        db.prepare(
+          `insert into memory_sender_names (provider, sender_id, display_name, last_ts)
+           select provider, sender_id, sender_display_name, max(timestamp) from timeline_events
+           where rowid > ? and rowid <= ? and sender_display_name is not null and sender_display_name != ''
+           group by provider, sender_id, sender_display_name
+           on conflict(provider, sender_id, display_name) do update set last_ts = max(last_ts, excluded.last_ts)`,
+        ).run(lo, cursor);
+        db.prepare(`insert into index_meta (key, value) values (?, ?) on conflict(key) do update set value = excluded.value`).run(
+          SENDER_BACKFILL_KEY,
+          String(lo),
+        );
+        return lo === 0;
+      }
+      if (!stored) db.prepare(`insert into index_meta (key, value) values (?, '0')`).run(SENDER_BACKFILL_KEY);
+      return true;
+    });
+  }
+
+  /** Run {@link backfillSenderNames} to completion in the background, pausing between batches. */
+  async runSenderNamesBackfill(opts: { signal?: AbortSignal; pauseMs?: number } = {}): Promise<void> {
+    while (!opts.signal?.aborted) {
+      if (await this.backfillSenderNames()) return;
+      await new Promise((resolve) => setTimeout(resolve, opts.pauseMs ?? 20).unref());
+    }
   }
 
   /** Distinct content hashes of every chunk (any agent). */
@@ -518,12 +565,9 @@ export class MemoryRetrievalStore {
     return this.storage.read((db) => {
       const rows = db
         .prepare(
-          `select sender_display_name as name, max(timestamp) as last
-           from timeline_events
-           where provider = ? and sender_id = ? and sender_display_name is not null
-             and sender_display_name != ''
-           group by sender_display_name
-           order by last desc
+          `select display_name as name, last_ts as last from memory_sender_names
+           where provider = ? and sender_id = ?
+           order by last_ts desc
            limit ?`,
         )
         .all(provider, senderId, limit + 1) as Array<{ name: string; last: number }>;

@@ -136,6 +136,7 @@ export async function createRetrievalSubsystem(
       : [{ agentName: null, workspaceRoot }];
 
   const store = new MemoryRetrievalStore(storage, { retrievalsRetentionDays: config.retrievalsRetentionDays });
+  const backfillStop = new AbortController();
   let primary: PrimaryIndex | undefined;
   let lateWorker: LateIndexWorker | undefined;
   // Participant tags from provenance (§9d): tags every block without a
@@ -480,6 +481,8 @@ export async function createRetrievalSubsystem(
         primary?.notifyNewWork();
         lateWorker?.notifyNewWork();
         await tagger.run();
+        // The display-name history of rows older than its triggers, in small batches.
+        void store.runSenderNamesBackfill({ signal: backfillStop.signal }).catch(() => undefined);
         for (const idx of indexers) void late?.refreshWindow(idx.agentName);
       })().catch((error) =>
         logger?.warn("memory_index_sweep_failed", {
@@ -492,6 +495,7 @@ export async function createRetrievalSubsystem(
     },
     stop: async () => {
       if (tagTimer) clearTimeout(tagTimer);
+      backfillStop.abort();
       await lateWorker?.stop();
       await late?.close();
       await lateChains?.documents.close();

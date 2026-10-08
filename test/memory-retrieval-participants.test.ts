@@ -132,6 +132,24 @@ test("display-name history: newest first, the current name excluded", async () =
   });
 });
 
+test("display-name history: rows older than the triggers are back-filled in small background batches", async () => {
+  await withFixture(async ({ storage, store }) => {
+    // As on an upgraded database: the history table starts empty, the rows already exist.
+    await storage.write((db) => db.exec(`delete from memory_sender_names; delete from index_meta where key = 'memory_sender_names_backfill'`));
+    assert.deepEqual(store.senderDisplayNameHistory("matrix", "@alice:x", 4), []);
+    let batches = 0;
+    while (!(await store.backfillSenderNames(2))) batches++;
+    assert.ok(batches >= 2, "several bounded batches");
+    assert.deepEqual(store.senderDisplayNameHistory("matrix", "@alice:x", 4), ["Alice", "Alice Old"]);
+    assert.equal(await store.backfillSenderNames(2), true, "done stays done");
+    assert.equal(
+      storage.read((db) => (db.prepare(`select count(*) as n from sqlite_master where name = 'idx_timeline_events_sender'`).get() as { n: number }).n),
+      0,
+      "no multi-second index build on timeline_events",
+    );
+  });
+});
+
 test("user scope: by sender id or a (former) display name, plus entries naming them", async () => {
   await withFixture(async ({ storage, store }) => {
     await new ParticipantTagger({ store }).run();
