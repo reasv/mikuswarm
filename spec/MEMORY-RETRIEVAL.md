@@ -572,6 +572,18 @@ Also decided (rev 5):
     - It sits before the cross-encoder. Its code is implemented regardless of the model choice.
 12. **Segmentation is not a problem here** (owner): memories are discrete blocks, so every stage scores whole blocks (§5.0).
 
+Decided by measurement (2026-10-08 evaluation: 80 real queries, pooled relevance labels from a self-hosted labeller, every method through the production search path):
+13. **The cross-encoder stage is on**, with bge-reranker-v2-m3 on a GPU. Precision@8 after re-ranking is ~0.37, against 0.17 for the hybrid's own top 8.
+14. **Late interaction is not used.**
+    - On its own it is weaker than BM25, even with the pipeline's real query: R@60 0.27 for mLateOn, against 0.375 for BM25.
+    - Added to an RRF of BM25 and dense, it significantly *lowers* precision@8 after re-ranking: −0.03 with mLateOn, −0.05 with pplx-0.6b.
+    - A 9B index (queried by 0.6B or 9B) gave no gain over 0.6B.
+    - The code stays, default off. TurboQuant 4-bit kept 90–95% of the exact top 20 in its top 60; 2-bit is not usable.
+15. **Recall uses reciprocal-rank fusion** (`fusion = "rrf"`, k = 60) of BM25 and the built-in vectors: R@60 0.264 → 0.375, and P@8 after re-ranking 0.308 → 0.373.
+    - A stronger embedder (Qwen3-Embedding-4B) added +0.02, which is not significant, so the built-in embedder stays.
+    - The weighted sum's vector half was actively hurting recall on this corpus.
+16. **Recall is not the bottleneck.** 94% of builds have at least one relevant entry in the recall set; ranking is where the gain was. The old unjudged selection showed entries that were only 10% relevant, no better than the recall set at random.
+
 Remaining:
 - **The survey and measurements of §5.0c,** which choose the models: GPU primary, API fallback (or primary), and the built-in CPU models. These run in parallel with the implementation.
 - **Whether the built-in CPU re-ranker ships enabled by default,** like the embedder. Proposed yes (§5.0a), pending its measured quality.
