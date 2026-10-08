@@ -435,3 +435,34 @@ test("late input races: after a partial compensation, an undone reaction is neve
     await h.stop();
   }
 });
+
+test("late input races: an addition arriving after the trigger's hold bound still gets its verdict honoured", async () => {
+  let first = true;
+  const h = await startHarness({
+    toml: LATE({ hold_ms: 300, extend_ms: 200, max_hold_ms: 800 }) + DECIDER({ timeout_ms: 500 }),
+    decideNoul: () => new Promise((r) => setTimeout(() => r(0.95), 100)),
+    script: (req) => {
+      if (isRecordTurnRequest(req)) return { text: "NO_REPLY" };
+      const reply = send(userText(req).includes("in Celsius") ? "20 C" : "68 F");
+      if (first) {
+        first = false;
+        return { ...reply, delayMs: 3000 };
+      }
+      return reply;
+    },
+  });
+  try {
+    h.say("temperature in Rome?", { mention: true });
+    await h.until(() => h.llm.requests.length >= 1, "first request");
+    // Inside the candidate window and before any delivery, but after the
+    // trigger's arrival + max_hold_ms + timeout_ms (1.3 s).
+    await new Promise((r) => setTimeout(r, 1600));
+    h.say("in Celsius please");
+    await h.until(() => h.sends.length >= 1, "a send", 15_000);
+    await new Promise((r) => setTimeout(r, 500));
+    assert.ok(!hasLog(h, "late_input_verdict_timeout"), "a 100 ms verdict is not discarded as a timeout");
+    assert.deepEqual(bodies(h), ["20 C"]);
+  } finally {
+    await h.stop();
+  }
+});

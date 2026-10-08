@@ -5654,29 +5654,32 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     if (pointSettings && entry.judged < knobs.maxJudged) {
       entry.judged += 1;
       markSteered(inbound.event.id);
-      // The held call waits for the verdict AND the join it leads to (the redo is
-      // filed before the hold may let the call go), bounded: a verdict later than
-      // max_hold_ms plus the point's timeout counts as unjudged.
-      const boundAt =
-        entry.ctl.triggerReceivedAt +
-        lateInputSettings.maxHoldMs +
-        Math.max(pointSettings.timeoutMs, pointSettings.vision?.timeoutMs ?? 0);
-      const verdict = boundedVerdict(judgeLateAddition(entry, inbound), boundAt, entry.sessionId);
-      const decided = verdict.then((v) => {
+      // The verdict always decides the candidate, whenever it arrives (the
+      // decision call is bounded by its own timeout). The held call waits for
+      // the verdict AND the join it leads to (the redo is filed before the hold
+      // may let the call go), but only until the later of the hold's bound and
+      // the candidate's arrival, plus the point's timeout (the vision timeout
+      // for an image candidate): a verdict after that still joins, by
+      // interjection once the held call went out.
+      const timeoutMs = hasImageAttachment(inbound.event) && pointSettings.vision ? pointSettings.vision.timeoutMs : pointSettings.timeoutMs;
+      const holdBoundAt = Math.max(entry.ctl.triggerReceivedAt + lateInputSettings.maxHoldMs, Date.now()) + timeoutMs;
+      const decided = judgeLateAddition(entry, inbound).then((v) => {
         if (v.judged) {
           if (v.belongs) return joinLateAddition(entry, inbound, form, "judged");
           logger.info("late_input_ignored", { sessionId: entry.sessionId, kind: "addition", reason: "judged_not_belonging", probability: v.probability });
           revertFollowUpToNativeFate(inbound, "late_addition_rejected");
           return;
         }
-        // No verdict (point failed or too late): the quick fold windows decide, as without the point.
+        // No verdict (the point failed): the quick fold windows decide, as without the point.
         if (quickFoldPasses(entry, inbound, form)) return joinLateAddition(entry, inbound, form, "quick_window");
         revertFollowUpToNativeFate(inbound, "late_addition_unjudged");
       }).catch((error) => {
         logger.error("late_input_addition_failed", { sessionId: entry.sessionId, error: error instanceof Error ? error.message : String(error) });
         revertFollowUpToNativeFate(inbound, "late_addition_failed");
       });
-      entry.ctl.trackVerdict(raceDeadline(decided, boundAt));
+      entry.ctl.trackVerdict(
+        raceDeadline(decided, holdBoundAt, () => logger.info("late_input_verdict_timeout", { sessionId: entry.sessionId, eventId: inbound.event.id })),
+      );
       return true;
     }
     if (!quickFoldPasses(entry, inbound, form)) return false;
@@ -5687,10 +5690,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     return true;
   }
 
-  /** `promise`, or undefined at `deadline` (wall clock) if it has not settled by then. */
-  function raceDeadline<T>(promise: Promise<T>, deadline: number): Promise<T | undefined> {
+  /** `promise`, or undefined at `deadline` (wall clock) if it has not settled by then (`onTimeout` is called). */
+  function raceDeadline<T>(promise: Promise<T>, deadline: number, onTimeout?: () => void): Promise<T | undefined> {
     return new Promise((resolve) => {
-      const timer = setTimeout(() => resolve(undefined), Math.max(0, deadline - Date.now()));
+      const timer = setTimeout(() => {
+        onTimeout?.();
+        resolve(undefined);
+      }, Math.max(0, deadline - Date.now()));
       timer.unref?.();
       promise.then(
         (value) => {
@@ -5703,14 +5709,6 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         },
       );
     });
-  }
-
-  /** A late-addition verdict, or "not judged" when it is not in by `deadline`. */
-  async function boundedVerdict(verdict: Promise<LateAdditionVerdict>, deadline: number, sessionId: string): Promise<LateAdditionVerdict> {
-    const settled = await raceDeadline(verdict, deadline);
-    if (settled !== undefined) return settled;
-    logger.info("late_input_verdict_timeout", { sessionId });
-    return LATE_ADDITION_NOT_JUDGED;
   }
 
   function quickFoldPasses(entry: LateInputEntry, inbound: InboundChatEvent, form: FollowUpForm): boolean {
