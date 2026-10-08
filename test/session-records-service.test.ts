@@ -18,7 +18,8 @@ import {
   SessionRecordService,
   type StartRecordTurnParams,
 } from "../src/agent/session-records.ts";
-import { SummaryDraft } from "../src/tools/session-record-tool.ts";
+import { createSessionRecordTool, SummaryDraft } from "../src/tools/session-record-tool.ts";
+import { wrapToolsWithRecordTurnGate } from "../src/agent/record-turn.ts";
 import { AgentSessionFactory, withDeferredLoads } from "../src/agent/factory.ts";
 import { LlmScheduler, type PriorityClass } from "../src/agent/scheduler.ts";
 import type { DynamicToolRegistry } from "../src/agent/dynamic-tools.ts";
@@ -464,11 +465,11 @@ test("record settle barrier includes asynchronous post-write judging", async () 
  const { logger } = quietLogger();
  const { agent } = stubAgent(makeTranscriptWithTool("web_fetch"));
  const draft = new SummaryDraft();
- draft.create("synthetic record");
  let listener: (event: any) => void = () => {};
  (agent as any).subscribe = (fn: typeof listener) => { listener = fn; return () => {}; };
  (agent as any).prompt = async (messages: AgentMessage[]) => {
    agent.state.messages.push(...messages);
+   draft.create("synthetic record");
    listener({ type: "tool_execution_end", toolName: "session_record_tool", isError: false, result: { terminate: true } });
  };
  let finishJudge!: () => void;
@@ -488,4 +489,134 @@ test("record settle barrier includes asynchronous post-write judging", async () 
  await run;
  await barrier;
  assert.equal(settled, true);
+});
+
+// ── Record turns of a revived run, aborts and the turn cap ───────────────────
+
+type Handles = StartRecordTurnParams["handles"];
+
+/**
+ * A scripted model: each LLM turn calls the record tool with the next scripted
+ * args (or `{ blocked: true }`: a finalize batched with another tool, so pi's
+ * loop goes on), through the real tool and the real record-turn gate, emitting
+ * pi's events. `abort()` ends the loop like pi's would.
+ */
+function scriptedAgent(handles: Handles, script: Array<Record<string, unknown>>, hooks: { afterFinalize?: () => void } = {}) {
+  const [tool] = wrapToolsWithRecordTurnGate([createSessionRecordTool({ draft: handles.draft, maxTokens: 1500 })], handles.gate);
+  let listener: (e: any) => void = () => {};
+  let aborted = false;
+  const agent: any = {
+    state: { messages: makeTranscriptWithTool("web_fetch"), errorMessage: undefined, model: { api: "openai-completions", provider: "p", id: "m" }, tools: [tool] },
+    prompts: 0,
+    turns: 0,
+    hasQueuedMessages: () => false,
+    clearAllQueues: () => {},
+    subscribe: (fn: any) => { listener = fn; return () => {}; },
+    abort: () => { aborted = true; },
+    waitForIdle: async () => {},
+    prompt: async (kickoff: AgentMessage[]) => {
+      agent.prompts += 1;
+      aborted = false;
+      agent.state.messages.push(...kickoff);
+      while (!aborted && agent.turns < 50) {
+        const next = script.shift();
+        if (!next) return;
+        const { blocked, ...args } = next as { blocked?: boolean };
+        agent.turns += 1;
+        agent.state.messages.push({ role: "assistant", content: [{ type: "toolCall", id: "c", name: "session_record_tool", arguments: args }], model: "m", timestamp: 2 });
+        let isError = false;
+        let result: any;
+        try { result = await tool!.execute("c", args as never); } catch (e) { isError = true; result = { content: [{ type: "text", text: (e as Error).message }] }; }
+        agent.state.messages.push({ role: "toolResult", toolCallId: "c", toolName: "session_record_tool", content: result.content, isError, timestamp: 2 });
+        listener({ type: "tool_execution_end", toolName: "session_record_tool", isError, result });
+        if (!isError && result?.terminate === true) hooks.afterFinalize?.();
+        listener({ type: "turn_end" });
+        if (!isError && result?.terminate === true && !blocked) return;
+      }
+    },
+  };
+  return agent;
+}
+
+function recordParams(handles: Handles, rows: Array<{ text: string }>, logger: StartRecordTurnParams["logger"]) {
+  const storage = { upsertSessionRecord: async (row: { text: string }) => { rows.push(row); } } as unknown as StartRecordTurnParams["storage"];
+  return startParams({ agent: undefined as never, logger, handles, storage });
+}
+
+test("record turn of a revived run writes its own record, not the earlier turn's draft", async () => {
+  const svc = new SessionRecordService();
+  const { logger } = quietLogger();
+  const rows: Array<{ text: string }> = [];
+  // One handles object per launch, reused by every run of the session.
+  const handles: Handles = { gate: { active: false }, draft: new SummaryDraft() };
+  const base = recordParams(handles, rows, logger);
+  await svc.start({ ...base, agent: scriptedAgent(handles, [{ command: "create", file_text: "RECORD A", finalize: true }]) });
+  assert.equal(rows.at(-1)?.text, "RECORD A");
+  // Revived, more work, and the record turn runs again on the same handles.
+  const revived = scriptedAgent(handles, [{ command: "create", file_text: "RECORD B: A, then Y", finalize: true }]);
+  await svc.start({ ...base, agent: revived });
+  assert.equal(revived.state.messages.some((m: any) => m.role === "toolResult" && m.isError), false, "create succeeded");
+  assert.equal(rows.at(-1)?.text, "RECORD B: A, then Y");
+});
+
+test("record turn aborted for revival after it finalized writes nothing", async () => {
+  const svc = new SessionRecordService();
+  const { logger, lines } = quietLogger();
+  const rows: Array<{ text: string }> = [];
+  const handles: Handles = { gate: { active: false }, draft: new SummaryDraft() };
+  let revival: Promise<void> | undefined;
+  const agent = scriptedAgent(handles, [{ command: "create", file_text: "forked away", finalize: true }], {
+    afterFinalize: () => { revival = svc.abortForRevival("s1"); },
+  });
+  await svc.start({ ...recordParams(handles, rows, logger), agent });
+  await revival;
+  assert.equal(rows.length, 0, "the record of a turn being forked away is not written");
+  assert.ok(lines.some((l) => l.message === "session_record_failed" && l.fields?.reason === "revival"));
+});
+
+test("record turn: an abort during the pre-write judge stops the judged rerun", async () => {
+  for (const abort of ["revival", "shutdown"] as const) {
+    const svc = new SessionRecordService();
+    const { logger, lines } = quietLogger();
+    const rows: Array<{ text: string }> = [];
+    const handles: Handles = { gate: { active: false }, draft: new SummaryDraft() };
+    const agent = scriptedAgent(handles, [
+      { command: "create", file_text: "first attempt", finalize: true },
+      { command: "create", file_text: "second attempt", finalize: true },
+    ]);
+    let enter!: () => void;
+    const entered = new Promise<void>((r) => { enter = r; });
+    let finish!: (v: "rerun") => void;
+    const verdict = new Promise<"rerun">((r) => { finish = r; });
+    let discarded = 0;
+    const run = svc.start({
+      ...recordParams(handles, rows, logger), agent,
+      judgeRecord: async () => { enter(); return verdict; },
+      discardTurn: async () => { discarded += 1; },
+    });
+    await entered;
+    const aborted = abort === "revival" ? svc.abortForRevival("s1") : (svc.shutdown(), Promise.resolve());
+    finish("rerun");
+    await aborted;
+    await run;
+    assert.equal(agent.prompts, 1, `${abort}: no new record-turn request`);
+    assert.equal(discarded, 0, `${abort}: nothing discarded for a rerun`);
+    assert.equal(rows.length, 0, `${abort}: nothing written`);
+    assert.ok(lines.some((l) => l.message === "session_record_failed" && l.fields?.reason === abort), abort);
+  }
+});
+
+test("record turn: max_turns still stops a loop that goes on after finalize", async () => {
+  const svc = new SessionRecordService();
+  const { logger, lines } = quietLogger();
+  const rows: Array<{ text: string }> = [];
+  const handles: Handles = { gate: { active: false }, draft: new SummaryDraft() };
+  // Finalize batched with a blocked call: pi's loop does not terminate.
+  const script = [{ command: "create", file_text: "the record", finalize: true, blocked: true }];
+  for (let i = 0; i < 20; i++) script.push({ command: "view", blocked: true } as never);
+  const agent = scriptedAgent(handles, script);
+  await svc.start({ ...recordParams(handles, rows, logger), agent, config: { enabled: true, max_turns: 3 } });
+  assert.equal(agent.turns, 4, "max_turns + 1, then aborted");
+  assert.deepEqual(rows.map((r) => r.text), ["the record"], "the finalized draft is still written");
+  assert.ok(lines.some((l) => l.message === "session_record_written"));
 });

@@ -396,6 +396,10 @@ export class SessionRecordService {
       agent.clearAllQueues();
       logger.warn("session_record_queue_cleared", { sessionId });
     }
+    // Every record turn starts on an empty draft. A revived run reuses its
+    // launch's handles: the draft of the turn the revival forked away is not
+    // this run's record (and `create` would refuse to start a new one).
+    handles.draft.reset();
 
     // The kickoff: the record prompt, plus the record tool's load when it is
     // not loaded yet. Rebuilt for a rerun (a fork unloads what only the
@@ -450,7 +454,10 @@ export class SessionRecordService {
       }
       if (event.type !== "turn_end") return;
       turns += 1;
-      if (turns >= maxTurns && !finalized) entry.abort?.("max_turns");
+      // Not finalized after max_turns: give up. Finalized but still looping (a
+      // finalize batched with another call does not end pi's loop): one turn of
+      // slack, then stop; the finalized draft is still written.
+      if ((turns >= maxTurns && !finalized) || turns > maxTurns) entry.abort?.("max_turns");
     });
     handles.gate.active = true;
     // The record's soft-refusal verdict (spec REFUSAL-HANDLING §5.2.3), when judged.
@@ -463,6 +470,9 @@ export class SessionRecordService {
         const draftText = handles.draft.isCreated() ? handles.draft.getContent() : "";
         if (draftText.trim().length === 0) break;
         const verdict = await params.judgeRecord(draftText);
+        // A revival or shutdown that landed while the judge ran ends the turn:
+        // no rerun, no write.
+        if (abortReason || this.stopping) break;
         if (verdict === undefined) break;
         if (verdict !== "rerun") {
           judged = verdict;
@@ -488,7 +498,9 @@ export class SessionRecordService {
       params.setRefusalSite?.(undefined);
     }
 
-    if (abortReason && !finalized) {
+    // A revival forks this turn away: it never writes, even when it finalized
+    // (the revived run writes the record at its new end).
+    if (abortReason === "revival" || (abortReason && !finalized)) {
       fail(abortReason, { turns });
       return;
     }
