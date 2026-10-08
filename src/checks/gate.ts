@@ -490,8 +490,10 @@ export class OutputGate implements SessionEndingHook {
       const now = this.now();
       // Never older than the bound: a parallel session's messages are recent.
       const rows = source.messages(target, Math.max(after, now - UNSEEN_MAX_AGE_MS), knobs.maxEarlier * 4 + 8);
-      // Deleted messages count as of now (the evaluation time).
-      const earlier = selectUnseen(rows, seen, { selfSessionId: scope.sessionId ?? "", max: knobs.maxEarlier, asOf: now });
+      // A stored deletion marker counts whatever its time: it is the provider's
+      // clock (Discord: our receipt), not ours, so an as-of compare could keep a
+      // message deleted a moment ago. Only the calibration replay reads as of a time.
+      const earlier = selectUnseen(rows, seen, { selfSessionId: scope.sessionId ?? "", max: knobs.maxEarlier });
       if (earlier.length === 0) return skip("no_unseen", { target });
       if (recheck) {
         // Only messages that arrived while the call waited start another evaluation.

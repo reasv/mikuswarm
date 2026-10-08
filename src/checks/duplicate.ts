@@ -213,9 +213,9 @@ export function messageText(event: CanonicalChatEvent): string {
 /**
  * The unseen messages among `rows` (another session's bot messages in the
  * target timeline, received after the last-seen point, any order): drops the
- * ones already seen, the session's own and the ones deleted by `asOf` (the
- * evaluation time; a deletion marker after it does not count), joins the
- * chunks of one long message, and keeps the newest `max`, oldest first.
+ * ones already seen, the session's own and the deleted ones (any marker; with
+ * `asOf`, the calibration replay's call time, only a marker dated by then),
+ * joins the chunks of one long message, and keeps the newest `max`, oldest first.
  */
 export function selectUnseen(
   rows: readonly DuplicateRow[],

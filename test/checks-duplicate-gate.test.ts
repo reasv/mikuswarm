@@ -478,12 +478,12 @@ test("deleted messages: one another session deleted does not count; deleting a q
   await botMessage(storage, "e1", "It's 42.", CUTOFF + 1000);
   await botMessage(storage, "e2", "It's 41.", CUTOFF + 1200);
   await deleteMessage(storage, "e2", Date.now() - 1000);
-  // A deletion marked later than the evaluation does not count yet.
+  // A marker dated after the evaluation (the provider's clock is ahead) still counts live.
   await botMessage(storage, "e3", "Or 43.", CUTOFF + 1300);
   await deleteMessage(storage, "e3", Date.now() + 60_000);
   const t = await setup({ storage, answer: (q) => (q === "repeats" ? 0.95 : 0.1) });
-  assert.match(await t.call({ message: "The answer is 42." }), /^Not sent\. Other sessions of yours/);
-  assert.deepEqual(t.decisions[0]!.state.earlier.map((m: any) => m.text), ["It's 42.", "Or 43."]);
+  assert.match(await t.call({ message: "The answer is 42." }), /^Not sent\. Another session of yours/);
+  assert.deepEqual(t.decisions[0]!.state.earlier.map((m: any) => m.text), ["It's 42."]);
   // The quoted message is deleted afterwards: it stays seen, nothing new to compare.
   await deleteMessage(storage, "e1", Date.now());
   assert.equal(await t.call({ message: "As I said: 42." }), "sent");

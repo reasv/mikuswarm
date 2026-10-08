@@ -311,7 +311,7 @@ test("prior rejections: live-branch check rows where a duplicate check fired, wi
   assert.deepEqual([...priorDuplicateRejections(rows, new Set(["duplicate"]))], [["c1", ["e1"]]]);
 });
 
-test("unseen: a message deleted by the evaluation time does not count; a later deletion does not yet", () => {
+test("unseen: live, any deletion marker counts; the replay (asOf) counts only one dated by then", () => {
   const deleted = (r: DuplicateRow, at: number): DuplicateRow => ({ ...r, event: { ...r.event, deleted: { at } } });
   const rows = [
     deleted(row("e1", "gone", 2100), 5000),
@@ -322,6 +322,9 @@ test("unseen: a message deleted by the evaluation time does not count; a later d
   ];
   const unseen = selectUnseen(rows, seenFromMessages([]), { selfSessionId: "s-self", max: 5, asOf: 6000 });
   assert.deepEqual(unseen.map((m) => m.text), ["deleted later", "part one", "part three"], "a deleted chunk breaks the message");
+  // Live (no asOf): any marker counts, whatever its time.
+  const live = selectUnseen(rows, seenFromMessages([]), { selfSessionId: "s-self", max: 5 });
+  assert.deepEqual(live.map((m) => m.text), ["part one", "part three"]);
 });
 
 test("send_dm target: the account's DM with the user with the newest activity, through indexed reads only", async () => {
