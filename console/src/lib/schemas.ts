@@ -1203,7 +1203,8 @@ export type MemoryFilterHitsResponse = Schema.Schema.Type<typeof MemoryFilterHit
  * One window of GET /api/memory/stats. The follow-up figures are
  * `MemoryRetrievalStore.followUpStats(sinceTs)`: distinct sessions with a build
  * that kept something, and how many of them followed up. `builds` / `sources`
- * count every build row since `sinceTs` by its `source`.
+ * count the confirmed build rows since `sinceTs` by their `source` (a build
+ * recorded as aborted, never shown, is left out).
  */
 export const MemoryStatsWindow = Schema.Struct({
 	days: Schema.Number,

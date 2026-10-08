@@ -772,8 +772,11 @@ export class ContextBuilder {
     // (`options.memoryRetrieval`): recall, the re-rank stages and the decision
     // filter run while routing and this build proceed, and the build waits only
     // here, bounded by the memory point's timeout plus a small grace (spec §8).
-    // A build that stops waiting abandons the plan: it is aborted and its block
-    // is never recorded as shown. A room preview (no session) runs the pipeline
+    // When that wait expires the plan finishes with what is ready (the judged
+    // keepers so far plus the fallback rule over the rest); only when nothing
+    // is ready does the build show no block and abandon the plan (aborted,
+    // never recorded as shown). The session confirms the plan once its
+    // kickoff is sent, and abandons it when the build is discarded. A room preview (no session) runs the pipeline
     // inline without the memory point; judged filters it meets follow
     // `pending`, though the recency layer it renders may still judge filters
     // (billed, attributed to the preview).
@@ -784,7 +787,8 @@ export class ContextBuilder {
         this.logger?.warn("auto_retrieval_failed", { error: error instanceof Error ? error.message : String(error) });
       const ticket = options.memoryRetrieval;
       if (ticket) {
-        const plan = await awaitPlan(ticket.plan, ticket.waitMs, onError);
+        let plan = await awaitPlan(ticket.plan, ticket.waitMs, onError);
+        if (!plan) plan = await ticket.bestEffort().catch(() => null);
         if (!plan) ticket.abandon();
         retrievedMemory = plan?.block ?? null;
       } else if (!options.selfSessionId) {

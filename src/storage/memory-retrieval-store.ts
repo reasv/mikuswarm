@@ -999,7 +999,9 @@ export class MemoryRetrievalStore {
   /**
    * Builds since `sinceTs` counted by source (model / fallback / unjudged /
    * none); a `model` build that also showed fallback-selected items counts as
-   * `model_fallback`.
+   * `model_fallback`. Only confirmed builds count: a row recorded as aborted
+   * (its build was cancelled, redone or discarded before the kickoff was
+   * sent) is left out.
    */
   sourceCounts(sinceTs: number): Record<string, number> {
     return this.storage.read((db) => {
@@ -1008,7 +1010,9 @@ export class MemoryRetrievalStore {
           `select case when source = 'model' and json_valid(report_json) and coalesce(json_extract(report_json, '$.fellBack'), 0) > 0
                        then 'model_fallback' else source end as source,
                   count(*) as n
-           from memory_retrievals where ts >= ? group by 1`,
+           from memory_retrievals
+           where ts >= ? and not (json_valid(report_json) and coalesce(json_extract(report_json, '$.aborted'), 0) = 1)
+           group by 1`,
         )
         .all(sinceTs) as Array<{ source: string; n: number }>;
       return Object.fromEntries(rows.map((r) => [r.source, r.n]));

@@ -93,3 +93,24 @@ test("retention: the prune deletes in small batches and yields to the event loop
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("stats count only confirmed builds: a row recorded as aborted is left out", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "miku-retr-"));
+  const storage = await Storage.open({ databasePath: path.join(dir, "t.db") });
+  try {
+    const store = new MemoryRetrievalStore(storage, { retrievalsRetentionDays: 0 });
+    const row = (id: string, kept: number, report: Record<string, unknown>) => ({
+      id, agentSessionId: id, agent: null, timelineKey: null, ts: 1000, source: "model", decisionGroup: null,
+      candidates: 3, judged: 3, kept, hidden: 0, tokens: kept * 10, ms: 1, reportJson: JSON.stringify(report),
+    });
+    await store.insertRetrieval(row("shown", 2, { source: "model", items: [] }));
+    await store.insertRetrieval(row("cancelled", 0, { source: "model", aborted: true, items: [] }));
+    await storage.waitForIdle();
+    assert.deepEqual(store.sourceCounts(0), { model: 1 });
+    assert.equal(store.followUpStats(0).sessionsWithBlock, 1);
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

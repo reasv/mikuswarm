@@ -1,8 +1,8 @@
 /**
  * The context build's side of auto-retrieval (ARCHITECTURE.md §9d "Judged
  * retrieval"): a live build waits for its launch-time plan within the ticket's
- * budget and abandons it on timeout; only a room preview runs the pipeline
- * inline. Fake pipeline; synthetic fixtures only.
+ * budget, then takes the plan's best effort and abandons it only when nothing
+ * is ready; only a room preview runs the pipeline inline. Fake pipeline; synthetic fixtures only.
  */
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -74,17 +74,44 @@ async function withBuilder(run: (b: ContextBuilder, inline: PlanInput[]) => Prom
 
 const finalContent = (r: Awaited<ReturnType<ContextBuilder["build"]>>) => r.messages[r.messages.length - 1]!.content;
 
-test("a live build abandons a plan that outlasts the ticket's wait, and renders no block", async () => {
+const ticketOf = (plan: Promise<RetrievalPlan | null>, waitMs: number, bestEffort: () => Promise<RetrievalPlan | null>, counts: { abandoned: number; bestEffort: number }): MemoryPlanTicket => ({
+  plan,
+  waitMs,
+  bestEffort: () => {
+    counts.bestEffort += 1;
+    return bestEffort();
+  },
+  confirm: () => undefined,
+  abandon: () => (counts.abandoned += 1),
+});
+
+test("a live build whose wait expires uses the plan's best effort now", async () => {
   await withBuilder(async (builder, inline) => {
-    let abandoned = 0;
-    const ticket: MemoryPlanTicket = { plan: new Promise(() => {}), waitMs: 30, abandon: () => (abandoned += 1) };
+    const counts = { abandoned: 0, bestEffort: 0 };
+    const ticket = ticketOf(new Promise(() => {}), 30, async () => plan(BLOCK), counts);
+    const result = await builder.build({
+      timelineKey: TK, trigger: ev("ev1", "hello there", 1000), activeSessions: [], workspace: emptyWorkspace,
+      selfSessionId: "s1", memoryRetrieval: ticket,
+    });
+    assert.equal(counts.bestEffort, 1);
+    assert.equal(counts.abandoned, 0, "the session confirms or abandons it later");
+    assert.ok(finalContent(result).includes("a memory"), "the block is shown");
+    assert.equal(inline.length, 0);
+  });
+});
+
+test("a live build abandons a plan that outlasts the ticket's wait with nothing ready, and renders no block", async () => {
+  await withBuilder(async (builder, inline) => {
+    const counts = { abandoned: 0, bestEffort: 0 };
+    const ticket = ticketOf(new Promise(() => {}), 30, async () => null, counts);
     const started = Date.now();
     const result = await builder.build({
       timelineKey: TK, trigger: ev("ev1", "hello there", 1000), activeSessions: [], workspace: emptyWorkspace,
       selfSessionId: "s1", memoryRetrieval: ticket,
     });
     assert.ok(Date.now() - started < 2000);
-    assert.equal(abandoned, 1);
+    assert.equal(counts.bestEffort, 1);
+    assert.equal(counts.abandoned, 1);
     assert.ok(!finalContent(result).includes("<retrieved_memory"));
     assert.equal(inline.length, 0);
   });
@@ -92,13 +119,14 @@ test("a live build abandons a plan that outlasts the ticket's wait, and renders 
 
 test("a live build renders its ticket's block and does not abandon it", async () => {
   await withBuilder(async (builder) => {
-    let abandoned = 0;
-    const ticket: MemoryPlanTicket = { plan: Promise.resolve(plan(BLOCK)), waitMs: 1000, abandon: () => (abandoned += 1) };
+    const counts = { abandoned: 0, bestEffort: 0 };
+    const ticket = ticketOf(Promise.resolve(plan(BLOCK)), 1000, async () => null, counts);
     const result = await builder.build({
       timelineKey: TK, trigger: ev("ev1", "hello there", 1000), activeSessions: [], workspace: emptyWorkspace,
       selfSessionId: "s1", memoryRetrieval: ticket,
     });
-    assert.equal(abandoned, 0);
+    assert.equal(counts.abandoned, 0);
+    assert.equal(counts.bestEffort, 0);
     assert.ok(finalContent(result).includes("a memory"));
   });
 });

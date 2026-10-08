@@ -75,6 +75,13 @@ export const MEMORY_SLOT_SHARE = "memory";
 /** Added to the memory point's timeout for the build's wait (recall and the re-rank stages run first). */
 export const PLAN_WAIT_GRACE_MS = 1500;
 
+/**
+ * How long a build whose wait expired gives a plan told to finish now
+ * (`PlanInput.finishNow`): enough for the selection and packing, which no
+ * longer wait on any model.
+ */
+export const BEST_EFFORT_GRACE_MS = 1000;
+
 /** Tagged rows read per person (and for the presence lane) while paging past the recency layer. */
 const MAX_PARTICIPANT_ROWS = 200;
 
@@ -236,6 +243,11 @@ export class MemoryRetrievalPipeline {
     const fallbackSelected = new Set<string>();
     const verdicts = new Map<string, MemoryPassageVerdict>();
     const aborted = () => input.signal?.aborted === true;
+    // Told to finish now (the build's wait expired): the stages still waiting on
+    // a model stop, and the plan uses what is ready (see PlanInput.finishNow).
+    const cut = () => input.finishNow?.aborted === true;
+    const stageSignal =
+      input.finishNow && input.signal ? AbortSignal.any([input.signal, input.finishNow]) : (input.finishNow ?? input.signal);
 
     // ── 1. Wide recall ────────────────────────────────────────────────────
     const requestText = input.request?.text.trim() ?? "";
@@ -450,7 +462,7 @@ export class MemoryRetrievalPipeline {
         agent,
         queryText: lateQuery,
         candidates: pool.map((c) => ({ contentHash: c.chunk.contentHash })),
-        signal: input.signal,
+        signal: stageSignal,
       });
       report.stages.late = {
         status: out.status,
@@ -488,7 +500,7 @@ export class MemoryRetrievalPipeline {
     // ── 4. Cross-encoder ──────────────────────────────────────────────────
     let rerankRan = false;
     let rerankCutoff: number | undefined;
-    if (this.deps.rerank && cfg.rerank.enabled && pool.length > 0 && !aborted()) {
+    if (this.deps.rerank && cfg.rerank.enabled && pool.length > 0 && !aborted() && !cut()) {
       const tail = input.conversation.slice(-RERANK_TAIL_MESSAGES).map((m) => `${m.from}: ${m.text}`).join("\n");
       const q = [requestText ? `${input.request!.from}: ${requestText}` : "", replyText ? `(replying to ${input.request!.replyTo!.from}: ${replyText})` : "", tail]
         .filter(Boolean)
@@ -497,7 +509,7 @@ export class MemoryRetrievalPipeline {
       const t0 = this.now();
       try {
         const docs = pool.map((c) => cleanBlockText(c.chunk.text).lines.join("\n"));
-        const res = await this.deps.rerank.run((p, s) => p.score(q, docs, s), { signal: input.signal });
+        const res = await this.deps.rerank.run((p, s) => p.score(q, docs, s), { signal: stageSignal });
         rerankRan = true;
         rerankCutoff = cfg.rerank.providers[res.provider.name]?.minScore;
         pool.forEach((c, i) => (c.rerank = res.value[i]));
@@ -507,7 +519,7 @@ export class MemoryRetrievalPipeline {
         report.stages.rerank = { status: "ok", provider: res.provider.name, ms: this.now() - t0 };
       } catch (error) {
         const aborted = error instanceof Error && error.name === "AbortError";
-        report.stages.rerank = { status: aborted ? "aborted" : "unavailable", provider: null, ms: this.now() - t0 };
+        report.stages.rerank = { status: cut() ? "cut_short" : aborted ? "aborted" : "unavailable", provider: null, ms: this.now() - t0 };
       }
     }
     // Without a cross-encoder: the late top 8 (missing-vector blocks bypass), or the hybrid top 12.
@@ -546,47 +558,49 @@ export class MemoryRetrievalPipeline {
       report.decisionGroup = decisionGroup;
       const knobs = memoryPointKnobs(engine.raw(agent));
       const conversation = input.conversation.slice(-(knobs.conversationMessages ?? DEFAULT_MEMORY_CONVERSATION_MESSAGES));
+      // On finish-now, unanswered passages count as not judged (the fallback
+      // rule), and their requests are aborted, freeing the group's slots.
       const judgedOutcomes = await Promise.all(
-        toJudge.map((c) =>
-          engine
-            .evaluate(
-              memoryPoint,
-              {
-                conversation,
-                ...(input.request
-                  ? {
-                      request: {
-                        from: input.request.from,
-                        text: input.request.text,
-                        ...(input.request.replyTo ? { reply_to: input.request.replyTo } : {}),
-                      },
-                    }
-                  : {}),
-                participants: laneNames,
-                passage: {
-                  date: agentDateStamp(c.chunk.entryTs),
-                  room: c.chunk.room,
-                  text: cleanBlockText(c.chunk.text).lines.join("\n"),
-                },
-                filters: c.pendingFilters,
-                meta: {
-                  citation: formatCitation(c.chunk),
-                  contentHash: c.chunk.contentHash,
-                  scores: { hybrid: round3(c.hybrid), late: c.late === undefined || c.late === null ? null : round3(c.late), rerank: c.rerank === undefined ? null : round3(c.rerank) },
-                },
+        toJudge.map((c) => {
+          if (cut()) return Promise.resolve(undefined);
+          const outcome = engine.evaluate(
+            memoryPoint,
+            {
+              conversation,
+              ...(input.request
+                ? {
+                    request: {
+                      from: input.request.from,
+                      text: input.request.text,
+                      ...(input.request.replyTo ? { reply_to: input.request.replyTo } : {}),
+                    },
+                  }
+                : {}),
+              participants: laneNames,
+              passage: {
+                date: agentDateStamp(c.chunk.entryTs),
+                room: c.chunk.room,
+                text: cleanBlockText(c.chunk.text).lines.join("\n"),
               },
-              {
-                agentName: agent,
-                attribution: input.attribution,
-                priority: MEMORY_PRIORITY,
-                share: { name: MEMORY_SLOT_SHARE, fraction: auto.judgeSlotShare },
-                signal: input.signal,
-                decisionGroup,
-                triggerEventId: input.triggerEventId ?? null,
+              filters: c.pendingFilters,
+              meta: {
+                citation: formatCitation(c.chunk),
+                contentHash: c.chunk.contentHash,
+                scores: { hybrid: round3(c.hybrid), late: c.late === undefined || c.late === null ? null : round3(c.late), rerank: c.rerank === undefined ? null : round3(c.rerank) },
               },
-            )
-            .catch(() => undefined),
-        ),
+            },
+            {
+              agentName: agent,
+              attribution: input.attribution,
+              priority: MEMORY_PRIORITY,
+              share: { name: MEMORY_SLOT_SHARE, fraction: auto.judgeSlotShare },
+              signal: stageSignal,
+              decisionGroup,
+              triggerEventId: input.triggerEventId ?? null,
+            },
+          );
+          return untilAborted(outcome, input.finishNow).catch(() => undefined);
+        }),
       );
       report.stages.judgeMs = this.now() - t0;
       const byCandidate = new Map(toJudge.map((c, i) => [c, judgedOutcomes[i]]));
@@ -635,7 +649,7 @@ export class MemoryRetrievalPipeline {
       } else {
         source = "fallback";
         const reasons = judgedOutcomes.map((o) => o?.reason).filter(Boolean);
-        report.reason = reasons[0] ?? (toJudge.length === 0 ? "max_judged" : "error");
+        report.reason = cut() ? "wait_budget" : (reasons[0] ?? (toJudge.length === 0 ? "max_judged" : "error"));
         for (const c of pool) if (c.hiddenBy) itemStage.set(c.chunk.contentHash, "hidden");
         selected = this.selectWithoutJudge(pool.filter((c) => !c.hiddenBy), {
           cap: auto.fallbackMaxResults,
@@ -664,15 +678,31 @@ export class MemoryRetrievalPipeline {
         }
         selected = selected.filter((c) => !c.hiddenBy);
       } else if (pending.length > 0 && this.deps.filters) {
-        const states = await this.deps.filters.enforce(agent, pending.map((c) => filterBlockOf(c.chunk)), {
-          surface: "auto_retrieval",
-          attribution: input.attribution,
-          priority: MEMORY_PRIORITY,
-          share: { name: MEMORY_SLOT_SHARE, fraction: auto.judgeSlotShare },
-          signal: input.signal,
-        });
+        const filters = this.deps.filters;
+        const states = cut()
+          ? null
+          : await untilAborted(
+              filters.enforce(agent, pending.map((c) => filterBlockOf(c.chunk)), {
+                surface: "auto_retrieval",
+                attribution: input.attribution,
+                priority: MEMORY_PRIORITY,
+                share: { name: MEMORY_SLOT_SHARE, fraction: auto.judgeSlotShare },
+                signal: stageSignal,
+              }),
+              input.finishNow,
+            ).catch((error: unknown) => {
+              if (!cut()) throw error;
+              return null;
+            });
         for (const c of pending) {
-          const st = states.get(c.chunk.contentHash);
+          // Finished now before the filters were judged: the `pending` policy applies.
+          const st = states
+            ? states.get(c.chunk.contentHash)
+            : (() => {
+                const p = { hidden: false, pendingJudged: c.pendingFilters } as { hidden: boolean; hiddenBy?: Candidate["hiddenBy"]; pendingJudged: Candidate["pendingFilters"] };
+                filters.applyPending(agent, p);
+                return p;
+              })();
           if (st?.hidden) {
             c.hiddenBy = st.hiddenBy;
             itemStage.set(c.chunk.contentHash, "hidden");
@@ -700,8 +730,9 @@ export class MemoryRetrievalPipeline {
           makeExcerpt(c.chunk.text, {
             queries: excerptQueries,
             budget: { tokens: auto.excerptMaxTokens },
-            ...(scorer && excerptQueries.length > 0
-              ? { scoreUnits: (units: string[]) => untilAborted(scorer(excerptQuery, units, input.signal), input.signal) }
+            // Finishing now: unscored excerpts (no embed wait).
+            ...(scorer && excerptQueries.length > 0 && !cut()
+              ? { scoreUnits: (units: string[]) => untilAborted(scorer(excerptQuery, units, input.signal), stageSignal) }
               : {}),
           }),
         );
@@ -732,6 +763,7 @@ export class MemoryRetrievalPipeline {
       report.reason = "aborted";
     }
     const block = lines.length > 0 ? `<retrieved_memory note="${note}">\n${lines.join("\n")}\n</retrieved_memory>` : null;
+    if (cut() && !aborted()) report.cutShort = true;
 
     // ── 7. Report ─────────────────────────────────────────────────────────
     report.source = lines.length > 0 || source !== "none" ? source : "none";
@@ -776,6 +808,7 @@ export class MemoryRetrievalPipeline {
       tokens: report.tokens,
       source: report.source,
       ...(report.reason ? { reason: report.reason } : {}),
+      ...(report.cutShort ? { cutShort: true } : {}),
       ms: report.ms,
       recallMs: report.stages.recallMs,
       ...(report.stages.late ? { late: report.stages.late.status, lateMs: report.stages.late.ms } : {}),
@@ -790,29 +823,39 @@ export class MemoryRetrievalPipeline {
         "auto_retrieval",
       );
     }
-    if (input.attribution.agentSessionId) {
-      void this.deps.store
-        .insertRetrieval({
-          id: nanoid(),
-          agentSessionId: input.attribution.agentSessionId,
-          agent,
-          timelineKey: input.timelineKey,
-          ts: this.now(),
-          source: report.source,
-          decisionGroup: report.decisionGroup ?? null,
-          candidates: report.candidates,
-          judged: report.judged,
-          kept: report.kept,
-          hidden: report.hidden,
-          tokens: report.tokens,
-          ms: report.ms,
-          reportJson: JSON.stringify(report),
-        })
-        .catch((error) =>
-          this.deps.logger?.warn("memory_retrieval_persist_failed", { error: error instanceof Error ? error.message : String(error) }),
-        );
+    if (input.attribution.agentSessionId && !input.deferRecord) {
+      this.recordBuild(report, { agentSessionId: input.attribution.agentSessionId, agent, timelineKey: input.timelineKey });
     }
     return { block, report };
+  }
+
+  /**
+   * Store a build's `memory_retrievals` row (best-effort, never rejects). A
+   * live session's plan defers it (`PlanInput.deferRecord`) to the moment its
+   * fate is known: shown when the kickoff carrying the block is sent, else
+   * recorded as aborted ({@link abortedReport}).
+   */
+  recordBuild(report: RetrievalReport, who: { agentSessionId: string; agent: string | null; timelineKey: string }): void {
+    void this.deps.store
+      .insertRetrieval({
+        id: nanoid(),
+        agentSessionId: who.agentSessionId,
+        agent: who.agent === "__legacy__" ? null : who.agent,
+        timelineKey: who.timelineKey,
+        ts: this.now(),
+        source: report.source,
+        decisionGroup: report.decisionGroup ?? null,
+        candidates: report.candidates,
+        judged: report.judged,
+        kept: report.kept,
+        hidden: report.hidden,
+        tokens: report.tokens,
+        ms: report.ms,
+        reportJson: JSON.stringify(report),
+      })
+      .catch((error) =>
+        this.deps.logger?.warn("memory_retrieval_persist_failed", { error: error instanceof Error ? error.message : String(error) }),
+      );
   }
 
   /**
@@ -856,6 +899,26 @@ export class MemoryRetrievalPipeline {
  * The citation as shown inside `<retrieved_memory>`: a room label is diary
  * text, so angle brackets are neutralized and line breaks flattened.
  */
+/**
+ * A resolved plan's report as never shown (the build that used it was
+ * cancelled, redone or discarded before its kickoff was sent): what it kept is
+ * recorded as `aborted`, and it counts as no shown block.
+ */
+export function abortedReport(report: RetrievalReport): RetrievalReport {
+  return {
+    ...report,
+    aborted: true,
+    reason: "aborted",
+    kept: 0,
+    tokens: 0,
+    items: report.items.map((i) => {
+      if (i.stage !== "kept") return i;
+      const { selectedBy: _selectedBy, ...rest } = i;
+      return { ...rest, stage: "aborted" as const };
+    }),
+  };
+}
+
 export function citationLabel(chunk: LexicalHit): string {
   return escapeAngleBrackets(formatCitation(chunk)).replace(/[\r\n]+/g, " ");
 }

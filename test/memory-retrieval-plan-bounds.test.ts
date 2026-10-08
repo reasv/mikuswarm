@@ -310,3 +310,66 @@ test("the build waits the memory point's timeout plus a grace", () => {
   const none = new MemoryRetrievalPipeline({ search: emptySearch, store: stubStore(new Map()), config });
   assert.equal(none.waitBudgetMs(null), 3000 + PLAN_WAIT_GRACE_MS);
 });
+
+test("finish now: the plan resolves with the judged keepers so far plus the fallback over the rest, and aborts the open requests", async () => {
+  const hits = Array.from({ length: 6 }, (_, i) => scored(hit(`Block ${i} about pancakes and syrup`, NOW - (40 + i) * DAY), 0.95 - i * 0.01));
+  const fast = new Set(hits.slice(0, 2).map((h) => h.contentHash));
+  const aborted: string[] = [];
+  const engine = {
+    isEnabled: () => true,
+    raw: () => ({}),
+    evaluate: (_p: unknown, inp: any, ctx: any) => {
+      const verdict = { keep: true, relevant: 0.9, aboutParticipant: null, filters: {}, judged: true, meta: inp.meta };
+      if (fast.has(inp.meta.contentHash)) return Promise.resolve({ source: "model", verdict });
+      // A slow judge that honours its signal.
+      return new Promise((resolve) => {
+        ctx.signal?.addEventListener("abort", () => {
+          aborted.push(inp.meta.contentHash);
+          resolve({ source: "fallback", reason: "aborted" });
+        });
+      });
+    },
+  };
+  const inserted: any[] = [];
+  const pipeline = new MemoryRetrievalPipeline({
+    search: { searchScored: async () => ({ scored: hits, mode: "hybrid" }), userLaneScored: async () => [], unitScorer: undefined } as any,
+    store: stubStore(new Map(), inserted),
+    config: resolveRetrievalConfig({ enabled: true, auto: { max_results: 10, max_tokens: 20000, fallback_max_results: 2, fallback_min_score: 0.5 } } as any),
+    engine: () => engine as any,
+  });
+  const finishNow = new AbortController();
+  const started = Date.now();
+  const planned = pipeline.plan(baseInput({ request: { from: "a", text: "pancakes syrup" }, finishNow: finishNow.signal, deferRecord: true }));
+  setTimeout(() => finishNow.abort(), 50);
+  const plan = await planned;
+  assert.ok(Date.now() - started < 1500, "the plan resolves at once after finish-now");
+  assert.equal(plan.report.cutShort, true);
+  assert.equal(plan.report.source, "model");
+  assert.equal(plan.report.judged, 2);
+  const kept = plan.report.items.filter((i) => i.stage === "kept");
+  assert.deepEqual(new Set(kept.filter((i) => i.selectedBy === "judge").map((i) => i.contentHash)), fast, "the judged keepers so far");
+  assert.equal(kept.filter((i) => i.selectedBy === "fallback").length, 2, "plus the fallback rule over the unanswered rest");
+  assert.ok(plan.block?.includes("Block 0"));
+  assert.equal(aborted.length, 4, "the open judge requests were aborted (their slots freed)");
+  await new Promise((r) => setImmediate(r));
+  assert.equal(inserted.length, 0, "a deferred plan leaves its row to the caller");
+});
+
+test("finish now before the judge: the fallback selection, no judge request", async () => {
+  const hits = Array.from({ length: 3 }, (_, i) => scored(hit(`Block ${i} about waffles`, NOW - (40 + i) * DAY), 0.9));
+  const calls: Array<{ hash: string }> = [];
+  const pipeline = new MemoryRetrievalPipeline({
+    search: { searchScored: async () => ({ scored: hits, mode: "hybrid" }), userLaneScored: async () => [], unitScorer: undefined } as any,
+    store: stubStore(new Map()),
+    config: resolveRetrievalConfig({ enabled: true } as any),
+    engine: () => stubEngine(calls),
+  });
+  const finishNow = new AbortController();
+  finishNow.abort();
+  const plan = await pipeline.plan(baseInput({ request: { from: "a", text: "waffles" }, finishNow: finishNow.signal }));
+  assert.equal(calls.length, 0);
+  assert.equal(plan.report.source, "fallback");
+  assert.equal(plan.report.reason, "wait_budget");
+  assert.ok(plan.report.kept > 0);
+  assert.ok(plan.block);
+});

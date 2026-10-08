@@ -229,6 +229,7 @@ import { McpClientPool, adaptMcpTools, type McpServerEntry } from "./mcp/index.j
 import { SummarizationIndexer, SummarizationWorkerPool, createEscalateSummary, MirrorWorker, buildMirrorTopology } from "./summarization/index.js";
 import { DiaryWorkerPool, recentDayFiles } from "./diary/index.js";
 import { MemoryRetrievalPipeline } from "./retrieval/auto/pipeline.js";
+import { createPlanTicket } from "./retrieval/auto/ticket.js";
 import { buildPlanInput } from "./retrieval/auto/input.js";
 import type { MemoryPlanTicket } from "./retrieval/auto/types.js";
 import {
@@ -7711,6 +7712,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         });
         ({ agent, kickoff, snapshot, tokenEstimate } = created);
         if (!kickoff) throw new Error("context build produced no final user turn");
+        // The rebuilt kickoff is run next: the build counts as shown.
+        memoryPlan?.confirm();
       } catch (error) {
         memoryPlan?.abandon();
         const message = error instanceof Error ? error.message : String(error);
@@ -8764,10 +8767,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
    * parallel with routing, records planning and the context build, which awaits
    * the plan only when it assembles the final user turn. Every session build
    * gets one (any trigger, any session type; a proactive session's conversation
-   * stands in for the request), and each records a `memory_retrievals` row
-   * under the session id. The ticket's `abandon` aborts the plan: called when
-   * the build stops waiting, a redo replaces it, or the session ends. Never
-   * rejects.
+   * stands in for the request), and each records one `memory_retrievals` row
+   * under the session id once its fate is known: `confirm` when the kickoff
+   * carrying its block is sent (shown), `abandon` before that (aborted). The
+   * ticket's `abandon` aborts the plan: called when the build shows no block,
+   * a cancel or redo replaces the build, the build fails, or the session ends.
+   * When the build's wait expires, `bestEffort` makes the plan finish with
+   * what is ready. Never rejects.
    */
   function planMemoryRetrieval(
     inbound: InboundChatEvent,
@@ -8778,6 +8784,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     const agentName = agentNameForTimeline(session.timelineKey);
     const maxWaitMs = config.recovery?.llm_request_max_wait_ms ?? 120_000;
     const abandoned = new AbortController();
+    const finishNow = new AbortController();
     const signal = AbortSignal.any([drainAbort.signal, abandoned.signal, AbortSignal.timeout(maxWaitMs)]);
     const plan = (async () => {
       const queryMessages = retrievalConfig.auto.queryMessages;
@@ -8822,7 +8829,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         queryMessages,
         signal,
       });
-      return memoryPipeline.plan(input);
+      return memoryPipeline.plan({ ...input, finishNow: finishNow.signal, deferRecord: true });
     })().catch((error) => {
       logger.warn("memory_retrieval_plan_failed", {
         sessionId: session.id,
@@ -8830,11 +8837,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       });
       return null;
     });
-    return {
+    return createPlanTicket({
       plan,
       waitMs: memoryPipeline.waitBudgetMs(agentName),
-      abandon: () => abandoned.abort(),
-    };
+      abort: abandoned,
+      finishNow,
+      record: (report) =>
+        memoryPipeline.recordBuild(report, { agentSessionId: session.id, agent: agentName, timelineKey: session.timelineKey }),
+    });
   }
 
   async function launchSession(
@@ -9360,12 +9370,16 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       });
       const cancelled = lateCtl!.takeCancelBeforeStart();
       if (cancelled) {
+        // Cancelled before the rebuilt kickoff was sent: its plan was never shown.
+        memoryPlan?.abandon();
         logger.info("late_input_cancelled", { sessionId: session.id, reason: cancelled.reason, causeEventId: cancelled.causeEventId, phase: "building" });
         return { kind: "end", noReply: true, cancelled: true };
       }
       // Corrections past max_redos are interjected into the rebuilt session.
       if (unapplied) for (const fallback of unapplied.fallbacks) await fallback("live");
       const redoOpts = sessionRedoOptions(next, binding.capture);
+      // The runner sends the rebuilt kickoff next: the build counts as shown.
+      memoryPlan?.confirm();
       return { kind: "continue", agent: next.agent, kickoff: next.kickoff, redo: redoOpts.redo, ...(next.gate ? { endings: next.gate } : {}) };
     };
     // Abort-and-interject: drop the aborted partial turn (kept as a branch) and
@@ -9624,6 +9638,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     };
     if (lateEntry) lateEntry.revive = revive;
 
+    // The kickoff carrying the memory block is sent now: the build counts as shown.
+    memoryPlan?.confirm();
     void startRun(kickoff, { holdsSlot: true });
   }
 

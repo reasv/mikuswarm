@@ -44,6 +44,19 @@ export interface PlanInput {
   activePeople?: Array<{ provider: string; senderId: string; name: string }>;
   signal?: AbortSignal;
   /**
+   * Finish now (the build's wait expired): the stages still waiting on a model
+   * stop (their requests are aborted) and the plan resolves with what is
+   * ready: the judged keepers so far plus the fallback rule over the passages
+   * not yet answered, with unscored excerpts. Before the candidate pool exists
+   * nothing is ready yet and the plan carries on (the build stops waiting).
+   */
+  finishNow?: AbortSignal;
+  /**
+   * The caller records the build (`MemoryRetrievalPipeline.recordBuild`) once
+   * its fate is known, instead of the plan recording it when it resolves.
+   */
+  deferRecord?: boolean;
+  /**
    * false = never call a decision model (a room preview): the selection is
    * unjudged and judged filters fall back to `pending`.
    */
@@ -127,6 +140,8 @@ export interface RetrievalReport {
   decisionGroup?: string;
   /** True when the plan was aborted before the build used it: nothing was shown. */
   aborted?: boolean;
+  /** True when the build's wait expired and the plan finished with what was ready (`PlanInput.finishNow`). */
+  cutShort?: boolean;
   stages: {
     recallMs: number;
     vectorIndex?: string;
@@ -143,11 +158,27 @@ export interface RetrievalPlan {
   report: RetrievalReport;
 }
 
-/** A launch-time plan handed to the session's context build (§9d). */
+/**
+ * A launch-time plan handed to the session's context build (§9d). Its
+ * `memory_retrievals` row is written once, when its fate is known: `confirm`
+ * (the kickoff carrying the block was sent) records it as shown; `abandon`
+ * before that records it as aborted. Only confirmed builds count as shown.
+ */
 export interface MemoryPlanTicket {
   plan: Promise<RetrievalPlan | null>;
   /** The longest the build waits for it: the memory point's timeout plus a grace (spec §8). */
   waitMs: number;
-  /** The build stopped waiting: the plan is aborted and its block never recorded as shown. */
+  /**
+   * The build's wait expired: the plan finishes now with what is ready
+   * (`PlanInput.finishNow`), within a short grace; null when nothing is.
+   */
+  bestEffort(): Promise<RetrievalPlan | null>;
+  /** The kickoff carrying the plan's block was sent: its row is recorded as shown (once). */
+  confirm(): void;
+  /**
+   * The build no longer uses the plan (it showed no block, or the session was
+   * cancelled, redone or ended): the plan is aborted and, unless confirmed,
+   * its row is recorded as aborted. Idempotent.
+   */
   abandon(): void;
 }
