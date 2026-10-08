@@ -197,6 +197,7 @@ zdr = true                          # required for a non-self-hosted remote prov
 kind = "local"                      # in-process ONNX, CPU; the shipped default model
 ```
 
+- **Query** (measured 2026-10-08): the request alone (trigger plus reply target, with speaker names) beat the request plus a conversation tail on 123 memory-needing queries with bge-reranker-v2-m3, graded nDCG@8 +0.035 [+0.014, +0.056], topical P@8 +0.039; so `query = "request"` is the default and `"conversation"` the alternative.
 - **Per-provider calibration.** Scores from different models are not comparable, so the fallback cutoff (`min_score`) and any score-based logic are calibrated per provider, like per-member decision calibration.
 - **Taking the GPU away.** Stopping or pausing the GPU server is enough: its health fails and the chain moves on. To skip it without waiting for a failure, set `enabled = false` on that provider and reload the config.
 - **Query.** The request plus a short conversation tail, clipped to the model's input budget alongside the passage.

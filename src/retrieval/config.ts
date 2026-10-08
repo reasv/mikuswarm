@@ -119,6 +119,8 @@ export interface ResolvedRetrievalConfig {
     chain: string[];
     topN: number;
     timeoutMs: number;
+    /** The query: the request alone, or the request plus a conversation tail. */
+    query: "request" | "conversation";
     queryMaxChars: number;
     providers: Record<string, ResolvedModelProvider>;
   };
@@ -320,6 +322,7 @@ function resolveRerank(raw: RetrievalConfig["rerank"]): ResolvedRetrievalConfig[
     chain,
     topN: raw?.top_n ?? 8,
     timeoutMs: raw?.timeout_ms ?? 1500,
+    query: raw?.query ?? "request",
     queryMaxChars: raw?.query_max_chars ?? 1200,
     providers,
   };

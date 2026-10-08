@@ -1093,7 +1093,10 @@ dim = 384
 enabled = false
 top_n = 8                         # survivors passed to the decision model
 timeout_ms = 1500                 # per member
-query_max_chars = 1200            # request + short conversation tail
+query = "request"                 # the trigger + its reply target, with speakers;
+                                  # "conversation" adds the last three messages
+                                  # (proactive sessions always use the latter)
+query_max_chars = 1200            # the query is clipped to this
 # chain = ["gpu", "cpu"]
 # [retrieval.rerank.providers.gpu]
 # kind = "remote"

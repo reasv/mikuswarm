@@ -25,6 +25,12 @@ Unreleased section; it is not part of any release's notes.
 
 ### Added
 
+- **Cross-encoder query choice**: `[retrieval.rerank].query = "request"` (the
+  default) gives the re-ranker the request alone, the trigger text and its reply
+  target with their speakers' names; `"conversation"` keeps the previous query, the
+  request plus the last three messages. Proactive sessions, which have no request,
+  use the conversation form. On a 123-query evaluation the request-only query ranked
+  better (graded nDCG@8 +0.035).
 - **Reciprocal-rank fusion for memory search**: `[retrieval.query].fusion = "rrf"`
   (default `"weighted"`, unchanged) merges the BM25 and vector lanes by rank,
   `Σ 1/(rrf_k + rank)` with `rrf_k` default 60, normalized into 0..1 so the existing

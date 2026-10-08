@@ -57,6 +57,29 @@ export const UNJUDGED_NOTE =
 const RERANK_TAIL_MESSAGES = 3;
 
 /**
+ * The cross-encoder's query (`[retrieval.rerank].query`). `"request"`: the
+ * trigger text (its grouped parts) and the reply target's text, each prefixed by
+ * its speaker as the memory point's state names them. `"conversation"`: that
+ * plus the last few messages. With no request (proactive) both use the
+ * conversation form. Clipped to `maxChars`.
+ */
+export function rerankQuery(input: PlanInput, mode: "request" | "conversation", maxChars: number): string {
+  const request = input.request;
+  const requestText = request?.text.trim() ?? "";
+  const replyText = request?.replyTo?.text.trim() ?? "";
+  const lines: string[] = [];
+  if (mode === "request" && requestText) {
+    lines.push(`${request!.from}: ${requestText}`);
+    if (replyText) lines.push(`${request!.replyTo!.from}: ${replyText}`);
+  } else {
+    if (requestText) lines.push(`${request!.from}: ${requestText}`);
+    if (replyText) lines.push(`(replying to ${request!.replyTo!.from}: ${replyText})`);
+    for (const m of input.conversation.slice(-RERANK_TAIL_MESSAGES)) lines.push(`${m.from}: ${m.text}`);
+  }
+  return lines.filter(Boolean).join("\n").slice(0, maxChars);
+}
+
+/**
  * Memory-point requests (and the judged filters riding with an unjudged
  * selection) queue below routing, records and the send/ending checks, which
  * run at `interactive` in the same `decision:<model>` group: the build needs
@@ -565,11 +588,7 @@ export class MemoryRetrievalPipeline {
     let rerankRan = false;
     let rerankCutoff: number | undefined;
     if (this.deps.rerank && cfg.rerank.enabled && pool.length > 0 && !aborted() && !cut()) {
-      const tail = input.conversation.slice(-RERANK_TAIL_MESSAGES).map((m) => `${m.from}: ${m.text}`).join("\n");
-      const q = [requestText ? `${input.request!.from}: ${requestText}` : "", replyText ? `(replying to ${input.request!.replyTo!.from}: ${replyText})` : "", tail]
-        .filter(Boolean)
-        .join("\n")
-        .slice(0, cfg.rerank.queryMaxChars);
+      const q = rerankQuery(input, cfg.rerank.query, cfg.rerank.queryMaxChars);
       const t0 = this.now();
       try {
         const docs = pool.map((c) => cleanBlockText(c.chunk.text).lines.join("\n"));

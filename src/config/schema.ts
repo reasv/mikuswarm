@@ -348,7 +348,10 @@ const RetrievalRerankSchema = StrictObject({
   top_n: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
   // Per-member deadline; a slow member falls over to the next. Default 1500.
   timeout_ms: Type.Optional(Type.Integer({ minimum: 50, maximum: 120_000 })),
-  // The query (request + a short conversation tail) is clipped to this. Default 1200.
+  // "request" (default): the trigger text and its reply target, each with its
+  // speaker. "conversation": that plus the last three messages.
+  query: Type.Optional(Type.Union([Type.Literal("request"), Type.Literal("conversation")])),
+  // The query is clipped to this. Default 1200.
   query_max_chars: Type.Optional(Type.Integer({ minimum: 50, maximum: 20_000 })),
   providers: Type.Optional(Type.Record(Type.String({ minLength: 1 }), RetrievalModelProviderSchema)),
 });

@@ -16,7 +16,7 @@ import { GptTokenizer } from "../src/context/tokenizer/index.js";
 import { buildDiaryHeader } from "../src/diary/header.js";
 import { configureAgentTimezone, resetAgentTimezone, parseZonedWallClock } from "../src/time/index.js";
 import { MemoryRetrievalStore } from "../src/storage/memory-retrieval-store.js";
-import { MemoryRetrievalPipeline, orderJudged, JUDGED_NOTE, UNJUDGED_NOTE } from "../src/retrieval/auto/pipeline.js";
+import { MemoryRetrievalPipeline, orderJudged, rerankQuery, JUDGED_NOTE, UNJUDGED_NOTE } from "../src/retrieval/auto/pipeline.js";
 import type { PlanInput } from "../src/retrieval/auto/types.js";
 import { DecisionClient, DecisionEngine, type DecisionEvaluationRow } from "../src/decisions/index.js";
 import { MemoryFilterService } from "../src/retrieval/filters/index.js";
@@ -88,7 +88,7 @@ async function withStack(
     decisionsConfig?: Record<string, unknown>;
     filters?: Record<string, unknown>;
     auto?: Record<string, unknown>;
-    rerank?: { minScore: number; score: (doc: string) => number };
+    rerank?: { minScore: number; score: (doc: string) => number; query?: "request" | "conversation"; queries?: string[] };
   },
   run: (s: Stack) => Promise<void>,
 ): Promise<void> {
@@ -107,7 +107,7 @@ async function withStack(
     enabled: true,
     auto: { ...(opts.auto ?? {}) },
     ...(opts.rerank
-      ? { rerank: { enabled: true, chain: ["fake"], providers: { fake: { kind: "remote", endpoint: "http://rerank.invalid", zdr: true, min_score: opts.rerank.minScore } } } }
+      ? { rerank: { enabled: true, chain: ["fake"], ...(opts.rerank.query ? { query: opts.rerank.query } : {}), providers: { fake: { kind: "remote", endpoint: "http://rerank.invalid", zdr: true, min_score: opts.rerank.minScore } } } }
       : {}),
   } as any);
   const indexer = new MemoryIndexer({ storage, workspaceRoot, config, tokenizer: new GptTokenizer() });
@@ -145,7 +145,7 @@ async function withStack(
   const rerank = rerankScore
     ? new ProviderChain<RerankProvider>("rerank", [
         {
-          provider: { name: "fake", kind: "remote", score: async (_q: string, docs: string[]) => docs.map(rerankScore), close: async () => {} } as unknown as RerankProvider,
+          provider: { name: "fake", kind: "remote", score: async (q: string, docs: string[]) => (opts.rerank!.queries?.push(q), docs.map(rerankScore)), close: async () => {} } as unknown as RerankProvider,
           enabled: true,
           timeoutMs: 1000,
         },
@@ -480,4 +480,41 @@ test("the memory_retrieval log line carries counts only", async () => {
 
 test("DAY constant sanity", () => {
   assert.equal(DAY, 86_400_000);
+});
+
+test("rerank query: request mode is the trigger plus its reply target, each with its speaker", () => {
+  const i = input({
+    request: { from: "alice", text: "what did we pick?\nfor the pancakes", replyTo: { from: "bob", text: "we settled it last week" } },
+    conversation: [{ from: "carol", text: "breakfast talk" }, { from: "bob", text: "we settled it last week" }],
+  });
+  assert.equal(rerankQuery(i, "request", 1200), "alice: what did we pick?\nfor the pancakes\nbob: we settled it last week");
+  assert.equal(rerankQuery(input(), "request", 1200), "alice: what did we decide about the pancake recipe");
+  assert.equal(rerankQuery(i, "request", 10), "alice: wha");
+});
+
+test("rerank query: conversation mode adds the last three messages", () => {
+  const i = input({
+    request: { from: "alice", text: "what did we pick?", replyTo: { from: "bob", text: "settled" } },
+    conversation: ["m1", "m2", "m3", "m4"].map((t) => ({ from: "carol", text: t })),
+  });
+  assert.equal(rerankQuery(i, "conversation", 1200), "alice: what did we pick?\n(replying to bob: settled)\ncarol: m2\ncarol: m3\ncarol: m4");
+});
+
+test("rerank query: with no request (proactive) both modes use the conversation", () => {
+  const { request: _drop, ...rest } = input({ proactive: true, conversation: [{ from: "carol", text: "pancakes again" }] });
+  for (const mode of ["request", "conversation"] as const) assert.equal(rerankQuery(rest, mode, 1200), "carol: pancakes again");
+});
+
+test("rerank query: the pipeline sends the configured query (request by default)", async () => {
+  const files = { "2026-05-09.md": block("2026-05-09", "09:00", "kitchen", "KEEP the pancake recipe needs buttermilk, we decided.") };
+  for (const mode of [undefined, "conversation"] as const) {
+    const queries: string[] = [];
+    const rerank = { minScore: 0.5, score: () => 0.9, queries, ...(mode ? { query: mode } : {}) };
+    await withStack(files, { rerank }, async ({ pipeline }) => {
+      const plan = await pipeline.plan(input());
+      assert.equal(plan.report.stages.rerank?.status, "ok");
+    });
+    const tail = mode === "conversation" ? "\nbob: we talked about breakfast" : "";
+    assert.deepEqual(queries, [`alice: what did we decide about the pancake recipe${tail}`]);
+  }
 });
