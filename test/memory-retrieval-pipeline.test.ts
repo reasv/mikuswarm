@@ -487,7 +487,7 @@ test("rerank query: request mode is the trigger plus its reply target, each with
     request: { from: "alice", text: "what did we pick?\nfor the pancakes", replyTo: { from: "bob", text: "we settled it last week" } },
     conversation: [{ from: "carol", text: "breakfast talk" }, { from: "bob", text: "we settled it last week" }],
   });
-  assert.equal(rerankQuery(i, "request", 1200), "alice: what did we pick?\nfor the pancakes\nbob: we settled it last week");
+  assert.equal(rerankQuery(i, "request", 1200), "alice: what did we pick?\nfor the pancakes\n(replying to bob: we settled it last week)");
   assert.equal(rerankQuery(input(), "request", 1200), "alice: what did we decide about the pancake recipe");
   assert.equal(rerankQuery(i, "request", 10), "alice: wha");
 });

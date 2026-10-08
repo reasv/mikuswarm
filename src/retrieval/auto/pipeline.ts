@@ -70,7 +70,7 @@ export function rerankQuery(input: PlanInput, mode: "request" | "conversation", 
   const lines: string[] = [];
   if (mode === "request" && requestText) {
     lines.push(`${request!.from}: ${requestText}`);
-    if (replyText) lines.push(`${request!.replyTo!.from}: ${replyText}`);
+    if (replyText) lines.push(`(replying to ${request!.replyTo!.from}: ${replyText})`);
   } else {
     if (requestText) lines.push(`${request!.from}: ${requestText}`);
     if (replyText) lines.push(`(replying to ${request!.replyTo!.from}: ${replyText})`);
