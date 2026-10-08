@@ -84,6 +84,11 @@ So the indexer attaches a `participants` list to each such chunk: the human send
 
 These are *presence* tags: the user took part in the conversation the entry was written from. That is not the same as the entry being about them, but it is the right scope for "my history with this person". The user lane (§4) becomes "blocks whose source conversation included this user id", with name matching as a second signal. `recall_memory` gains an optional `user` argument that scopes a manual search the same way.
 
+**Person-cued recall** (owner, 2026-10-08; one more heuristic): this lane needs no text match.
+- For each human active in the conversation (the requester, the reply target's author, mentioned users, and the senders in the last `auto.query_messages` messages), take the newest `auto.person_recent` (default 2) tagged entries they took part in, outside the recency layer. The total is capped at `auto.person_recent_max` (default 8).
+- These candidates **skip the re-rank cut** and go straight to the judge. A message with nothing to match ("hey, how's it going") would otherwise score them out. The judge decides whether each is worth having in mind.
+- Within the user lanes, ranking follows the query's similarity when the query has content, and recency otherwise.
+
 ## 5.0 Ranking and relevance methods considered
 
 The decision model is one option among several. They differ in what they answer (a ranking vs a keep/drop decision), where they run, and whether they can see the conversation.
@@ -474,6 +479,11 @@ There is **no corpus pass and no backfill**.
   - Label relevance with a ZDR-eligible labeller through the existing calibration tool (scripts/calibrate-checks.ts generalised to the `memory` point).
   - Calibrate `relevance_threshold` per member.
   - The harness prints only ids, labels and aggregates.
+- **The recall ceiling, measured first:** the share of sessions with at least one labelled-relevant entry anywhere in the recall set. A ranker cannot beat that, so it decides how much the re-rank work (the TurboQuant kernel, a large index model) is worth.
+- **Experiment, offline only: write-time cues.**
+  - A ZDR model writes, for each entry, a few lines naming what it would come up for. These are indexed beside the entry; the diary file is unchanged.
+  - Compare recall with and without cues on the labelled set.
+  - It is unclear whether generated cues work as an index: many different messages could call for one memory, and the cues have to anticipate them. No production code unless it shows a real gain.
 
 ## 10. Configuration sketch
 
@@ -504,6 +514,8 @@ pending = "show"              # unevaluated blocks on non-judged surfaces
 - **Filters require a decision model.** Without one, no filter applies, and startup warns if filters are configured.
 
 ## 11. Out of scope
+
+- A "long gap" prompt (telling the agent to search its memories when a person or room returns after a long absence). Considered and rejected as too ad hoc and opinionated (owner, 2026-10-08).
 
 - A new memory format: structured units, user-id tags, consistent references to people. This is the root-cause fix, to be designed separately.
 - Summary pre-expansion (DECISION-MODEL §5.5, second half).
