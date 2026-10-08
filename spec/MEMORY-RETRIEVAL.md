@@ -1,6 +1,6 @@
 # Memory retrieval: judged candidates, readable excerpts, operator filters
 
-**Status**: PROPOSAL, draft rev 1 (2026-10-08), for owner review. Not implemented.
+**Status**: PROPOSAL, draft rev 2 (2026-10-08: owner answers folded in, §12). Not implemented.
 **Supersedes**: spec/DECISION-MODEL.md §5.5, first half (re-ranking and richer excerpts). Summary pre-expansion (the second half of §5.5) stays out of scope.
 **Builds on**: ARCHITECTURE.md §9c (diary memory, recency layer), §9d (hybrid search, `recall_memory`, auto-retrieval), §8h (decision engine, chains, calibration), spec/DECISION-MODEL.md §3 (client, fits, billing).
 **Target ARCHITECTURE.md home once implemented**: §9d (auto-retrieval, `recall_memory`), §9c (recency layer filtering), §8h (the `memory` decision point).
@@ -17,7 +17,11 @@ Collected from metadata and pattern counts only; no memory or message content wa
 
 - **Corpus.** About 4,000 chunks (one per diary block), 336 tokens on average (max 512), ~200 files spanning about seven months. Embeddings: the local default `bge-small-en-v1.5` (384-dim, English).
 - **Auto-retrieval is effectively unconditional.** In the last 7 days the `<retrieved_memory>` block was present in 99% of chat sessions. 80% of those carried the maximum of 5 items (3 topical + 2 user-lane), so the `min_score` floor almost never removes anything.
-- **Snippets are the block's first 200 characters** (`makeSnippet` in `src/retrieval/search.ts`), about 50 tokens. They are not the region that matched. A block that matched on its last paragraph shows only its opening line. This is the main reason a relevant hit often reads as noise.
+- **Snippets are too short to be comprehensible.** Each item is the first 200 characters of its block (`makeSnippet` in `src/retrieval/search.ts`), about 50 tokens, and much of that is overhead:
+  - the citation repeats the date (once in the file name, once as a separate field);
+  - the snippet often starts with the block's own heading residue (`## Evening Events (~7:33 PM)`).
+
+  The owner reviewed live blocks: some items are fine, but many are not understandable on their own. They read as noise: fragments too short to tell what was being discussed, so the agent cannot judge whether to look further. Being the head of the block rather than the matching part is a secondary issue. Diary blocks are often lists of loosely related events, so even a longer excerpt of scattered facts is hard to use unless it is relevant. Relevance judging (§5) and longer, cleaner excerpts (§6) address it together.
 - **The agent almost never follows up.** Over 30 days and ~6,100 chat sessions:
   - `search_memory` was used in 0.5% of sessions, `recall_memory` in 0.4%, and a diary file was opened in 0.1%.
   - 0.8% of sessions did any manual memory lookup at all.
@@ -67,15 +71,17 @@ The re-ranker makes recall the goal. The hybrid search's job becomes "do not mis
 - **Exclusions**: blocks already in the recency layer (as today), and blocks hidden by a filter (§7).
 - **The candidate unit is the whole chunk** (one diary block, at most 512 tokens).
 
-## 4a. Index-time enrichment: who a block is about, from provenance
+## 4a. Participant tags from provenance (mechanical, no model)
 
-The diary has no structural author or participant tags, but **every diary block written by the pipeline has exact provenance**. It is generated from one level-1 summary range (§9c "Trigger & unit"): one room, a time range, a known set of source events. Those events carry stable sender ids. So without changing the diary format, the indexer can attach metadata to each chunk:
+The diary has no structural author or participant tags, but **every diary block written by the pipeline has exact provenance**. It is generated from one level-1 summary range (§9c "Trigger & unit"): one room, a time range, a known set of source events. Those events carry stable sender ids.
 
-- `participants`: the sender ids (humans only) of the source range, with message counts. This is mechanical and exact, needs no model, and is immune to display-name changes. The block header's room and time range already locate the range. A `summaries` row links the block to its lineage.
-- `mentioned` (optional, model-assisted): which of those participants, plus anyone else the block names, the text is actually about. One decision call per block at index time, asked as one `noul` per candidate person ("the entry describes <name> or an interaction with them"). The candidates are the range's participants plus names the block contains that resolve to known users of that room. Cached per content hash like filter verdicts.
-- Legacy blocks (imported, header-less) get neither and keep relying on name matching.
+So the indexer attaches a `participants` list to each such chunk: the human sender ids of its source range, with message counts.
+- **Exact.** It reads ids, not names, so it is immune to display-name changes.
+- **Free.** It needs no model call; it is a join over data already stored (the block header's room and time range locate the range, the `summaries` lineage gives its events).
+- **Backfill** for existing blocks is the same join, run once.
+- **Legacy blocks** (imported, header-less) get no tags and keep relying on name matching.
 
-This turns the user lane from "BM25 on a display name" into "blocks whose source conversation included this user id", optionally narrowed to "blocks about this user". It is the closest this spec can get to the user-scoped memory the owner wants without a new memory format. It also gives `recall_memory` a reliable `user` filter (a new optional argument), so the agent can scope a manual search to a person.
+These are *presence* tags: the user took part in the conversation the entry was written from. That is not the same as the entry being about them, but it is the right scope for "my history with this person". The user lane (§4) becomes "blocks whose source conversation included this user id", with name matching as a second signal. `recall_memory` gains an optional `user` argument that scopes a manual search the same way.
 
 ## 5.0 Ranking and relevance methods considered
 
@@ -86,25 +92,26 @@ The decision model is one option among several. They differ in what they answer 
 | Hybrid score as today (vector + BM25, decay) | similarity rank | free, ms | local | Not a relevance decision; the floor does not bite (§1). |
 | Fusion and retrieval tuning: reciprocal rank fusion instead of the weighted sum, MMR on, multiple queries (§4) | a better candidate set | free, ms | local | Cheap wins for recall. Does not decide relevance. |
 | Better embedding model (multilingual, larger, longer context) | better semantic recall | one re-embed of the corpus; per-query embed | local or remote (remote needs ZDR) | Today's model is small, English-only and capped at 512 tokens. Worth an offline comparison. |
-| Local cross-encoder re-ranker (e.g. the open bge-reranker family, run on ONNX like today's embedder) | a query–passage relevance score per candidate | ~tens to hundreds of ms on CPU for 24 short passages | local, no data leaves | Scores a query against a passage. It does not read the whole conversation or the participants, and its scores need a calibrated cutoff. Availability of a Node/ONNX runtime path must be checked. |
+| Local cross-encoder re-ranker (e.g. the open bge-reranker family, run on ONNX like today's embedder) | a query–passage relevance score per candidate | to be measured: a large multilingual model over 24 passages of ~400 tokens likely costs hundreds of ms to seconds of CPU per build, and tens of ms on a GPU; a small English model is much cheaper but weaker | local, no data leaves | Scores a query against a passage. It does not read the conversation or the participants, and needs a calibrated cutoff. |
 | Hosted re-rank APIs | as above | ~100–300 ms, per-search pricing | remote; ZDR status per provider must be verified | Same limits as the local cross-encoder. Adds a vendor. |
 | Decision model (§5) | a calibrated keep/drop decision per passage, with conversation, request and participants in state | ~1–1.5 s, ~$0.0005 per session | remote, ZDR routes exist | Judges "relevant to this conversation", not "similar to the query". Same machinery as the filters (§7) and other points. |
 | Listwise re-ranking by a chat LLM (rank or select from the candidate list) | ranking plus selection | seconds, cents per call | remote, needs a ZDR model | The strongest reasoning, but the slowest and most expensive per session. Better as an offline labeller (§9) than on the hot path. |
 | Query rewriting / hypothetical-entry generation (an LLM writes the search query or a fake diary entry to embed) | better recall on terse follow-ups | an LLM call per session | remote, needs a ZDR model | Addresses problem 3 differently from §4's conversation-window query. |
-| Index-time enrichment (§4a) | exact participant tags, optional "about" tags | free (provenance) or one decision call per new block | local or the decision chain | Fixes the user lane at the source, not per query. |
+| Provenance participant tags (§4a) | exact "was in the conversation" tags | free | local | Fixes the user lane at the source, not per query. |
 
 **Recommended combination.**
-- **First:** §4 (wider recall with several queries and fusion) plus §4a (provenance participant tags).
-- **Then:** a local cross-encoder to order candidates cheaply, followed by the decision model for the final keep/drop cut on the top ~12 with the conversation in view. The cross-encoder trims what the decision model has to read; the decision model supplies the relevance judgement and the zero-result case.
-- **Before committing to any of this,** compare the options offline with the §9 harness:
-  - Hybrid alone, the cross-encoder alone, the decision model alone, and the combination, scored against ZDR-labelled relevance.
-  - An embedding-model swap as a separate axis.
-
-  Pick on measured precision/recall at the budgets of §10, not on assumption.
+- Wider recall (§4) with fusion, plus provenance participant tags (§4a).
+- The decision model as the relevance judge (§5).
+  - On a per-request-billed member, one call already judges all ~24 candidates, so nothing needs trimming before it.
+  - A cross-encoder's remaining value is better ordering for the fallback path and for per-question members. Its cost is CPU or GPU time and latency on every build.
+  - Start without it. Measure it offline (below) and on the deployment's hardware before adding it to the hot path.
+- **Compare the options offline** with the §9 harness before tuning:
+  - hybrid alone, the cross-encoder alone, the decision model alone, and combinations, scored against ZDR-labelled relevance;
+  - an embedding-model swap as a separate axis.
 
 ## 5. Relevance judgement: the `memory` decision point
 
-**When.** Every human-triggered chat-lane session build that runs auto-retrieval. Proactive sessions too, with the conversation window standing in for the request (open question 2). It starts at launch, as soon as the trigger group is known: candidate recall needs only the trigger, the window and the local index. It runs in parallel with routing, records planning and the context build.
+**When.** Every human-triggered chat-lane session build that runs auto-retrieval. Proactive sessions too, with the conversation window standing in for the request. It starts at launch, as soon as the trigger group is known: candidate recall needs only the trigger, the window and the local index. It runs in parallel with routing, records planning and the context build.
 
 **State** (one object; long fields clipped; candidates packed to the member's state budget, highest hybrid score first):
 
@@ -128,35 +135,48 @@ Phrasing follows the documented weaknesses (§2 of DECISION-MODEL): literal, no 
 
 **Verdict.**
 - Keep passages with `relevant_<i> ≥ relevance_threshold`. The default is 0.7, calibrated per member like the other points.
-- Order by `relevant` probability. Among passages within 0.1 of each other, those about a participant come first.
+- Order by `relevant` probability. `about_participant` (and §4a presence) only breaks near-ties (within 0.1): it never outranks a clearly more relevant passage, and reserves no slots.
 - Pack up to `auto.max_results` (default 4) items and `auto.max_tokens` (default 2000) tokens.
 - **Zero kept means no block.**
-- `about_participant` only orders; it never admits a passage on its own. The owner wants participant-tied and other relevant memories alike.
+- `about_participant` never admits a passage on its own. Participant-tied and other relevant memories are wanted alike.
 
 **Billing layouts** (the client picks by the serving member's `billing`):
 - **Per-request members (Jev).** One call: 24 passages × 2 questions over ~10–12k tokens of state, about $0.0005 at $0.042/M.
 - **Per-question members (Perplexity, D1).** Re-billing 12k tokens for each of 48 questions is wasteful. The client splits instead: one call per passage, with state `{conversation, request, participants, passage}` and that passage's two questions, at bounded concurrency. This needs a generic "split by item" mode in the decision client (a point declares its item list; the client chooses whole or split per member). §5.5 of DECISION-MODEL anticipated it.
 
-**Fallback** (the whole chain failed, timed out or is budget-blocked) is open question 1. The candidates are always available, so a fallback never costs latency.
+**Fallback** (the whole chain failed, timed out or is budget-blocked; owner, 2026-10-08): today's hybrid ranking with a higher floor (`auto.fallback_min_score`, default 0.6), at most `auto.fallback_max_results` (default 2) items, with the §6 excerpts. The candidates are always available, so a fallback never costs latency.
+
+**Proactive sessions** run the judged retrieval too (owner, 2026-10-08), with the conversation window standing in for the request.
 
 **Billing class.** `decision`, billed to the session payee like every runtime point.
 
 ## 6. Excerpts the agent can read
 
-- A kept block of up to `auto.excerpt_max_tokens` (default 400) is shown **whole**. With today's chunk sizes that is most of them.
-- A longer block shows a window centred on its best-matching region. That is the sentence or line range with the highest query-term overlap, or the highest vector similarity at sentence granularity when embeddings exist. The window is expanded to sentence boundaries and marked `…` where cut.
-- Each item keeps its citation so the agent can open the full block: `- [memory/<file>.md:<lines> · <room> · <date>] <excerpt>`.
-- **`recall_memory` gets the same fix:** match-centred snippets instead of the block head. Its default length goes from 200 characters to about 600, configurable.
-- The block's note tells the agent that items were judged relevant to this conversation and can be opened in full. It drops the current phrasing that frames the block as incidental.
+Excerpts must be long enough to tell what was being discussed. The citation must not eat the budget.
+
+- **Whole blocks by default.** A kept block of up to `auto.excerpt_max_tokens` (default 400) is shown whole. With today's chunk sizes that is most of them.
+- **Longer blocks.** A longer block shows its own heading text plus a window around its best-matching region: the sentence or line range with the highest query-term overlap, or the highest vector similarity at sentence granularity when embeddings exist. The window is expanded to sentence boundaries and marked `…` where cut.
+- **Compact, non-repeating citation.** One short header per item, then the text:
+  - The path stays, so the agent can open the full block (`memory/<file>.md:<lines>`).
+  - The date is shown separately only when the file name does not already contain it. Pipeline-written day files always do.
+  - The room is shown when known.
+  - The block's own markdown heading markers are stripped. Heading text that only restates the time is dropped.
+  - Example: `- [memory/2026-05-22.md:90-109 · general] <text>`.
+- **`recall_memory` gets the same treatment:** match-centred, cleaned excerpts with the same citation form. Its default length goes from 200 characters to about 600, configurable.
+- **The block's note** tells the agent that items were judged relevant to this conversation and can be opened in full. It drops the current phrasing that frames the block as incidental.
+
+Diary blocks are often lists of loosely related events. Whole, relevant blocks are the best this spec can do with that format; making individual memories self-contained is part of the out-of-scope memory redesign (§11).
 
 ## 7. Operator memory filters (soft delete)
 
-**Purpose.** The operator defines criteria for memories the agent should not see. This is a reversible, auditable alternative to editing or deleting diary entries, and it keeps working as new entries are written. Example: hide entries in which the agent describes doing something the operator no longer wants, so old examples do not reinforce it.
+**Purpose.** The operator defines criteria for memories that should not be pushed into the agent's context. This is a reversible alternative to editing or deleting diary entries, and it keeps working as new entries are written. Example: entries in which the agent describes behaviour the operator no longer wants, which would otherwise reinforce it in a loop.
+
+It is **not an access control**. A memory that must never be reachable should be deleted. Filters keep unwanted memories out of what the harness *pushes* into context. They are also applied to the memory search tools because that is easy and consistent, but direct file reads (editor, bash) stay unfiltered by design.
 
 ### 7.1 Configuration
 
 ```toml
-[retrieval.filters.self_harmful_habit]       # any key
+[retrieval.filters.unwanted_habit]           # any key
 description = "The entry describes the assistant <doing the unwanted thing>."
 examples = { hide = ["..."], keep = ["..."] } # optional, become criteria.true / criteria.false
 threshold = 0.8                               # hide at or above
@@ -166,38 +186,39 @@ enabled = true
 - Per-agent overrides go in `[agents.<name>.retrieval.filters]`.
 - A filter is one `noul` per block: "`entry` matches: <description>." The model is the `memory` point's chain, or `[retrieval.filters].model`.
 
-### 7.2 Evaluation: precomputed, cached, re-evaluated when a filter changes
+### 7.2 Evaluation: lazy, only where a block is about to be shown, cached
 
-- **A background worker** evaluates each memory chunk against every enabled filter once. It stores `memory_filter_verdicts(agent, content_hash, filter_key, filter_hash, probability, hidden, model, served_version, evaluated_at)`.
-  - `filter_hash` covers the description, examples and threshold. Editing a filter re-queues the whole corpus for that filter. Disabling it simply stops consulting its verdicts.
-  - One block with all filters is one call (filters are independent questions). Cost of a full pass over ~4,000 blocks on Jev is about 2M tokens, roughly $0.08.
-- **New or changed blocks** are evaluated when the indexer stamps them, in the same background pool.
-- **A not-yet-evaluated block reaching a surface** is evaluated inline:
-  - In auto-retrieval, its filter questions ride in the same relevance call, so it costs nothing extra on per-request members. The verdict is stored.
-  - Elsewhere (the recency layer, `recall_memory`), the surface waits up to a short bound for the verdict. On timeout it applies `filters.pending` (`"show"`, default, or `"hide"`).
-- **Decision-chain outage.** Stored verdicts keep applying. New blocks follow `filters.pending`.
+There is **no corpus pass and no backfill**. A block is judged only when a surface is about to show it, and the verdict is cached.
 
-### 7.3 Enforcement: every surface that shows diary text to the agent
+- **The cache.** `memory_filter_verdicts(agent, content_hash, filter_key, filter_hash, probability, hidden, model, served_version, evaluated_at)`.
+  - `filter_hash` covers the description, examples and threshold. Editing a filter makes its old verdicts stale. Blocks are re-judged lazily the next time they surface; nothing is re-run in bulk.
+  - Disabling a filter simply stops consulting its verdicts.
+- **Auto-retrieval:** a candidate without a fresh verdict has its filter questions ride in the same relevance call (§5). That costs nearly nothing extra on per-request members, and the verdict is stored.
+- **Recency diary layer and the diary writer's continuity window:** these show a handful of recent blocks, which change a few times a day. Each block is judged once when it first enters the layer, at layer build time, bounded by the point's timeout, and served from the cache afterwards.
+- **Memory search tools** (`recall_memory`, `search_memory`): results without a fresh verdict are judged in one call before the tool returns.
+- **Unavailable verdict** (timeout, decision-chain outage): `filters.pending` decides (`"show"`, default, or `"hide"`). Cached verdicts keep applying during an outage.
+
+### 7.3 Enforcement
 
 | Surface | Today | With filters |
 |---|---|---|
 | Auto-retrieval | top-K snippets | hidden blocks are never candidates |
-| `recall_memory` | ranked snippets | hidden blocks are dropped from results |
 | Recency diary layer (§9c read side) | the latest N files' blocks | hidden blocks dropped from the layer |
-| Diary writer's continuity window | the latest N files' blocks | hidden blocks dropped (stops the reinforcement loop at the source of new entries) |
-| `search_memory` (ripgrep over files) | matching lines | matching lines inside a hidden block are dropped (line ranges map to chunks) |
-| Direct file reads (editor, bash) | raw file | **not filtered** (open question 3) |
+| Diary writer's continuity window | the latest N files' blocks | hidden blocks dropped (stops the loop where new entries are written) |
+| `recall_memory` | ranked snippets | hidden blocks dropped (easy and consistent, not required) |
+| `search_memory` (ripgrep over files) | matching lines | lines inside a hidden block dropped (line ranges map to chunks) |
+| Direct file reads (editor, bash) | raw file | not filtered, by design |
 
 ### 7.4 Audit
 
-- **Console page.** Per filter: hidden count, the hidden blocks with their probabilities and citations (the operator can read them there), and changes over time. Hidden blocks also appear in a session's retrieval card as "hidden by <filter>".
-- **Logs.** `memory_filter_evaluated` (aggregate counts per pass) and `memory_filter_hidden` (per surface, counts only).
+- **Console.** A filters page lists, per filter, the blocks it has hidden so far, with probabilities and citations (the operator can read them there). Hidden blocks also appear in a session's retrieval card as "hidden by <filter>".
+- **Logs.** `memory_filter_hidden` (per surface, counts only).
 - **Write-time filtering** (refusing to write such entries) is NOT part of this spec. Display-time filtering is reversible and auditable. A counterfactual entry that was never written is neither.
 
 ## 8. Placement, latency and cost
 
 - **Latency.** Candidate recall is local: a query embed on the local model plus FTS, tens of milliseconds. The decision call takes about 1–1.5 s through a gateway and starts at launch alongside routing. The build waits for it only when assembling the final user turn, bounded by the point's timeout (default the global `[decisions].timeout_ms`). Today the auto-retrieval block is built inside the build too, so the added wall time is the part of the decision call that outlasts routing and the build, usually little or none.
-- **Cost.** About $0.0005 per session on Jev; around $0.10/day at a few hundred interactive sessions. Filters cost cents per full pass.
+- **Cost.** About $0.0005 per session on Jev; around $0.10/day at a few hundred interactive sessions. Filters add a few questions to calls that happen anyway, plus a handful of small calls per day for the recency layer.
 - **Prompt cache.** Unchanged: the block stays in the volatile final user turn. Filtering the recency layer changes that layer only when a verdict changes, like a diary write does today.
 
 ## 9. Observability and evaluation
@@ -245,16 +266,16 @@ pending = "show"              # unevaluated blocks on non-judged surfaces
 - The user profile system.
 - Changing the embedding model. A stronger remote embedder is already supported by config (`[retrieval.embedding.remote]`), but diary text derives from user messages and would need a ZDR provider. Worth evaluating separately once the judged pipeline exists, because recall then matters more than precision.
 
-## 12. Open questions for the owner
+## 12. Owner decisions (2026-10-08) and remaining questions
 
-1. **Fallback when the decision chain is unavailable.**
-   - (a) Today's ranking with a higher floor (e.g. 0.6), at most 2 items, match-centred excerpts.
-   - (b) No block.
+Decided:
+1. **Fallback** when the decision chain is unavailable: today's ranking with a higher floor, at most 2 items, the §6 excerpts (§5).
+2. **Proactive sessions** run the judged retrieval, with the conversation window as the request (§5).
+3. **Filters** are about not pushing memories into context, not access control. They also apply to the memory search tools because that is easy. Direct file reads stay unfiltered. There is no backfill: blocks are judged lazily when they are about to be shown (§7).
+4. **Budgets:** up to 4 items and ~2k tokens when relevant, none otherwise (§10).
+5. **Participants** only break near-ties in the ordering (§5); no reserved slots.
+6. **Participant tags** come from provenance only (§4a). There are no model-assisted "about" tags.
+7. **Snippets** were noise because they were too short to understand and wasted space on repeated citation parts, more than because they were the wrong part of the block (§1, §6).
 
-   (a) keeps some memory during outages. (b) avoids the noise the judged pipeline exists to remove. Recommendation: (a).
-2. **Proactive sessions.** Should they run the judged retrieval with the conversation window as the request? Recommendation: yes, since joining a conversation is where remembered context helps most.
-3. **Direct file reads** (editor, bash) bypass filters. The agent opened a diary file in 0.1% of sessions over 30 days. Recommendation: accept and document. A later option is to apply filters in the editor's `view` of `memory/` paths.
-4. **Budgets.** Defaults `max_results` 4, `max_tokens` 2000, `excerpt_max_tokens` 400, `candidates` 24. The always-on cost becomes "up to ~2k tokens when relevant, none when not", against today's ~250 every time.
-5. **`about_participant`.** Keep it as an ordering signal only, or also reserve slots for participant memories when several are relevant? With §4a tags, this question can also be answered mechanically.
-6. **Which ranking methods to evaluate** (§5.0). The proposal is the §9 offline comparison of hybrid, local cross-encoder, decision model and their combination, plus an embedding-model axis, before building the hot path. Is the local cross-encoder worth the added runtime dependency, or should the decision model alone carry relevance?
-7. **§4a "about" tags.** Provenance participant tags are free. The model-assisted `mentioned` tags cost one decision call per new block and one backfill pass. Worth it?
+Remaining:
+- **Cross-encoder.** Whether a local cross-encoder earns its place depends on its resource use and the latency it adds on the deployment's hardware (CPU, or a GPU if one is available to the agent). The proposal is to measure that, together with its offline quality against the decision model, before putting it on the hot path (§5.0).
