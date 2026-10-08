@@ -454,8 +454,11 @@ test("factory: an Anthropic stream aborted mid-way records one estimated row (re
   const out = estimateTokens(text);
   assert.equal(row.estimated, true);
   assert.equal(row.logicalModelId, "default");
-  assert.deepEqual([row.inputTokens, row.cacheReadTokens, row.cacheWriteTokens, row.outputTokens], [40, 1000, 0, out]);
-  assert.ok(Math.abs(row.costUsd - (40 * 3 + out * 15 + 1000 * 0.3) / 1e6) < 1e-12);
+  assert.deepEqual([row.inputTokens, row.cacheReadTokens, row.cacheWriteTokens], [40, 1000, 0]);
+  // At least the streamed deltas; the per-second floor can win on a loaded host (the test aborts
+  // after real wall time), so the exact count is not pinned here.
+  assert.ok(row.outputTokens >= out);
+  assert.ok(Math.abs(row.costUsd - (40 * 3 + row.outputTokens * 15 + 1000 * 0.3) / 1e6) < 1e-12);
   // The session tracker (cost ceiling) counted it too.
   assert.equal(usage.llmRequests, 1);
   assert.ok(Math.abs(usage.cost - row.costUsd) < 1e-12);
@@ -463,7 +466,7 @@ test("factory: an Anthropic stream aborted mid-way records one estimated row (re
   assert.ok(line, "llm_request_aborted is logged");
   assert.deepEqual(
     [line!.fields!.sessionId, line!.fields!.model, line!.fields!.inputTokens, line!.fields!.outputTokens, line!.fields!.estimated, line!.fields!.firstEventSeen],
-    ["s-anthropic", "default", 1040, out, true, true],
+    ["s-anthropic", "default", 1040, row.outputTokens, true, true],
   );
 });
 
@@ -475,7 +478,7 @@ test("factory: an OpenAI stream without usage is billed on the estimated context
   assert.equal(row.estimated, true);
   assert.ok(row.inputTokens > 0, "input estimated from the running context");
   assert.equal(row.cacheReadTokens, 0, "no prior request: no cache credit");
-  assert.equal(row.outputTokens, estimateTokens(text));
+  assert.ok(row.outputTokens >= estimateTokens(text), "at least the streamed deltas (the time floor can win under load)");
   assert.ok(row.costUsd > 0);
 });
 
