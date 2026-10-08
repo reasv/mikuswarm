@@ -27,12 +27,20 @@
 import { nanoid } from "nanoid";
 import type { AppConfig } from "../config/index.js";
 import type { PriorityClass } from "../agent/scheduler.js";
-import { checksPointKnobs, decisionsFor, type ChecksPointKnobs, type DecisionPointName } from "../decisions/config.js";
+import {
+  checksPointKnobs,
+  decisionsFor,
+  duplicateKnobs,
+  type ChecksPointKnobs,
+  type DecisionPointName,
+  type DuplicateKnobs,
+} from "../decisions/config.js";
 import type { DecisionEngine, DecisionEvaluationRow, DecisionPoint } from "../decisions/registry.js";
 import {
   assignItemIds,
   checksPoint,
   planCheckCalls,
+  planDuplicateCalls,
   type CheckItem,
   type ChecksCallInput,
   type ChecksCallVerdict,
@@ -45,6 +53,7 @@ import type {
   RefusalOutcome,
 } from "../storage/database.js";
 import { firstPatternMatch, prefilterAllows } from "./catalogue.js";
+import { duplicateRejection, type DuplicateContext } from "./duplicate.js";
 import { hasSource, sourceText, type CheckContext, type CheckSources } from "./state.js";
 import type { CheckCatalogue, CheckDefinition, CheckKind, CheckRemedy, CheckSource, Checkpoint } from "./types.js";
 
@@ -64,6 +73,17 @@ export interface FiredCheck {
   matched?: string;
   /** `choice` questions: the option picked. */
   choice?: string;
+  /** Judged checks: the names of the named questions that fired (e.g. `repeats`). */
+  questions?: string[];
+  /**
+   * The agent-facing explanation written from the verdict (a duplicate check:
+   * the unseen messages it quoted), used instead of the catalogue's.
+   */
+  explanation?: string;
+  /** The whole tool error when this check alone blocks the call (a duplicate check). */
+  standalone?: string;
+  /** Timeline event ids the explanation quotes (a duplicate check's unseen messages). */
+  quoted?: string[];
 }
 
 /** Who and where an evaluation is for. */
@@ -192,6 +212,16 @@ export class CheckEvaluation {
   /** @internal */ budgetRow?: DecisionEvaluationRow;
   done!: Promise<CheckEvaluationResult>;
   result?: CheckEvaluationResult;
+  /**
+   * When the output stops waiting for the verdict: the start plus the
+   * checkpoint's deadline, pushed later by a stage started after the start
+   * (the duplicate stage, {@link CheckEvaluator.extendDuplicate}).
+   */
+  deadlineAt: number;
+  /** The duplicate stage's context, when one was started (the rerun's, after a rerun). */
+  duplicate?: DuplicateContext;
+  /** A rerun of the duplicate stage was started (new unseen messages during the wait). */
+  duplicateRerun = false;
   completedAt?: number;
   recorded = false;
   canceled = false;
@@ -206,7 +236,13 @@ export class CheckEvaluation {
     groupPrefix = "",
   ) {
     this.startedAt = now;
+    this.deadlineAt = now + deadlineMs;
     this.decisionGroup = `${groupPrefix}${nanoid()}`;
+  }
+
+  /** Completed after its deadline (the output proceeded unjudged). */
+  get late(): boolean {
+    return this.completedAt !== undefined && this.completedAt > this.deadlineAt;
   }
 
   get checkpoint(): Checkpoint {
@@ -264,6 +300,11 @@ export class CheckEvaluator {
     return checksPointKnobs(decisionsFor(this.options.config as AppConfig, agent));
   }
 
+  /** The duplicate check's knobs for an agent (chain, earlier count and clip). */
+  duplicateKnobs(agent: string | null): DuplicateKnobs {
+    return duplicateKnobs(decisionsFor(this.options.config as AppConfig, agent));
+  }
+
   /** True when judged checks run for the agent (both enables and a model). */
   judgedEnabled(agent: string | null): boolean {
     return this.options.engine?.isEnabled(this.pointName, agent) ?? false;
@@ -311,6 +352,9 @@ export class CheckEvaluator {
     for (const check of this.options.catalogue.enabledFor(checkpoint, scope.agent)) {
       if (opts.kinds && !opts.kinds.includes(check.kind)) continue;
       if (opts.skipCodes?.has(check.code)) continue;
+      // Duplicate checks judge a send against unseen messages, read when the
+      // call executes (extendDuplicate), never at the early start.
+      if (check.kind === "duplicate") continue;
       const hasQuestions = check.questions.length > 0;
       const shortStyle = check.kind === "style" && messageChars < (check.minChars ?? knobs.styleMinChars);
       // A style check with questions skips a short message entirely; a
@@ -341,14 +385,7 @@ export class CheckEvaluator {
       if (took) evaluation.checks.push(check);
     }
     const items = assignItemIds(raw);
-    const judged = this.judge(evaluation, items).catch((error): { fired: FiredCheck[]; unjudgedReason?: string } => {
-      this.options.logger?.warn("check_gate_call_failed", {
-        sessionId: scope.sessionId,
-        checkpoint,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return { fired: [], unjudgedReason: "error" };
-    });
+    const judged = this.judgeSafely(evaluation, items);
     evaluation.done = judged.then((partial) => {
       const completedAt = this.now();
       evaluation.completedAt = completedAt;
@@ -364,9 +401,88 @@ export class CheckEvaluator {
     return evaluation;
   }
 
+  /** The enabled duplicate checks with questions at sends, when judged checks run for the agent. */
+  duplicateChecks(agent: string | null): CheckDefinition[] {
+    if (!this.judgedEnabled(agent)) return [];
+    return this.options.catalogue
+      .enabledFor("send", agent)
+      .filter((c) => c.kind === "duplicate" && c.questions.length > 0);
+  }
+
+  /**
+   * Add the duplicate stage to a send's evaluation (ARCHITECTURE.md §8j
+   * "Duplicate sends"): the enabled duplicate checks' questions over
+   * `{ earlier, draft }`, on the duplicate chain (`[decisions.checks.duplicate].model`,
+   * default `[decisions].model`), started now. The evaluation's `done` waits for
+   * it, and its deadline runs from now. Returns false (nothing added) when no
+   * duplicate question applies or the evaluation already completed or was
+   * canceled.
+   */
+  extendDuplicate(evaluation: CheckEvaluation, ctx: DuplicateContext, opts: { rerun?: boolean } = {}): boolean {
+    if (evaluation.canceled || evaluation.recorded) return false;
+    // At most one stage, plus at most one rerun (new unseen messages arrived
+    // while the call waited for its verdict); a rerun keeps the deadline.
+    if (opts.rerun ? evaluation.duplicateRerun : evaluation.duplicate) return false;
+    const { scope, subject } = evaluation;
+    const message = subject.sources.message ?? "";
+    if (!message.trim() || ctx.earlier.length === 0) return false;
+    const raw: Array<Omit<CheckItem, "id">> = [];
+    const checks: CheckDefinition[] = [];
+    for (const check of this.duplicateChecks(scope.agent)) {
+      if (!prefilterAllows(check, message)) continue;
+      const questions = check.questions.filter((q) => q.source === "message");
+      if (questions.length === 0) continue;
+      for (const question of questions) raw.push({ code: check.code, kind: check.kind, source: question.source, question });
+      checks.push(check);
+    }
+    if (raw.length === 0) return false;
+    if (opts.rerun) evaluation.duplicateRerun = true;
+    else evaluation.deadlineAt = Math.max(evaluation.deadlineAt, this.now() + evaluation.deadlineMs);
+    evaluation.duplicate = ctx;
+    for (const check of checks) if (!evaluation.checks.includes(check)) evaluation.checks.push(check);
+    const items = assignItemIds(raw);
+    const knobs = this.duplicateKnobs(scope.agent);
+    const stage = this.judgeSafely(evaluation, items, {
+      context: { ...subject.context, duplicate: ctx },
+      ...(knobs.model ? { chainHead: knobs.model } : {}),
+      duplicate: ctx,
+    });
+    const main = evaluation.done;
+    evaluation.done = Promise.all([main, stage]).then(([first, partial]) => {
+      const completedAt = this.now();
+      evaluation.completedAt = completedAt;
+      const unjudgedReason = first.unjudgedReason ?? partial.unjudgedReason;
+      const result: CheckEvaluationResult = {
+        fired: [...first.fired, ...partial.fired],
+        judgedQuestions: first.judgedQuestions + items.length,
+        latencyMs: completedAt - evaluation.startedAt,
+        ...(unjudgedReason ? { unjudgedReason } : {}),
+      };
+      evaluation.result = result;
+      return result;
+    });
+    return true;
+  }
+
+  private judgeSafely(
+    evaluation: CheckEvaluation,
+    items: CheckItem[],
+    opts: JudgeOptions = {},
+  ): Promise<{ fired: FiredCheck[]; unjudgedReason?: string }> {
+    return this.judge(evaluation, items, opts).catch((error): { fired: FiredCheck[]; unjudgedReason?: string } => {
+      this.options.logger?.warn("check_gate_call_failed", {
+        sessionId: evaluation.scope.sessionId,
+        checkpoint: evaluation.checkpoint,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { fired: [], unjudgedReason: "error" };
+    });
+  }
+
   private async judge(
     evaluation: CheckEvaluation,
     items: CheckItem[],
+    opts: JudgeOptions = {},
   ): Promise<{ fired: FiredCheck[]; unjudgedReason?: string }> {
     const engine = this.options.engine;
     if (items.length === 0 || !engine) return { fired: [] };
@@ -380,6 +496,7 @@ export class CheckEvaluator {
     };
     if (scope.sessionId && this.options.isPayeeOverBudget?.(scope.sessionId)) {
       // Never refuse or delay the output for budget: it proceeds unjudged.
+      if (evaluation.budgetRow) return { fired: [], unjudgedReason: "payee_budget" };
       evaluation.budgetRow = {
         ts: this.now(),
         decisionGroup: evaluation.decisionGroup,
@@ -411,11 +528,14 @@ export class CheckEvaluator {
     const configuredTimeout = decisionsFor(this.options.config as AppConfig, scope.agent).checks?.timeout_ms;
     const callTimeoutMs = judging?.timeoutMs ?? configuredTimeout ?? evaluation.deadlineMs * CALL_TIMEOUT_DEADLINE_FACTOR;
     const usageClass = judging?.usageClass ?? "decision";
-    const members = engine.usableMembers(this.pointName, scope.agent, attribution, usageClass);
+    const members = engine.usableMembers(this.pointName, scope.agent, attribution, usageClass, opts.chainHead);
     const checksByCode = new Map(evaluation.checks.map((c) => [c.code, c]));
-    const plan: PlannedCall[] = planCheckCalls(items, members[0], checkpoint, subject.sources, checksByCode);
-    const context = { ...subject.context, checkpoint };
+    const plan: PlannedCall[] = opts.duplicate
+      ? planDuplicateCalls(items, members[0])
+      : planCheckCalls(items, members[0], checkpoint, subject.sources, checksByCode);
+    const context = { ...(opts.context ?? subject.context), checkpoint };
     let unjudgedReason: string | undefined;
+    const records: CallRecord[] = [];
     await Promise.all(
       plan.map(async (call) => {
         const record: Partial<CallRecord> & { verdict: ChecksCallVerdict } = { verdict: { results: [] } };
@@ -439,6 +559,7 @@ export class CheckEvaluator {
               decisionGroup: evaluation.decisionGroup,
               timeoutMs: callTimeoutMs,
               usageClass,
+              ...(opts.chainHead ? { chainHead: opts.chainHead } : {}),
               onEvaluation: (row) => {
                 record.row = row;
               },
@@ -454,20 +575,27 @@ export class CheckEvaluator {
             error: error instanceof Error ? error.message : String(error),
           });
         }
-        if (record.row) evaluation.calls.push({ row: record.row, verdict: record.verdict });
+        if (record.row) {
+          evaluation.calls.push({ row: record.row, verdict: record.verdict });
+          records.push({ row: record.row, verdict: record.verdict });
+        }
       }),
     );
 
     // Per check: fired when any question reached its threshold; the reported
     // probability and source are those of the strongest question (§4.2).
     const fired: FiredCheck[] = [];
-    const byCode = new Map<string, { best?: { p: number; source: CheckSource; choice?: string }; firedBest?: { p: number; source: CheckSource; choice?: string } }>();
-    for (const call of evaluation.calls) {
+    type Best = { p: number; source: CheckSource; choice?: string };
+    const byCode = new Map<string, { best?: Best; firedBest?: Best; names: string[] }>();
+    const nameOf = new Map(items.map((i) => [i.id, i.question.name]));
+    for (const call of records) {
       for (const r of call.verdict.results) {
-        const entry = byCode.get(r.code) ?? {};
+        const entry = byCode.get(r.code) ?? { names: [] };
         const candidate = { p: r.probability, source: r.source, ...(r.choice !== undefined ? { choice: r.choice } : {}) };
         if (!entry.best || r.probability > entry.best.p) entry.best = candidate;
         if (r.fired && (!entry.firedBest || r.probability > entry.firedBest.p)) entry.firedBest = candidate;
+        const name = nameOf.get(r.id);
+        if (r.fired && name) entry.names.push(name);
         byCode.set(r.code, entry);
       }
     }
@@ -475,14 +603,21 @@ export class CheckEvaluator {
       if (!entry.firedBest) continue;
       const check = checksByCode.get(code);
       if (!check) continue;
-      fired.push(
-        firedOf(check, {
-          method: "judged",
-          source: entry.firedBest.source,
-          probability: entry.firedBest.p,
-          ...(entry.firedBest.choice !== undefined ? { choice: entry.firedBest.choice } : {}),
-        }),
-      );
+      const hit = firedOf(check, {
+        method: "judged",
+        source: entry.firedBest.source,
+        probability: entry.firedBest.p,
+        ...(entry.firedBest.choice !== undefined ? { choice: entry.firedBest.choice } : {}),
+        ...(entry.names.length > 0 ? { questions: entry.names } : {}),
+      });
+      if (opts.duplicate && check.kind === "duplicate") {
+        // The tool error quotes the unseen messages and names the questions that fired.
+        const rejection = duplicateRejection(opts.duplicate, entry.names, check.code);
+        hit.explanation = rejection.explanation;
+        hit.standalone = rejection.standalone;
+        hit.quoted = opts.duplicate.earlier.flatMap((m) => m.eventIds);
+      }
+      fired.push(hit);
     }
     return unjudgedReason ? { fired, unjudgedReason } : { fired };
   }
@@ -608,6 +743,16 @@ export class CheckEvaluator {
     });
     return ids;
   }
+}
+
+/** Options of one judged stage of an evaluation. */
+interface JudgeOptions {
+  /** The state context (default the subject's). */
+  context?: CheckContext;
+  /** Run on this chain instead of the point's. */
+  chainHead?: string;
+  /** The duplicate stage: plan its calls over `{ earlier, draft }` and write its rejection. */
+  duplicate?: DuplicateContext;
 }
 
 function firedOf(check: CheckDefinition, extra: Omit<FiredCheck, "code" | "kind" | "remedy" | "reason">): FiredCheck {

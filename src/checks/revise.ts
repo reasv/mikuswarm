@@ -131,9 +131,11 @@ export function fillMatched(explanation: string, matched: string | undefined): s
  */
 export function reviseErrorMessage(
   info: Pick<GateCallInfo, "action" | "checkpoint">,
-  blocking: readonly { code: string; explanation: string }[],
+  blocking: readonly { code: string; explanation: string; standalone?: string }[],
   overridable: readonly string[],
 ): string {
+  // A check that writes its own whole error (the duplicate check) uses it when it blocks alone.
+  if (blocking.length === 1 && blocking[0]!.standalone) return blocking[0]!.standalone;
   const lines = blocking.map((b) => `- ${b.code}: ${b.explanation}`);
   const codes = JSON.stringify([...overridable]);
   if (info.checkpoint === "ending") {
@@ -260,7 +262,11 @@ export function createRevisePolicyPart(options: RevisePolicyPartOptions): Revise
     consecutive += 1;
     sessionTotal += 1;
     lastRejected = [...new Set(fired.map((f) => f.code))];
-    const lines = uniqueByCode(blocking).map((f) => ({ code: f.code, explanation: explanationOf(f, agent) }));
+    const lines = uniqueByCode(blocking).map((f) => ({
+      code: f.code,
+      explanation: explanationOf(f, agent),
+      ...(f.standalone ? { standalone: f.standalone } : {}),
+    }));
     logger?.info("check_revise_blocked", {
       ...logFields(info),
       codes: lines.map((l) => l.code),
@@ -273,6 +279,8 @@ export function createRevisePolicyPart(options: RevisePolicyPartOptions): Revise
   };
 
   const explanationOf = (fired: FiredCheck, agent: string | null): string => {
+    // Written from the verdict (a duplicate check quotes what it compared against).
+    if (fired.explanation) return fired.explanation;
     const check = evaluator.catalogue.get(fired.code, agent);
     return fillMatched(check?.agentExplanation ?? check?.description ?? fired.code, fired.matched);
   };

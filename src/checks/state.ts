@@ -23,6 +23,7 @@ import { estimateTokens } from "../context/tokens.js";
 import { clipText, packNewest } from "../decisions/state.js";
 import { matchForcedCompletionPrompt } from "../agent/contract.js";
 import { harnessKindOf, isHarnessMade } from "../agent/harness.js";
+import type { DuplicateContext } from "./duplicate.js";
 import type { CheckSource, Checkpoint } from "./types.js";
 
 /** One chat message in check state. */
@@ -55,6 +56,8 @@ export interface CheckContext {
   nudges?: number;
   /** Text written before the first nudge (endings after a nudge). */
   firstAttempt?: string;
+  /** The duplicate check's unseen messages and request (src/checks/duplicate.ts); sends only. */
+  duplicate?: DuplicateContext;
 }
 
 /** Per-field character clips (the token budget clips further when needed). */
@@ -285,7 +288,7 @@ export function tailTokens(text: string, maxTokens: number): string {
 }
 
 /** Clip a text to `maxTokens` from its start (with an ellipsis). */
-function headTokens(text: string, maxTokens: number): string {
+export function headTokens(text: string, maxTokens: number): string {
   if (estimateTokens(text) <= maxTokens) return text;
   let chars = Math.max(1, maxTokens * 4);
   let head = clipText(text, chars);
@@ -297,7 +300,7 @@ function headTokens(text: string, maxTokens: number): string {
 }
 
 /** Which state a call's questions read (spec §6.2 split by state shape). */
-export type CheckStateScope = "full" | "message_only";
+export type CheckStateScope = "full" | "message_only" | "duplicate";
 
 export interface CheckStateInput {
   context: CheckContext;

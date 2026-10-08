@@ -94,6 +94,7 @@ export function checkKind(code: string, info?: CheckInfo): string {
 	if (code.startsWith('refusal_')) return 'refusal';
 	if (code.startsWith('style_')) return 'style';
 	if (code.startsWith('no_reply_')) return 'contract';
+	if (code === 'duplicate') return 'duplicate';
 	return 'check';
 }
 

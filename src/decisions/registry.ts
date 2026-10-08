@@ -241,6 +241,12 @@ export interface EvaluateContext {
    * `[[limits]]` rules with `classes = ["audit"]` cap it.
    */
   usageClass?: "decision" | "audit";
+  /**
+   * Run on this chain (a system-one `[models.*]` key) instead of the point's
+   * `model`; the point's other settings apply. The duplicate check uses it
+   * (its chain defaults to `[decisions].model`, ARCHITECTURE.md §8j).
+   */
+  chainHead?: string;
 }
 
 /** A member of a point's chain, as the fits planner sees it. */
@@ -523,7 +529,7 @@ export class DecisionEngine {
       }
     }
 
-    const textRun = await run(settings.model, undefined);
+    const textRun = await run(ctx.chainHead ?? settings.model, undefined);
     if (textRun.ok) return succeed(textRun);
     return fallback(textRun.reason, textRun.extra);
   }
@@ -600,12 +606,13 @@ export class DecisionEngine {
     agentName: string | null,
     attribution: DecisionAttribution,
     usageClass: "decision" | "audit" = "decision",
+    chainHead?: string,
   ): DecisionChainMember[] {
     const settings = this.settings(point, agentName);
     if (!settings) return [];
     let chain;
     try {
-      chain = this.options.client.chain(settings.model);
+      chain = this.options.client.chain(chainHead ?? settings.model);
     } catch {
       return [];
     }
@@ -673,7 +680,7 @@ export class DecisionEngine {
       agent: ctx.agentName ?? undefined,
       timelineKey: ctx.attribution.timelineKey ?? undefined,
       sessionId: ctx.attribution.agentSessionId ?? undefined,
-      model: settings.model,
+      model: ctx.chainHead ?? settings.model,
       latencyMs: (this.options.now ?? Date.now)() - started,
       ...(answers ? { answers: summarizeAnswers(answers) } : {}),
       ...(ctx.heuristicVerdict !== undefined ? { heuristicVerdict: ctx.heuristicVerdict } : {}),

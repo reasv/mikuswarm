@@ -1161,6 +1161,17 @@ const DecisionChecksSchema = StrictObject({
   recent_messages: Type.Optional(Type.Integer({ minimum: 0, maximum: 50 })),
   // Tokens of the thinking block's tail sent as the `thinking` source. Default 800.
   thinking_tail_tokens: Type.Optional(Type.Integer({ minimum: 0 })),
+  // The duplicate-send check (`kind = "duplicate"`, ARCHITECTURE.md §8j
+  // "Duplicate sends"): its own decision chain and state limits.
+  duplicate: Type.Optional(StrictObject({
+    // Decision chain of the duplicate questions. Unset = `[decisions].model`
+    // (not this point's `model`, which may be a judge chain for style).
+    model: Type.Optional(Type.String({ minLength: 1 })),
+    // Newest unseen messages compared with the draft. Default 5.
+    max_earlier: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+    // Each unseen message's text is clipped to about this many tokens. Default 1500.
+    earlier_max_tokens: Type.Optional(Type.Integer({ minimum: 50 })),
+  })),
 });
 
 // The offline audit worker's decision point (spec REFUSAL-HANDLING §7.6, §10.2;
@@ -1202,6 +1213,9 @@ const DecisionAuditSchema = StrictObject({
 // models/agents/sites/reasons) lives in src/checks/catalogue.ts and
 // src/refusals/rules.ts.
 const CheckQuestionSchema = StrictObject({
+  // Optional stable name: the question id becomes `<code>__<name>`, and
+  // `thresholds` and per-member calibration (`"checks.<code>.<name>"`) can name it.
+  name: Type.Optional(Type.String({ pattern: "^[a-z0-9_]+$" })),
   source: Type.Union([
     Type.Literal("message"),
     Type.Literal("analysis"),
@@ -1231,7 +1245,12 @@ const CheckApiSignalSchema = StrictObject({
 // every field is optional here; a new code needs `kind` (and `reason` for a
 // refusal check).
 const CheckSchema = StrictObject({
-  kind: Type.Optional(Type.Union([Type.Literal("refusal"), Type.Literal("style"), Type.Literal("contract")])),
+  kind: Type.Optional(Type.Union([
+    Type.Literal("refusal"),
+    Type.Literal("style"),
+    Type.Literal("contract"),
+    Type.Literal("duplicate"),
+  ])),
   enabled: Type.Optional(Type.Boolean()),
   remedy: Type.Optional(Type.Union([Type.Literal("redo"), Type.Literal("revise"), Type.Literal("observe")])),
   reason: Type.Optional(Type.String({ minLength: 1 })),
@@ -1252,6 +1271,9 @@ const CheckSchema = StrictObject({
   prefilter: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
   min_chars: Type.Optional(Type.Integer({ minimum: 0 })),
   questions: Type.Optional(Type.Array(CheckQuestionSchema)),
+  // Per-question thresholds, keyed by question name (or source, for an unnamed
+  // question): overrides the thresholds of the built-in or configured questions.
+  thresholds: Type.Optional(Type.Record(Type.String({ minLength: 1 }), Type.Number({ minimum: 0, maximum: 1 }))),
 });
 
 const RefusalRuleSchema = StrictObject({

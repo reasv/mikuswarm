@@ -283,6 +283,32 @@ export function checksPointKnobs(decisions: DecisionsRawConfig): ChecksPointKnob
   };
 }
 
+// `[decisions.checks.duplicate]` defaults (DECISION-MODEL §5.4).
+export const DEFAULT_DUPLICATE_MAX_EARLIER = 5;
+export const DEFAULT_DUPLICATE_EARLIER_MAX_TOKENS = 1500;
+
+/** The duplicate-send check's knobs, defaults applied. */
+export interface DuplicateKnobs {
+  /**
+   * Head of the chain the duplicate questions run on: `[decisions.checks.duplicate].model`,
+   * else `[decisions].model`, else the checks point's own `model`.
+   */
+  model?: string;
+  maxEarlier: number;
+  earlierMaxTokens: number;
+}
+
+/** The duplicate check's knobs for an effective decisions table (enabled or not). */
+export function duplicateKnobs(decisions: DecisionsRawConfig): DuplicateKnobs {
+  const raw = decisions.checks?.duplicate ?? {};
+  const model = raw.model ?? decisions.model ?? decisions.checks?.model;
+  return {
+    ...(model ? { model } : {}),
+    maxEarlier: raw.max_earlier ?? DEFAULT_DUPLICATE_MAX_EARLIER,
+    earlierMaxTokens: raw.earlier_max_tokens ?? DEFAULT_DUPLICATE_EARLIER_MAX_TOKENS,
+  };
+}
+
 /**
  * A threshold for the member that served an answer: `[decisions.calibration.<member>]`
  * `"<point>.<name>"`, then its bare `<name>`, then the point's own value.
@@ -506,6 +532,8 @@ function validateEffective(
     requireDecisionModel(config, decisionKeys, decisions[point]?.model, `${where}.${point}.model`);
     addChain(decisions[point]?.model);
   }
+  requireDecisionModel(config, decisionKeys, decisions.checks?.duplicate?.model, `${where}.checks.duplicate.model`);
+  addChain(decisions.checks?.duplicate?.model);
   // Vision chains (DECISION-MODEL §3.5): system-one, and every member reads images.
   requireVisionChain(config, decisionKeys, decisions.vision_model, `${where}.vision_model`);
   addChain(decisions.vision_model);

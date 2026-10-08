@@ -107,6 +107,8 @@ describe('small readers', () => {
 		expect(splitQuestionId('refusal_safety__message')).toEqual({ code: 'refusal_safety', source: 'message' });
 		expect(splitQuestionId('op_x__analysis_2')).toEqual({ code: 'op_x', source: 'analysis' });
 		expect(checkKind('no_reply_intent')).toBe('contract');
+		expect(checkKind('duplicate')).toBe('duplicate');
+		expect(splitQuestionId('duplicate__answered_already')).toEqual({ code: 'duplicate', source: 'answered_already' });
 		expect(checkKind('custom')).toBe('check');
 	});
 

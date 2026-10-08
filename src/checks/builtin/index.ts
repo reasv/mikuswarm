@@ -4,13 +4,15 @@
  */
 import type { CheckDefinition } from "../types.js";
 import { BUILTIN_CONTRACT_CHECKS } from "./contract.js";
+import { BUILTIN_DUPLICATE_CHECKS } from "./duplicate.js";
 import { BUILTIN_REFUSAL_CHECKS } from "./refusal.js";
 import { BUILTIN_STYLE_CHECKS } from "./style.js";
 
-export { BUILTIN_CONTRACT_CHECKS, BUILTIN_REFUSAL_CHECKS, BUILTIN_STYLE_CHECKS };
+export { BUILTIN_CONTRACT_CHECKS, BUILTIN_DUPLICATE_CHECKS, BUILTIN_REFUSAL_CHECKS, BUILTIN_STYLE_CHECKS };
 
 export const BUILTIN_CHECKS: readonly CheckDefinition[] = [
   ...BUILTIN_REFUSAL_CHECKS,
   ...BUILTIN_STYLE_CHECKS,
   ...BUILTIN_CONTRACT_CHECKS,
+  ...BUILTIN_DUPLICATE_CHECKS,
 ];

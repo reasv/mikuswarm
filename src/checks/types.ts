@@ -4,13 +4,13 @@
  * one catalogue, one judging machinery and one statistics path.
  */
 
-export type CheckKind = "refusal" | "style" | "contract";
+export type CheckKind = "refusal" | "style" | "contract" | "duplicate";
 export type CheckRemedy = "redo" | "revise" | "observe";
 export type CheckSource = "message" | "analysis" | "text" | "thinking" | "artifact" | "rollout";
 export type Checkpoint = "send" | "ending" | "artifact" | "rollout";
 export type RefusalDetectionMethod = "stop_reason" | "provider_category" | "pattern" | "judged";
 
-export const CHECK_KINDS: readonly CheckKind[] = ["refusal", "style", "contract"];
+export const CHECK_KINDS: readonly CheckKind[] = ["refusal", "style", "contract", "duplicate"];
 export const CHECK_REMEDIES: readonly CheckRemedy[] = ["redo", "revise", "observe"];
 export const CHECK_SOURCES: readonly CheckSource[] = ["message", "analysis", "text", "thinking", "artifact", "rollout"];
 export const CHECKPOINTS: readonly Checkpoint[] = ["send", "ending", "artifact", "rollout"];
@@ -32,6 +32,13 @@ export const BUILTIN_REFUSAL_REASONS = [
 ] as const;
 
 export interface CheckQuestion {
+  /**
+   * Stable question name (e.g. `repeats`). Optional; when set it replaces the
+   * source in the question id (`<code>__<name>`), names the question in
+   * `thresholds` and in per-member calibration (`"checks.<code>.<name>"`), and
+   * tells a check's several questions over one source apart.
+   */
+  name?: string;
   source: CheckSource;
   instructions: string;
   criteria: { true: string; false: string };

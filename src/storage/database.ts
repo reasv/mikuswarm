@@ -1308,6 +1308,25 @@ export interface RefusalEventInsert {
 /** Stored length cap of `refusal_events.explanation` (the provider's free text). */
 export const REFUSAL_EXPLANATION_MAX_CHARS = 300;
 
+/** Clock skew allowed between a message's `timestamp` and `received_at` in {@link Storage.listSessionMessagesSince}. */
+const SESSION_MESSAGES_SKEW_MS = 60 * 60 * 1000;
+
+/** A bot message of a session, with that session's request (the duplicate-send check). */
+export interface SessionMessageRow {
+  event: CanonicalChatEvent;
+  sessionId: string;
+  receivedAt: number;
+  /** Null when the session row is gone. */
+  session: {
+    timelineKey: string;
+    sessionType: string;
+    triggerEventId: string | null;
+    triggerBody: string | null;
+    triggerSenderId: string | null;
+    triggerSenderDisplayName: string | null;
+  } | null;
+}
+
 /** A persisted `refusal_events` row (snake_case columns). */
 export interface RefusalEventRow {
   id: number;
@@ -9968,6 +9987,85 @@ export class Storage {
       if (!row) return undefined;
       return JSON.parse(row.event_json) as import("../types.js").CanonicalChatEvent;
     });
+  }
+
+  /**
+   * Bot messages other sessions stored in `timelineKey` after `after`
+   * (`received_at`), newest first, with the request of the session that sent
+   * each (the duplicate-send check, ARCHITECTURE.md §8j "Duplicate sends").
+   * `excludeSessionId`'s own messages are left out. The `timestamp` lower bound
+   * (an hour of skew under `after`) keeps the read on the timeline index.
+   */
+  listSessionMessagesSince(opts: {
+    timelineKey: string;
+    after: number;
+    excludeSessionId: string;
+    limit: number;
+  }): SessionMessageRow[] {
+    return this.read((db) => {
+      const rows = db
+        .prepare(
+          `select te.id, te.agent_session_id, te.received_at, te.event_json,
+                  s.timeline_key as session_timeline_key, s.session_type, s.trigger_event_id,
+                  s.trigger_body, s.trigger_sender_id, s.trigger_sender_display_name
+             from timeline_events te
+             left join agent_sessions s on s.id = te.agent_session_id
+            where te.timeline_key = @timelineKey and te.timestamp >= @floor and te.received_at > @after
+              and te.role = 'assistant' and te.agent_session_id is not null and te.agent_session_id != @exclude
+            order by te.received_at desc, te.id desc
+            limit @limit`,
+        )
+        .all({
+          timelineKey: opts.timelineKey,
+          floor: opts.after - SESSION_MESSAGES_SKEW_MS,
+          after: opts.after,
+          exclude: opts.excludeSessionId,
+          limit: Math.max(1, opts.limit),
+        }) as Array<{
+          id: string;
+          agent_session_id: string;
+          received_at: number;
+          event_json: string;
+          session_timeline_key: string | null;
+          session_type: string | null;
+          trigger_event_id: string | null;
+          trigger_body: string | null;
+          trigger_sender_id: string | null;
+          trigger_sender_display_name: string | null;
+        }>;
+      return rows.map((row) => ({
+        event: JSON.parse(row.event_json) as CanonicalChatEvent,
+        sessionId: row.agent_session_id,
+        receivedAt: row.received_at,
+        session: row.session_timeline_key === null
+          ? null
+          : {
+              timelineKey: row.session_timeline_key,
+              sessionType: row.session_type ?? "default",
+              triggerEventId: row.trigger_event_id,
+              triggerBody: row.trigger_body,
+              triggerSenderId: row.trigger_sender_id,
+              triggerSenderDisplayName: row.trigger_sender_display_name,
+            },
+      }));
+    });
+  }
+
+  /**
+   * The DM timelines of one account with `userId`: the recorded DM peers
+   * (`dm_peers`) and the DMs the user posted in.
+   */
+  dmTimelineKeysForPeer(provider: string, accountId: string, userId: string): string[] {
+    const keys = new Set<string>();
+    this.read((db) => {
+      const rows = db
+        .prepare(`select dm_channel_id from dm_peers where provider = ? and account_id = ? and peer_user_id = ?`)
+        .all(provider, accountId, userId) as Array<{ dm_channel_id: string }>;
+      for (const row of rows) keys.add(buildTimelineKey({ provider, accountId, kind: "dm", channelId: row.dm_channel_id }));
+    });
+    const prefix = `${provider}:${accountId}:dm:`;
+    for (const key of this.findDmTimelineKeysForUser(userId, { limit: 20 })) if (key.startsWith(prefix)) keys.add(key);
+    return [...keys];
   }
 
   // ── Workspace seed ledger (spec WORKSPACE-TEMPLATE-RECONCILIATION §6) ────────

@@ -12,7 +12,7 @@ import type { Logger } from "../observability/logger.js";
 import type { SessionRedoControl } from "../agent/redo-signal.js";
 import type { SessionRefusalHandle } from "../refusals/session.js";
 import type { CheckEvaluator } from "./evaluator.js";
-import { OutputGate, type GatePolicy } from "./gate.js";
+import { OutputGate, type GateDuplicateSource, type GatePolicy } from "./gate.js";
 import type { StateMessage } from "./state.js";
 
 /** What the app hands the factory (built once in app.ts, around the one check catalogue). */
@@ -34,6 +34,12 @@ export interface OutputGateServices {
     session: AgentSessionRecord,
     handles: { refusal: SessionRefusalHandle; redoControl: SessionRedoControl },
   ) => GatePolicy | undefined;
+  /**
+   * The duplicate check's reads for a session (ARCHITECTURE.md §8j "Duplicate
+   * sends"): send targets, other sessions' messages, the draft's request.
+   * Absent = no duplicate stage.
+   */
+  duplicate?: (session: AgentSessionRecord, agentName: string | null) => GateDuplicateSource | undefined;
   logger?: Logger;
 }
 
@@ -58,6 +64,7 @@ export function createSessionOutputGate(
   if (!services || args.internalJob) return undefined;
   const { session } = args;
   const policy = services.policy?.(session);
+  const duplicate = services.duplicate?.(session, args.agentName);
   return new OutputGate({
     evaluator: services.evaluator,
     scope: {
@@ -73,6 +80,7 @@ export function createSessionOutputGate(
     ...(services.chat ? { chat: (recent: number) => services.chat!(session, recent) } : {}),
     servingModel: args.servingModel,
     ...(policy ? { policy } : {}),
+    ...(duplicate ? { duplicate } : {}),
     ...(services.logger ? { logger: services.logger } : {}),
   });
 }

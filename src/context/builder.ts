@@ -1025,8 +1025,10 @@ export class ContextBuilder {
     // missed, excluding trigger members, claim-marked and budget-truncated.
     const gapActive =
       options.gap !== undefined && options.gap.maxMessages !== 0 && options.gap.maxTokens !== 0;
+    // The gap's messages count as seen by the duplicate check (§8j "Duplicate sends").
+    const gapShown: string[] = [];
     const gapRendered = gapActive
-      ? this.renderResumeGap(options.timelineKey, options.trigger, triggerGroupIds, options.gap!, options.selfSessionId)
+      ? this.renderResumeGap(options.timelineKey, options.trigger, triggerGroupIds, options.gap!, options.selfSessionId, gapShown)
       : null;
 
     const finalUserContent = [gapRendered, systemBlock, triggerContent].filter(Boolean).join("\n\n");
@@ -1039,6 +1041,7 @@ export class ContextBuilder {
       tier: "trigger",
       tokenEstimate: estimateTokens(finalUserContent),
       ...(modelTailAt ? { modelTailAt } : {}),
+      ...(gapRendered && gapShown.length > 0 ? { seen: { eventIds: gapShown } } : {}),
     } as AgentMessage;
   }
 
@@ -1061,6 +1064,7 @@ export class ContextBuilder {
     triggerGroupIds: Set<string>,
     gap: { maxMessages: number; maxTokens: number; lowerBoundTimestamp: number },
     selfSessionId: string,
+    shownIds?: string[],
   ): string | null {
     // Walk back from the trigger group's latest member (the trigger itself, the
     // chronologically-last event). The query is NOT pre-budget-capped: it fetches
@@ -1104,6 +1108,7 @@ export class ContextBuilder {
         break;
       }
       kept.push(text);
+      shownIds?.push(gapEvents[i]!.id);
       totalTokens += tokens;
     }
     if (kept.length === 0) return null;
