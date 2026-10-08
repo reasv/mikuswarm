@@ -15,6 +15,7 @@ import { MemoryRetrievalStore } from "../src/storage/memory-retrieval-store.js";
 import {
   MemoryFilterService,
   filterBoundTs,
+  filtersFor,
   filterMemoryFileText,
   resolveMemoryFilters,
   splitFileBlocks,
@@ -91,6 +92,27 @@ test("config: kinds, defaults, validation errors", () => {
   assert.throws(() => resolveMemoryFilters({ x: { keywords: ["k"], after: "2026-05-10", before: "2026-05-01" } }), /range is empty/);
   assert.throws(() => resolveMemoryFilters({ pending: "maybe" }), /pending/);
   assert.throws(() => validateMemoryFilters(cfg({ bad: { patterns: ["("] } })), /regular expression/);
+});
+
+test("config: the per-agent merge is deep; an agent switch-off of an unknown filter is ignored with a warning", () => {
+  const config = cfg(
+    { habit: { description: "d", examples: { hide: ["x"], keep: ["y"] } }, old: { keywords: ["k"] } },
+    {
+      a: {
+        workspace_root: "/w",
+        retrieval: { filters: { habit: { examples: { keep: ["z"] } }, old: { enabled: false }, ghost: { enabled: false } } },
+      },
+    },
+  );
+  const merged = filtersFor(config, "a");
+  const habit = merged.filters.find((f) => f.key === "habit")!;
+  assert.deepEqual(habit.examplesHide, ["x"], "examples.keep alone keeps the global examples.hide");
+  assert.deepEqual(habit.examplesKeep, ["z"]);
+  assert.equal(merged.filters.find((f) => f.key === "old")!.enabled, false);
+  assert.equal(merged.filters.find((f) => f.key === "ghost"), undefined);
+  const warns: Array<[string, any]> = [];
+  validateMemoryFilters(config, (e, f) => warns.push([e, f]));
+  assert.deepEqual(warns.map(([e, f]) => [e, f.where]), [["memory_filter_disable_unknown", "agents.a.retrieval.filters.ghost"]]);
 });
 
 test("config: the filter hash changes when anything defining it changes", () => {

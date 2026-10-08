@@ -179,18 +179,47 @@ function resolveOne(key: string, f: RawFilter, where: string): ResolvedMemoryFil
   };
 }
 
-/** Deep-merge an agent's `[agents.<name>.retrieval.filters]` over the global table. */
+function deepMerge(base: Record<string, unknown>, over: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...base };
+  for (const [key, value] of Object.entries(over)) {
+    const prev = out[key];
+    out[key] = isPlainObject(prev) && isPlainObject(value) ? deepMerge(prev, value) : value;
+  }
+  return out;
+}
+
+/** An agent filter table that only switches a filter off (nothing that defines one). */
+function onlyDisables(value: unknown): boolean {
+  return isPlainObject(value) && value.enabled === false && Object.keys(value).every((k) => k === "enabled");
+}
+
+/**
+ * Agent filter keys that only set `enabled = false` for a filter the global
+ * table does not define: ignored by {@link mergeFilterTables}, reported at startup.
+ */
+export function unknownDisabledFilters(
+  global: Record<string, unknown> | undefined,
+  agent: Record<string, unknown> | undefined,
+): string[] {
+  return Object.entries(agent ?? {})
+    .filter(([key, value]) => onlyDisables(value) && !isPlainObject(global?.[key]))
+    .map(([key]) => key);
+}
+
+/**
+ * Deep-merge an agent's `[agents.<name>.retrieval.filters]` over the global
+ * table, recursively (`examples.keep` alone keeps the global `examples.hide`).
+ * An agent `enabled = false` for a filter the global table does not define is
+ * ignored (validateMemoryFilters warns about it).
+ */
 export function mergeFilterTables(
   global: Record<string, unknown> | undefined,
   agent: Record<string, unknown> | undefined,
 ): Record<string, unknown> | undefined {
   if (!agent) return global;
-  const out: Record<string, unknown> = { ...(global ?? {}) };
-  for (const [key, value] of Object.entries(agent)) {
-    const prev = out[key];
-    out[key] = isPlainObject(prev) && isPlainObject(value) ? { ...prev, ...value } : value;
-  }
-  return out;
+  const unknown = new Set(unknownDisabledFilters(global, agent));
+  const over = Object.fromEntries(Object.entries(agent).filter(([key]) => !unknown.has(key)));
+  return deepMerge(global ?? {}, over);
 }
 
 /** The effective filters of an agent (null = legacy / global only). */
@@ -201,8 +230,21 @@ export function filtersFor(config: AppConfig, agentName: string | null): Resolve
   return resolveMemoryFilters(mergeFilterTables(global, agent), where);
 }
 
-/** Startup validation of every agent's effective filters (throws on the first problem). */
-export function validateMemoryFilters(config: AppConfig): void {
+/**
+ * Startup validation of every agent's effective filters (throws on the first
+ * problem); warns about an agent `enabled = false` naming no global filter.
+ */
+export function validateMemoryFilters(config: AppConfig, warn?: (event: string, fields: Record<string, unknown>) => void): void {
   filtersFor(config, null);
-  for (const name of Object.keys(config.agents ?? {})) filtersFor(config, name);
+  const global = config.retrieval?.filters as Record<string, unknown> | undefined;
+  for (const name of Object.keys(config.agents ?? {})) {
+    filtersFor(config, name);
+    const agent = config.agents?.[name]?.retrieval?.filters as Record<string, unknown> | undefined;
+    for (const key of unknownDisabledFilters(global, agent)) {
+      warn?.("memory_filter_disable_unknown", {
+        where: `agents.${name}.retrieval.filters.${key}`,
+        hint: `enabled = false switches off a filter of [retrieval.filters], which has no "${key}"; the entry is ignored`,
+      });
+    }
+  }
 }

@@ -1221,7 +1221,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // Operator memory filters (ARCHITECTURE.md §9c "Memory filters"): validated at
   // startup (patterns compile, bounds parse); judged filters run on the memory
   // decision point's chain, read per call (the engine is built further down).
-  validateMemoryFilters(config);
+  validateMemoryFilters(config, (event, fields) => logger.warn(event, fields));
   const memoryStore = retrieval?.store ?? new MemoryRetrievalStore(storage);
   const memoryFilters = new MemoryFilterService({
     config,
