@@ -10,15 +10,21 @@
  * any other model and of vanished blocks are pruned at start. The index is
  * keyed by {@link lateIndexKey}: the model plus every document-side setting
  * that shapes the vectors, so changing one re-indexes instead of mixing
- * spaces. A block whose encoding fails is retried after a doubling backoff
- * (`memory_index_failures`, capped at an hour), never every poll and never
- * dropped for good; its failure row is cleared once it is indexed.
+ * spaces. A failed batch is not blamed on every block in it
+ * (`retrieval/isolate.ts`): a canary request tells an outage (nothing blamed,
+ * the chain's member health paces the retries) from a bad input, and a bisect
+ * finds the blocks that fail on their own. Such a block is retried after a
+ * doubling backoff (`memory_index_failures`, capped at an hour), never every
+ * poll; after `INDEX_GIVE_UP_ATTEMPTS` failures it is unembeddable for this
+ * index (no more retries, left out of the lag; it bypasses the late cut like
+ * any block without vectors). Its failure row is cleared once it is indexed.
  *
  * Index lag is a metric: the worker logs `late_index_lag` at start and hourly
  * (and warns when a block has left the recency layer without vectors).
  */
 import type { Logger } from "../../observability/logger.js";
-import { INDEX_RETRY_BASE_MS, INDEX_RETRY_MAX_MS, type MemoryRetrievalStore } from "../../storage/memory-retrieval-store.js";
+import { INDEX_GIVE_UP_ATTEMPTS, INDEX_RETRY_BASE_MS, INDEX_RETRY_MAX_MS, type MemoryRetrievalStore } from "../../storage/memory-retrieval-store.js";
+import { CANARY_TEXT, runIsolating } from "../isolate.js";
 import type { ResolvedRetrievalConfig } from "../config.js";
 import { ChainUnavailableError, type ProviderChain } from "../models/chain.js";
 import type { LateEncoder } from "../models/types.js";
@@ -51,6 +57,8 @@ export interface LateIndexWorkerOptions {
   /** First retry delay of a failed block (default 1 min), doubling up to `retryMaxMs` (default 1 h). */
   retryBaseMs?: number;
   retryMaxMs?: number;
+  /** Isolated failures after which a block is unembeddable for this index (default 5). */
+  giveUpAttempts?: number;
 }
 
 export class LateIndexWorker {
@@ -104,7 +112,7 @@ export class LateIndexWorker {
 
   /** Blocks without vectors, and how many of them left the recency layer. */
   async lag(): Promise<LateLag> {
-    const rows = this.options.store.lateIndexLag(this.indexKey);
+    const rows = this.options.store.lateIndexLag(this.indexKey, this.indexName);
     const byHash = new Map<string, { path: string; agent: string | null }[]>();
     for (const r of rows) {
       const list = byHash.get(r.contentHash) ?? [];
@@ -168,32 +176,78 @@ export class LateIndexWorker {
   /** Encode and store one batch; returns the number of blocks stored. */
   async batch(): Promise<number> {
     const { store, config } = this.options;
-    const retry = { now: this.now(), baseMs: this.options.retryBaseMs ?? INDEX_RETRY_BASE_MS, maxMs: this.options.retryMaxMs ?? INDEX_RETRY_MAX_MS };
+    const retry = {
+      now: this.now(),
+      baseMs: this.options.retryBaseMs ?? INDEX_RETRY_BASE_MS,
+      maxMs: this.options.retryMaxMs ?? INDEX_RETRY_MAX_MS,
+      giveUpAttempts: this.options.giveUpAttempts ?? INDEX_GIVE_UP_ATTEMPTS,
+    };
     const blocks = store.blocksMissingLateVectors(this.indexKey, this.indexName, retry, config.indexBatchSize);
     if (blocks.length === 0) return 0;
-    let matrices;
+    const signal = this.stopController.signal;
+    const encode = async (list: typeof blocks, isolating: boolean) => {
+      const out = await this.options.chain.run((p, s) => p.encodeDocuments(list.map((b) => b.text), s), { signal, isolating });
+      if (out.value.length !== list.length) throw new Error("encoder returned a wrong count");
+      return out.value;
+    };
+    let first: Awaited<ReturnType<typeof encode>> | undefined;
+    let firstError: unknown;
     try {
-      const out = await this.options.chain.run((p, signal) => p.encodeDocuments(blocks.map((b) => b.text), signal), {
-        signal: this.stopController.signal,
-      });
-      matrices = out.value;
+      first = await encode(blocks, false);
     } catch (error) {
-      if (error instanceof Error && error.name === "AbortError") return 0;
-      // Every member not ready yet (a local model still loading): try later, no strike.
+      if (signal.aborted || (error instanceof Error && error.name === "AbortError")) return 0;
+      // Every member not ready yet (a local model still loading) or skipped as
+      // unhealthy: try later, nothing blamed.
       if (error instanceof ChainUnavailableError && error.attempts.every((a) => a.outcome === "not_ready" || a.outcome === "unhealthy")) {
         return 0;
       }
-      const message = error instanceof Error ? error.message : String(error);
-      for (const b of blocks) await store.noteIndexFailure(this.indexName, b.contentHash, message, this.now());
-      return 0;
+      firstError = error;
     }
-    if (matrices.length !== blocks.length) {
-      for (const b of blocks) await store.noteIndexFailure(this.indexName, b.contentHash, "encoder returned a wrong count", this.now());
-      return 0;
+    let encoded: Array<{ item: (typeof blocks)[number]; value: Awaited<ReturnType<typeof encode>>[number] }>;
+    if (first) {
+      encoded = blocks.map((item, i) => ({ item, value: first[i]! }));
+    } else {
+      // Isolate: the canary tells an outage from a bad block; a bisect finds the
+      // blocks that fail on their own (the failed batch is not retried whole).
+      let result;
+      try {
+        let failedOnce = false;
+        result = await runIsolating(
+          blocks,
+          async (list) => {
+            if (!failedOnce) {
+              failedOnce = true;
+              throw firstError;
+            }
+            return encode(list, true);
+          },
+          () => this.options.chain.run((p, s) => p.encodeDocuments([CANARY_TEXT], s), { signal, isolating: true }),
+          signal,
+        );
+      } catch (error) {
+        if (signal.aborted || (error instanceof Error && error.name === "AbortError")) return 0;
+        throw error;
+      }
+      if (result.outage !== undefined) {
+        this.options.logger?.warn("late_index_failed", { model: config.model, blocks: blocks.length, error: result.outage });
+        return 0;
+      }
+      const giveUp = retry.giveUpAttempts;
+      for (const { item, error } of result.bad) {
+        const attempts = await store.noteIndexFailure(this.indexName, item.contentHash, error, this.now());
+        this.options.logger?.warn(attempts >= giveUp ? "late_index_block_unembeddable" : "late_index_block_failed", {
+          model: config.model,
+          contentHash: item.contentHash,
+          attempts,
+          error,
+        });
+      }
+      encoded = result.ok;
+      if (encoded.length === 0) return 0;
     }
-    const rows = blocks.map((b, i) => {
-      const enc = encodeTokenMatrix(matrices[i]!, config.dtype);
-      return { contentHash: b.contentHash, ...enc };
+    const rows = encoded.map(({ item, value }) => {
+      const enc = encodeTokenMatrix(value, config.dtype);
+      return { contentHash: item.contentHash, ...enc };
     });
     await store.putLateVectors(this.indexKey, rows, this.now());
     await store.clearIndexFailuresFor(this.indexName, rows.map((r) => r.contentHash));

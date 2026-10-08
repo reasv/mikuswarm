@@ -127,23 +127,33 @@ type ChunkRow = LexicalHit;
 
 /**
  * Retry pacing of a failed block in an index without a status column
- * (`memory_index_failures`): never excluded for good, only delayed. The n-th
- * consecutive failure waits `base × 2^(n-1)`, capped at `max`.
+ * (`memory_index_failures`). Only failures isolated to the block itself are
+ * recorded (an outage blames no block, see `retrieval/isolate.ts`). The n-th
+ * consecutive failure waits `base × 2^(n-1)`, capped at `max`; after
+ * `giveUpAttempts` of them the block is unembeddable for that index: never
+ * retried, and counted as covered (served by the other indexes only). A model
+ * change clears the index's failures; an edited block has a new hash.
  */
 export interface IndexRetryPolicy {
   now: number;
   baseMs?: number;
   maxMs?: number;
+  giveUpAttempts?: number;
 }
 
 export const INDEX_RETRY_BASE_MS = 60_000;
 export const INDEX_RETRY_MAX_MS = 3_600_000;
+/** Isolated failures after which a block is unembeddable for an index (about 15 min of backoff). */
+export const INDEX_GIVE_UP_ATTEMPTS = 5;
 
-/** SQL predicate (alias `f` = memory_index_failures): no failure, or its backoff has elapsed. Binds 3 params. */
-const RETRY_DUE = `(f.content_hash is null or f.updated_at + min(?, ? * (1 << min(f.attempts - 1, 30))) <= ?)`;
+/**
+ * SQL predicate (alias `f` = memory_index_failures): no failure, or a failure
+ * short of the give-up count whose backoff has elapsed. Binds 4 params.
+ */
+const RETRY_DUE = `(f.content_hash is null or (f.attempts < ? and f.updated_at + min(?, ? * (1 << min(f.attempts - 1, 30))) <= ?))`;
 
 function retryParams(p: IndexRetryPolicy): number[] {
-  return [p.maxMs ?? INDEX_RETRY_MAX_MS, p.baseMs ?? INDEX_RETRY_BASE_MS, p.now];
+  return [p.giveUpAttempts ?? INDEX_GIVE_UP_ATTEMPTS, p.maxMs ?? INDEX_RETRY_MAX_MS, p.baseMs ?? INDEX_RETRY_BASE_MS, p.now];
 }
 
 const CHUNK_COLUMNS = `c.rowid as rowid, c.id as id, c.path as path, c.start_line as startLine,
@@ -766,17 +776,25 @@ export class MemoryRetrievalStore {
     );
   }
 
-  /** Index lag: blocks without late vectors for `model`, with their paths. */
-  lateIndexLag(model: string): Array<{ contentHash: string; path: string; agent: string | null; entryTs: number }> {
+  /**
+   * Index lag: blocks without late vectors for `model`, with their paths. With
+   * `indexName`, blocks given up as unembeddable for that index are left out.
+   */
+  lateIndexLag(
+    model: string,
+    indexName?: string,
+    giveUpAttempts = INDEX_GIVE_UP_ATTEMPTS,
+  ): Array<{ contentHash: string; path: string; agent: string | null; entryTs: number }> {
     return this.storage.read((db) =>
       db
         .prepare(
           `select c.content_hash as contentHash, c.path as path, c.agent as agent, c.entry_ts as entryTs
            from memory_chunks c
            left join memory_late_vectors v on v.model = ? and v.content_hash = c.content_hash
-           where v.content_hash is null`,
+           left join memory_index_failures f on f.index_name = ? and f.content_hash = c.content_hash
+           where v.content_hash is null and (f.content_hash is null or f.attempts < ?)`,
         )
-        .all(model) as Array<{ contentHash: string; path: string; agent: string | null; entryTs: number }>,
+        .all(model, indexName ?? "", giveUpAttempts) as Array<{ contentHash: string; path: string; agent: string | null; entryTs: number }>,
     );
   }
 
@@ -800,15 +818,34 @@ export class MemoryRetrievalStore {
 
   // ── Per-index failures ────────────────────────────────────────────────────
 
-  noteIndexFailure(indexName: string, contentHash: string, error: string, at: number): Promise<void> {
-    return this.storage.write((db) => {
-      db.prepare(
-        `insert into memory_index_failures (index_name, content_hash, attempts, last_error, updated_at)
-         values (?, ?, 1, ?, ?)
-         on conflict(index_name, content_hash) do update set attempts = attempts + 1,
-           last_error = excluded.last_error, updated_at = excluded.updated_at`,
-      ).run(indexName, contentHash, error.slice(0, 500), at);
-    });
+  /** Record an isolated failure of a block; returns its consecutive failure count. */
+  noteIndexFailure(indexName: string, contentHash: string, error: string, at: number): Promise<number> {
+    return this.storage.write(
+      (db) =>
+        (
+          db
+            .prepare(
+              `insert into memory_index_failures (index_name, content_hash, attempts, last_error, updated_at)
+               values (?, ?, 1, ?, ?)
+               on conflict(index_name, content_hash) do update set attempts = attempts + 1,
+                 last_error = excluded.last_error, updated_at = excluded.updated_at
+               returning attempts`,
+            )
+            .get(indexName, contentHash, error.slice(0, 500), at) as { attempts: number }
+        ).attempts,
+    );
+  }
+
+  /** Blocks given up as unembeddable for an index (diagnostics and tests). */
+  unembeddableCount(indexName: string, giveUpAttempts = INDEX_GIVE_UP_ATTEMPTS): number {
+    return this.storage.read(
+      (db) =>
+        (
+          db
+            .prepare(`select count(*) as n from memory_index_failures where index_name = ? and attempts >= ?`)
+            .get(indexName, giveUpAttempts) as { n: number }
+        ).n,
+    );
   }
 
   clearIndexFailures(indexName: string): Promise<void> {
@@ -859,13 +896,32 @@ export class MemoryRetrievalStore {
     );
   }
 
-  /** Chunks with no row in the vector table `table`, failed or not (0 = the index covers every chunk). */
-  countMissingFromVectorTable(table: string): number {
+  /**
+   * Chunks with no row in the vector table `table`, failed or not (0 = the
+   * index covers every chunk). With `indexName`, blocks given up as
+   * unembeddable for that index count as covered.
+   */
+  countMissingFromVectorTable(table: string, indexName?: string, giveUpAttempts = INDEX_GIVE_UP_ATTEMPTS): number {
     if (!/^memory_vec_[a-z0-9_]+$/.test(table)) throw new Error(`invalid vector table name ${table}`);
+    if (indexName === undefined) {
+      return this.storage.read(
+        (db) =>
+          (db.prepare(`select count(*) as n from memory_chunks c where c.rowid not in (select chunk_id from ${table})`).get() as { n: number })
+            .n,
+      );
+    }
     return this.storage.read(
       (db) =>
-        (db.prepare(`select count(*) as n from memory_chunks c where c.rowid not in (select chunk_id from ${table})`).get() as { n: number })
-          .n,
+        (
+          db
+            .prepare(
+              `select count(*) as n from memory_chunks c
+               where c.rowid not in (select chunk_id from ${table})
+                 and not exists (select 1 from memory_index_failures f
+                                 where f.index_name = ? and f.content_hash = c.content_hash and f.attempts >= ?)`,
+            )
+            .get(indexName, giveUpAttempts) as { n: number }
+        ).n,
     );
   }
 

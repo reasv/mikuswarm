@@ -170,22 +170,45 @@ test("indexer: encodes blocks newest first in batches, prunes other models, repo
     const worker = new LateIndexWorker({
       store,
       config: lateCfg({ index_batch_size: 10 }),
-      chain: new ProviderChain("late_documents", [{ provider: flaky, enabled: true, timeoutMs: 5000 }], { baseBackoffMs: 0 }),
+      chain: new ProviderChain("late_documents", [{ provider: flaky, enabled: true, timeoutMs: 5000 }], { now: () => clock }),
       recencyPaths: async () => new Set(),
       now: () => clock,
     });
-    for (let i = 0; i < 5; i++) await worker.batch();
-    assert.equal(enc.docCalls, 1, "a failed block waits for its backoff, never every poll");
-    for (let i = 0; i < 6; i++) {
-      clock += 2 * 3_600_000; // past even the capped backoff
-      await worker.batch();
-    }
-    assert.equal(enc.docCalls, 7, "...and is retried at a capped pace, never dropped for good");
-    assert.equal(store.indexFailureCount(`late:${worker.indexKey}`), 4);
+    await worker.batch();
+    assert.equal(enc.docCalls, 2, "the batch and its canary");
+    assert.equal(store.indexFailureCount(`late:${worker.indexKey}`), 0, "an outage blames no block");
+    await worker.batch();
+    assert.equal(enc.docCalls, 2, "the struck member is skipped while its backoff runs (the chain paces an outage)");
     failing = false;
     clock += 2 * 3_600_000;
     assert.equal(await worker.batch(), 4, "the outage is over: every block is indexed");
-    assert.equal(store.indexFailureCount(`late:${worker.indexKey}`), 0, "and its failure rows are cleared");
+  });
+  // One bad block: isolated by a bisect (its batch-mates are stored at once), retried after
+  // its backoff, then unembeddable (left out of the lag, never retried).
+  await withFixture(FILES, async ({ store }) => {
+    let clock = 1_000_000;
+    const enc = fakeEncoder("cpu");
+    const poison = { ...enc, async encodeDocuments(texts: string[]) { enc.docCalls++; if (texts.some((t) => t.includes("chess"))) throw new Error("400 bad input"); return texts.map(encodeText); } };
+    const worker = new LateIndexWorker({
+      store,
+      config: lateCfg({ index_batch_size: 10 }),
+      chain: new ProviderChain("late_documents", [{ provider: poison, enabled: true, timeoutMs: 5000 }], { baseBackoffMs: 0 }),
+      recencyPaths: async () => new Set(),
+      now: () => clock,
+    });
+    assert.equal(await worker.batch(), 3, "the innocent blocks are stored in the same pass");
+    assert.equal(store.indexFailureCount(`late:${worker.indexKey}`), 1, "only the bad block is blamed");
+    assert.equal(await worker.batch(), 0, "the bad block waits for its backoff");
+    for (let i = 0; i < 10; i++) {
+      clock += 2 * 3_600_000;
+      await worker.batch();
+    }
+    assert.equal(store.unembeddableCount(`late:${worker.indexKey}`), 1);
+    const calls = enc.docCalls;
+    clock += 2 * 3_600_000;
+    await worker.batch();
+    assert.equal(enc.docCalls, calls, "an unembeddable block is never retried");
+    assert.deepEqual(await worker.lag(), { missing: 0, outsideRecency: 0 }, "and is left out of the lag");
   });
 });
 

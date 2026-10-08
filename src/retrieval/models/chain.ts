@@ -137,11 +137,13 @@ export class ProviderChain<P extends ProviderBase> {
    * Run `fn` on the first member that serves. Each member gets its own
    * deadline (composed with the caller's signal). Throws
    * {@link ChainUnavailableError} when no member served, or the caller's
-   * AbortError when it aborted.
+   * AbortError when it aborted. `isolating` (a background indexer isolating a
+   * bad input after a failed batch) tries every enabled member whatever its
+   * health and never strikes: a rejected input says nothing about the member.
    */
   async run<R>(
     fn: (provider: P, signal: AbortSignal) => Promise<R>,
-    opts: { signal?: AbortSignal } = {},
+    opts: { signal?: AbortSignal; isolating?: boolean } = {},
   ): Promise<{ value: R; provider: P; ms: number }> {
     const attempts: Array<{ name: string; outcome: string }> = [];
     for (const member of this.members) {
@@ -150,11 +152,11 @@ export class ProviderChain<P extends ProviderBase> {
       if (opts.signal?.aborted) throw abortError();
       const h = this.health.get(name)!;
       // Past its backoff an unhealthy member is probed by one caller; the others skip it.
-      if (h.retryAt !== null && (h.retryAt > this.now() || h.probing)) {
+      if (!opts.isolating && h.retryAt !== null && (h.retryAt > this.now() || h.probing)) {
         attempts.push({ name, outcome: "unhealthy" });
         continue;
       }
-      const probe = h.retryAt !== null;
+      const probe = !opts.isolating && h.retryAt !== null;
       if (probe) h.probing = true;
       const controller = new AbortController();
       const onAbort = () => controller.abort();
@@ -181,7 +183,7 @@ export class ProviderChain<P extends ProviderBase> {
           continue;
         }
         const message = timedOut ? `timeout after ${member.timeoutMs} ms` : error instanceof Error ? error.message : String(error);
-        this.strike(name, message);
+        if (!opts.isolating) this.strike(name, message);
         attempts.push({ name, outcome: timedOut ? "timeout" : "error" });
       } finally {
         if (probe) h.probing = false;

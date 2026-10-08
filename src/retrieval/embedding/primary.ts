@@ -13,11 +13,15 @@
  * Coverage: a query uses the primary index only while it covers every chunk
  * (the simplest rule that never loses a chunk, since the two indexes' scores
  * are not comparable and cannot be merged); otherwise the built-in index,
- * which is always complete. A chunk the primary failed to embed is retried
- * after a doubling backoff (1 min up to 1 h, `memory_index_failures`), never
- * dropped, and a run of failed batches slows the worker down (an outage costs
- * a request every few minutes, not every few seconds). Until the chunk is in,
- * queries stay on the built-in index.
+ * which is always complete. A failed batch is not blamed on every chunk in it
+ * (`retrieval/isolate.ts`): a canary request tells an outage from a bad input,
+ * and a bisect finds the chunks that fail on their own. An outage blames no
+ * chunk; a run of failed batches slows the worker down (a request every few
+ * minutes, not every few seconds). A chunk that fails on its own is retried
+ * after a doubling backoff (1 min up to 1 h, `memory_index_failures`), and
+ * after {@link INDEX_GIVE_UP_ATTEMPTS} such failures it is unembeddable for
+ * this model: it counts as covered, so it never keeps the primary from
+ * serving, and only the built-in index (and the lexical lane) can find it.
  *
  * Latency: the built-in query starts after a short hedge delay when the
  * primary has not answered, and whichever answers first is used; a primary
@@ -25,7 +29,8 @@
  * query at a time. A hanging primary never costs its full `timeout_ms` per query.
  */
 import type { Storage } from "../../storage/index.js";
-import { INDEX_RETRY_BASE_MS, INDEX_RETRY_MAX_MS, type MemoryRetrievalStore } from "../../storage/memory-retrieval-store.js";
+import { INDEX_GIVE_UP_ATTEMPTS, INDEX_RETRY_BASE_MS, INDEX_RETRY_MAX_MS, type MemoryRetrievalStore } from "../../storage/memory-retrieval-store.js";
+import { CANARY_TEXT, runIsolating } from "../isolate.js";
 import type { Logger } from "../../observability/logger.js";
 import { textSimilarity, type QueryVectorIndex } from "../search.js";
 import type { VectorStore } from "../vector-store.js";
@@ -62,6 +67,8 @@ export interface PrimaryIndexOptions {
   /** First retry delay of a failed chunk (default 1 min), doubling up to `retryMaxMs` (default 1 h). */
   retryBaseMs?: number;
   retryMaxMs?: number;
+  /** Isolated failures after which a chunk is unembeddable for this model (default 5). */
+  giveUpAttempts?: number;
   logger?: Logger;
   now?: () => number;
 }
@@ -72,7 +79,7 @@ export class PrimaryIndex {
   private wake: (() => void) | null = null;
   private pendingWake = false;
   private stopController = new AbortController();
-  /** True once the index covers every chunk (failed ones included). */
+  /** True once the index covers every chunk (unembeddable ones count as covered). */
   ready = false;
   private readonly indexName: string;
   /** Consecutive failed batches (slows the worker down during an outage). */
@@ -175,11 +182,13 @@ export class PrimaryIndex {
     if (this.options.shouldPause?.()) return 0;
     const { storage, store, provider, vectorStore } = this.options;
     const now = (this.options.now ?? Date.now)();
-    const retry = { now, baseMs: this.options.retryBaseMs ?? INDEX_RETRY_BASE_MS, maxMs: this.options.retryMaxMs ?? INDEX_RETRY_MAX_MS };
+    const giveUp = this.options.giveUpAttempts ?? INDEX_GIVE_UP_ATTEMPTS;
+    const retry = { now, baseMs: this.options.retryBaseMs ?? INDEX_RETRY_BASE_MS, maxMs: this.options.retryMaxMs ?? INDEX_RETRY_MAX_MS, giveUpAttempts: giveUp };
     const missing = store.chunksMissingFromVectorTable(vectorStore.table, this.indexName, retry, this.options.batchSize);
     if (missing.length === 0) {
-      // Nothing due; complete only when no chunk is missing at all (failed ones wait for their retry).
-      const left = store.countMissingFromVectorTable(vectorStore.table);
+      // Nothing due; complete only when no chunk is missing (failed ones wait for
+      // their retry; unembeddable ones count as covered).
+      const left = store.countMissingFromVectorTable(vectorStore.table, this.indexName, giveUp);
       if (left === 0 && !this.ready) this.options.logger?.info("primary_embed_index_ready", { model: provider.modelId });
       if (left > 0 && left !== this.lastIncomplete) {
         this.options.logger?.warn("primary_embed_index_incomplete", {
@@ -203,19 +212,40 @@ export class PrimaryIndex {
       else toEmbed.push({ hash: c.contentHash, text: c.text });
     }
     if (toEmbed.length > 0) {
+      const signal = this.stopController.signal;
+      let result;
       try {
-        const vectors = await provider.embedDocuments(toEmbed.map((t) => t.text), this.stopController.signal);
-        for (let i = 0; i < toEmbed.length; i++) {
-          byHash.set(toEmbed[i]!.hash, vectors[i]!);
-          await storage.putCachedEmbedding(toEmbed[i]!.hash, provider.modelId, vecToBuffer(vectors[i]!));
-        }
-        this.failedBatches = 0;
+        result = await runIsolating(
+          toEmbed,
+          (list) => provider.embedDocuments(list.map((t) => t.text), signal),
+          () => provider.embedDocuments([CANARY_TEXT], signal),
+          signal,
+        );
       } catch (error) {
-        if (this.stopController.signal.aborted) return 0;
-        const message = error instanceof Error ? error.message : String(error);
-        for (const t of toEmbed) await store.noteIndexFailure(this.indexName, t.hash, message, now);
+        if (signal.aborted) return 0;
+        throw error;
+      }
+      for (const { item, value } of result.ok) {
+        byHash.set(item.hash, value);
+        await storage.putCachedEmbedding(item.hash, provider.modelId, vecToBuffer(value));
+      }
+      if (result.outage !== undefined) {
+        // The canary failed too: an outage, no chunk is blamed; the worker slows down.
         this.failedBatches++;
-        this.options.logger?.warn("primary_embed_failed", { count: toEmbed.length, error: message });
+        this.options.logger?.warn("primary_embed_failed", { count: toEmbed.length, error: result.outage });
+      } else {
+        this.failedBatches = 0;
+        for (const { item, error } of result.bad) {
+          const attempts = await store.noteIndexFailure(this.indexName, item.hash, error, now);
+          const unembeddable = attempts >= giveUp;
+          this.options.logger?.warn(unembeddable ? "primary_embed_chunk_unembeddable" : "primary_embed_chunk_failed", {
+            model: provider.modelId,
+            contentHash: item.hash,
+            attempts,
+            error,
+            ...(unembeddable ? { note: "never retried for this model; only the built-in index serves it" } : {}),
+          });
+        }
       }
     }
     let stored = 0;
