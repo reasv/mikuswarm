@@ -215,13 +215,15 @@ A late-interaction model encodes text into one small vector per token (e.g. 128 
 **Query-time cost has two parts, and both must fit the latency budget:**
 1. **Query encoding,** in proportion to the query model's size times the query's tokens.
    - A model of a few hundred million active parameters over a few dozen tokens is expected to take tens of milliseconds on CPU (to be measured).
-   - **A multi-billion model on the query side is rejected** (owner, 2026-10-08). It would need a GPU at query time: ~17–18 GB for a 9B in bf16/fp16, nearly a whole 24 GB card, held permanently, for a marginal retrieval gain. The query model is small and runs on CPU.
+   - **A multi-billion query model needs a GPU at query time:** ~17–18 GB for a 9B in bf16/fp16, nearly a whole 24 GB card, held permanently. That is acceptable only for a meaningful gain, not a marginal one (owner, 2026-10-08).
    - **A large model on the index side is an option, if it is worthwhile** (owner). Index time is off the hot path (above), so the large model's cost is paid in the background:
      - seconds per block on CPU for increments, within the buffer;
      - a one-off rebuild of hours on CPU, or about half an hour on a GPU that is released afterwards.
      A small model in the same space then queries that index on CPU.
    - **Published gain of this asymmetric pair** (pplx-embed-v2-late: 0.6B queries on a 9B index, against 0.6B on both sides): ViDoRe v3 image 62.3 → 63.5, and +1.6 points on Perplexity's domain-specific set. 9B on both sides is better still, but needs the GPU at query time.
-   - **The bar is a meaningful, useful benefit, not a marginal one** (owner, 2026-10-08). A large model can have 10–20 GB of memory on a server that has it, but that is not free. The choice is reversible: the index can be rebuilt with the small model at any time.
+   - **The bar is a meaningful, useful benefit, not a marginal one** (owner, 2026-10-08). A large model can have 10–20 GB of memory on a server that has it, but that is not free.
+   - **A shared-space pair makes the query side a provider chain over one index.** Index with the large model. The query encoder chain is then the large model on the GPU first, with the small model on CPU as the always-ready fallback. Both are valid against the same index, so moving between them, or dropping the GPU member, never touches the index.
+   - **Rebuilding is cheap anyway.** A full re-index takes minutes to about half an hour on one GPU. Moving to an unrelated model costs one rebuild, and the offline comparison (§5.0c) can index the whole corpus with many candidate models.
    - **Whether it is worthwhile is a measurement on the §9 set.** Compare small/small, small-query/large-index, and the best small CPU alternative (e.g. an ONNX late model).
      - **Weigh the gain against the costs:** the large model's index-time compute, and the serving path. Today the pplx late models have no ONNX export and use linear-attention layers with no known fast CPU kernel, so even the small query encoder may need a PyTorch sidecar (see the survey).
 2. **MaxSim,** in proportion to query tokens × document tokens scored × dimensions.
@@ -283,7 +285,8 @@ The turbovec figure is a top-k scan, which does the same per-token work as MaxSi
 [retrieval.late]
 enabled = false
 model = "..."                 # the document-side model; the index belongs to it
-query_model = ""              # default: model; a smaller shared-space model (large index, small CPU query)
+query_chain = []              # query encoders, tried in order; default [model]. Any shared-space member is
+                              # valid against the index, e.g. a large model on GPU, then a small one on CPU
 query_max_tokens = 64
 exhaustive_blocks = 0         # newest N indexed blocks outside the recency layer, scored exhaustively; "all"; 0 = re-rank only
 top_n = 20                    # candidates passed on to the cross-encoder
@@ -314,6 +317,7 @@ Still to do: the measurements below, on real hardware and the labelled set.
 A companion `spec/MEMORY-RETRIEVAL-SURVEY.md`, like DECISION-MODEL-SURVEY.md. For re-rankers (cross-encoder and late interaction) and embedders it records:
 - **Open-weights candidates:** quality on retrieval benchmarks and languages, size, VRAM at the serving precision, GPU latency, CPU latency on ONNX, and licence.
 - **API candidates:** quality, price, latency, rate limits, and **ZDR status, verified per provider and route** (direct and through aggregators).
+- **Comparisons by full re-index:** indexing the whole corpus is minutes per model on one GPU, so candidate embedders and late models are compared on complete indexes, not samples.
 - **Measurements on the deployment's own hardware** for the shortlist: latency for ~60 × ~400-token pairs, VRAM held, CPU time; for late interaction, index build time (GPU and CPU), index size and query-side CPU time.
 - **Corpus shape:** the share of blocks longer than each shortlisted model's input window (the only segmentation question left, §5.0). Measured on one deployment: none. The pipeline caps blocks at 512 tokens, and the average is ~336.
 - **Offline quality** on the §9 labelled items.

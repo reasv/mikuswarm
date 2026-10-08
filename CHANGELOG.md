@@ -356,6 +356,14 @@ Unreleased section; it is not part of any release's notes.
 
 ### Changed
 
+- **The local embedder uses each model's trained prefixes.** fastembed added the e5
+  prefixes `query: ` and `passage: ` for every model. bge-small-en-v1.5, the default,
+  was trained with a retrieval instruction on queries and no passage prefix, and now
+  gets exactly that. New `[retrieval.embedding.local]` keys `query_prefix` and
+  `passage_prefix` override the built-in prefixes. The local model id now covers the
+  weight source and both prefixes, so **an existing local memory index re-embeds once
+  on the first start after upgrading** (search stays lexical for chunks still waiting).
+- **fastembed upgraded from 2.1.0 to 3.0.0.**
 - **A deletion no longer wipes the stored message.** A Discord deletion used to empty
   the stored message's body and attachments through the edit path (and a Matrix
   redaction did the same for a short time), re-indexing and re-summarizing it. Now
@@ -435,6 +443,12 @@ Unreleased section; it is not part of any release's notes.
 
 ### Fixed
 
+- **A fresh install could not download the local embedding model.** fastembed 2.1.0
+  fetched models from a Google Cloud Storage bucket that now returns HTTP 403, so a new
+  data directory got no semantic memory search. The bge v1.5 English models now download
+  BAAI's fp32 ONNX export from a pinned Hugging Face commit, checked against its sha256.
+  The other local models download from Hugging Face through fastembed 3.0.0.
+  `HF_ENDPOINT` selects a Hub mirror.
 - **A failed `send_dm` or `send_to_channel` was not reported as an error.** Its result
   text did not start with `error:`, so the harness counted the message as sent (late input
   then interjected instead of redoing). Every failure of the two tools now returns an
