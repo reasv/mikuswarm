@@ -86,6 +86,16 @@ export class MemoryIndexer {
   readonly agentName: string | null;
   /** Strict-FIFO tail so reconciles never overlap (low volume; mirrors the writer). */
   private tail: Promise<unknown> = Promise.resolve();
+  /**
+   * Per-file `(mtimeMs, size)` stamps of the last reconcile of each file in this
+   * process: a sweep re-chunks only the files whose stamp changed. Empty until
+   * the first sweep, which therefore reconciles every file.
+   */
+  private readonly stamps = new Map<string, string>();
+  /** The in-flight query-time freshness check, shared by concurrent searches. */
+  private freshCheck: Promise<void> | null = null;
+  /** True while the startup sweep runs (searches use the index as it stands). */
+  private startupSweep = false;
 
   constructor(opts: MemoryIndexerOptions) {
     this.storage = opts.storage;
@@ -139,6 +149,15 @@ export class MemoryIndexer {
   }
 
   /**
+   * The subsystem's startup sweep is pending or running for this indexer (it
+   * walks the indexers one after another): searches meanwhile use the index as
+   * it stands. Cleared by the subsystem once the sweep ends, whatever its outcome.
+   */
+  setStartupSweep(on: boolean): void {
+    this.startupSweep = on;
+  }
+
+  /**
    * Reconcile every `memory/*.md` and prune index entries for vanished files (§7).
    * Returns the set of workspace-relative paths that are on disk in this indexer's
    * `memory/` directory, so the subsystem can build the union across all agents and
@@ -154,17 +173,46 @@ export class MemoryIndexer {
    * Near-free when clean; the safety net if a write hook was ever missed.
    */
   async ensureFreshForQuery(): Promise<void> {
-    const signature = await this.corpusSignature();
-    if (signature === this.storage.getIndexMeta(this.corpusSignatureKey)) return;
-    await this.reconcileAll();
+    // The startup sweep is reconciling every file: the index left by the last run
+    // serves meanwhile instead of every search queueing behind the whole sweep.
+    if (this.startupSweep) return;
+    // Concurrent searches (the auto-retrieval lanes run several at once) share
+    // one check instead of each queueing its own sweep.
+    if (!this.freshCheck) {
+      this.freshCheck = (async () => {
+        const { signature } = await this.corpusState();
+        if (signature === this.storage.getIndexMeta(this.corpusSignatureKey)) return;
+        // Re-checked on the tail: a sweep queued ahead may have caught up already.
+        await this.enqueue(async () => {
+          const now = await this.corpusState();
+          if (now.signature === this.storage.getIndexMeta(this.corpusSignatureKey)) return;
+          await this.reconcileAllInner(now, { incremental: true });
+        });
+      })().finally(() => {
+        this.freshCheck = null;
+      });
+    }
+    return this.freshCheck;
   }
 
-  private async reconcileAllInner(): Promise<Set<string>> {
-    const names = await this.listMemoryFiles();
-    const onDisk = new Set(names.map((n) => this.relativePath(n)));
-    for (const name of names) {
-      await this.reconcileFileInner(this.relativePath(name));
+  /**
+   * A full sweep (startup, explicit callers) re-chunks every file, repairing any
+   * drift between the files and the index. The query-time catch-up is
+   * incremental: only files whose stamp changed since their last reconcile in
+   * this process (a write hook already reconciled the file it wrote).
+   */
+  private async reconcileAllInner(
+    state?: { signature: string; stamps: Map<string, string> },
+    opts: { incremental?: boolean } = {},
+  ): Promise<Set<string>> {
+    const { signature, stamps } = state ?? (await this.corpusState());
+    const onDisk = new Set([...stamps.keys()].map((n) => this.relativePath(n)));
+    for (const [name, stamp] of stamps) {
+      const rel = this.relativePath(name);
+      if (opts.incremental && this.stamps.get(rel) === stamp) continue;
+      await this.reconcileFileInner(rel);
     }
+    for (const rel of [...this.stamps.keys()]) if (!onDisk.has(rel)) this.stamps.delete(rel);
     // Prune index entries owned by THIS agent whose file no longer exists on disk.
     // Scoped strictly to `this.agentName` (including NULL for legacy mode) — never
     // touches another agent's rows or NULL rows in agents mode. The subsystem is
@@ -181,7 +229,8 @@ export class MemoryIndexer {
         });
       }
     }
-    const signature = await this.corpusSignature();
+    // The signature read before the walk: a file changed during it reads as a
+    // mismatch on the next check (a cheap, incremental catch-up).
     await this.storage.setIndexMeta(this.corpusSignatureKey, signature);
     return onDisk;
   }
@@ -195,13 +244,16 @@ export class MemoryIndexer {
     const abs = path.join(this.workspaceRoot, rel);
     let text: string;
     let mtimeMs: number;
+    let stamp: string;
     try {
       const st = await stat(abs);
       mtimeMs = st.mtimeMs;
+      stamp = fileStamp(st);
       text = await readFile(abs, "utf8");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         // File gone between hook and read → drop its chunks (this agent's only).
+        this.stamps.delete(rel);
         await this.storage.deleteMemoryChunksForPath(rel, this.agentName);
         return;
       }
@@ -233,6 +285,9 @@ export class MemoryIndexer {
       });
     }
     if (result.inserted > 0) this.onChunksInserted?.();
+    // Stamped from the stat taken before the read: a write after it changes the
+    // stamp, so the next sweep reconciles the file again.
+    this.stamps.set(rel, stamp);
   }
 
   private async listMemoryFiles(): Promise<string[]> {
@@ -247,19 +302,28 @@ export class MemoryIndexer {
     }
   }
 
-  /** Cheap corpus fingerprint: sorted (name, mtimeMs, size) hashed. */
-  private async corpusSignature(): Promise<string> {
+  /**
+   * Cheap corpus fingerprint: sorted (name, mtimeMs, size) hashed, with each
+   * file's stamp (the files present, by name).
+   */
+  private async corpusState(): Promise<{ signature: string; stamps: Map<string, string> }> {
     const names = await this.listMemoryFiles();
     const hash = createHash("sha256");
+    const stamps = new Map<string, string>();
     for (const name of names) {
       try {
         const st = await stat(path.join(this.memoryDir, name));
         hash.update(`${name}\0${st.mtimeMs}\0${st.size}\n`);
+        stamps.set(name, fileStamp(st));
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
         throw error;
       }
     }
-    return hash.digest("hex");
+    return { signature: hash.digest("hex"), stamps };
   }
+}
+
+function fileStamp(st: { mtimeMs: number; size: number }): string {
+  return `${st.mtimeMs}\0${st.size}`;
 }

@@ -144,6 +144,21 @@ export interface RetrievalReport {
   cutShort?: boolean;
   stages: {
     recallMs: number;
+    /**
+     * Recall's sub-steps (ms): the corpus freshness check (once per request),
+     * the query embeddings, FTS and the vector half (summed over the queries,
+     * which run concurrently), the participants' earlier names, the user
+     * lanes, the recency layer's read (concurrent with the queries) and the
+     * person-cued pages (after `recallMs`).
+     */
+    freshMs?: number;
+    embedMs?: number;
+    lexicalMs?: number;
+    vectorMs?: number;
+    namesMs?: number;
+    lanesMs?: number;
+    recencyMs?: number;
+    personMs?: number;
     vectorIndex?: string;
     late?: { status: string; backend: string | null; ms: number; windowSize: number; missing: number; queryModel: string | null };
     rerank?: { status: string; provider: string | null; ms: number };

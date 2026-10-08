@@ -456,9 +456,15 @@ export async function createRetrievalSubsystem(
       void (async () => {
         const agentsMode = indexers.some((idx) => idx.agentName !== null);
         const allOnDiskPaths = new Set<string>();
-        for (const idx of indexers) {
-          const onDisk = await idx.reconcileAll();
-          for (const p of onDisk) allOnDiskPaths.add(p);
+        for (const idx of indexers) idx.setStartupSweep(true);
+        try {
+          for (const idx of indexers) {
+            const onDisk = await idx.reconcileAll();
+            for (const p of onDisk) allOnDiskPaths.add(p);
+            idx.setStartupSweep(false);
+          }
+        } finally {
+          for (const idx of indexers) idx.setStartupSweep(false);
         }
         // Subsystem-level null-orphan sweep: delete NULL-agent rows for paths that no
         // longer exist under any walked root (spec §7.1 "NULL rows whose files no longer
@@ -482,6 +488,9 @@ export async function createRetrievalSubsystem(
         embedWorker?.notifyNewWork();
         primary?.notifyNewWork();
         lateWorker?.notifyNewWork();
+        // Load the local embedder now: its first load is seconds of synchronous
+        // native work, which would otherwise land on the first retrieval.
+        if (provider && !remoteActive) void provider.embedQuery("warm-up").catch(() => undefined);
         await tagger.run();
         // The display-name history of rows older than its triggers, in small batches.
         void store.runSenderNamesBackfill({ signal: backfillStop.signal }).catch(() => undefined);

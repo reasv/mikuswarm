@@ -27,9 +27,15 @@
  *   bounded number of times instead of every poll.
  * - `memory_retrievals`: one row per auto-retrieval build (counts, source,
  *   timings, the per-candidate report) and the session's follow-up, if any.
- * - `idx_memory_chunks_content_hash` / `idx_memory_chunks_entry_ts`: lookups of
- *   blocks by content hash (candidate rows, the late-vector joins and prunes)
- *   and the newest-first walk of the late-interaction window.
+ * - `idx_memory_chunks_hash_agent_ts` / `idx_memory_chunks_entry_ts`: lookups of
+ *   blocks by content hash (candidate rows, the late-vector joins and prunes,
+ *   covering for the participant join) and the newest-first walk of the
+ *   late-interaction window.
+ * - `idx_memory_block_participants_sender_hash`: a sender's tagged blocks,
+ *   covering, so the presence and person-cued pages join and sort without
+ *   reading a chunk's text. Both covering indexes replaced narrower ones on
+ *   existing databases: the schema runs on every open, and the drop and create
+ *   statements are idempotent (a few milliseconds on a large corpus).
  * - `memory_sender_names`: the display-name history of the user lanes (each
  *   `sender_display_name` a sender id has used, with its latest timestamp),
  *   kept by triggers on `timeline_events` and back-filled for older rows in
@@ -59,8 +65,9 @@ create table if not exists memory_block_participants (
   message_count  integer not null,
   primary key (agent, content_hash, provider, sender_id)
 );
-create index if not exists idx_memory_block_participants_sender
-  on memory_block_participants(agent, provider, sender_id);
+drop index if exists idx_memory_block_participants_sender;
+create index if not exists idx_memory_block_participants_sender_hash
+  on memory_block_participants(agent, provider, sender_id, content_hash, message_count);
 
 create table if not exists memory_filter_verdicts (
   agent           text not null default '',
@@ -139,8 +146,9 @@ create index if not exists idx_memory_retrievals_session
 create index if not exists idx_memory_retrievals_ts
   on memory_retrievals(ts);
 
-create index if not exists idx_memory_chunks_content_hash
-  on memory_chunks(content_hash);
+drop index if exists idx_memory_chunks_content_hash;
+create index if not exists idx_memory_chunks_hash_agent_ts
+  on memory_chunks(content_hash, agent, entry_ts);
 create index if not exists idx_memory_chunks_entry_ts
   on memory_chunks(entry_ts);
 `;

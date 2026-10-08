@@ -32,7 +32,7 @@ import type { Storage } from "../../storage/index.js";
 import { INDEX_GIVE_UP_ATTEMPTS, INDEX_RETRY_BASE_MS, INDEX_RETRY_MAX_MS, type MemoryRetrievalStore } from "../../storage/memory-retrieval-store.js";
 import { CANARY_TEXT, runIsolating } from "../isolate.js";
 import type { Logger } from "../../observability/logger.js";
-import { textSimilarity, type QueryVectorIndex } from "../search.js";
+import { memoizeQueryEmbed, textSimilarity, type QueryVectorIndex } from "../search.js";
 import type { VectorStore } from "../vector-store.js";
 import type { EmbeddingProvider } from "./provider.js";
 
@@ -280,11 +280,18 @@ export function dualVectorIndex(
   /** The primary is skipped until then (0 = healthy). */
   let skipUntil = 0;
   let probing = false;
-  type Found = { hits: ReturnType<VectorStore["knn"]>; store: VectorStore; index: string; vector: Float32Array };
+  type Found = { hits: ReturnType<VectorStore["knn"]>; store: VectorStore; index: string; vector: Float32Array; knnMs: number };
+  const knn = (store: VectorStore, vector: Float32Array, k: number, index: string): Found => {
+    const t0 = performance.now();
+    const hits = store.knn(vector, k, "memory");
+    return { hits, store, index, vector, knnMs: performance.now() - t0 };
+  };
+  const builtinEmbed = builtin ? memoizeQueryEmbed((text, signal) => builtin.provider.embedQuery(text, signal)) : undefined;
+  const primaryEmbed = primary ? memoizeQueryEmbed((text, signal) => primary.options.provider.embedQuery(text, signal)) : undefined;
   const viaBuiltin = async (text: string, k: number, signal?: AbortSignal): Promise<Found | null> => {
-    if (!builtin) return null;
-    const vector = await builtin.provider.embedQuery(text, signal);
-    return { hits: builtin.store.knn(vector, k, "memory"), store: builtin.store, index: "builtin", vector };
+    if (!builtin || !builtinEmbed) return null;
+    const vector = await builtinEmbed(text, signal);
+    return knn(builtin.store, vector, k, "builtin");
   };
   const degraded = (reason: string): void => {
     skipUntil = now() + (opts.skipMs ?? PRIMARY_SKIP_MS);
@@ -308,8 +315,8 @@ export function dualVectorIndex(
       const onAbort = () => controller.abort();
       signal?.addEventListener("abort", onAbort, { once: true });
       const viaPrimary = (async (): Promise<Found> => {
-        const vector = await primary.options.provider.embedQuery(text, controller.signal);
-        return { hits: primary.options.vectorStore.knn(vector, k, "memory"), store: primary.options.vectorStore, index: "primary", vector };
+        const vector = await primaryEmbed!(text, controller.signal);
+        return knn(primary.options.vectorStore, vector, k, "primary");
       })();
       try {
         if (!builtin) return await viaPrimary;

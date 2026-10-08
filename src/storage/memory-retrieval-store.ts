@@ -530,21 +530,41 @@ export class MemoryRetrievalStore {
     if (senders.length === 0 || limit <= 0) return [];
     const a = agentKey(agent);
     return this.storage.read((db) => {
-      const pairs = senders.map(() => "(p.provider = ? and p.sender_id = ?)").join(" or ");
-      const params: unknown[] = [a];
-      for (const s of senders) params.push(s.provider, s.senderId);
+      // Two steps so the sort never carries chunk text: the page's (rowid, sender)
+      // pairs from the covering indexes, one index range per sender (an OR of the
+      // pairs plans as a scan of every tag of the agent), then the page's rows.
       const agentClause = a === "" ? "" : " and c.agent = p.agent";
+      const one = `select c.rowid as rowid, c.entry_ts as entryTs, p.provider as provider,
+          p.sender_id as senderId, p.message_count as messageCount
+        from memory_block_participants p indexed by idx_memory_block_participants_sender_hash
+        cross join memory_chunks c indexed by idx_memory_chunks_hash_agent_ts
+          on c.content_hash = p.content_hash${agentClause}
+        where p.agent = ? and p.provider = ? and p.sender_id = ?`;
+      const params: unknown[] = [];
+      for (const s of senders) params.push(a, s.provider, s.senderId);
       params.push(limit, Math.max(0, offset));
-      return db
+      const page = db
         .prepare(
-          `select ${CHUNK_COLUMNS}, p.sender_id as senderId, p.message_count as messageCount
-           from memory_block_participants p
-           join memory_chunks c on c.content_hash = p.content_hash${agentClause}
-           where p.agent = ? and (${pairs})
-           order by c.entry_ts desc, c.rowid desc, p.provider, p.sender_id
+          `select rowid, senderId, messageCount from (${senders.map(() => one).join(" union all ")})
+           order by entryTs desc, rowid desc, provider, senderId
            limit ? offset ?`,
         )
-        .all(...params) as Array<ChunkRow & { senderId: string; messageCount: number }>;
+        .all(...params) as Array<{ rowid: number; senderId: string; messageCount: number }>;
+      if (page.length === 0) return [];
+      const ids = [...new Set(page.map((r) => r.rowid))];
+      const rows = new Map(
+        (
+          db
+            .prepare(`select ${CHUNK_COLUMNS} from memory_chunks c where c.rowid in (${ids.map(() => "?").join(",")})`)
+            .all(...ids) as ChunkRow[]
+        ).map((r) => [r.rowid, r]),
+      );
+      const out: Array<ChunkRow & { senderId: string; messageCount: number }> = [];
+      for (const r of page) {
+        const row = rows.get(r.rowid);
+        if (row) out.push({ ...row, senderId: r.senderId, messageCount: r.messageCount });
+      }
+      return out;
     });
   }
 

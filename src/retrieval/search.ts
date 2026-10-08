@@ -78,6 +78,8 @@ export interface UserLaneOptions {
    * Null / absent = legacy mode (no filter). `"__legacy__"` treated as null.
    */
   agentName?: string | null;
+  /** The caller already ran {@link MemorySearch.ensureFresh} for this request. */
+  fresh?: boolean;
 }
 
 export interface SearchOutcome {
@@ -119,6 +121,8 @@ export interface ScoredSearchOptions {
   afterTs?: number;
   beforeTs?: number;
   rowidScope?: number[];
+  /** The caller already ran {@link MemorySearch.ensureFresh} for this request. */
+  fresh?: boolean;
 }
 
 /** One scored candidate chunk (pre-excerpt). */
@@ -129,6 +133,18 @@ export interface ScoredChunk extends LexicalHit {
   relevance: number;
   /** Relevance after temporal decay (ordering only). */
   score: number;
+}
+
+/** Where a hybrid search's time went (ms). */
+export interface SearchTimings {
+  /** The corpus freshness check (and any reconcile it waited for). */
+  freshMs: number;
+  /** The FTS half. */
+  lexicalMs: number;
+  /** The query embedding (and, on the dual index, the hedge between embedders). */
+  embedMs: number;
+  /** The KNN (or the scope's exact cosine) and the hits' rows. */
+  vectorMs: number;
 }
 
 /**
@@ -142,7 +158,7 @@ export interface QueryVectorIndex {
     text: string,
     k: number,
     signal?: AbortSignal,
-  ): Promise<{ hits: VecHit[]; store: VectorStore; index: string; vector: Float32Array } | null>;
+  ): Promise<{ hits: VecHit[]; store: VectorStore; index: string; vector: Float32Array; knnMs?: number } | null>;
   /** Stored vectors of the index last used for `query` (MMR). */
   vectors(store: VectorStore, rowids: number[]): Map<number, Float32Array>;
   /**
@@ -289,10 +305,15 @@ export class MemorySearch {
     vectorStore?: VectorStore;
     /** Which vector index served the semantic half ("builtin" | "primary"). */
     vectorIndex?: string;
+    /** Where the call's time went (ms). */
+    timings: SearchTimings;
   }> {
     // Normalize the sentinel so it's never accidentally used as a filter.
     const agentName = opts.agentName === "__legacy__" ? null : (opts.agentName ?? null);
-    await this.ensureFresh();
+    const timings: SearchTimings = { freshMs: 0, lexicalMs: 0, embedMs: 0, vectorMs: 0 };
+    let t0 = performance.now();
+    if (!opts.fresh) await this.ensureFresh();
+    timings.freshMs = performance.now() - t0;
     const now = opts.now ?? Date.now();
     const q = this.config.query;
     const candidateLimit = Math.max(1, opts.limit);
@@ -306,6 +327,7 @@ export class MemorySearch {
     // specials and returns null on degenerate input, so this is defensive insurance.
     const match = opts.semanticOnly ? null : buildFtsMatch(opts.query);
     let ftsHits: LexicalHit[] = [];
+    t0 = performance.now();
     if (match) {
       try {
         ftsHits = this.storage.searchMemoryLexical({
@@ -324,6 +346,7 @@ export class MemorySearch {
         ftsHits = [];
       }
     }
+    timings.lexicalMs = performance.now() - t0;
 
     // --- Vector candidates (when embeddings are available) ---
     let vecScoreByRow = new Map<number, number>();
@@ -349,8 +372,12 @@ export class MemorySearch {
       ? Math.min(candidateLimit * FILTERED_KNN_OVERFETCH, MAX_KNN_CANDIDATES)
       : Math.min(candidateLimit, MAX_KNN_CANDIDATES);
     if (this.vectorIndex) {
+      t0 = performance.now();
       try {
         const found = await this.vectorIndex.query(opts.query, scope ? 1 : knnK, opts.signal);
+        const queried = performance.now() - t0;
+        timings.embedMs = queried - (found?.knnMs ?? 0);
+        t0 = performance.now() - (found?.knnMs ?? 0);
         if (found) {
           vectorStore = found.store;
           vectorIndexUsed = found.index;
@@ -371,10 +398,12 @@ export class MemorySearch {
             });
           }
           semanticRan = true;
+          timings.vectorMs = performance.now() - t0;
         } else {
           degraded = true;
         }
       } catch (error) {
+        timings.embedMs = performance.now() - t0;
         // Query-embed or KNN failed → lexical-only for this query (never cross spaces).
         // This also covers the bounded-embed-wait abort (§9d #7): when an
         // interactive build's deadline elapses, `embedQuery` rejects and we
@@ -436,6 +465,7 @@ export class MemorySearch {
       mode: useVec ? "hybrid" : "lexical",
       degraded,
       ...(useVec ? { vectorStore, vectorIndex: vectorIndexUsed } : {}),
+      timings,
     };
   }
 
@@ -520,7 +550,7 @@ export class MemorySearch {
     if (opts.maxResults <= 0) return [];
     const agentName =
       opts.agentName === "__legacy__" ? null : (opts.agentName ?? null);
-    await this.ensureFresh();
+    if (!opts.fresh) await this.ensureFresh();
     const now = opts.now ?? Date.now();
     const q = this.config.query;
     const tokens = userLaneTokens(opts.names);
@@ -589,13 +619,40 @@ export class MemorySearch {
 
 /** The single-index vector seam over one provider + store (no primary embedder). */
 export function singleVectorIndex(provider: EmbeddingProvider, store: VectorStore): QueryVectorIndex {
+  const embed = memoizeQueryEmbed((text, signal) => provider.embedQuery(text, signal));
   return {
     async query(text, k, signal) {
-      const vector = await provider.embedQuery(text, signal);
-      return { hits: store.knn(vector, k, "memory"), store, index: "builtin", vector };
+      const vector = await embed(text, signal);
+      const t0 = performance.now();
+      const hits = store.knn(vector, k, "memory");
+      return { hits, store, index: "builtin", vector, knnMs: performance.now() - t0 };
     },
     vectors: (s, rowids) => s.getVectors(rowids),
     similarity: (query, texts, signal) => textSimilarity(provider, query, texts, signal),
+  };
+}
+
+/**
+ * Remembers the last few query embeddings by text: one retrieval embeds the
+ * same request text for its trigger lane and again for the user lanes' ranking.
+ * Only answered embeddings are kept (a failed or aborted one is never reused).
+ */
+export function memoizeQueryEmbed(
+  embed: (text: string, signal?: AbortSignal) => Promise<Float32Array>,
+  size = 16,
+): (text: string, signal?: AbortSignal) => Promise<Float32Array> {
+  const cache = new Map<string, Float32Array>();
+  return async (text, signal) => {
+    const hit = cache.get(text);
+    if (hit) {
+      cache.delete(text);
+      cache.set(text, hit);
+      return hit;
+    }
+    const vector = await embed(text, signal);
+    cache.set(text, vector);
+    if (cache.size > size) cache.delete(cache.keys().next().value!);
+    return vector;
   };
 }
 

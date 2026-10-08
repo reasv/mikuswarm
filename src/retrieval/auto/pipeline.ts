@@ -31,7 +31,7 @@ import type { FilterBlock, MemoryFilterService } from "../filters/service.js";
 import type { LateStage, LateOutcome } from "../late/stage.js";
 import type { ProviderChain } from "../models/chain.js";
 import type { RerankProvider } from "../models/types.js";
-import type { MemorySearch, ScoredChunk } from "../search.js";
+import type { MemorySearch, ScoredChunk, SearchTimings } from "../search.js";
 import { dayFromFilename } from "../chunk.js";
 import { parseDiaryHeaderLine } from "../participants.js";
 import type {
@@ -146,6 +146,18 @@ export interface MemoryRetrievalPipelineDeps {
   logger?: Logger;
   now?: () => number;
 }
+
+/** Rounds the recall sub-step timings of a report's stages; returns them for the build log. */
+function recallSubSteps(stages: RetrievalReport["stages"]): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const key of RECALL_SUB_STEPS) {
+    const v = stages[key];
+    if (v !== undefined) out[key] = stages[key] = Math.round(v);
+  }
+  return out;
+}
+
+const RECALL_SUB_STEPS = ["freshMs", "embedMs", "lexicalMs", "vectorMs", "namesMs", "lanesMs", "recencyMs", "personMs"] as const;
 
 const norm = (s: string) => s.replace(/\s+/g, " ").trim().toLowerCase();
 
@@ -264,33 +276,67 @@ export class MemoryRetrievalPipeline {
 
     // The recency layer's text (its blocks are already in context): started now,
     // in parallel with recall.
-    const recencyPromise = auto.dedupAgainstRecency && this.deps.recencyContent
-      ? this.deps.recencyContent(agent, input.timelineKey, input.now, input.attribution).catch(() => null)
-      : Promise.resolve(null);
+    const stages = report.stages;
+    const clock = () => this.now();
+    const recencyStarted = clock();
+    const recencyPromise = (
+      auto.dedupAgainstRecency && this.deps.recencyContent
+        ? this.deps.recencyContent(agent, input.timelineKey, input.now, input.attribution).catch(() => null)
+        : Promise.resolve(null)
+    ).finally(() => {
+      stages.recencyMs = clock() - recencyStarted;
+    });
     const participants = input.participants;
+    let t0 = clock();
     const laneNames = [...new Set(participants.flatMap((p) => this.namesOf(p)))];
-    const searchOpts = { limit: auto.candidates, minScore: auto.candidateMinScore, now: input.now, agentName: agent };
+    stages.namesMs = clock() - t0;
+    // One corpus freshness check for every search of this request.
+    t0 = clock();
+    try {
+      await this.deps.search.ensureFresh?.();
+    } catch {
+      // a failed check leaves the index as it stands (as each search would)
+    }
+    stages.freshMs = clock() - t0;
+    const searchOpts = { limit: auto.candidates, minScore: auto.candidateMinScore, now: input.now, agentName: agent, fresh: true };
+    // Per-query sub-step timings, summed over the queries (they run concurrently).
+    const addTimings = (t: SearchTimings | undefined) => {
+      if (!t) return;
+      stages.embedMs = (stages.embedMs ?? 0) + t.embedMs;
+      stages.lexicalMs = (stages.lexicalMs ?? 0) + t.lexicalMs;
+      stages.vectorMs = (stages.vectorMs ?? 0) + t.vectorMs;
+    };
+    let nameLane: Promise<ScoredChunk[]> = Promise.resolve([]);
+    if (auto.userLane.enabled && laneNames.length > 0 && auto.userLaneCandidates > 0) {
+      // Synchronous with `fresh` (FTS only): timed here, not by when it settles.
+      t0 = clock();
+      nameLane = this.deps.search
+        .userLaneScored({
+          names: laneNames,
+          maxResults: auto.userLaneCandidates * 3,
+          minScore: auto.userLane.minScore,
+          prefixEnabled: auto.userLane.prefixEnabled,
+          prefixMinChars: auto.userLane.prefixMinChars,
+          now: input.now,
+          agentName: agent,
+          fresh: true,
+        })
+        .catch(() => [] as ScoredChunk[]);
+      stages.lanesMs = clock() - t0;
+    }
     const [laneResults, nameHits] = await Promise.all([
       Promise.all(
         queries.map((q) =>
           this.deps.search
             .searchScored({ ...searchOpts, query: q.text, semanticOnly: q.semanticOnly, signal: input.signal })
+            .then((r) => {
+              addTimings(r.timings);
+              return r;
+            })
             .catch(() => ({ scored: [] as ScoredChunk[], mode: "lexical" as const, degraded: true, vectorIndex: undefined })),
         ),
       ),
-      auto.userLane.enabled && laneNames.length > 0 && auto.userLaneCandidates > 0
-        ? this.deps.search
-            .userLaneScored({
-              names: laneNames,
-              maxResults: auto.userLaneCandidates * 3,
-              minScore: auto.userLane.minScore,
-              prefixEnabled: auto.userLane.prefixEnabled,
-              prefixMinChars: auto.userLane.prefixMinChars,
-              now: input.now,
-              agentName: agent,
-            })
-            .catch(() => [] as ScoredChunk[])
-        : Promise.resolve([] as ScoredChunk[]),
+      nameLane,
     ]);
     report.stages.vectorIndex = laneResults.find((r) => r.vectorIndex)?.vectorIndex;
 
@@ -306,6 +352,7 @@ export class MemoryRetrievalPipeline {
     // The presence lane: the newest blocks tagged with a participant, paging
     // past the recency layer so an active person's older entries are reached.
     const presenceRows: LexicalHit[] = [];
+    t0 = clock();
     if (auto.userLane.enabled && participants.length > 0 && auto.userLaneCandidates > 0) {
       const want = auto.userLaneCandidates * 3;
       const seen = new Set<number>();
@@ -355,10 +402,13 @@ export class MemoryRetrievalPipeline {
     let laneSimilarity: Map<number, number> | null = null;
     if (laneRows.size > 0 && queryTerms([laneQuery]).length > 0) {
       const scoped = await this.deps.search
-        .searchScored({ query: laneQuery, limit: laneRows.size, minScore: 0, now: input.now, agentName: agent, rowidScope: [...laneRows.keys()], signal: input.signal })
+        .searchScored({ query: laneQuery, limit: laneRows.size, minScore: 0, now: input.now, agentName: agent, rowidScope: [...laneRows.keys()], signal: input.signal, fresh: true })
         .catch(() => null);
       if (scoped) laneSimilarity = new Map(scoped.scored.map((x) => [x.rowid, x.relevance]));
     }
+    // The user lanes: the name search (concurrent with the queries), the
+    // presence pages and the lane ranking.
+    stages.lanesMs = (stages.lanesMs ?? 0) + (clock() - t0);
     const laneOrder = [...laneRows.values()].sort((a, b) =>
       laneSimilarity
         ? (laneSimilarity.get(b.rowid) ?? 0) - (laneSimilarity.get(a.rowid) ?? 0) || b.entryTs - a.entryTs
@@ -412,6 +462,7 @@ export class MemoryRetrievalPipeline {
     // newest tagged entries they took part in, outside the recency layer. No text
     // match needed; they skip the re-rank cuts and go straight to the judge.
     const personCued: Candidate[] = [];
+    t0 = clock();
     if (auto.personRecent > 0 && auto.personRecentMax > 0) {
       const taken = new Set<string>();
       for (const person of input.activePeople ?? []) {
@@ -451,6 +502,7 @@ export class MemoryRetrievalPipeline {
         });
       }
       pool = pool.filter((c) => !c.personCued);
+      stages.personMs = clock() - t0;
     }
 
     // ── 3. Late interaction ───────────────────────────────────────────────
@@ -795,6 +847,7 @@ export class MemoryRetrievalPipeline {
     const fellBack = report.items.filter((i) => i.selectedBy === "fallback").length;
     if (fellBack > 0) report.fellBack = fellBack;
     report.ms = this.now() - started;
+    const subSteps = recallSubSteps(report.stages);
     this.deps.logger?.info("memory_retrieval", {
       agent: agent ?? undefined,
       timelineKey: input.timelineKey,
@@ -811,6 +864,7 @@ export class MemoryRetrievalPipeline {
       ...(report.cutShort ? { cutShort: true } : {}),
       ms: report.ms,
       recallMs: report.stages.recallMs,
+      ...subSteps,
       ...(report.stages.late ? { late: report.stages.late.status, lateMs: report.stages.late.ms } : {}),
       ...(report.stages.rerank ? { rerank: report.stages.rerank.status, rerankMs: report.stages.rerank.ms } : {}),
       ...(report.stages.judgeMs !== undefined ? { judgeMs: report.stages.judgeMs } : {}),
