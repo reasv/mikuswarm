@@ -50,6 +50,12 @@ Unreleased section; it is not part of any release's notes.
   and a session evicted by a restart cannot be revived. A trigger deleted before its
   session launched (during the trigger hold, while queued, during activation) is
   never answered, and a part deleted by then leaves the request.
+  A message that reached a running session outside its request (a reply to its
+  message, a co-reply, an interjected addition) and that its sender then deletes
+  is taken back while unread, otherwise followed by a short deletion note (or a
+  redo without it, when it belonged to the request and nothing irreversible
+  happened yet); a co-reply deleted before it reached the session never carries
+  its content.
   A discarded rollout is kept as a branch with the message that caused it. The console
   session view labels redo, revival and aborted-turn branches with that message, shows
   how long a call was held, labels each interjection's kind, and marks redone sessions

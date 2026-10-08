@@ -108,6 +108,7 @@ import {
   mergeRestart,
   resolveLateInputSettings,
   takeQueuedSteers,
+  withdrawQueuedSteers,
   type CorrectionFallback,
   type LateInputPending,
   type RestartRequest,
@@ -3586,6 +3587,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       if (!marked?.changed) return;
       const { deleted: _marker, ...prior } = marked.event;
       onRequestEdited(inbound, prior, { ...prior, body: "", attachments: [] });
+      onSteeredInputDeleted(inbound, prior);
       return;
     }
     // Late input (§8 "Late input"): the message before the edit, for the request
@@ -4210,6 +4212,18 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   }
 
   /**
+   * A message about to be steered into a session (a parked co-reply or
+   * follow-up) that its own sender deleted meanwhile, late input on: withdrawn,
+   * so it is neither steered nor re-dispatched (like `inputWithdrawn` for a
+   * trigger). A moderator's deletion leaves it; it is steered as the placeholder.
+   */
+  function withdrawnBeforeSteer(inbound: InboundChatEvent): boolean {
+    if (!inputWithdrawn(inbound)) return false;
+    logger.info("late_input_ignored", { timelineKey: inbound.timelineKey, eventId: inbound.event.id, kind: "delete", reason: "deleted_before_steer" });
+    return true;
+  }
+
+  /**
    * Fill an inbound reply event's `replyTo` from its resolved (hydrated) target so
    * a steered interjection quotes the original message (captions/media included),
    * instead of rendering "[original message unavailable]". Shared by the existing
@@ -4321,7 +4335,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         return true;
       }
       const outcome = trySteerCoReply(ownerSessionId, inbound);
-      if (outcome === "steered") return true;
+      if (outcome === "steered" || outcome === "withdrawn") return true;
       // Cannot hydrate the quote → spawn rather than inject a broken interjection.
       if (outcome === "no-target") return noCoalesce("no_hydration_target", { ownerSessionId: match.sessionId });
       // outcome === "not-live": owner attributed but not steerable. Defer only if it
@@ -4368,14 +4382,17 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // omits it and rebuilds internally (no pixels to mark).
     prebuiltEventForRender?: CanonicalChatEvent,
   ): string {
-    const eventForRender = prebuiltEventForRender ?? buildReplyHydratedEvent(inbound, target);
+    const built = prebuiltEventForRender ?? buildReplyHydratedEvent(inbound, target);
+    // A co-reply deleted by then (a moderator's deletion) shows as the placeholder.
+    const deleted = timeline.getById(inbound.event.id)?.deleted;
+    const eventForRender = deleted ? { ...built, deleted } : built;
     // §6.2: human-facing label uses `username ?? id` as the fallback.
     const senderName = inbound.event.sender.displayName ?? inbound.event.sender.username ?? inbound.event.sender.id;
     const externalId = inbound.event.externalId;
     return (
       `<interjection reason="co-reply">\n` +
       `${escapeXml(senderName)} replied to the same message you're answering:\n\n` +
-      `${renderRichMessage(eventForRender)}\n\n` +
+      `${renderRichMessage(eventForRender, { deletedPlaceholder: true })}\n\n` +
       `Handle it as part of this session if it fits here (sending a second message is fine) — ` +
       (externalId
         ? `or, if it warrants being worked independently, call spawn_session with message_id="${escapeAttr(externalId)}" to give it its own session.`
@@ -4393,12 +4410,17 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   function trySteerCoReply(
     coReplySessionId: string,
     inbound: InboundChatEvent,
-  ): "steered" | "no-target" | "not-live" {
+  ): "steered" | "no-target" | "not-live" | "withdrawn" {
     const replyTarget = inbound.event.replyTo?.externalId;
     const target = replyTarget
       ? timeline.getByExternalId(inbound.provider, replyTarget, inbound.timelineKey)
       : undefined;
     if (!target || target.timelineKey !== inbound.timelineKey) return "no-target";
+    // Deleted by its sender while parked: nothing is steered or re-dispatched.
+    if (withdrawnBeforeSteer(inbound)) {
+      markSteered(inbound.event.id);
+      return "withdrawn";
+    }
 
     const content = buildCoReplyInterjection(inbound, target);
     // Pass the interjection source so it is indexed for the timeline→session debug
@@ -4471,6 +4493,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     target: CanonicalChatEvent,
   ): Promise<void> {
     await awaitEnrichmentComplete(inbound.event.id, config.enrichment?.trigger_wait_timeout_ms ?? 30_000);
+    // Deleted by its sender meanwhile: nothing is steered or re-dispatched; a
+    // moderator's deletion steers the placeholder, without pixels.
+    if (withdrawnBeforeSteer(inbound)) return;
     // Build the rendered event ONCE (off the hydrated stored event so the co-reply's
     // own image attachments carry `localPath`), then condition + mark + render the SAME
     // object — marking a separately-built copy would be a no-op (review #1). The
@@ -4478,7 +4503,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // its own; here pixels exist so the marked object must be the rendered one.
     const eventForRender = buildReplyHydratedEvent(inbound, target, followUpHydratedEvent(inbound));
     let imageBlocks: ImageBlock[] | undefined;
-    try {
+    if (!eventForRender.deleted) try {
       const coReplySessionType = sessions.get(coReplySessionId)?.sessionType ?? "default";
       // Resolve the per-agent model's vision capability (spec PER-AGENT-MODEL-OVERRIDES
       // FIX 6): use inbound.timelineKey to pick the agent, then look up the model.
@@ -4582,7 +4607,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         });
         continue;
       }
-      if (trySteerCoReply(sessionId, inbound) !== "steered") {
+      const outcome = trySteerCoReply(sessionId, inbound);
+      if (outcome === "no-target" || outcome === "not-live") {
         void redispatchCoReply(inbound).catch((error) => {
           logger.error("co_reply_redispatch_failed", {
             timelineKey: inbound.timelineKey,
@@ -4704,6 +4730,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   interface FoldDelivery {
     inbound: InboundChatEvent;
     form: FollowUpForm | "reply" | "co-reply" | "edit";
+    /** A late addition or a reply to the request (§8 "Late input"): part of the request. */
+    request?: true;
   }
 
   /**
@@ -4876,8 +4904,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       await awaitEnrichmentComplete(inbound.event.id, config.enrichment?.trigger_wait_timeout_ms ?? 30_000);
     }
     const hydrated = followUpHydratedEvent(inbound);
+    // Deleted before it reached the session: its sender's deletion withdraws it;
+    // otherwise it shows as the placeholder, without its pixels (§8 "Late input").
+    if (withdrawnBeforeSteer(inbound)) return;
     let imageBlocks: ImageBlock[] | undefined;
-    if (form === "media") {
+    if (form === "media" && !hydrated.deleted) {
       try {
         const followUpSessionType = sessions.get(sessionId)?.sessionType ?? "default";
         // Resolve the per-agent model's vision capability (spec PER-AGENT-MODEL-OVERRIDES
@@ -4927,7 +4958,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // The owner settled between the fold decision and here (it completed during the
       // download wait above): revive it when the follow-up was sent before its run
       // ended (§8 "Late input"), else the follow-up takes its native fate.
-      if (!(await tryReviveWithSteer(sessionId, message, inbound))) revertFollowUpToNativeFate(inbound, "owner-settled");
+      if (!(await tryReviveWithSteer(sessionId, message, delivery))) revertFollowUpToNativeFate(inbound, "owner-settled");
       return;
     }
     trackSteer(sessionId, message, delivery);
@@ -5057,7 +5088,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   async function reviveWithFollowUp(ownerSessionId: string, delivery: FollowUpDelivery): Promise<void> {
     const { inbound, form, gapMs } = delivery;
     const message = await buildAdditionInterjection(ownerSessionId, inbound, form, gapMs);
-    if (!(await tryReviveWithSteer(ownerSessionId, message, inbound))) {
+    if (!(await tryReviveWithSteer(ownerSessionId, message, delivery))) {
       revertFollowUpToNativeFate(inbound, "fold-owner-not-revivable");
     }
   }
@@ -5092,6 +5123,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   >();
 
   function trackSteer(sessionId: string, message: SteerMessage, delivery: FoldDelivery): void {
+    noteSteeredInput(sessionId, message, delivery);
     let slot = pendingSteers.get(sessionId);
     if (!slot) {
       const agent = sessions.getAgent(sessionId);
@@ -5178,7 +5210,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // session (§8 "Late input"); a session that cannot be revived gives the
       // message its native fate.
       const inbound = entry.delivery.inbound;
-      void tryReviveWithSteer(sessionId, entry.message, inbound)
+      void tryReviveWithSteer(sessionId, entry.message, entry.delivery)
         .then((revived) => {
           if (!revived) revertFollowUpToNativeFate(inbound, "steer-unread");
         })
@@ -5208,7 +5240,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       : `handle it separately`;
     // A quote of a deleted message shows the placeholder (§6 "Message edits").
     const [shown] = markDeletedReplyTargets([hydrated], (timelineKey, ids) => storage.getDeletedMessages(timelineKey, ids));
-    const rendered = renderRichMessage(shown!);
+    // A follow-up deleted by then (a moderator's deletion) shows as the placeholder.
+    const rendered = renderRichMessage(shown!, { deletedPlaceholder: true });
     if (form === "media") {
       return (
         `<interjection reason="follow-up-media">\n` +
@@ -5259,6 +5292,15 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     folded: number;
     /** Interjections that arrived while the session was still building. */
     parked: Array<{ message: SteerMessage; source: InterjectionSource; delivery: FoldDelivery }>;
+    /**
+     * Timeline messages steered in outside the trigger group (a reply-steer, a
+     * co-reply, a follow-up, an interjected addition or reply to the request, and
+     * the revivals carrying one), by event id: their interjections, and whether
+     * the message is part of the request (§8 "Late input", deleted steered input).
+     */
+    steered: Map<string, { messages: AgentMessage[]; partOfRequest: boolean }>;
+    /** Interjections withdrawn by their sender's deletion: a redo never redelivers them. */
+    withdrawn: Set<AgentMessage>;
     expiry?: ReturnType<typeof setTimeout>;
   }
   const lateInputEntries = new Map<string, LateInputEntry>();
@@ -5287,7 +5329,15 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   }
 
   function registerLateInputEntry(entry: Pick<LateInputEntry, "sessionId" | "timelineKey" | "sessionType" | "inbound" | "ctl">): LateInputEntry {
-    const registered: LateInputEntry = { ...entry, revive: async () => false, judged: 0, folded: 0, parked: [] };
+    const registered: LateInputEntry = {
+      ...entry,
+      revive: async () => false,
+      judged: 0,
+      folded: 0,
+      parked: [],
+      steered: new Map(),
+      withdrawn: new Set(),
+    };
     lateInputEntries.set(entry.sessionId, registered);
     // A session that ends any other way than completed (discarded before it ran,
     // parked, interrupted) is not correctable any more.
@@ -5508,6 +5558,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     removed?: string[];
     /** The correction reached nobody (a late fallback that could not revive). */
     onUndelivered?: () => void;
+    /** Never a redo: the message was not part of the request (a deleted reply-steer or co-reply). */
+    interjectOnly?: true;
   }
 
   type CorrectionOutcome = "redo" | "cancelled" | "interjected" | "revived" | "ignored";
@@ -5521,6 +5573,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   async function reviveWithCorrection(entry: LateInputEntry, plan: CorrectionPlan): Promise<boolean> {
     const message = await plan.interjection({ late: true });
     if (!(await entry.revive([message], { eventId: plan.causeEventId }))) return false;
+    noteSteeredInput(entry.sessionId, message, plan.delivery);
     void storage.insertSessionInterjection({
       sessionId: entry.sessionId,
       eventId: plan.source.eventId ?? null,
@@ -5572,7 +5625,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     }
     const ctl = entry.ctl;
     if (ctl.phase !== "ended") {
-      if (ctl.canRedo()) {
+      if (ctl.canRedo() && !plan.interjectOnly) {
         const fallback = correctionFallback(entry, plan);
         if (plan.kind === "delete_trigger" || plan.kind === "unmention") {
           ctl.requestCancel(plan.kind, plan.causeEventId, fallback);
@@ -5748,6 +5801,95 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     }).catch((error) => {
       logger.error("late_input_edit_failed", { sessionId: entry.sessionId, error: error instanceof Error ? error.message : String(error) });
     });
+  }
+
+  /**
+   * Record a timeline message steered into a session with a late-input
+   * controller (an edit correction is no new input): its trigger-hold group's
+   * ids, the interjection, and whether it is part of the request (a follow-up, a
+   * late addition, a reply to the request) or not (a reply-steer, a co-reply).
+   */
+  function noteSteeredInput(sessionId: string, message: AgentMessage, delivery: FoldDelivery): void {
+    if (delivery.form === "edit") return;
+    const entry = lateInputEntries.get(sessionId);
+    if (!entry) return;
+    const partOfRequest = delivery.request === true || delivery.form === "text" || delivery.form === "media" || delivery.form === "mention";
+    for (const id of triggerGroupOf(delivery.inbound)) {
+      const known = entry.steered.get(id);
+      if (known) {
+        if (!known.messages.includes(message)) known.messages.push(message);
+        known.partOfRequest ||= partOfRequest;
+      } else {
+        entry.steered.set(id, { messages: [message], partOfRequest });
+      }
+    }
+  }
+
+  /**
+   * A message steered into a running session outside its trigger group was
+   * deleted (§8 "Late input"; a deleted grouped part goes through
+   * `onRequestEdited`). Like a deleted part, while the run is live: its sender's
+   * deletion withdraws it (one never delivered, parked or still queued, is taken
+   * back; one read already gets a short deletion note, or, when it was part of
+   * the request and nothing irreversible happened, a redo without it); a
+   * moderator's deletion only marks the message; after the run ended nothing
+   * happens.
+   */
+  function onSteeredInputDeleted(inbound: InboundChatEvent, prior: CanonicalChatEvent): void {
+    if (!lateInputSettings.enabled) return;
+    const byOther = inbound.edit?.deletedBy !== undefined && inbound.edit.deletedBy !== prior.sender.id;
+    for (const entry of [...lateInputEntries.values()]) {
+      if (triggerGroupOf(entry.inbound).includes(prior.id)) continue;
+      const isParked = (p: LateInputEntry["parked"][number]) => p.delivery.form !== "edit" && triggerGroupOf(p.delivery.inbound).includes(prior.id);
+      const steered = entry.steered.get(prior.id);
+      if (!steered && !entry.parked.some(isParked)) continue;
+      if (byOther) {
+        logger.info("late_input_ignored", { sessionId: entry.sessionId, kind: "delete", reason: "deleted_by_other", eventId: prior.id });
+        continue;
+      }
+      if (entry.ctl.phase === "ended") {
+        logger.info("late_input_ignored", { sessionId: entry.sessionId, kind: "delete", reason: "after_run_end", eventId: prior.id });
+        continue;
+      }
+      // Parked while the session was building: never delivered, just dropped.
+      for (let i = entry.parked.length - 1; i >= 0; i--) if (isParked(entry.parked[i]!)) entry.parked.splice(i, 1);
+      if (!steered) {
+        logger.info("late_input_withdrawn", { sessionId: entry.sessionId, eventId: prior.id, parked: true });
+        continue;
+      }
+      entry.steered.delete(prior.id);
+      for (const message of steered.messages) entry.withdrawn.add(message);
+      // Never redelivered (or reviving the session) as an unread steer at settle.
+      const slot = pendingSteers.get(entry.sessionId);
+      if (slot) for (const [key, pending] of slot.entries) if (steered.messages.includes(pending.message)) slot.entries.delete(key);
+      // Still queued, not read: taken back, there is nothing to correct.
+      const agent = sessions.getAgent(entry.sessionId);
+      if (agent && steered.messages.every((m) => !agent.state.messages.includes(m)) && withdrawQueuedSteers(agent, new Set(steered.messages))) {
+        logger.info("late_input_withdrawn", { sessionId: entry.sessionId, eventId: prior.id, unread: true });
+        continue;
+      }
+      const who = senderLabel(prior.sender);
+      const ref = prior.externalId ? ` (${escapeXml(prior.externalId)})` : "";
+      const text = `${who} deleted a message${ref} they sent while you were answering. Leave it out.`;
+      void deliverCorrection(entry, {
+        kind: "delete_part",
+        causeEventId: prior.id,
+        sentAt: inbound.event.timestamp,
+        interjection: async ({ late }) => lateInterjection(late ? "revival" : "edit", late ? `${LATE_NOTE(prior.sender)}\n${text}` : text),
+        source: {
+          eventId: prior.id,
+          externalId: prior.externalId,
+          senderId: prior.sender.id,
+          senderDisplayName: prior.sender.displayName,
+          kind: "edit",
+          body: "",
+        },
+        delivery: { inbound: { ...inbound, edit: undefined, event: { ...prior, body: "", attachments: [] } }, form: "edit" },
+        ...(steered.partOfRequest ? {} : { interjectOnly: true as const }),
+      }).catch((error) => {
+        logger.error("late_input_edit_failed", { sessionId: entry.sessionId, error: error instanceof Error ? error.message : String(error) });
+      });
+    }
   }
 
   /**
@@ -5983,7 +6125,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         kind: "addition",
         body: inbound.event.body ?? "",
       },
-      delivery: { inbound, form: form === "reply" ? "reply" : form },
+      delivery: { inbound, form: form === "reply" ? "reply" : form, request: true },
       added,
       onUndelivered: () => {
         releaseSlot();
@@ -6206,7 +6348,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   }
 
   /** Revive the owner of an unread steer or a settled fold, when it is revivable. */
-  async function tryReviveWithSteer(sessionId: string, message: SteerMessage, inbound: InboundChatEvent): Promise<boolean> {
+  async function tryReviveWithSteer(sessionId: string, message: SteerMessage, delivery: FoldDelivery): Promise<boolean> {
+    const inbound = delivery.inbound;
     const entry = lateInputEntries.get(sessionId);
     if (!entry || !sentBeforeRunEnd(entry.ctl, inbound.event.timestamp)) return false;
     const content = (message as { content?: string }).content ?? "";
@@ -6216,7 +6359,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       (message as { imageBlocks?: ImageBlock[] }).imageBlocks,
       (message as { seen?: SeenStamp }).seen,
     );
-    return entry.revive([late], { eventId: inbound.event.id });
+    if (!(await entry.revive([late], { eventId: inbound.event.id }))) return false;
+    noteSteeredInput(sessionId, late, delivery);
+    return true;
   }
 
   /**
@@ -8772,7 +8917,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       sessions.attachAgent(session.id, next.agent);
       // Steers the old agent never read (some may have reached it during the
       // rebuild, while it was still the session's agent) move to the new one.
-      for (const message of [...redeliver, ...takeQueuedSteers(current)]) next.agent.steer(message);
+      // An interjection its sender's deletion withdrew is not redelivered (§8 "Late input").
+      const withdrawn = lateInputEntries.get(session.id)?.withdrawn;
+      for (const message of [...redeliver, ...takeQueuedSteers(current)]) if (!withdrawn?.has(message)) next.agent.steer(message);
       rebindPendingSteers(session.id, next.agent);
       lateCtl!.markRunning();
       drainLateInputParked(session.id);

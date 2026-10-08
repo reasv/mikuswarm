@@ -185,6 +185,21 @@ export function takeQueuedSteers(agent: Agent): AgentMessage[] {
   return messages;
 }
 
+/**
+ * Take `messages` back from the agent's steering queue, when every one of them is
+ * still queued (not read yet); the rest of the queue keeps its order. False (the
+ * queue unchanged) when any of them is not queued any more.
+ */
+export function withdrawQueuedSteers(agent: Agent, messages: ReadonlySet<AgentMessage>): boolean {
+  const queue = (agent as unknown as { steeringQueue?: { messages?: unknown } }).steeringQueue;
+  if (!Array.isArray(queue?.messages)) return false;
+  const queued = queue.messages as AgentMessage[];
+  for (const message of messages) if (!queued.includes(message)) return false;
+  const rest = takeQueuedSteers(agent).filter((m) => !messages.has(m));
+  for (const message of rest) agent.steer(message);
+  return true;
+}
+
 // ── Corrections and steps ──────────────────────────────────────────────────
 
 /** A correction that redoes the session from scratch. */
