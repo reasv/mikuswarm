@@ -253,3 +253,46 @@ test("a deleted revival addition that was part of the request, nothing irreversi
     await h.stop();
   }
 });
+
+// A session without a late-input controller (a proactive or bot-triggered one)
+// receiving a reply-steer: no redo is possible, but a deletion of the steered
+// reply still reaches it, as the same short note (or taken back while unread).
+// Driven here through a bot-triggered session, which shares the path.
+const OTHER_BOT = { id: "@otherbot:fake", displayName: "OtherBot", isBot: true } as unknown as { id: string; displayName: string };
+
+for (const read of [true, false]) {
+  test(`no controller: a reply-steer its sender deletes ${read ? "after it was read gets the deletion note" : "while unread is taken back"}`, async () => {
+    const h = await startHarness({
+      toml: LATE(),
+      script: (req) => {
+        if (isRecordTurnRequest(req)) return { text: "NO_REPLY" };
+        const text = userText(req);
+        if (text.includes(NOTE)) return send("done, leaving it out");
+        if (text.includes("my reply")) return { ...send("got your reply", false), delayMs: 1500 };
+        if (chatRequests(h).length === 1) return send("posted", false);
+        return { ...send("still working", !read), delayMs: 1500 };
+      },
+    });
+    try {
+      h.say("hey bot, do the thing", { mention: true, sender: OTHER_BOT });
+      await h.until(() => h.sends.length === 1, "the bot-triggered session posted");
+      const session = h.query<{ id: string }>("select id from agent_sessions")[0]!.id;
+      const reply = h.say("my reply", { replyTo: h.sends[0]!.externalId });
+      await h.until(() => hasLog(h, "reply_steered", { eventId: `evt-${reply}` }), "reply steered");
+      if (read) await h.until(() => chatRequests(h).some((r) => userText(r).includes("my reply")), "the reply was read");
+      h.remove(reply);
+      await h.until(() => settledAll(h)(), "settled", 15000);
+      if (read) {
+        assert.ok(hasLog(h, "late_input_interjected", { sessionId: session, kind: "delete_part", controller: false }), "the note was steered");
+        assert.ok(userText(chatRequests(h).at(-1)!).includes(NOTE), "the next request carries the note");
+        assert.ok(userText(chatRequests(h).at(-1)!).includes("Leave it out."));
+      } else {
+        assert.ok(hasLog(h, "late_input_withdrawn", { sessionId: session, unread: true }), "taken back");
+        assert.ok(!chatRequests(h).some((r) => userText(r).includes("my reply")), "never read");
+        assert.ok(!chatRequests(h).some((r) => userText(r).includes(NOTE)), "no note for a reply never read");
+      }
+    } finally {
+      await h.stop();
+    }
+  });
+}

@@ -5881,7 +5881,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   function noteSteeredInput(sessionId: string, message: AgentMessage, delivery: FoldDelivery): void {
     if (delivery.form === "edit") return;
     const entry = lateInputEntries.get(sessionId);
-    if (!entry) return;
+    if (!entry) {
+      noteUncontrolledSteer(sessionId, message, delivery);
+      return;
+    }
     const partOfRequest = delivery.request === true || delivery.form === "text" || delivery.form === "media" || delivery.form === "mention";
     for (const id of triggerGroupOf(delivery.inbound)) {
       const known = entry.steered.get(id);
@@ -5891,6 +5894,76 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       } else {
         entry.steered.set(id, { messages: [message], partOfRequest });
       }
+    }
+  }
+
+  /**
+   * Messages steered into a running session that has no late-input controller
+   * (a proactive or bot-triggered session receiving a reply-steer), by the ids
+   * of their trigger-hold group, while late input is on: such a session cannot
+   * be redone, but a deletion still reaches it as a short note (§8 "Late input").
+   * Dropped when the session settles.
+   */
+  const uncontrolledSteers = new Map<string, Map<string, AgentMessage[]>>();
+
+  function noteUncontrolledSteer(sessionId: string, message: AgentMessage, delivery: FoldDelivery): void {
+    if (!lateInputSettings.enabled || !sessions.get(sessionId)) return;
+    let byEvent = uncontrolledSteers.get(sessionId);
+    if (!byEvent) {
+      const created = new Map<string, AgentMessage[]>();
+      byEvent = created;
+      uncontrolledSteers.set(sessionId, created);
+      sessions.onSettle(sessionId, () => {
+        if (uncontrolledSteers.get(sessionId) === created) uncontrolledSteers.delete(sessionId);
+      });
+    }
+    for (const id of triggerGroupOf(delivery.inbound)) {
+      const known = byEvent.get(id);
+      if (!known) byEvent.set(id, [message]);
+      else if (!known.includes(message)) known.push(message);
+    }
+  }
+
+  /**
+   * A message steered into a session without a controller was deleted: its
+   * sender's deletion takes it back while it is still queued unread, else steers
+   * the short deletion note (no redo: nothing can be redone without a
+   * controller); a moderator's deletion only marks the message.
+   */
+  function onUncontrolledSteerDeleted(prior: CanonicalChatEvent, byOther: boolean): void {
+    for (const [sessionId, byEvent] of [...uncontrolledSteers]) {
+      const messages = byEvent.get(prior.id);
+      if (!messages) continue;
+      if (byOther) {
+        logger.info("late_input_ignored", { sessionId, kind: "delete", reason: "deleted_by_other", eventId: prior.id });
+        continue;
+      }
+      byEvent.delete(prior.id);
+      // Never redelivered (or reviving anything) as an unread steer at settle.
+      const slot = pendingSteers.get(sessionId);
+      if (slot) for (const [key, pending] of slot.entries) if (messages.includes(pending.message)) slot.entries.delete(key);
+      const agent = sessions.getAgent(sessionId);
+      if (agent && messages.every((m) => !agent.state.messages.includes(m)) && withdrawQueuedSteers(agent, new Set(messages))) {
+        logger.info("late_input_withdrawn", { sessionId, eventId: prior.id, unread: true });
+        continue;
+      }
+      const ref = prior.externalId ? ` (${escapeXml(prior.externalId)})` : "";
+      const note = lateInterjection("edit", `${senderLabel(prior.sender)} deleted a message${ref} they sent while you were answering. Leave it out.`);
+      const steered = sessions.steer(sessionId, note, {
+        eventId: prior.id,
+        externalId: prior.externalId,
+        senderId: prior.sender.id,
+        senderDisplayName: prior.sender.displayName,
+        kind: "edit",
+        body: "",
+      });
+      logger.info(steered ? "late_input_interjected" : "late_input_ignored", {
+        sessionId,
+        kind: "delete_part",
+        causeEventId: prior.id,
+        ...(steered ? {} : { reason: "not_steerable" }),
+        controller: false,
+      });
     }
   }
 
@@ -5907,6 +5980,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   function onSteeredInputDeleted(inbound: InboundChatEvent, prior: CanonicalChatEvent): void {
     if (!lateInputSettings.enabled) return;
     const byOther = inbound.edit?.deletedBy !== undefined && inbound.edit.deletedBy !== prior.sender.id;
+    onUncontrolledSteerDeleted(prior, byOther);
     for (const entry of [...lateInputEntries.values()]) {
       if (triggerGroupOf(entry.inbound).includes(prior.id)) continue;
       const isParked = (p: LateInputEntry["parked"][number]) => p.delivery.form !== "edit" && triggerGroupOf(p.delivery.inbound).includes(prior.id);

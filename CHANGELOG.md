@@ -58,7 +58,8 @@ Unreleased section; it is not part of any release's notes.
   is taken back while unread, otherwise followed by a short deletion note (or a
   redo without it, when it belonged to the request and nothing irreversible
   happened yet); a co-reply deleted before it reached the session never carries
-  its content.
+  its content. A proactive or bot-triggered session that a reply was steered into
+  gets the same note (it cannot be redone).
   A discarded rollout is kept as a branch with the message that caused it. The console
   session view labels redo, revival and aborted-turn branches with that message, shows
   how long a call was held, labels each interjection's kind, and marks redone sessions
