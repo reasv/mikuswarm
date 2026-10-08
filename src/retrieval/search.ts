@@ -4,7 +4,8 @@ import type { Logger } from "../observability/logger.js";
 import type { MemoryIndexer } from "./indexer.js";
 import type { ResolvedRetrievalConfig } from "./config.js";
 import type { EmbeddingProvider } from "./embedding/provider.js";
-import type { VectorStore } from "./vector-store.js";
+import type { VectorStore, VecHit } from "./vector-store.js";
+import { makeExcerpt } from "./excerpt.js";
 
 /** One ranked, source-cited retrieval result (ARCHITECTURE.md §9d / design §9). */
 export interface RetrievalResult {
@@ -17,10 +18,12 @@ export interface RetrievalResult {
   entryTs: number;
   /** Combined relevance in [0,1] (post-decay). */
   score: number;
-  /** Short human snippet (header line stripped, whitespace-collapsed). */
+  /** Match-centred, cleaned excerpt (§9d "Excerpts"). */
   snippet: string;
   /** Chunk content identity, for dedup across read-paths (§8c). */
   id: string;
+  /** sha256 of the chunk text (the filter / tag / vector key). */
+  contentHash: string;
 }
 
 export interface SearchOptions {
@@ -31,8 +34,10 @@ export interface SearchOptions {
   /** Inclusive `YYYY-MM-DD` lower/upper bounds on entry date. */
   after?: string;
   before?: string;
-  /** Snippet length cap in characters (tool ≈700; auto-retrieval ≈200). */
+  /** Excerpt length cap in characters (`recall_memory`, §9d "Excerpts"). */
   snippetMaxChars: number;
+  /** Restrict to these chunk rowids (a scoped search, e.g. `recall_memory` `user`). */
+  rowidScope?: number[];
   /** Override "now" for temporal decay (testing); defaults to Date.now(). */
   now?: number;
   /**
@@ -98,7 +103,53 @@ export interface SearchOutcome {
   contradictoryDateBounds: boolean;
 }
 
+/** Options of the candidate-level search behind recall (§9d "Wide recall"). */
+export interface ScoredSearchOptions {
+  query: string;
+  /** Candidates returned (pre-floor, best decayed score first). */
+  limit: number;
+  /** Pre-decay relevance floor. */
+  minScore: number;
+  now?: number;
+  signal?: AbortSignal;
+  agentName?: string | null;
+  /** Vector half only (the conversation-window query); empty when embeddings are down. */
+  semanticOnly?: boolean;
+  room?: string;
+  afterTs?: number;
+  beforeTs?: number;
+  rowidScope?: number[];
+}
+
+/** One scored candidate chunk (pre-excerpt). */
+export interface ScoredChunk extends LexicalHit {
+  vecScore: number;
+  bm25Score: number;
+  /** Pre-decay combined relevance (the floor tests this). */
+  relevance: number;
+  /** Relevance after temporal decay (ordering only). */
+  score: number;
+}
+
+/**
+ * The query-side vector seam: embeds a query and runs KNN on the index that
+ * matches the embedder. With a primary embedder (§9d "Two vector indexes") it
+ * picks the primary index when its embedder answers in time, else the
+ * built-in one; never mixes spaces within one query.
+ */
+export interface QueryVectorIndex {
+  query(
+    text: string,
+    k: number,
+    signal?: AbortSignal,
+  ): Promise<{ hits: VecHit[]; store: VectorStore; index: string; vector: Float32Array } | null>;
+  /** Stored vectors of the index last used for `query` (MMR). */
+  vectors(store: VectorStore, rowids: number[]): Map<number, Float32Array>;
+}
+
 export interface MemorySearchDeps {
+  /** Overrides the provider/vectorStore pair (the dual-index seam). */
+  vectorIndex?: QueryVectorIndex;
   provider?: EmbeddingProvider;
   vectorStore?: VectorStore;
   /** Optional structured logger for degraded-path warnings (e.g. lexical FTS failure, #9). */
@@ -126,8 +177,7 @@ interface Scored extends LexicalHit {
  * cross-space mismatch (§4/§5a).
  */
 export class MemorySearch {
-  private readonly provider?: EmbeddingProvider;
-  private readonly vectorStore?: VectorStore;
+  private readonly vectorIndex?: QueryVectorIndex;
   private readonly logger?: Logger;
   /**
    * All indexers managed by this search instance. In legacy mode there is exactly
@@ -145,16 +195,23 @@ export class MemorySearch {
     deps?: MemorySearchDeps,
   ) {
     this.indexers = Array.isArray(indexerOrIndexers) ? indexerOrIndexers : [indexerOrIndexers];
-    this.provider = deps?.provider;
-    this.vectorStore = deps?.vectorStore;
+    this.vectorIndex =
+      deps?.vectorIndex ??
+      (deps?.provider && deps.vectorStore ? singleVectorIndex(deps.provider, deps.vectorStore) : undefined);
     this.logger = deps?.logger;
   }
 
-  async search(opts: SearchOptions): Promise<SearchOutcome> {
-    // Normalize the sentinel so it's never accidentally used as a filter.
-    const agentName =
-      opts.agentName === "__legacy__" ? null : (opts.agentName ?? null);
+  /** True when a semantic half is wired (the index may still be empty). */
+  get hasSemantic(): boolean {
+    return this.vectorIndex !== undefined;
+  }
+
+  /** Refresh every indexer's corpus signature (cheap when clean). */
+  async ensureFresh(): Promise<void> {
     for (const idx of this.indexers) await idx.ensureFreshForQuery();
+  }
+
+  async search(opts: SearchOptions): Promise<SearchOutcome> {
     // Temporal-decay anchor. Callers that need determinism across context rebuilds
     // and replay (auto-retrieval, diary) pass `opts.now` = the trigger timestamp so
     // the cache-stable layers stay byte-identical (review issue #15). The
@@ -162,7 +219,6 @@ export class MemorySearch {
     // `Date.now()`: it is a live, one-shot agent action reasoning in the present, not
     // a cached context layer, so the determinism rationale does not apply — anchoring
     // its decay on "now" is the correct behavior.
-    const now = opts.now ?? Date.now();
     const q = this.config.query;
     const candidateLimit = Math.max(opts.maxResults, opts.maxResults * q.candidateMultiplier);
     // Resolve the optional date filters. A bound that's present but unparseable (bad
@@ -172,8 +228,6 @@ export class MemorySearch {
     // `before` day is fully inclusive down to 23:59:59.999 (review issue #12).
     const after = dateBoundTs(opts.after, "start");
     const before = dateBoundTs(opts.before, "end");
-    const afterTs = after.ts;
-    const beforeTs = before.ts;
     const invalidDateBounds: string[] = [];
     if (after.invalid) invalidDateBounds.push("after");
     if (before.invalid) invalidDateBounds.push("before");
@@ -182,25 +236,75 @@ export class MemorySearch {
     // Distinct from an unparseable bound (which lands in `ignoredDateBounds`); surfaced
     // separately so the caller can tell "empty window" from "no such memory" (#12).
     const contradictoryDateBounds =
-      afterTs !== undefined && beforeTs !== undefined && afterTs >= beforeTs;
+      after.ts !== undefined && before.ts !== undefined && after.ts >= before.ts;
 
-    // --- Lexical candidates (always) ---
+    const outcome = await this.searchScored({
+      query: opts.query,
+      limit: candidateLimit,
+      minScore: 0,
+      now: opts.now,
+      signal: opts.signal,
+      agentName: opts.agentName,
+      room: opts.room,
+      afterTs: after.ts,
+      beforeTs: before.ts,
+      rowidScope: opts.rowidScope,
+    });
+    // Floor on PRE-DECAY relevance, order by the decayed score (review issue #13).
+    const aboveThreshold = outcome.scored.filter((s) => s.relevance >= opts.minScore);
+    const ranked =
+      q.mmrEnabled && outcome.vectorStore
+        ? this.mmrRerank(aboveThreshold, q.mmrLambda, opts.maxResults, outcome.vectorStore)
+        : aboveThreshold.slice(0, opts.maxResults);
+
+    return {
+      results: await Promise.all(ranked.map((s) => this.toResult(s, opts.snippetMaxChars, [opts.query]))),
+      mode: outcome.mode,
+      degraded: outcome.degraded,
+      ignoredDateBounds: invalidDateBounds,
+      contradictoryDateBounds,
+    };
+  }
+
+  /**
+   * The candidate-level hybrid search (§9d): lexical BM25 and vector KNN merged
+   * into pre-decay relevance and decayed score, best score first, floored on
+   * relevance. Never throws for a degraded half.
+   */
+  async searchScored(opts: ScoredSearchOptions): Promise<{
+    scored: ScoredChunk[];
+    mode: "hybrid" | "lexical";
+    degraded: boolean;
+    vectorStore?: VectorStore;
+    /** Which vector index served the semantic half ("builtin" | "primary"). */
+    vectorIndex?: string;
+  }> {
+    // Normalize the sentinel so it's never accidentally used as a filter.
+    const agentName = opts.agentName === "__legacy__" ? null : (opts.agentName ?? null);
+    await this.ensureFresh();
+    const now = opts.now ?? Date.now();
+    const q = this.config.query;
+    const candidateLimit = Math.max(1, opts.limit);
+    const scope = opts.rowidScope ? new Set(opts.rowidScope) : undefined;
+
+    // --- Lexical candidates (always, unless semantic-only) ---
     // The lexical half is wrapped (mirroring the semantic half below) so a future
     // `buildFtsMatch`/FTS5 change that emits a rejectable MATCH degrades to empty
     // lexical results rather than throwing out of `search()` into context assembly,
     // which has no caller-side guard (review issue #9). `buildFtsMatch` strips FTS
     // specials and returns null on degenerate input, so this is defensive insurance.
-    const match = buildFtsMatch(opts.query);
+    const match = opts.semanticOnly ? null : buildFtsMatch(opts.query);
     let ftsHits: LexicalHit[] = [];
     if (match) {
       try {
         ftsHits = this.storage.searchMemoryLexical({
           match,
-          limit: candidateLimit,
+          limit: scope ? Math.max(candidateLimit, scope.size) : candidateLimit,
           room: opts.room,
-          afterTs,
-          beforeTs,
+          afterTs: opts.afterTs,
+          beforeTs: opts.beforeTs,
           agent: agentName ?? undefined,
+          rowids: opts.rowidScope,
         });
       } catch (error) {
         this.logger?.warn("memory_lexical_search_failed", {
@@ -215,6 +319,8 @@ export class MemorySearch {
     let vecMeta: LexicalHit[] = [];
     let semanticRan = false;
     let degraded = false;
+    let vectorStore: VectorStore | undefined;
+    let vectorIndexUsed: string | undefined;
     // The vec0 KNN can't cleanly carry the room/date predicate (it ranks purely by
     // vector distance), so the filter is applied post-hoc via `getChunksByRowids`.
     // With a narrow room/date filter the top-`candidateLimit` neighbours can all fall
@@ -222,32 +328,41 @@ export class MemorySearch {
     // relevant chunks sit deeper in the KNN ranking. To reduce that silent degradation,
     // over-fetch the KNN when a filter is active so enough in-range neighbours survive
     // the post-filter (review issue #2). No filter → no over-fetch (the plain top-K is
-    // already correct).
+    // already correct). A rowid scope is scored exactly (below), not through KNN.
     const filterActive =
-      opts.room !== undefined || afterTs !== undefined || beforeTs !== undefined;
+      opts.room !== undefined || opts.afterTs !== undefined || opts.beforeTs !== undefined;
     // Cap the over-fetched `k` so the resulting `getChunksByRowids` IN-list stays within
     // the bound the config maxima target (see src/config/schema.ts) — over-fetch is a
     // recall improvement, never a path to blow SQLite's bound-parameter limit.
     const knnK = filterActive
       ? Math.min(candidateLimit * FILTERED_KNN_OVERFETCH, MAX_KNN_CANDIDATES)
-      : candidateLimit;
-    if (this.provider && this.vectorStore) {
+      : Math.min(candidateLimit, MAX_KNN_CANDIDATES);
+    if (this.vectorIndex) {
       try {
-        const queryVec = await this.provider.embedQuery(opts.query, opts.signal);
-        const hits = this.vectorStore.knn(queryVec, knnK, "memory");
-        if (hits.length > 0) {
-          vecScoreByRow = new Map(
-            hits.map((h) => [h.chunkId, clamp01(1 - h.distance)]),
-          );
-          // Fetch metadata for vector hits, applying the same room/date filters.
-          vecMeta = this.storage.getChunksByRowids([...vecScoreByRow.keys()], {
-            room: opts.room,
-            afterTs,
-            beforeTs,
-            agent: agentName ?? undefined,
-          });
+        const found = await this.vectorIndex.query(opts.query, scope ? 1 : knnK, opts.signal);
+        if (found) {
+          vectorStore = found.store;
+          vectorIndexUsed = found.index;
+          if (scope) {
+            // Exact cosine against the scope's stored vectors (no KNN cut-off).
+            const vectors = this.vectorIndex.vectors(found.store, [...scope]);
+            for (const [rowid, v] of vectors) vecScoreByRow.set(rowid, clamp01(dot(found.vector, v)));
+          } else if (found.hits.length > 0) {
+            vecScoreByRow = new Map(found.hits.map((h) => [h.chunkId, clamp01(1 - h.distance)]));
+          }
+          if (vecScoreByRow.size > 0) {
+            // Fetch metadata for vector hits, applying the same room/date filters.
+            vecMeta = this.storage.getChunksByRowids([...vecScoreByRow.keys()], {
+              room: opts.room,
+              afterTs: opts.afterTs,
+              beforeTs: opts.beforeTs,
+              agent: agentName ?? undefined,
+            });
+          }
+          semanticRan = true;
+        } else {
+          degraded = true;
         }
-        semanticRan = true;
       } catch (error) {
         // Query-embed or KNN failed → lexical-only for this query (never cross spaces).
         // This also covers the bounded-embed-wait abort (§9d #7): when an
@@ -281,12 +396,14 @@ export class MemorySearch {
     // Parenthesized so a zero-sum (both weights 0) falls back to 1 rather than
     // `0 || 1` binding as `vectorWeight + (textWeight || 1)` (review issue #6). Config
     // resolution also rejects a zero-sum weight pair, so this is belt-and-suspenders.
+    // A semantic-only query weighs the vector half alone.
     const wSum = useVec ? (q.vectorWeight + q.textWeight) || 1 : 1;
-    const wv = useVec ? q.vectorWeight / wSum : 0;
-    const wt = useVec ? q.textWeight / wSum : 1;
+    const wv = opts.semanticOnly ? (useVec ? 1 : 0) : useVec ? q.vectorWeight / wSum : 0;
+    const wt = opts.semanticOnly ? 0 : useVec ? q.textWeight / wSum : 1;
 
-    const scored: Scored[] = [];
+    const scored: ScoredChunk[] = [];
     for (const rowid of candidateRows) {
+      if (scope && !scope.has(rowid)) continue;
       const meta = metaByRow.get(rowid)!;
       const vecScore = vecScoreByRow.get(rowid) ?? 0;
       const bm25Score = bm25ByRow.get(rowid) ?? 0;
@@ -296,36 +413,27 @@ export class MemorySearch {
       // *old* match survives the floor but ranks below a fresher equal-relevance one,
       // instead of decaying below the floor and vanishing (review issue #13).
       const relevance = wv * vecScore + wt * bm25Score;
+      if (relevance < opts.minScore) continue;
       const score = q.temporalDecayEnabled
         ? relevance * decayFactor(meta.entryTs, now, q.temporalDecayHalfLifeDays)
         : relevance;
       scored.push({ ...meta, vecScore, bm25Score, relevance, score });
     }
-
     scored.sort((a, b) => b.score - a.score);
-    // Floor on PRE-DECAY relevance, order by the decayed score (review issue #13).
-    const aboveThreshold = scored.filter((s) => s.relevance >= opts.minScore);
-
-    const ranked =
-      q.mmrEnabled && useVec
-        ? this.mmrRerank(aboveThreshold, q.mmrLambda, opts.maxResults)
-        : aboveThreshold.slice(0, opts.maxResults);
-
     return {
-      results: ranked.map((s) => this.toResult(s, opts.snippetMaxChars)),
+      scored: scored.slice(0, candidateLimit),
       mode: useVec ? "hybrid" : "lexical",
       degraded,
-      ignoredDateBounds: invalidDateBounds,
-      contradictoryDateBounds,
+      ...(useVec ? { vectorStore, vectorIndex: vectorIndexUsed } : {}),
     };
   }
 
   /** MMR diversity re-rank (§8a) using stored vectors; falls back to plain top-K. */
-  private mmrRerank(cands: Scored[], lambda: number, k: number): Scored[] {
-    if (cands.length <= 1 || !this.vectorStore) return cands.slice(0, k);
-    const vectors = this.vectorStore.getVectors(cands.map((c) => c.rowid));
+  private mmrRerank(cands: ScoredChunk[], lambda: number, k: number, store: VectorStore): ScoredChunk[] {
+    if (cands.length <= 1 || !this.vectorIndex) return cands.slice(0, k);
+    const vectors = this.vectorIndex.vectors(store, cands.map((c) => c.rowid));
     if (vectors.size === 0) return cands.slice(0, k);
-    const selected: Scored[] = [];
+    const selected: ScoredChunk[] = [];
     const pool = [...cands];
     while (selected.length < k && pool.length > 0) {
       let bestIdx = 0;
@@ -358,9 +466,10 @@ export class MemorySearch {
     return selected;
   }
 
-  private toResult(hit: Scored, snippetMaxChars: number): RetrievalResult {
+  private async toResult(hit: ScoredChunk, snippetMaxChars: number, queries: string[]): Promise<RetrievalResult> {
     return {
       id: hit.id,
+      contentHash: hit.contentHash,
       path: hit.path,
       startLine: hit.startLine,
       endLine: hit.endLine,
@@ -368,7 +477,7 @@ export class MemorySearch {
       date: agentDateStamp(hit.entryTs),
       entryTs: hit.entryTs,
       score: hit.score,
-      snippet: makeSnippet(hit.text, snippetMaxChars),
+      snippet: await makeExcerpt(hit.text, { queries, budget: { chars: snippetMaxChars } }),
     };
   }
 
@@ -387,10 +496,16 @@ export class MemorySearch {
    * controls are `minScore` and the prefix stem length (`prefixMinChars`).
    */
   async searchUserLane(opts: UserLaneOptions): Promise<RetrievalResult[]> {
+    const scored = await this.userLaneScored(opts);
+    return Promise.all(scored.map((s) => this.toResult(s, opts.snippetMaxChars, opts.names)));
+  }
+
+  /** The user lane's scored candidates (exact hits before prefix-only hits). */
+  async userLaneScored(opts: Omit<UserLaneOptions, "snippetMaxChars">): Promise<ScoredChunk[]> {
     if (opts.maxResults <= 0) return [];
     const agentName =
       opts.agentName === "__legacy__" ? null : (opts.agentName ?? null);
-    for (const idx of this.indexers) await idx.ensureFreshForQuery();
+    await this.ensureFresh();
     const now = opts.now ?? Date.now();
     const q = this.config.query;
     const tokens = userLaneTokens(opts.names);
@@ -421,7 +536,7 @@ export class MemorySearch {
 
     // Score a hit set with the same saturating-BM25 → temporal-decay transform the
     // hybrid path uses, but lexical-only (relevance == normalized bm25; vec half off).
-    const score = (hits: LexicalHit[]): Scored[] => {
+    const score = (hits: LexicalHit[]): ScoredChunk[] => {
       const rel = normalizeBm25(hits);
       return hits.map((h) => {
         const relevance = rel.get(h.rowid) ?? 0;
@@ -441,9 +556,7 @@ export class MemorySearch {
       .sort((a, b) => b.score - a.score);
 
     // Exact always before prefix (favor exact); prefix only fills remaining slots.
-    return [...exactScored, ...prefixScored]
-      .slice(0, opts.maxResults)
-      .map((s) => this.toResult(s, opts.snippetMaxChars));
+    return [...exactScored, ...prefixScored].slice(0, opts.maxResults);
   }
 
   /** FTS lookup for the user lane, degrading to empty (mirrors the topical guard, #9). */
@@ -457,6 +570,17 @@ export class MemorySearch {
       return [];
     }
   }
+}
+
+/** The single-index vector seam over one provider + store (no primary embedder). */
+export function singleVectorIndex(provider: EmbeddingProvider, store: VectorStore): QueryVectorIndex {
+  return {
+    async query(text, k, signal) {
+      const vector = await provider.embedQuery(text, signal);
+      return { hits: store.knn(vector, k, "memory"), store, index: "builtin", vector };
+    },
+    vectors: (s, rowids) => s.getVectors(rowids),
+  };
 }
 
 /**
@@ -642,11 +766,4 @@ function dateBoundTs(date: string | undefined, edge: "start" | "end"): DateBound
   const nextDay = agentDateStamp(noon + 86_400_000);
   const ts = parseZonedWallClock(`${nextDay} 00:00`, tz);
   return ts === null ? { ts: undefined, invalid: true } : { ts, invalid: false };
-}
-
-/** Strip a leading `## ` header line, collapse whitespace, truncate to N chars. */
-function makeSnippet(text: string, maxChars: number): string {
-  const body = text.replace(/^##[^\n]*\n?/, "").replace(/\s+/g, " ").trim();
-  if (body.length <= maxChars) return body;
-  return `${body.slice(0, maxChars).trimEnd()}…`;
 }

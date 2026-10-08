@@ -14,6 +14,11 @@ import {
   MODEL_BEHAVIOUR_TABLES_SCHEMA,
 } from "./model-behaviour-schema.js";
 import { SESSION_AUDITS_SCHEMA } from "./session-audits-schema.js";
+import {
+  MEMORY_RETRIEVAL_SCHEMA,
+  MEMORY_RETRIEVAL_TABLES_SCHEMA,
+  MEMORY_RETRIEVAL_TIMELINE_INDEX,
+} from "./memory-retrieval-schema.js";
 
 export interface ExaResearchOrigin {
   agent: string | null;
@@ -404,6 +409,11 @@ export interface LexicalHit {
   room: string | null;
   entryTs: number;
   text: string;
+  /** sha256 of `text`: the block identity shared by every retrieval table. */
+  contentHash: string;
+  tokenCount: number;
+  /** Owning agent (null in legacy mode). */
+  agent: string | null;
   /** Raw SQLite bm25() cost — lower (more negative) is a better match. */
   bm25: number;
 }
@@ -7304,10 +7314,18 @@ export class Storage {
     beforeTs?: number;
     /** In agents mode: restrict results to this agent's chunks. Null/absent = no filter (legacy). */
     agent?: string | null;
+    /** Restrict to these chunk rowids (a scoped search). */
+    rowids?: number[];
   }): LexicalHit[] {
     return this.read((db) => {
       const clauses: string[] = ["memory_chunks_fts match @match"];
       const params: Record<string, unknown> = { match: opts.match, limit: opts.limit };
+      if (opts.rowids !== undefined) {
+        // Integers only (they come from the index), interpolated to avoid the
+        // bound-parameter limit on large scopes.
+        const ids = opts.rowids.filter((r) => Number.isInteger(r));
+        clauses.push(ids.length > 0 ? `c.rowid in (${ids.join(",")})` : "0");
+      }
       if (opts.room !== undefined) {
         clauses.push("c.room = @room");
         params.room = opts.room;
@@ -7334,6 +7352,7 @@ export class Storage {
         .prepare(
           `select c.rowid as rowid, c.id as id, c.path as path, c.start_line as startLine,
                   c.end_line as endLine, c.room as room, c.entry_ts as entryTs, c.text as text,
+                  c.content_hash as contentHash, c.token_count as tokenCount, c.agent as agent,
                   bm25(memory_chunks_fts) as bm25
            from memory_chunks_fts
            join memory_chunks c on c.rowid = memory_chunks_fts.rowid
@@ -7387,7 +7406,8 @@ export class Storage {
       const rows = db
         .prepare(
           `select rowid, id, path, start_line as startLine, end_line as endLine, room,
-                  entry_ts as entryTs, text, 0 as bm25
+                  entry_ts as entryTs, text, content_hash as contentHash,
+                  token_count as tokenCount, agent, 0 as bm25
            from memory_chunks where ${clauses.join(" and ")}`,
         )
         .all(...params) as LexicalHit[];
@@ -12853,7 +12873,8 @@ create index if not exists idx_decision_evaluations_ts
 ${REFUSAL_HANDLING_SCHEMA}
 ${MODEL_BEHAVIOUR_SCHEMA}
 ${SESSION_AUDITS_SCHEMA}
-${EXA_RESEARCH_SCHEMA}`;
+${EXA_RESEARCH_SCHEMA}
+${MEMORY_RETRIEVAL_SCHEMA}`;
 
 // SCHEMA above defines the complete current shape with idempotent
 // `create … if not exists` DDL, so a fresh database is built directly at the
@@ -12861,7 +12882,7 @@ ${EXA_RESEARCH_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 33;
+export const LATEST_SCHEMA_VERSION = 34;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -13946,6 +13967,22 @@ function markSiblingWipedDeletions(db: Database.Database): void {
   ).run();
 }
 
+/**
+ * v33→v34 (ARCHITECTURE.md §9d "Judged retrieval", §9c "Memory filters"): the
+ * memory-retrieval tables (participant tags from provenance, judged-filter
+ * verdicts and hits, late-interaction token vectors, per-index failures, the
+ * per-build retrieval rows) and the sender display-name history index on
+ * `timeline_events`. Pure additions; every statement is idempotent. The
+ * participant-tag backfill is not a migration: the indexer tags every block
+ * that has no provenance row yet, so existing blocks are tagged once, in the
+ * background, after startup.
+ */
+function addMemoryRetrievalTables(db: Database.Database): void {
+  db.exec(MEMORY_RETRIEVAL_TABLES_SCHEMA);
+  const exists = (db.prepare(`select count(*) as n from sqlite_master where type = 'table' and name = 'timeline_events'`).get() as { n: number }).n > 0;
+  if (exists) db.exec(MEMORY_RETRIEVAL_TIMELINE_INDEX);
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -13987,6 +14024,8 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   markWipedDeletions,                   // v30→v31 deletion markers on wiped rows
   repairWipedDeletionMarkers,           // v31→v32 bot/webhook false markers out, own rows in
   markSiblingWipedDeletions,            // v32→v33 sibling agents' wiped messages marked
+  // ── Memory retrieval (judged retrieval, filters, late interaction) ────────────
+  addMemoryRetrievalTables,             // v33→v34 memory retrieval tables
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write

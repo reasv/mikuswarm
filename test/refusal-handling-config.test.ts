@@ -214,7 +214,9 @@ test("decisions: the checks point merges per agent and resolves like other point
 
 test("decisions: judged checks need [decisions].enabled AND [decisions.checks].enabled", () => {
   assert.equal(anyDecisionPointEnabled(cfg({ decisions: { model: "decider", checks: { enabled: true } } })), false);
-  assert.equal(anyDecisionPointEnabled(cfg({ decisions: { enabled: true, model: "decider" } })), false);
+  // The memory point is on by default whenever [decisions] is (ARCHITECTURE.md §9d).
+  assert.equal(anyDecisionPointEnabled(cfg({ decisions: { enabled: true, model: "decider", memory: { enabled: false } } })), false);
+  assert.equal(anyDecisionPointEnabled(cfg({ decisions: { enabled: true, model: "decider" } })), true);
 });
 
 test("decisions: checks point validation", () => {

@@ -40,7 +40,9 @@ import {
 import type { ModelTailAt } from "../agent/model-prompts.js";
 import { renderToolBlock, type ToolDefinitionLike, type ToolBlockSummary } from "./tool-block.js";
 import { buildRecentDiaryContent } from "./diary-layer.js";
-import { buildAutoRetrievalBlock, type AutoRetrievalDeps } from "./auto-retrieval.js";
+import { awaitPlan, type AutoRetrievalDeps } from "./auto-retrieval.js";
+import { buildPlanInput } from "../retrieval/auto/input.js";
+import type { RetrievalPlan } from "../retrieval/auto/types.js";
 import { agentDateStamp, formatAgentTimestamp } from "../time/index.js";
 import type { Logger } from "../observability/index.js";
 
@@ -98,6 +100,12 @@ export interface ImageBlock {
 export interface BuildContextOptions {
   /** Decision-model routing additions to the satellite (ARCHITECTURE.md §8h). */
   routedSatellite?: RoutedSatellite;
+  /**
+   * The session's auto-retrieval plan, started at launch in parallel with routing
+   * (ARCHITECTURE.md §9d "Judged retrieval"). Absent = the build runs the pipeline
+   * inline, unjudged. Rebuilds of one session reuse the same promise.
+   */
+  memoryRetrieval?: Promise<RetrievalPlan | null>;
   /**
    * Redo rebuild (ARCHITECTURE.md §8 "Late input"): render only timeline events
    * received at or before this instant (the first build's
@@ -354,6 +362,13 @@ export class ContextBuilder {
    * is unresolvable; auto-retrieval then runs without an agent filter.
    */
   resolveAgentName?: (timelineKey: string) => string | null | undefined;
+
+  /**
+   * Operator memory filters on the recency layer (ARCHITECTURE.md §9c "Memory
+   * filters"): returns the per-day-file filter for a build, which drops blocks
+   * hidden by the agent's filters. Injected by app wiring; absent = unfiltered.
+   */
+  filterDiaryFile?: (timelineKey: string, sessionId?: string) => (relPath: string, text: string) => Promise<string>;
 
   constructor(
     private readonly store: TimelineStore,
@@ -745,112 +760,57 @@ export class ContextBuilder {
     // chronologically. Any cross-midnight divergence from §10a's literal "latest
     // in-context message day" wording is cosmetic: recentMemoryWindow only surfaces
     // existing files ≤ the anchor and never shows empty days.
-    const diaryLayer = generation ? null : await this.buildDiaryLayerMessage(now, options.timelineKey);
+    const diaryLayer = generation ? null : await this.buildDiaryLayerMessage(now, options.timelineKey, options.selfSessionId);
 
-    // Auto-retrieval (§8c): a small, cited block of relevant-but-not-recent memory,
-    // riding INSIDE the final user turn (cache-safe) BEFORE the trigger messages, so
-    // the trigger stays last (most-attended). Deduped against the recency layer.
-    // Omitted from generation builds (cutoff and diary-range) — temporally wrong,
-    // a feedback risk.
+    // Auto-retrieval (§9d "Judged retrieval"): a cited block of memories relevant to
+    // this conversation, riding INSIDE the final user turn (cache-safe) BEFORE the
+    // trigger messages, so the trigger stays last (most-attended). Omitted from
+    // generation builds (cutoff and diary-range): temporally wrong, a feedback risk.
     //
-    // The retrieval QUERY is the plain message body the user typed — the bare
-    // `body` of each trigger event joined by newlines, NOT `triggerContent` (the
-    // rich `<message sender=… time=…>…` envelope with reply/attachment/link-preview
-    // XML). Per the operator's decision, reply/caption/attachment context is
-    // deliberately excluded from the query for now: the rich envelope's structural
-    // tokens (sender, timestamps, XML) only dilute the lexical/semantic match. This
-    // does NOT touch the context turn the model reads — `triggerContent` is still
-    // what goes into `finalUserContent` below.
-    const retrievalQuery = triggerEvents
-      .map((e) => e.body)
-      .filter(Boolean)
-      .join("\n");
-    // The user lane (§9d) keys on WHO is talking: the distinct username (or
-    // display name when username is absent) of the trigger senders, excluding
-    // the bot itself. Using `username ?? displayName` makes the key stable even
-    // when a guild nick changes (audit §3.4 finding 13).
-    //
-    // Alias expansion (§6.5 bullet 3): OR the current name with the most recent
-    // prior usernames from alias history so diary/history recall survives renames.
-    // Bound: current + up to 4 prior distinct usernames (5 names total per sender).
-    // Only applies to senders with a username (Discord); Matrix senders keyed on
-    // displayName get no alias expansion — there is no alias history for them.
-    const triggerUserSenders = triggerEvents
-      .filter((e) => !e.sender.isSelf)
-      .filter((e) => {
-        const name = (e.sender.username ?? e.sender.displayName)?.trim();
-        return name !== undefined && name.length > 0;
-      });
-    const triggerUserNames = new Set(
-      triggerUserSenders
-        .map((e) => (e.sender.username ?? e.sender.displayName)!.trim()),
-    );
-    // Expand with alias history for senders that have a username.
-    for (const e of triggerUserSenders) {
-      if (!e.sender.username) continue; // Matrix sender — no alias history
-      const aliases = this.storage.getUserIdentityAliases(e.provider, e.sender.id, 4);
-      for (const alias of aliases) {
-        triggerUserNames.add(alias);
-      }
-    }
-    const triggerUsers = Array.from(triggerUserNames);
-    // Bound the inline auto-retrieval query-embed wait (spec LLM-FAILURE-HANDLING
-    // §7.1 / §9d #7): the embed is transitively an inference wait riding inside an
-    // interactive build, so it gets the SAME interactive wall-clock budget as the
-    // inference request — measured from here, composed with the build's own drain
-    // signal. On expiry the search degrades to lexical-only (never blocks the
-    // build for minutes during an embed-model outage); the `.catch(…null)` below
-    // still omits the whole block on any rejection. The embed query is kept at
-    // BACKGROUND scheduler priority (set inside the remote provider) — auto-
-    // retrieval is a best-effort enrichment, not a live reply, so it should not
-    // outrank real interactive work just because its host build is interactive;
-    // only the WAIT is bounded, not the priority.
-    const waiterClass = options.priority ?? "interactive";
-    const interactiveBuild = waiterClass === "interactive" || waiterClass === "proactive";
-    const embedMaxWaitMs = this.config.recovery?.llm_request_max_wait_ms ?? 120_000;
-    let retrievalEmbedSignal: AbortSignal | undefined;
-    let retrievalEmbedTimer: ReturnType<typeof setTimeout> | undefined;
-    let retrievalEmbedAbort: (() => void) | undefined;
-    if (!generation && this.autoRetrieval && interactiveBuild) {
-      const ctrl = new AbortController();
-      retrievalEmbedSignal = ctrl.signal;
-      retrievalEmbedTimer = setTimeout(() => ctrl.abort(), embedMaxWaitMs);
-      // Shutdown drain also aborts the embed wait (no worker will ever finish it).
-      const onDrain = () => ctrl.abort();
-      if (options.abortSignal) {
-        if (options.abortSignal.aborted) ctrl.abort();
-        else options.abortSignal.addEventListener("abort", onDrain, { once: true });
-      }
-      retrievalEmbedAbort = () => {
-        if (retrievalEmbedTimer !== undefined) clearTimeout(retrievalEmbedTimer);
-        options.abortSignal?.removeEventListener("abort", onDrain);
-      };
-    } else if (!generation && this.autoRetrieval && options.abortSignal) {
-      // Non-interactive (hypothetical background) build: no wall-clock bound, but
-      // the drain signal still aborts the embed wait at shutdown.
-      retrievalEmbedSignal = options.abortSignal;
-    }
-    // Resolve the agent name for memory-retrieval scoping (spec §7.1): each agent's
-    // session reads only its own corpus. Returns null/undefined in legacy mode.
+    // A live session's plan was started at launch, in parallel with routing
+    // (`options.memoryRetrieval`): recall, the re-rank stages and the decision
+    // filter run while routing and this build proceed, and the build waits only
+    // here, bounded by the interactive wall-clock budget
+    // (`recovery.llm_request_max_wait_ms`). A build without a plan (a room preview)
+    // runs the pipeline inline, never judged (no decision call is billed), with the
+    // query-embed wait bounded the same way and aborted on shutdown drain.
     const retrievalAgentName = this.resolveAgentName?.(options.timelineKey) ?? null;
-    const retrievedMemory =
-      generation || !this.autoRetrieval
-        ? null
-        : await buildAutoRetrievalBlock(this.autoRetrieval, {
-            query: retrievalQuery,
-            triggerUsers,
-            recencyContent: diaryLayer?.content ?? null,
-            now,
-            signal: retrievalEmbedSignal,
-            agentName: retrievalAgentName,
-          })
-            .catch((error) => {
-              this.logger?.warn("auto_retrieval_failed", {
-                error: error instanceof Error ? error.message : String(error),
-              });
-              return null;
-            })
-            .finally(() => retrievalEmbedAbort?.());
+    let retrievedMemory: string | null = null;
+    if (!generation && this.autoRetrieval) {
+      const maxWaitMs = this.config.recovery?.llm_request_max_wait_ms ?? 120_000;
+      const onError = (error: unknown) =>
+        this.logger?.warn("auto_retrieval_failed", { error: error instanceof Error ? error.message : String(error) });
+      if (options.memoryRetrieval) {
+        retrievedMemory = (await awaitPlan(options.memoryRetrieval, maxWaitMs, onError))?.block ?? null;
+      } else {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), maxWaitMs);
+        const onDrain = () => ctrl.abort();
+        if (options.abortSignal?.aborted) ctrl.abort();
+        else options.abortSignal?.addEventListener("abort", onDrain, { once: true });
+        const triggerIdSet = new Set(triggerEvents.map((e) => e.id));
+        const input = buildPlanInput({
+          agentName: retrievalAgentName,
+          timelineKey: options.timelineKey,
+          attribution: { timelineKey: options.timelineKey, agentSessionId: null },
+          proactive,
+          now,
+          triggerEvents,
+          recent: compactionInput.filter((e) => !triggerIdSet.has(e.id)),
+          signal: ctrl.signal,
+        });
+        retrievedMemory = await awaitPlan(
+          this.autoRetrieval.pipeline.plan({ ...input, judge: false }),
+          maxWaitMs,
+          onError,
+        )
+          .then((plan) => plan?.block ?? null)
+          .finally(() => {
+            clearTimeout(timer);
+            options.abortSignal?.removeEventListener("abort", onDrain);
+          });
+      }
+    }
 
     const systemBlock = `${SATELLITE_OPEN}${satellite}\n</system>`;
     // For a proactive build there are no trigger events; the immediate "decide now"
@@ -1191,7 +1151,7 @@ export class ContextBuilder {
    * nothing is surfaceable. Bounded by `diary.recency_max_tokens` and front-trimmed
    * by whole blocks; shared sparsity handling lives in `recentMemoryWindow` (§9a).
    */
-  private async buildDiaryLayerMessage(now: number, timelineKey?: string): Promise<ContextMessage | null> {
+  private async buildDiaryLayerMessage(now: number, timelineKey?: string, sessionId?: string): Promise<ContextMessage | null> {
     const diaryCfg = this.config.diary ?? {};
     const workspaceRoot =
       (timelineKey && this.resolveWorkspaceRoot?.(timelineKey)) ??
@@ -1202,6 +1162,7 @@ export class ContextBuilder {
       anchorDay: agentDateStamp(now),
       ceilingTokens: diaryCfg.recency_max_tokens ?? 6000,
       fileCount: diaryCfg.recency_file_count ?? 2,
+      ...(timelineKey && this.filterDiaryFile ? { filterFile: this.filterDiaryFile(timelineKey, sessionId) } : {}),
     }).catch((error) => {
       this.logger?.warn("diary_layer_build_failed", {
         error: error instanceof Error ? error.message : String(error),

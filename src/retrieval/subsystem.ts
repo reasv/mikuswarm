@@ -13,6 +13,17 @@ import { VectorStore } from "./vector-store.js";
 import { createEmbeddingProvider, type EmbeddingProvider } from "./embedding/index.js";
 import type { ResolvedRetrievalConfig } from "./config.js";
 import { makeChainClaimGate, type BudgetHooks } from "../budget/index.js";
+import { MemoryRetrievalStore } from "../storage/memory-retrieval-store.js";
+import { ParticipantTagger } from "./participants.js";
+import { PrimaryIndex, PRIMARY_INDEX_SLUG, dualVectorIndex } from "./embedding/primary.js";
+import { RemoteEmbeddingProvider } from "./embedding/remote.js";
+import { createLateChains, createRerankChain } from "./models/factory.js";
+import type { ProviderChain } from "./models/chain.js";
+import type { RerankProvider } from "./models/types.js";
+import { LateIndexWorker } from "./late/indexer.js";
+import { LateStage } from "./late/stage.js";
+import { ExactMaxSimScorer } from "./late/maxsim.js";
+import type { MaxSimScorer } from "./late/scorer.js";
 
 /**
  * The assembled memory-retrieval subsystem (ARCHITECTURE.md §9d): the reconciliation
@@ -26,6 +37,12 @@ import { makeChainClaimGate, type BudgetHooks } from "../budget/index.js";
  */
 export interface RetrievalSubsystem {
   search: MemorySearch;
+  /** The judged-retrieval tables (participants, filters, late vectors, retrieval rows). */
+  store: MemoryRetrievalStore;
+  /** Cross-encoder chain, when `[retrieval.rerank]` is enabled. */
+  rerank?: ProviderChain<RerankProvider>;
+  /** Late-interaction query stage, when `[retrieval.late]` is enabled and its scorer loaded. */
+  late?: LateStage;
   /**
    * Return the `MemoryIndexer` that owns the given agent's workspace, or `undefined`
    * if the name isn't known. Pass `null` for the legacy / single-agent indexer.
@@ -64,6 +81,14 @@ export interface CreateSubsystemOptions {
   embeddingChain?: ModelChainEntry[];
   /** Budget availability by logical id (spec MODEL-FALLBACK §3/§7) for the remote chain. */
   isModelAvailable?: (logicalId: string) => boolean;
+  /** The agent owning a timeline (participant tags; agents mode). */
+  agentForTimeline?: (timelineKey: string) => string | null | undefined;
+  /** The diary's room label of a timeline (participant-tag disambiguation). */
+  roomLabelFor?: (timelineKey: string) => Promise<string | undefined> | string | undefined;
+  /** Paths the recency layer shows for an agent (late interaction window and lag). */
+  recencyPaths?: (agent: string | null) => Promise<Set<string>>;
+  /** Budget availability by logical id for the primary embedder chain. */
+  primaryEmbeddingChain?: ModelChainEntry[];
   /**
    * Embedder-matched tokenizer for chunking (spec/TOKENIZER-SWAP.md §5.3). Defaults
    * to the registry's retrieval tokenizer (`[tokenizer].retrieval`, default
@@ -110,6 +135,29 @@ export async function createRetrievalSubsystem(
       ? opts.agentWorkspaces.map((w) => ({ agentName: w.agentName, workspaceRoot: w.workspaceRoot }))
       : [{ agentName: null, workspaceRoot }];
 
+  const store = new MemoryRetrievalStore(storage);
+  let primary: PrimaryIndex | undefined;
+  let lateWorker: LateIndexWorker | undefined;
+  // Participant tags from provenance (§9d): tags every block without a
+  // provenance row, so the first pass after an upgrade is the one-off backfill.
+  const tagger = new ParticipantTagger({
+    store,
+    agentForTimeline: opts.agentForTimeline,
+    roomLabelFor: opts.roomLabelFor,
+    logger,
+  });
+  let tagTimer: ReturnType<typeof setTimeout> | undefined;
+  const scheduleTagging = (): void => {
+    if (tagTimer) return;
+    tagTimer = setTimeout(() => {
+      tagTimer = undefined;
+      void tagger.run().catch((error) =>
+        logger?.warn("memory_participants_tag_failed", { error: error instanceof Error ? error.message : String(error) }),
+      );
+    }, 2000);
+    tagTimer.unref?.();
+  };
+
   const indexers = agentWorkspaceEntries.map(
     (entry) =>
       new MemoryIndexer({
@@ -120,9 +168,17 @@ export async function createRetrievalSubsystem(
         logger,
         agentName: entry.agentName,
         pruneVectors: (rowids) => {
-          for (const r of rowids) void vectorStore?.remove(r);
+          for (const r of rowids) {
+            void vectorStore?.remove(r);
+            primary?.remove(r);
+          }
         },
-        onChunksInserted: () => embedWorker?.notifyNewWork(),
+        onChunksInserted: () => {
+          embedWorker?.notifyNewWork();
+          primary?.notifyNewWork();
+          lateWorker?.notifyNewWork();
+          scheduleTagging();
+        },
         // Lexical-only when no provider came up: stamp new chunks 'skip' so the embed
         // queue doesn't grow unbounded (#2). Read live (closure over `provider`) so a
         // provider that comes up below flips this without re-wiring the indexer.
@@ -257,10 +313,117 @@ export async function createRetrievalSubsystem(
     if (skipped > 0) logger?.info("embed_skip_lexical_only", { skipped });
   }
 
-  const search = new MemorySearch(storage, indexers, config, { provider, vectorStore, logger });
+  // Optional primary embedder with its own index (§9d "Two vector indexes").
+  if (config.embedding.primary && opts.primaryEmbeddingChain && opts.primaryEmbeddingChain.length > 0) {
+    try {
+      const primaryProvider = new RemoteEmbeddingProvider({
+        chain: opts.primaryEmbeddingChain,
+        dim: config.embedding.primary.dim,
+        batchSize: config.index.embedBatchSize,
+        httpProxyUrl: opts.httpProxyUrl,
+        scheduler: opts.scheduler,
+        isModelAvailable: opts.isModelAvailable,
+        charsPerToken: config.embedding.primary.charsPerToken,
+        onUsage: (info) =>
+          opts.budget?.record?.({
+            class: "embedding",
+            modelId: info.modelId,
+            logicalModelId: info.logicalModelId,
+            inputTokens: info.promptTokens,
+            costUsd: info.costUsd,
+          }),
+        logger,
+      });
+      const primaryStore = new VectorStore(storage, logger, PRIMARY_INDEX_SLUG);
+      const index = new PrimaryIndex({
+        storage,
+        store,
+        provider: primaryProvider,
+        vectorStore: primaryStore,
+        timeoutMs: config.embedding.primary.timeoutMs,
+        batchSize: config.index.embedBatchSize,
+        shouldPause: makeChainClaimGate({
+          engine: () => opts.budget?.engine,
+          descriptors: () => opts.primaryEmbeddingChain!.map((m) => ({ class: "embedding", modelId: m.logicalId })),
+        }),
+        logger,
+      });
+      await index.init();
+      primary = index;
+      logger?.info("retrieval_primary_embedder_ready", { model: primaryProvider.modelId, dim: primaryProvider.dim });
+    } catch (error) {
+      logger?.warn("retrieval_primary_embedder_unavailable", { error: error instanceof Error ? error.message : String(error) });
+      primary = undefined;
+    }
+  }
+
+  const search = new MemorySearch(storage, indexers, config, {
+    vectorIndex: dualVectorIndex(provider && vectorStore ? { provider, store: vectorStore } : undefined, primary, logger),
+    logger,
+  });
+
+  // Cross-encoder chain (§9d "Re-rank stages").
+  const providerOpts = { dataDir: opts.dataDir, httpProxyUrl: opts.httpProxyUrl, logger };
+  const rerank = createRerankChain(config.rerank, providerOpts);
+
+  // Late interaction (§9d "Late interaction"): background indexing + query stage.
+  let late: LateStage | undefined;
+  const lateChains = createLateChains(config.late, providerOpts);
+  const recencyPaths = opts.recencyPaths ?? (async () => new Set<string>());
+  if (lateChains) {
+    try {
+      const exact = await ExactMaxSimScorer.create({ logger });
+      let scan: MaxSimScorer = exact;
+      if (config.late.quantization === "turboquant") {
+        try {
+          // Optional native backend: resolved at runtime so a build without it still loads.
+          const turboquantModule = "./late/turboquant.js";
+          const mod = (await import(turboquantModule)) as {
+            createTurboQuantScorer: (o: { bits: 2 | 3 | 4; logger?: Logger }) => Promise<MaxSimScorer>;
+          };
+          scan = await mod.createTurboQuantScorer({ bits: config.late.bits, logger });
+        } catch (error) {
+          logger?.warn("late_turboquant_unavailable", {
+            error: error instanceof Error ? error.message : String(error),
+            note: "falling back to the exact fp32 scan",
+          });
+        }
+      }
+      const worker = new LateIndexWorker({
+        store,
+        config: config.late,
+        chain: lateChains.documents,
+        recencyPaths,
+        logger,
+        onIndexed: () => {
+          for (const idx of indexers) void late?.refreshWindow(idx.agentName);
+        },
+      });
+      lateWorker = worker;
+      late = new LateStage({
+        config: config.late,
+        store,
+        queryChain: lateChains.queries,
+        exact,
+        scan,
+        recencyPaths,
+        indexVersion: () => worker.version,
+        logger,
+      });
+      lateChains.queries.warmAll();
+    } catch (error) {
+      logger?.warn("late_interaction_unavailable", { error: error instanceof Error ? error.message : String(error) });
+      lateWorker = undefined;
+      late = undefined;
+    }
+  }
+  rerank?.warmAll();
 
   return {
     search,
+    store,
+    ...(rerank ? { rerank } : {}),
+    ...(late ? { late } : {}),
     indexerForAgent: (agentName) => {
       // Normalize the legacy sentinel so map lookup works.
       const key = agentName === "__legacy__" ? null : agentName;
@@ -314,14 +477,27 @@ export async function createRetrievalSubsystem(
           }
         }
         embedWorker?.notifyNewWork();
+        primary?.notifyNewWork();
+        lateWorker?.notifyNewWork();
+        await tagger.run();
+        for (const idx of indexers) void late?.refreshWindow(idx.agentName);
       })().catch((error) =>
         logger?.warn("memory_index_sweep_failed", {
           error: error instanceof Error ? error.message : String(error),
         }),
       );
       await embedWorker?.start();
+      primary?.start();
+      await lateWorker?.start();
     },
     stop: async () => {
+      if (tagTimer) clearTimeout(tagTimer);
+      await lateWorker?.stop();
+      await late?.close();
+      await lateChains?.documents.close();
+      await lateChains?.queries.close();
+      await rerank?.close();
+      await primary?.stop();
       await embedWorker?.stop();
       await provider?.close().catch(() => {});
     },

@@ -15,6 +15,8 @@ export async function buildRecentDiaryContent(opts: {
   anchorDay: string;
   ceilingTokens: number;
   fileCount: number;
+  /** Hidden-block removal per day file (ARCHITECTURE.md §9c "Memory filters"). */
+  filterFile?: (relPath: string, text: string) => Promise<string>;
 }): Promise<string | null> {
   const window = await recentMemoryWindow(opts);
   if (window.trim().length === 0) return null;

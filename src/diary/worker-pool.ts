@@ -48,6 +48,12 @@ export interface DiaryWorkerPoolOptions {
    */
   resolveJobDeps?: (timelineKey: string) => { workspaceRoot: string; memoryWriter: MemoryFileWriter } | undefined;
   /**
+   * Operator memory filters on the writer's continuity window (ARCHITECTURE.md
+   * §9c "Memory filters"): the per-day-file filter for a job's timeline, which
+   * drops hidden blocks so the writer never continues an unwanted entry.
+   */
+  filterContinuityFile?: (timelineKey: string) => ((relPath: string, text: string) => Promise<string>) | undefined;
+  /**
    * Resolve a human channel label for a timeline (Matrix: `Room (Space)`). May
    * throw; the worker retries a few times and falls back to the room id parsed
    * from the timeline key, so the header (mandatory) never blocks a diary job.
@@ -402,6 +408,7 @@ export class DiaryWorkerPool {
       anchorDay: targetDate,
       ceilingTokens: config.recency_max_tokens ?? DEFAULT_RECENCY_MAX_TOKENS,
       fileCount: config.recency_file_count ?? DEFAULT_RECENCY_FILE_COUNT,
+      filterFile: this.options.filterContinuityFile?.(job.timelineKey),
     });
 
     const perSessionBudget = config.per_session_budget_tokens ?? DEFAULT_PER_SESSION_BUDGET;

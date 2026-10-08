@@ -31,6 +31,12 @@ export async function recentMemoryWindow(opts: {
   anchorDay: string;
   ceilingTokens: number;
   fileCount: number;
+  /**
+   * Operator memory filters (ARCHITECTURE.md §9c "Memory filters"): returns a
+   * day file's text with its hidden blocks removed. Applied per file, before the
+   * files are joined and trimmed, so block boundaries match the index.
+   */
+  filterFile?: (relPath: string, text: string) => Promise<string>;
 }): Promise<string> {
   const { workspaceRoot, anchorDay, ceilingTokens, fileCount } = opts;
   const memoryDir = path.join(workspaceRoot, "memory");
@@ -57,7 +63,8 @@ export async function recentMemoryWindow(opts: {
   const contents: string[] = [];
   for (const date of selected) {
     try {
-      contents.push(await readFile(path.join(memoryDir, `${date}.md`), "utf8"));
+      const raw = await readFile(path.join(memoryDir, `${date}.md`), "utf8");
+      contents.push(opts.filterFile ? await opts.filterFile(`memory/${date}.md`, raw) : raw);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; // raced deletion
       throw error;
@@ -161,4 +168,27 @@ function splitIntoHeaderBlocks(text: string): string[] {
     blocks.push(text.slice(begin, end));
   }
   return blocks;
+}
+
+/**
+ * The day files the recency layer reads (the newest `fileCount` existing
+ * `memory/YYYY-MM-DD.md` at or before `anchorDay`), as workspace-relative paths.
+ * Blocks of these files are shown in full by the layer, so retrieval stages
+ * treat them as already present (ARCHITECTURE.md §9d "Late interaction").
+ */
+export async function recentDayFiles(workspaceRoot: string, anchorDay: string, fileCount: number): Promise<string[]> {
+  let entries: string[];
+  try {
+    entries = await readdir(path.join(workspaceRoot, "memory"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+  return entries
+    .map((name) => DAY_FILE_RE.exec(name)?.[1])
+    .filter((d): d is string => d != null && d <= anchorDay)
+    .sort()
+    .reverse()
+    .slice(0, Math.max(0, fileCount))
+    .map((d) => `memory/${d}.md`);
 }

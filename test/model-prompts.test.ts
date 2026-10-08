@@ -24,7 +24,8 @@ import type { WorkspaceContent } from "../src/workspace/types.js";
 import { Storage } from "../src/storage/index.js";
 import { TimelineStore } from "../src/timeline/index.js";
 import { ContextBuilder } from "../src/context/builder.js";
-import { resolveRetrievalConfig, type MemorySearch } from "../src/retrieval/index.js";
+import { resolveRetrievalConfig } from "../src/retrieval/index.js";
+import type { MemoryRetrievalPipeline } from "../src/retrieval/auto/pipeline.js";
 import { configureAgentTimezone, resetAgentTimezone } from "../src/time/index.js";
 
 // --- resolution ladder --------------------------------------------------------
@@ -474,16 +475,13 @@ const builderConfig = () =>
     workspace: { root_dir: "/tmp" },
     matrix: { enabled: false, trigger_hold_ms: 0, accounts: {} },
   }) as unknown as AppConfig;
-const memorySearch = {
-  search: async () => ({
-    results: [{ id: "id", path: "memory/x.md", startLine: 1, endLine: 2, room: "R", date: "2026-01-01", entryTs: 1, score: 0.9, snippet: "An older decision." }],
-    mode: "hybrid",
-    degraded: false,
-    ignoredDateBounds: [],
-    contradictoryDateBounds: false,
+// A pipeline stub: the builder only needs a plan with a block (ARCHITECTURE.md §9d).
+const memoryPipeline = {
+  plan: async () => ({
+    block: '<retrieved_memory note="n">\n- [memory/x.md:1-2 · R] An older decision.\n</retrieved_memory>',
+    report: { source: "unjudged", candidates: 1, judged: 0, kept: 1, hidden: 0, tokens: 10, ms: 1, stages: { recallMs: 1 }, items: [] },
   }),
-  searchUserLane: async () => [],
-} as unknown as MemorySearch;
+} as unknown as MemoryRetrievalPipeline;
 const EXPECT = "TAIL-MD\n</tail_instructions>\n\n<X/>\n\n<session_instruction>\nSI\n</session_instruction>\n</system>";
 
 test("builder: fresh build records the slot after TAIL.md, past the retrieved_memory block", async () => {
@@ -491,7 +489,7 @@ test("builder: fresh build records the slot after TAIL.md, past the retrieved_me
   const storage = await Storage.open({ databasePath: ":memory:" });
   const timeline = new TimelineStore(storage);
   const builder = new ContextBuilder(timeline, builderConfig(), storage, undefined, {
-    search: memorySearch,
+    pipeline: memoryPipeline,
     config: resolveRetrievalConfig({ enabled: true }),
   });
   try {
