@@ -360,3 +360,38 @@ test("late input races: the hold waits for a late-addition verdict at most max_h
     await h.stop();
   }
 });
+
+test("late input races: a cancel undoes the session's reaction before discarding it", async () => {
+  const reactions: string[] = [];
+  let n = 0;
+  const h = await startHarness({
+    toml: LATE({ hold_ms: 0 }),
+    channelClient: {
+      react: async (id: string, emoji: string) => {
+        reactions.push(`+${id}:${emoji}`);
+        return { display: emoji };
+      },
+      unreact: async (id: string, emoji: string) => {
+        reactions.push(`-${id}:${emoji}`);
+        return { removed: 1 };
+      },
+    },
+    script: (req) => {
+      if (isRecordTurnRequest(req)) return { text: "NO_REPLY" };
+      n += 1;
+      if (n === 1) return { toolCalls: [{ name: "react", args: { message_id: "$user1", emoji: "👀" } }] };
+      return { ...send("never"), delayMs: 800 };
+    },
+  });
+  try {
+    const id = h.say("hi bot", { mention: true });
+    await h.until(() => reactions.length >= 1 && h.llm.requests.length >= 2, "reacted, then the next request");
+    h.remove(id);
+    await h.until(settledAll(h), "settled");
+    assert.equal(h.sends.length, 0);
+    assert.equal(sessionRows(h)[0]!.status, "discarded");
+    assert.deepEqual(reactions, ["+$user1:👀", "-$user1:👀"], "the reaction was removed");
+  } finally {
+    await h.stop();
+  }
+});

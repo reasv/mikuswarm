@@ -13,6 +13,7 @@ import { loadConfig } from "../../src/config/index.js";
 import { startMikuAgent } from "../../src/app.js";
 import type {
   AttachmentMeta,
+  ChannelClient,
   ChatProviderHost,
   DeliveryReceipt,
   IChatProvider,
@@ -134,6 +135,8 @@ export async function startHarness(opts: {
    * messages that arrived meanwhile. Unset: one delivery per message.
    */
   triggerHoldMs?: number;
+  /** A channel client for the room tools (opt-in; reactions are enabled with it). */
+  channelClient?: Partial<ChannelClient>;
 }): Promise<AppHarness> {
   const llm = await startFakeLlm(opts.script, opts.decideNoul);
   const root = await mkdtemp(path.join(os.tmpdir(), "miku-app-harness-"));
@@ -156,7 +159,7 @@ export async function startHarness(opts: {
   let sendSeq = 0;
   const provider: IChatProvider = {
     id: "matrix",
-    capabilities: FAKE_CAPABILITIES,
+    capabilities: opts.channelClient ? { ...FAKE_CAPABILITIES, reactions: true, reactionKinds: ["unicode"] } : FAKE_CAPABILITIES,
     async start(h: ChatProviderHost) {
       host = h;
     },
@@ -175,7 +178,7 @@ export async function startHarness(opts: {
     getSelf: () => ({ id: BOT_ID, displayName: "Bot" }),
     ownsUserId: (id: string) => id === BOT_ID,
     enrichment: () => undefined,
-    channelClient: () => undefined,
+    channelClient: () => opts.channelClient as ChannelClient | undefined,
   } as unknown as IChatProvider;
 
   // Capture the structured logs (the logger writes one JSON line per console call)
