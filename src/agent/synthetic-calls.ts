@@ -10,7 +10,8 @@ import type { DynamicToolRegistry } from "./dynamic-tools.js";
  * Carried on every assistant and toolResult message the harness synthesises,
  * and on the harness's own user turns (record turn, forced-completion nudges).
  * pi-agent-core ignores unknown top-level fields; the marker persists through
- * transcript serialisation and is available to the console and W6.
+ * transcript serialisation and is available to the console and W6. A message
+ * carrying it is never the model's work (`src/agent/harness.ts`).
  */
 export type HarnessMarker =
   | { kind: "injection"; decisionGroup?: string } // synthetic call/result at session start

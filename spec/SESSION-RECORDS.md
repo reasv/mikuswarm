@@ -1,6 +1,7 @@
 # Session records — carrying a session's work into later sessions
 
 **Status**: IMPLEMENTED — superseded by ARCHITECTURE.md §8i (with §8 "Resumable sessions" / "Follow-up folding", §8h "Routing" / "Decision visibility" / "Records", §10, §11); retained for review. Implementation decisions that refine this design (waiting policy, failure granularity, the record-load call, the prompt text) are recorded there. Originally a PROPOSAL of 2026-10-05, from the owner design discussion of 2026-10-04/05.
+**Owner rule (2026-10-08)**: nothing injected ever counts as work. The harness's injected `read_session_record` pairs (and every other harness-made call: routing's skill preloads, synthetic `tool_search` loads) never pass the work gate of §3.1; only the model's own calls do. A session given a record that did no work of its own therefore writes none (this narrows §3.3: B carries A forward only when B did work). See ARCHITECTURE.md §8 "The work gate".
 **Supersedes**: the continuation point of `spec/DECISION-MODEL.md` §5.2 as shipped (ARCHITECTURE.md §8h "Continuation", deployed off). It is removed when this lands.
 **Replaces as default**: reply-to-continue (`spec/RESUMABLE-SESSIONS.md`). The resume code stays but ships off by default.
 **Changes**: decision-model routing's skill preload (ARCHITECTURE.md §8h "Routing") moves from a satellite render to the injection mechanism of §4.

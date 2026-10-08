@@ -3,6 +3,7 @@ import { Type } from "@earendil-works/pi-ai";
 import type { Storage } from "../storage/index.js";
 import type { ChannelVisibilityResolver } from "../visibility/index.js";
 import { estimateTokens, truncateToTokens } from "../context/tokens.js";
+import { harnessKindOf, isHarnessMade } from "../agent/harness.js";
 
 /**
  * Context injected by the session assembly (W6 wires the real values;
@@ -205,7 +206,7 @@ function collectEntries(messages: unknown[]): { entries: TranscriptEntry[]; tota
   for (const msg of messages) {
     const m = msg as { role?: string; content?: unknown; harness?: unknown };
     if (m?.role === "user") {
-      inRecordTurn = (m.harness as { kind?: unknown } | undefined)?.kind === "record_turn";
+      inRecordTurn = harnessKindOf(m) === "record_turn";
       continue;
     }
     if (inRecordTurn) continue;
@@ -218,7 +219,7 @@ function collectEntries(messages: unknown[]): { entries: TranscriptEntry[]; tota
       const result = call.id ? results.get(call.id) : undefined;
       entries.push({
         turn,
-        isHarness: typeof m.harness === "object" && m.harness !== null,
+        isHarness: isHarnessMade(m),
         name: call.name ?? "(unknown)",
         argsJson: call.arguments !== undefined ? JSON.stringify(withoutPrefillAnalysis(call.arguments)) : "",
         resultText: result?.text,

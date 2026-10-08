@@ -91,8 +91,9 @@ async function settled(h: AppHarness, count: number): Promise<SessionRow[]> {
     const rows = sessions(h);
     if (rows.length < count || rows.some((r) => r.status === "running" || r.status === "created")) return false;
     return rows.every((r) => {
+      // The model's own calls only: an injected (harness-made) read is not work.
       const worked = transcript(r).some(
-        (m) => m.role === "assistant" && Array.isArray(m.content) && m.content.some((b: any) => b.name === "search_memory" || b.name === "read_session_record"),
+        (m) => m.role === "assistant" && !m.harness && Array.isArray(m.content) && m.content.some((b: any) => b.name === "search_memory" || b.name === "read_session_record"),
       );
       return !worked || recordOutcomeLogged(h, r.id);
     });
@@ -374,6 +375,25 @@ test("app: a reply to a bot message injects that session's record (kickoff regre
     assert.equal(pair[1]!.isError, false);
     // B builds on A.
     assert.deepEqual(JSON.parse(records(h).find((r) => r.session_id === b.id)!.builds_on), [a!.id]);
+  } finally {
+    await h.stop();
+  }
+});
+
+test("app: a pure-chat reply given an injected record runs no record turn (injections are not work)", async () => {
+  let n = 0;
+  const h = await startHarness({ script: chatScript({ recordTurn: () => finalize(`record #${++n}`) }) });
+  try {
+    h.say("[work] look something up", { mention: true });
+    await settled(h, 1);
+    // A pure-chat reply: the harness injects A's record, the model only sends.
+    h.say("thanks!", { mention: true, replyTo: h.sends.at(-1)!.externalId });
+    const rows = await settled(h, 2);
+    await h.until(() => h.query("select 1 from session_record_generation where session_id=?", rows[1]!.id).length === 1, "B outcome");
+    assert.ok(injectedCall(firstRequestFor(h, "thanks!")), "A's record was injected into B");
+    assert.equal(h.llm.requests.filter(isRecordTurnRequest).length, 1, "only A ran a record turn");
+    assert.deepEqual(h.query("select status,reason from session_record_generation where session_id=?", rows[1]!.id), [{ status: "skipped", reason: "no_work" }]);
+    assert.equal(records(h).length, 1);
   } finally {
     await h.stop();
   }

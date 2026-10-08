@@ -22,6 +22,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { estimateTokens } from "../context/tokens.js";
 import { clipText, packNewest } from "../decisions/state.js";
 import { matchForcedCompletionPrompt } from "../agent/contract.js";
+import { harnessKindOf, isHarnessMade } from "../agent/harness.js";
 import type { CheckSource, Checkpoint } from "./types.js";
 
 /** One chat message in check state. */
@@ -144,8 +145,7 @@ function userText(message: unknown): string {
 /** A forced-completion corrective turn (tagged by the runner, or by its known wording). */
 export function isNudgeMessage(message: unknown): boolean {
   if (roleOf(message) !== "user") return false;
-  const harness = (message as { harness?: { kind?: unknown } }).harness;
-  if (harness?.kind === "forced_completion") return true;
+  if (harnessKindOf(message) === "forced_completion") return true;
   const text = userText(message).trimStart();
   // Every wording the runner ever sent (FORCED_COMPLETION_PROMPTS, history included).
   return NUDGE_PREFIXES.some((prefix) => text.startsWith(prefix)) || matchForcedCompletionPrompt(text) !== undefined;
@@ -154,7 +154,7 @@ export function isNudgeMessage(message: unknown): boolean {
 /** A user turn that brought new input (a trigger, an interjection), not a harness turn. */
 export function isInboundMessage(message: unknown): boolean {
   if (roleOf(message) !== "user") return false;
-  if ((message as { harness?: unknown }).harness !== undefined) return false;
+  if (isHarnessMade(message)) return false;
   return !isNudgeMessage(message);
 }
 

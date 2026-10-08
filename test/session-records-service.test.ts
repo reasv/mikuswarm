@@ -134,6 +134,20 @@ test("isEligibleForRecord: tool work is NOT exempt → true", () => {
   );
 });
 
+test("isEligibleForRecord: an injected read_session_record pair is not work (owner rule)", () => {
+  const [call, result] = makeTranscriptWithTool("read_session_record") as Array<Record<string, unknown>>;
+  const injected = [
+    { ...call, harness: { kind: "injection", decisionGroup: "g" } },
+    { ...result, harness: { kind: "injection", decisionGroup: "g" } },
+  ] as unknown as AgentMessage[];
+  assert.equal(isEligibleForRecord("default", undefined, enabledConfig, injected, new Set()), false);
+  // The model's own call to the same tool still counts.
+  assert.equal(
+    isEligibleForRecord("default", undefined, enabledConfig, [...injected, ...makeTranscriptWithTool("read_session_record")], new Set()),
+    true,
+  );
+});
+
 // ── SessionRecordService in-flight registry ───────────────────────────────────
 
 test("SessionRecordService: isInFlight false before any turn", () => {

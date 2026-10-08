@@ -19,6 +19,7 @@ import type { RedoRequest } from "./redo-signal.js";
 import type { RedoOutcome } from "./runner.js";
 import { findForkPoint, forkSession, type ForkContext } from "./fork.js";
 import { servedModelOf } from "./contract.js";
+import { isHarnessMade } from "./harness.js";
 import { isPostingTool } from "../tools/side-effects.js";
 
 /** The refusal redo (`createSoftRefusalRedoHandler`): pin the model, then fork with `forkSession`. */
@@ -33,8 +34,8 @@ export interface RedoHandlerOptions {
 /** The logical model that served the last real assistant message, if stamped. */
 export function lastServedModel(messages: readonly unknown[]): string | undefined {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const m = messages[i] as { role?: unknown; harness?: unknown } | undefined;
-    if (m?.role !== "assistant" || m.harness !== undefined) continue;
+    const m = messages[i] as { role?: unknown } | undefined;
+    if (m?.role !== "assistant" || isHarnessMade(m)) continue;
     const served = servedModelOf(m);
     if (served) return served;
   }
