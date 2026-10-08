@@ -1,6 +1,14 @@
 # Memory retrieval: judged candidates, readable excerpts, operator filters
 
-**Status**: PROPOSAL, draft rev 7 (2026-10-08: owner answers, §12; filters, §7; cross-encoder and embedder provider chains, §5.0a–c; late interaction, §5.0d; one passage per judgement, §5). Not implemented.
+**Status**: IMPLEMENTED (branch `memory-retrieval`), rev 7 with the later additions (query encoder chain, person-cued recall, recall ceiling) — superseded by ARCHITECTURE.md §9d (judged retrieval, excerpts, participant tags, re-rank stages, late interaction, two vector indexes, observability), §9c (memory filters, recency-layer filtering) and §8h (the `memory` decision point); retained for review. Not implemented: the write-time cue experiment of §9 (offline only by design). Deviations, as built:
+- Keyword and pattern filters apply without a decision model; only judged filters need the `memory` point (§10 reads "no filter applies"; §7.2 says mechanical filters always apply). Startup warns per agent about judged filters that cannot run.
+- The late-interaction store is one table, `memory_late_vectors (model, content_hash, …)`, rather than a table per model (same keying and one-model semantics); the primary embedder's index is `memory_vec_primary`, its model recorded in `index_meta` (a model change clears and refills it).
+- When some passages got a model verdict and others did not, the unjudged ones are dropped; the fallback selection runs only when no passage was judged.
+- Without a cross-encoder, the late top 8 plus blocks without vectors (which bypass the cut) go to the judge, capped at 12 in all.
+- No built-in default re-ranker or late model is shipped (§12.10); a `local` provider names its model. Local ONNX inference runs in a child process per model (onnxruntime-node cannot be loaded in more than one thread of a process).
+- An oversized block that the indexer sub-splits is judged per chunk on the retrieval surfaces and as one block on the file surfaces (recency layer, writer window, `search_memory`).
+- Recency-layer exclusion keeps today's text-probe heuristic.
+- Taking a provider out with `enabled = false` applies on the next start (there is no live config reload).
 **Supersedes**: spec/DECISION-MODEL.md §5.5, first half (re-ranking and richer excerpts). Summary pre-expansion (the second half of §5.5) stays out of scope.
 **Builds on**: ARCHITECTURE.md §9c (diary memory, recency layer), §9d (hybrid search, `recall_memory`, auto-retrieval), §8h (decision engine, chains, calibration), spec/DECISION-MODEL.md §3 (client, fits, billing).
 **Target ARCHITECTURE.md home once implemented**: §9d (auto-retrieval, `recall_memory`), §9c (recency layer filtering), §8h (the `memory` decision point).
