@@ -4588,8 +4588,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // A quick same-sender follow-up — a forced-split image, a trailing bare-text
   // thought, or an amending re-`@` — is folded into the session its immediately-prior
   // triggering message produced: STEERED in if it is running, PARKED if it is still
-  // building, or, if it already completed, handed to a FRESH session that starts with
-  // the owner's session record (fold-after-settle, spec SESSION-RECORDS §7). The synchronous `foldFollowUp` fork
+  // building, or, if it already completed, it revives the owner when it was sent before
+  // the owner's run ended (§8 "Late input"), else takes its native fate. The synchronous `foldFollowUp` fork
   // (in `handleInbound`, after reply-steer and before the `!trigger` return / accept)
   // makes the decision; the deliveries run async, never blocking the dispatch path.
 
@@ -4635,7 +4635,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
 
   /**
    * The synchronous fold fork (spec §6). Returns true when the follow-up was consumed
-   * (steered / parked / fold-after-settle dispatched, or its trigger-hold twin suppressed) — the
+   * (steered / parked / revival dispatched, or its trigger-hold twin suppressed) — the
    * caller returns without spawning. Returns false to fall through to the normal path
    * (native fate): a reply, a non-matching event, the RAW delivery of a trigger-bearing
    * follow-up (folded later on its post-hold delivery), or an owner that settled into
