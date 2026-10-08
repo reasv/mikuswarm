@@ -180,7 +180,8 @@ export interface MemorySearchDeps {
 interface Scored extends LexicalHit {
   vecScore: number;
   bm25Score: number;
-  /** Pre-decay combined relevance (`wv·vec + wt·bm25`). The `min_score` floor tests
+  /** Pre-decay combined relevance (`wv·vec + wt·bm25`, or the normalized RRF score
+   * under `fusion = "rrf"`). The `min_score` floor tests
    * THIS, not the decayed `score` — so a high-relevance old chunk survives the cut and
    * merely ranks lower (review issue #13). */
   relevance: number;
@@ -192,7 +193,7 @@ interface Scored extends LexicalHit {
 /**
  * The shared query path behind `recall_memory` (§9) and auto-retrieval (§8c). Hybrid
  * when an embedding provider + vector store are wired (§8a): parallel vector-KNN and
- * FTS5/BM25 candidate fetch → weighted merge → temporal decay (§8b) → optional MMR
+ * FTS5/BM25 candidate fetch → weighted (or reciprocal-rank) merge → temporal decay (§8b) → optional MMR
  * diversity re-rank → minScore cut → top-K. Degrades to lexical-only (a strict
  * upgrade over ripgrep) whenever embeddings are unavailable — never an error, never a
  * cross-space mismatch (§4/§5a).
@@ -440,6 +441,18 @@ export class MemorySearch {
     const wSum = useVec ? (q.vectorWeight + q.textWeight) || 1 : 1;
     const wv = opts.semanticOnly ? (useVec ? 1 : 0) : useVec ? q.vectorWeight / wSum : 0;
     const wt = opts.semanticOnly ? 0 : useVec ? q.textWeight / wSum : 1;
+    // Reciprocal-rank fusion (`fusion = "rrf"`): each lane that returned candidates
+    // ranks its own survivors (post room/date/scope filter), and the fused relevance
+    // is the normalized RRF score (see `rrfFuse`). The semantic-only window query and
+    // the scoped user-lane ranking go through the same path with their one lane.
+    let rrf: Map<number, number> | undefined;
+    if (q.fusion === "rrf") {
+      const inScope = (rowid: number) => candidateRows.has(rowid) && (!scope || scope.has(rowid));
+      const lanes: number[][] = [];
+      if (wt > 0) lanes.push(rankLane(ftsHits.map((h) => h.rowid).filter(inScope), bm25ByRow));
+      if (wv > 0) lanes.push(rankLane([...vecScoreByRow.keys()].filter(inScope), vecScoreByRow));
+      rrf = rrfFuse(lanes.filter((l) => l.length > 0), q.rrfK);
+    }
 
     const scored: ScoredChunk[] = [];
     for (const rowid of candidateRows) {
@@ -452,7 +465,7 @@ export class MemorySearch {
       // `score` adds temporal decay and is used ONLY for ordering, so a high-relevance
       // *old* match survives the floor but ranks below a fresher equal-relevance one,
       // instead of decaying below the floor and vanishing (review issue #13).
-      const relevance = wv * vecScore + wt * bm25Score;
+      const relevance = rrf ? (rrf.get(rowid) ?? 0) : wv * vecScore + wt * bm25Score;
       if (relevance < opts.minScore) continue;
       const score = q.temporalDecayEnabled
         ? relevance * decayFactor(meta.entryTs, now, q.temporalDecayHalfLifeDays)
@@ -785,6 +798,32 @@ function normalizeBm25(hits: LexicalHit[]): Map<number, number> {
     const rel = Math.max(0, -h.bm25); // bm25() is a cost; flip to non-negative relevance
     out.set(h.rowid, rel / (rel + BM25_SATURATION));
   }
+  return out;
+}
+
+/**
+ * One lane's rowids, best first, by that lane's own score (stable: the lane's
+ * original order breaks ties).
+ */
+function rankLane(rowids: number[], scoreByRow: Map<number, number>): number[] {
+  return [...new Set(rowids)].sort((a, b) => (scoreByRow.get(b) ?? 0) - (scoreByRow.get(a) ?? 0));
+}
+
+/**
+ * Reciprocal-rank fusion (ARCHITECTURE.md §9d "Fusion"): per lane `1 / (k + rank)`
+ * (rank 1-based), summed over the lanes a block appears in, then divided by the
+ * maximum possible score, `lanes × 1 / (k + 1)`, so the fused relevance lives in
+ * (0, 1] and the `[0,1]` relevance floors keep their meaning: a block ranked first
+ * in every lane scores 1, first in one of two lanes 0.5, and 60th in one of two
+ * lanes at k = 60 about 0.25. `lanes` counts only the lanes that returned
+ * candidates. Exported for tests.
+ */
+export function rrfFuse(lanes: number[][], k: number): Map<number, number> {
+  const out = new Map<number, number>();
+  if (lanes.length === 0) return out;
+  for (const lane of lanes) lane.forEach((rowid, i) => out.set(rowid, (out.get(rowid) ?? 0) + 1 / (k + i + 1)));
+  const max = lanes.length / (k + 1);
+  for (const [rowid, v] of out) out.set(rowid, Math.min(1, v / max));
   return out;
 }
 

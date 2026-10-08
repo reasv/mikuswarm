@@ -958,6 +958,14 @@ max_results = 6                   # recall_memory default
 min_score = 0.35
 vector_weight = 0.7               # §8a hybrid weights (normalized; sum must be > 0)
 text_weight = 0.3
+# How the vector and BM25 halves fuse: "weighted" (the weighted score sum above) or
+# "rrf" (reciprocal-rank fusion: per lane 1/(rrf_k + rank), summed over the lanes a
+# block appears in). RRF is normalized by its maximum (lanes / (rrf_k + 1)) into
+# (0, 1], so min_score and the [retrieval.auto] floors stay meaningful (first in one
+# of two lanes = 0.5, rank 60 in one lane ~ 0.25). Temporal decay still multiplies
+# the fused score. A lane whose weight is 0 is left out.
+fusion = "weighted"
+rrf_k = 60
 candidate_multiplier = 4
 mmr_enabled = false               # §8a diversity re-rank (off, like OpenClaw)
 mmr_lambda = 0.7

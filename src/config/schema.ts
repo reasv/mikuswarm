@@ -463,6 +463,8 @@ const RetrievalSchema = StrictObject({
       min_score: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
       vector_weight: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
       text_weight: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+      fusion: Type.Optional(Type.Union([Type.Literal("weighted"), Type.Literal("rrf")])),
+      rrf_k: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_000 })),
       candidate_multiplier: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
       mmr_enabled: Type.Optional(Type.Boolean()),
       mmr_lambda: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),

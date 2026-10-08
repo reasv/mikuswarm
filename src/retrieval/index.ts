@@ -4,6 +4,7 @@ export {
   buildFtsMatch,
   userLaneTokens,
   userLanePrefixStem,
+  rrfFuse,
   type MemorySearchDeps,
 } from "./search.js";
 export type { RetrievalResult, SearchOptions, SearchOutcome, UserLaneOptions } from "./search.js";

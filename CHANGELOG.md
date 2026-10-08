@@ -25,6 +25,11 @@ Unreleased section; it is not part of any release's notes.
 
 ### Added
 
+- **Reciprocal-rank fusion for memory search**: `[retrieval.query].fusion = "rrf"`
+  (default `"weighted"`, unchanged) merges the BM25 and vector lanes by rank,
+  `Σ 1/(rrf_k + rank)` with `rrf_k` default 60, normalized into 0..1 so the existing
+  score floors keep working. It applies to `recall_memory`, auto-retrieval recall
+  and the user-lane ranking alike; temporal decay still multiplies the fused score.
 - **Judged memory retrieval** (spec MEMORY-RETRIEVAL): the `<retrieved_memory>` block
   is now chosen by a judge that reads the conversation. Recall widens
   (the trigger, the trigger with its reply target and the conversation window as

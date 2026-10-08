@@ -27,6 +27,10 @@ export interface ResolvedRetrievalConfig {
     minScore: number;
     vectorWeight: number;
     textWeight: number;
+    /** How the hybrid halves fuse: weighted score sum, or reciprocal-rank fusion. */
+    fusion: "weighted" | "rrf";
+    /** The RRF constant `k` (per lane `1 / (k + rank)`). */
+    rrfK: number;
     candidateMultiplier: number;
     mmrEnabled: boolean;
     mmrLambda: number;
@@ -449,6 +453,8 @@ function resolveQuery(
     minScore: query.min_score ?? 0.35,
     vectorWeight,
     textWeight,
+    fusion: query.fusion ?? "weighted",
+    rrfK: query.rrf_k ?? 60,
     candidateMultiplier: query.candidate_multiplier ?? 4,
     mmrEnabled: query.mmr_enabled ?? false,
     mmrLambda: query.mmr_lambda ?? 0.7,
