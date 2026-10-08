@@ -15,17 +15,6 @@ Accumulate user-visible changes here as they land, under any of:
 
   ### Added
   ### Changed
-
-- **Faster startup.** The Docker image now compiles the TypeScript to `dist/` at
-  build time and runs it with plain `node` (with source maps), instead of
-  transpiling the whole codebase through `tsx` on every container start.
-  Independent startup work now overlaps: the native tokenizer asset loads on a
-  worker thread while storage opens, sandbox containers and MCP servers come up
-  concurrently (MCP tools still register in config order, so prompts are
-  unchanged), the yt-dlp probe runs in the background, and chat providers start
-  concurrently. The observability console starts before the providers and worker
-  pools, so it answers while the rest of startup finishes. Each startup milestone
-  logs `startup_phase` with its duration.
   ### Fixed
   ### Removed
 
@@ -36,6 +25,77 @@ Unreleased section; it is not part of any release's notes.
 
 ### Added
 
+- **Late input** (`[agent.sessions.late_input]`, on by default): a person's request can be
+  corrected after its chat session started. While the session has done nothing
+  irreversible, an edit of the triggering message (or a part grouped with it), a late
+  addition from the same sender, or a reply from that sender to the request **redoes
+  the session from scratch** with the corrected input; routing and record selection run
+  again, at most `max_redos` times (default 3). Removing the bot mention from the
+  trigger, or deleting it, cancels the session, and an edit that adds a bot mention to
+  a recent message triggers it. Once something irreversible has happened, the
+  correction is **interjected** instead: a generation in flight is aborted and the
+  correction is delivered at once. An edit made after the reply only updates the stored
+  message.
+  To give corrections time to land, the session's first irreversible tool call (a send
+  included) is **held** until `hold_ms` (default 8 s) after the trigger arrived,
+  extended by `extend_ms` per correction up to `max_hold_ms` (default 20 s). The model
+  keeps working meanwhile, so the hold is usually over before it sends.
+  A message the sender wrote before the session's run ended, but which arrived after
+  it, **revives** the finished session within `revive_max_ms` (default 5 min) and
+  continues it, with the record turn written again at the new end. This replaces the
+  fresh session that such a follow-up used to start. A reply to the request belongs to
+  it without any judgement; after the run ended it triggers like a reply to the bot's
+  message. Matrix redactions are not routed (Discord deletions are), and a session
+  evicted by a restart cannot be revived.
+  A discarded rollout is kept as a branch with the message that caused it. The console
+  session view labels redo, revival and aborted-turn branches with that message, shows
+  how long a call was held, labels each interjection's kind, and marks redone sessions
+  with a `restarted n` chip. Spans discarded by late input are left out of the model
+  behaviour statistics and the send-contract records. Database schema v30 adds
+  `agent_sessions.redo_count`, `agent_session_branches.cause_event_id` and
+  `usage_events.estimated`. See ARCHITECTURE.md §8 "Late input".
+- **Tool effect classes.** Every tool is classified as `redo_safe` (no external
+  effect), `repeatable` (no visible effect, but repeating it costs money or time),
+  `undoable` (`react`, pinning and unpinning) or `irreversible`. MCP tools take their
+  class from the server's tool annotations (`readOnlyHint` makes a tool redo-safe,
+  `idempotentHint` without `destructiveHint` repeatable, anything else irreversible),
+  and `[mcp.servers.<name>].effects = { <tool> = "<class>" }` overrides them for a
+  server that annotates badly or not at all. A late-input redo serves the results of
+  redo-safe and repeatable calls with the same arguments from the discarded run instead
+  of running them again, and undoes reactions and pins newest first; a reaction or pin
+  call that changed nothing is left alone, and an effect that cannot be undone turns the
+  redo into an interjection.
+- **Late-addition and implicit-reply decision points** (`[decisions.late_addition]`,
+  `[decisions.implicit_reply]`, off by default; need `[decisions]` enabled).
+  `late_addition` judges whether a message the trigger's sender sent within
+  `candidate_window_ms` (default 60 s) of the request belongs to it (`threshold` 0.7;
+  at most `max_judged` candidates judged and `max_folded` joining per request, default
+  8 and 3); the irreversibility hold waits for the verdict. Without the point, the quick
+  follow-up windows decide. `implicit_reply` judges whether a bare group message (no
+  reply, no mention) answers one of the bot's last messages (within
+  `max_messages_after` messages and `max_age_ms`, default 3 and 2 min; `threshold`
+  0.8), and handles it as a reply to that message on a yes.
+- **Vision decision chain** (`[decisions].vision_model`, or per point; unset by
+  default): a decision point can send images to a decision chain whose members read
+  them, instead of only their captions. `[decisions.<point>].vision` (`"off"`,
+  `"uncaptioned"`, `"always"`) chooses when; `vision_timeout_ms`, `max_images`,
+  `image_max_pixels` and `max_image_bytes` bound the request, and
+  `[models.*.decision].max_images`, `max_image_bytes` and `images` describe what each
+  member accepts. Any failure of the vision attempt retries once on the text chain with
+  captions. `late_addition` is the first point that uses it (`always`), so a picture
+  sent after the question is judged by what it shows before it has a caption. Every
+  member of a vision chain must declare `"image"` input, checked at startup.
+- **4chan support** (`[features].yotsuba`, off by default; configured under
+  `[yotsuba]`). 4chan thread and post links get rich previews (the opening or linked
+  post with its files, upgraded with images when the link triggers the bot), and the
+  `yotsuba` tool, with a matching skill, browses boards, catalogs and threads in several
+  views, shows a post's image, video storyboard or PDF, and downloads files. API
+  requests follow 4chan's one-request-per-second rule and use
+  `[network].http_proxy_url` when set. See ARCHITECTURE.md §7f.
+- **`compat.openrouter_routing`** (Chat Completions models, unset by default): an
+  OpenRouter provider-routing object (`order`, `only`, `ignore`, `zdr`, `sort`, ...)
+  sent as the request's `provider` field, to pin a model to specific upstream providers
+  or to zero-data-retention endpoints. A gateway in front of OpenRouter must forward it.
 - **`[[limits]].reserve_usd`** (optional, default 0): the headroom a new spend needs.
   The rule blocks once less than `reserve_usd` is left, so a cap over expensive single
   calls (for example `x_search`) no longer lets the last call overshoot it by a full
@@ -44,6 +104,7 @@ Unreleased section; it is not part of any release's notes.
   durable delegated research, with cost accounting, runtime fallback and recoverable
   job results. New web/deep research skills combine web sources with Grok X evidence;
   generic skill capability requirements prevent unavailable workflows being preloaded.
+  Database schema v28 adds `tool_invocations.metadata_json` and v29 `exa_research_jobs`.
 - Operator console Exa health and saved research-job monitoring without exposing
   API credentials or full research output.
 
@@ -62,10 +123,12 @@ Unreleased section; it is not part of any release's notes.
   is clamped to each member's budget. `compat.openrouter_routing` is sent as the request's
   `provider` object (e.g. `{ zdr = true }`); a data-policy 404 skips that member without a
   health strike. While a later member could still answer, a member waits at most its
-  `attempt_timeout_ms` (default two thirds of the call's timeout), so a stalled member is
-  struck and the call falls over instead of spending the whole timeout on it. Each decision
-  model gets its own rate-limit group, so its 429s never pause chat. Spend is recorded as usage class `decision` (with OpenRouter's reported cost), billed
-  to the session's payee like a tool call, and `[[limits]].classes` accepts `"decision"`.
+  `[models.*.decision].attempt_timeout_ms` (default two thirds of the call's timeout), so a
+  stalled member is struck and the call falls over instead of spending the whole timeout on
+  it; the last member gets whatever time is left. Each decision model gets its own
+  rate-limit group, so its 429s never pause chat. Spend is recorded as usage class
+  `decision` (with OpenRouter's reported cost), billed to the session's payee like a tool
+  call, and `[[limits]].classes` accepts `"decision"`.
   Every evaluation logs `decision_evaluated` and is stored in the `decision_evaluations` table
   with its verdict, its answers and probabilities, the state and questions sent (capped), the
   serving member and version, latency and cost; the console shows each one in the session
@@ -80,8 +143,8 @@ Unreleased section; it is not part of any release's notes.
   selection is unchanged), a `thinking_level`, skills to preload, and extra `tail_files`.
   Preloaded skills are loaded by synthetic `load_skill` calls at the start of the session's
   transcript, so the cached prompt prefix is unchanged and a resume finds them already
-  loaded. Several selected tasks join their cascades in config order and take the highest
-  thinking level. Proactive sessions carry the built-in `proactive` task (a reserved key).
+  loaded; a preload does not count as work done by the session. Several selected tasks join
+  their cascades in config order and take the highest thinking level. Proactive sessions carry the built-in `proactive` task (a reserved key).
   Low confidence or any decision-model failure leaves the session exactly as before.
   Database schema v22 adds `agent_sessions.initial_preloads`.
 - **Model prompts** (off by default): a model can carry its own system-prompt preamble and
@@ -102,33 +165,39 @@ Unreleased section; it is not part of any release's notes.
   that did tool work writes a compact record of that work in one extra turn right after it
   completes, while the prompt cache is warm. Tools that only talk in the room or steer the
   session (the resume work gate's exempt set, which now also holds `no_reply`, `load_skill`
-  and `tool_search`) do not count as work. The record is written with `session_record_tool`,
-  a harness-only tool the agent cannot use outside that turn, at interactive priority and
-  bounded by `timeout_ms` (default 60 s) and `max_turns` (default 4); a session with nothing
-  worth recording writes none. A reply to a bot message injects that message's session record
+  and `tool_search`) do not count as work, and neither does anything the harness injected
+  (see "Nothing injected counts as work" under Changed). The record is written with
+  `session_record_tool`, a harness-only tool the agent cannot use outside that turn, at
+  interactive priority and bounded by `max_turns` (default 4); a session with nothing worth
+  recording writes none. A reply to a bot message injects that message's session record
   into the new session as a synthetic `read_session_record` call and its result
   (`inject_on_reply`, default on); if the record is still being written, the reply waits for
-  it, up to `timeout_ms`. The agent can read any record of its own on demand with
-  `read_session_record(session_id)` (an immediate tool in chat and proactive sessions) and
-  open the full rollout with `read_session_transcript(session_id)` (deferred, in the
-  `sessions` skill). Database schema v24 adds `session_records` and `decision_evaluations`.
+  it up to `wait_timeout_ms` (default 60 s; `timeout_ms` is a legacy alias) and then goes
+  ahead without it, while the record is still finished. The agent can read any record of
+  its own on demand with `read_session_record(session_id)` (an immediate tool in chat and
+  proactive sessions), which says why a record is missing (still being written, skipped,
+  failed or interrupted), and open the full rollout with
+  `read_session_transcript(session_id)` (deferred, in the `sessions` skill). Database
+  schema v24 adds `session_records` and `decision_evaluations`.
   In the console, the session view shows the session's record, the records it was given, and
   the record turn with its harness prompt collapsed; every decision gets an inline card in
   the rollout and an entry in the details pane's Decisions list.
-- **Decision-model records point** (`[decisions.records]`, off by default; needs `[decisions]`
-  enabled): the decision model judges which session records a new session needs, for every
-  trigger, replies or not. The candidates are the replied-to message's session and the
-  sessions behind the last `candidates` bot messages (default 3), each only if it has a
-  record; every candidate is its own request, sent in parallel with routing. A record whose
-  `relevant` probability is at or above `inject_threshold` (default 0.6) is injected, most
-  relevant first, up to `max_injected` (default 2); a replied-to record judged below the
-  threshold is left out. When the point is off or fails as a whole, the reply rule applies. A
-  failed evaluation of the replied-to record injects it, and a failed evaluation of any other
-  candidate injects nothing. `[decisions.calibration.<model>]` can override the threshold per
-  decision model with `records.inject_threshold` (or `inject_threshold`); `min_confidence` is
-  rejected under `[decisions.records]`, because its one question carries no separate
-  confidence. Startup logs `decisions_records_capacity_low` when a decision model's
-  rate-limit group admits fewer requests at once than one trigger can send.
+- **Decision-model records point** (`[decisions.records]`, off by default; needs
+  `[decisions]` enabled): the decision model judges which session records a new session
+  needs, for every trigger, replies or not. The candidates are the replied-to message's
+  session and the sessions behind the last `candidates` bot messages (default 3) within
+  `candidate_max_age_ms` (default 1 hour), each only if it has a record the new session
+  could read itself; every candidate is its own request, sent in parallel with routing. A
+  record whose `relevant` probability is at or above `inject_threshold` (default 0.6) is
+  injected, most relevant first, up to `max_injected` (default 2); a replied-to record
+  judged below the threshold is left out. When the point is off or fails as a whole, the
+  reply rule applies. A failed evaluation of the replied-to record injects it when
+  `inject_on_reply` is on, and a failed evaluation of any other candidate injects nothing.
+  `[decisions.calibration.<model>]` can override the threshold per decision model with
+  `records.inject_threshold` (or `inject_threshold`); `min_confidence` is rejected under
+  `[decisions.records]`, because its one question carries no separate confidence. Startup
+  logs `decisions_records_capacity_low` when a decision model's rate-limit group admits
+  fewer requests at once than one trigger can send.
 - **OpenAI Responses API prefill**: `[models.<name>.prefill]` forces a required `analysis` argument on every tool call via strict JSON schema `pattern`, anchoring persona adherence on GPT-6 Sol/Luna. Includes `no_reply` tool, `drop_reasoning` option, and per-serving-member gating via `onPayload`. See spec/OPENAI-PREFILL.md.
 - **Captioning via OpenAI Responses API**: `[models.*]` with `api = "openai-responses"` can now serve as a caption model for images. Incomplete, refused, and unsupported-modality results are classified as content failures. (Port of MR !1 captioning code by contributor nopm.)
 
@@ -168,8 +237,11 @@ Unreleased section; it is not part of any release's notes.
   (`{ model, tries }` entries, `@same` retries the model that refused), keeps the
   rest of the session on the model that succeeded (with that model's own model
   prompts), and decides what happens when every entry refuses (`on_exhausted`:
-  `send_last`, `withhold`, `park`). Rules cover chat and proactive sessions, the
-  session record turn, summaries, diary entries and captions. Anthropic refusal
+  `send_last`, `withhold`, `park`); `exclude_reasons` vetoes a rule when any fired
+  refusal check has a listed reason. Rules cover chat and proactive sessions, the
+  session record turn, summaries, diary entries and captions. Without a matching rule,
+  a refusal falls over within the call to a chain member that has not refused, costs the
+  model no health strike, and is never retried on the model that refused. Anthropic refusal
   categories are recognized, a refused attempt's usage is billed to the model
   that refused, and every refusal is recorded. Database schema v25 adds
   `refusal_events`, `contract_attempts` and `agent_session_branches`, plus new
@@ -233,11 +305,51 @@ Unreleased section; it is not part of any release's notes.
 - **Resume is off by default** (`[agent.sessions.resume].enabled`, both `dm` and `group`). A
   reply now starts a fresh session that is given the replied-to session's record. A
   deployment that turns resume back on gets the earlier behaviour: a reply that resumes a
-  session injects nothing, and the resumed run writes a new record when it ends.
-- **A follow-up to a finished session starts a fresh session.** A follow-up message folded
-  into a session that has already completed now starts a new session with that session's
-  record injected, waiting for the record if it is still being written. Before, it resumed the
-  completed session. Folding into a running or not-yet-started session is unchanged.
+  session injects nothing, and the resumed run writes a new record when it ends. With late
+  input on, a session stays revivable for `revive_max_ms` after its run ended and is never
+  resumed in that time, so a reply within it starts a fresh session.
+- **A follow-up to a finished session no longer resumes it.** With late input on, a
+  follow-up the sender wrote before the session's run ended revives that session (see Late
+  input). Any other follow-up to a finished session is handled as an ordinary message: one
+  that triggers starts its own session. Folding into a running or not-yet-started session
+  is unchanged.
+- **Nothing injected counts as work.** Record loads the harness injects (`inject_on_reply`,
+  the records point) and routing's skill preloads no longer count as tool work. A session
+  that was given a record or a skill and did no work of its own neither writes a session
+  record nor passes the resume work gate. Only the model's own tool calls count, including
+  its own `read_session_record` and `read_session_transcript` calls. The send-contract
+  records and the offline audit read transcripts the same way.
+- **Aborted requests are billed.** A request the run aborts after it reached the provider
+  (operator Stop, a tool or turn cap, a drain, a late-input redo) is now recorded with
+  estimated usage: reported input and cache counts are kept, a missing prompt is estimated
+  from the context, and the output is the largest of the reported output, a count of the
+  streamed text, and 20 tokens per second of streaming (hidden reasoning is billed without
+  streaming any text). The estimate counts toward session cost ceilings and `[[limits]]`
+  like any request and is marked `estimated` (`usage_events.estimated`, and a badge on the
+  console's Usage page, scheduler page and rollout). Before, such a request was recorded
+  only with the usage it reported, usually none.
+- **Shorter trigger hold.** The shipped `[matrix].trigger_hold_ms` drops from 2000 to
+  250 ms, and with late input on every provider's trigger hold is clamped to at most 500 ms
+  at startup (`trigger_hold_clamped`). Text or a picture sent after the trigger is handled
+  by late input instead of by delaying every trigger.
+- **Model fallback makes one pass per request.** Within one request a chain's head gets
+  `recovery.llm_primary_attempts_per_request` attempts (default 2), then the request moves
+  down the chain with one attempt per remaining member and no backoff between members, so a
+  longer chain never means a longer outage. An unhealthy agent-loop model is re-tested by a
+  small background probe, sent with the member's own `thinking_level`, instead of with live
+  traffic, and no live request goes to it while another member can serve. A zero-token
+  attempt cut off by `recovery.llm_request_max_wait_ms` now counts as a failure of its
+  model.
+- **Faster startup.** The Docker image now compiles the TypeScript to `dist/` at
+  build time and runs it with plain `node` (with source maps), instead of
+  transpiling the whole codebase through `tsx` on every container start.
+  Independent startup work now overlaps: the native tokenizer asset loads on a
+  worker thread while storage opens, sandbox containers and MCP servers come up
+  concurrently (MCP tools still register in config order, so prompts are
+  unchanged), the yt-dlp probe runs in the background, and chat providers start
+  concurrently. The observability console starts before the providers and worker
+  pools, so it answers while the rest of startup finishes. Each startup milestone
+  logs `startup_phase` with its duration.
 - **Prefill: past `analysis` arguments are no longer replayed to the model.** They stay in the stored transcript; the wire history is stripped deterministically so prompt caching is unaffected.
 - **Silence is now a tool call.** `no_reply` is part of every chat session's tool set
   (next to `send_message`, same session-type filtering, always in the initial set
@@ -259,6 +371,16 @@ Unreleased section; it is not part of any release's notes.
 
 ### Fixed
 
+- **A failed `send_dm` or `send_to_channel` was not reported as an error.** Its result
+  text did not start with `error:`, so the harness counted the message as sent (late input
+  then interjected instead of redoing). Every failure of the two tools now returns an
+  `error:` result.
+- **Resuming a parked Discord or IRC session from the console failed.** The resume
+  looked up the bot's own user id on the Matrix provider only; it now asks the session's
+  own provider.
+- **Discord: custom emoji were sent as literal `:name:` text.** Discord does not resolve
+  shortcodes for bots, so `send_message` and `edit_message` now rewrite a `:name:` that
+  matches a custom emoji the bot can use into Discord's emoji markup.
 - **Caption calls ignored `compat.openrouter_routing`.** Media captioning built
   its own request and never sent the model's OpenRouter `provider` object, so a
   caption model set to `{ zdr = true }` (or pinned with `order`/`only`) was still
