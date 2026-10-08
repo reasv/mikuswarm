@@ -1,6 +1,6 @@
 # Memory retrieval: judged candidates, readable excerpts, operator filters
 
-**Status**: PROPOSAL, draft rev 5 (2026-10-08: owner answers, §12; filters, §7; cross-encoder and embedder provider chains, §5.0a–c; one passage per judgement, §5). Not implemented.
+**Status**: PROPOSAL, draft rev 6 (2026-10-08: owner answers, §12; filters, §7; cross-encoder and embedder provider chains, §5.0a–c; late interaction, §5.0d; one passage per judgement, §5). Not implemented.
 **Supersedes**: spec/DECISION-MODEL.md §5.5, first half (re-ranking and richer excerpts). Summary pre-expansion (the second half of §5.5) stays out of scope.
 **Builds on**: ARCHITECTURE.md §9c (diary memory, recency layer), §9d (hybrid search, `recall_memory`, auto-retrieval), §8h (decision engine, chains, calibration), spec/DECISION-MODEL.md §3 (client, fits, billing).
 **Target ARCHITECTURE.md home once implemented**: §9d (auto-retrieval, `recall_memory`), §9c (recency layer filtering), §8h (the `memory` decision point).
@@ -41,10 +41,11 @@ Collected from metadata and pattern counts only; no memory or message content wa
 Per interactive session build:
 
 ```
-query set ─► wide candidate recall (hybrid + participant tags, fused, low floor, ~24 blocks)
-          ─► drop blocks hidden by operator filters (precomputed verdicts, §7)
-          ─► optional cheap re-rank (local cross-encoder, §5.0)
-          ─► one decision call judging the top candidates' relevance (§5)
+query set ─► wide candidate recall (hybrid + participant tags + late-interaction lane, fused, ~60 blocks)
+          ─► drop blocks hidden by operator filters (§7)
+          ─► late-interaction scoring cuts to ~20 (precomputed token vectors, CPU-cheap, §5.0d)
+          ─► cross-encoder ranks and eliminates to ~8 (§5.0a)
+          ─► decision model as the final filter, one passage per request (§5)
           ─► excerpt each kept block (whole block, or a match-centred window, §6)
           ─► pack into <retrieved_memory>: 0..N items within a token budget
 ```
@@ -67,7 +68,7 @@ The re-ranker makes recall the goal. The hybrid search's job becomes "do not mis
   - users mentioned in the trigger.
 
   Each lane uses the user's current name plus up to 4 earlier names. **New, generic:** for providers without usernames (Matrix), earlier names come from the distinct `sender_display_name` values that sender id has had in the timeline, newest first.
-- **Floor and cap.** `auto.candidate_min_score` (default 0.25, below today's 0.45) and `auto.candidates` (default 24), with user-lane hits reserved up to `auto.user_lane_candidates` (default 8).
+- **Floor and cap.** `auto.candidate_min_score` (default 0.25, below today's 0.45) and `auto.candidates` (default 60, widened for the re-rankers, §5.0), with user-lane hits reserved up to `auto.user_lane_candidates` (default 8).
 - **Exclusions**: blocks already in the recency layer (as today), and blocks hidden by a filter (§7).
 - **The candidate unit is the whole chunk** (one diary block, at most 512 tokens).
 
@@ -93,24 +94,42 @@ The decision model is one option among several. They differ in what they answer 
 | Fusion and retrieval tuning: reciprocal rank fusion instead of the weighted sum, MMR on, multiple queries (§4) | a better candidate set | free, ms | local | Cheap wins for recall. Does not decide relevance. |
 | Better embedding model (multilingual, larger, longer context) | better semantic recall | one re-embed of the corpus; per-query embed | local or remote (remote needs ZDR) | Today's model is small, English-only and capped at 512 tokens. Worth an offline comparison. |
 | Local cross-encoder re-ranker (e.g. the open bge-reranker family, run on ONNX like today's embedder) | a query–passage relevance score per candidate | to be measured: a large multilingual model over 24 passages of ~400 tokens likely costs hundreds of ms to seconds of CPU per build, and tens of ms on a GPU; a small English model is much cheaper but weaker | local, no data leaves | Scores a query against a passage. It does not read the conversation or the participants, and needs a calibrated cutoff. |
+| Late interaction (ColBERT-style multi-vector: one small vector per token, scored by MaxSim; e.g. pplx-embed-v2-late, released 2026-10-07) | a query–passage score that sees token-level matches, usually between single-vector similarity and a cross-encoder in quality | the passage side is encoded once at index time and stored; per query, one short query encode plus MaxSim, milliseconds on CPU even over the whole corpus | local (or a remote encoder with ZDR for indexing) | A re-ranker whose expensive half is precomputed. Also usable as a recall lane. The index is tied to one model, like an embedder (§5.0d). |
 | Hosted re-rank APIs | as above | ~100–300 ms, per-search pricing | remote; ZDR status per provider must be verified | Same limits as the local cross-encoder. Adds a vendor. |
 | Decision model (§5) | a calibrated keep/drop decision per passage, with conversation, request and participants in state | ~1–1.5 s, ~$0.0005 per session | remote, ZDR routes exist | Judges "relevant to this conversation", not "similar to the query". Same machinery as the filters (§7) and other points. |
 | Listwise re-ranking by a chat LLM (rank or select from the candidate list) | ranking plus selection | seconds, cents per call | remote, needs a ZDR model | The strongest reasoning, but the slowest and most expensive per session. Better as an offline labeller (§9) than on the hot path. |
 | Query rewriting / hypothetical-entry generation (an LLM writes the search query or a fake diary entry to embed) | better recall on terse follow-ups | an LLM call per session | remote, needs a ZDR model | Addresses problem 3 differently from §4's conversation-window query. |
 | Provenance participant tags (§4a) | exact "was in the conversation" tags | free | local | Fixes the user lane at the source, not per query. |
 
+**Segmentation is already solved** (owner, 2026-10-08). The hardest part of dense retrieval is usually cutting documents into units: windows split a fact across two chunks or bury it among unrelated text. Here the memories are nearly always discrete blocks, one diary entry from one summary range, with a header naming the room and time. Every method in this table therefore scores a whole, natural unit:
+- no sliding windows or overlap;
+- per-block token vectors for late interaction;
+- whole-block pairs for the cross-encoder;
+- whole-block excerpts (§6).
+
+Methods built to repair segmentation (contextual chunk embeddings, parent-document retrieval) buy little here. Blocks longer than a model's input window are the only exception, and their share is to be measured (§5.0c).
+
 **The pipeline** (owner, 2026-10-08):
 
 ```
-wide recall (§4, ~60 blocks) ─► cross-encoder ranks and eliminates (§5.0a) ─► the few survivors
-   ─► decision model as the FINAL FILTER, one passage per request (§5) ─► excerpts (§6)
+wide recall (§4, ~60 blocks) ─► late interaction scores and cuts (§5.0d) ─► cross-encoder ranks and eliminates (§5.0a)
+   ─► the few survivors ─► decision model as the FINAL FILTER, one passage per request (§5) ─► excerpts (§6)
 ```
 
 - **The cross-encoder ranks and eliminates.** It reads each query–passage pair together, so it is far better at "does this passage answer this" than vector or BM25 similarity. Because each pair is cheap, recall can widen to ~60 candidates, and most are cut here.
 - **The decision model is the final filter, not a re-ranker.** It only sees the cross-encoder's survivors, one passage per request, with the conversation, the reply target and the participants in view. It keeps or drops each, and "none" is a valid outcome.
 - **The fallback improves too.** When the decision chain is down, the cross-encoder's calibrated cutoff selects the items in place of hybrid similarity.
-- **Every stage is optional and degrades in order:** no cross-encoder → the decision model filters the hybrid top ~12; no decision model → the cross-encoder cutoff; neither → the hybrid ranking with the higher floor.
-- **Measure offline first** with the §9 harness (hybrid alone, cross-encoder alone, cross-encoder + filter, scored against ZDR-labelled relevance), plus the embedding axis (§5.0b). The measurements set cut-offs and `top_n`; they do not change the shape.
+- **Late interaction is a cheap first re-ranker** (owner, 2026-10-08). Passage token vectors are computed at index time, so scoring all ~60 candidates (or the whole corpus, as a recall lane) costs one short query encode plus arithmetic. It cuts the list before the cross-encoder, which is the expensive per-pair stage, and it is a strong rung on its own when no cross-encoder is available.
+- **Every stage is optional and degrades in order:**
+  - no late interaction → the cross-encoder sees the recall set;
+  - no cross-encoder → the late-interaction top ~8, or the hybrid top ~12, go to the decision model;
+  - no decision model → the last scorer's calibrated cutoff;
+  - none → the hybrid ranking with the higher floor.
+- **Measure offline first** with the §9 harness, scored against ZDR-labelled relevance:
+  - the combinations: hybrid alone, late interaction alone, cross-encoder alone, late interaction → cross-encoder, each with and without the final filter;
+  - the embedding axis (§5.0b).
+
+  The measurements set cut-offs and `top_n`, and decide whether both re-rankers earn their place. They do not change the shape.
 
 ### 5.0a The cross-encoder: a provider chain
 
@@ -177,12 +196,42 @@ The embedder has the same three kinds of provider and the same decision rule. On
 - **Quality.** Today's built-in model is small, English-only and capped at 512 tokens. Choose the built-in by measured quality per CPU-millisecond and language coverage, and the primary by the same decision rule as the re-ranker (§5.0c).
 - **With a cross-encoder in the pipeline,** the embedder's job is recall, not precision. A stronger embedder matters less than before, but still sets the ceiling on what the cross-encoder can see.
 
+### 5.0d Late interaction: a precomputed re-ranker
+
+A late-interaction model encodes text into one small vector per token (e.g. 128 dimensions). The score of a passage for a query is the sum, over query tokens, of each one's best match among the passage's tokens (MaxSim). The passage side does not depend on the query, so it is computed once at index time and stored.
+
+- **Index.** The indexer keeps a token-vector store (`memory_late_<model>`, one blob per chunk, keyed by chunk hash like the vector index) and maintains it incrementally as blocks are written.
+  - **Size** for a corpus of ~4k blocks of ~340 tokens: about 350 MB at fp16, half at int8, and less again with token pooling.
+  - **The index is tied to one model,** as for embedders (§5.0b). A family that shares one space counts as one model: pplx-embed-v2-late's 0.6B model can query an index built by its 9B model.
+- **Query time.**
+  - Encode the query, a few dozen tokens. This is cheap enough in process on CPU, so the query side never needs a GPU.
+  - Then compute MaxSim over the candidates' stored vectors. That is arithmetic only: milliseconds for ~60 candidates, and still fast exhaustively over a corpus this size.
+- **Two uses.**
+  1. **The first re-ranker:** score the recall set and pass the top `late.top_n` (default 20) to the cross-encoder.
+  2. **Optionally, a recall lane:** exhaustive MaxSim over every indexed block, fused with the hybrid lanes (§4). This finds blocks that neither BM25 nor the single vector surfaced.
+- **Indexing compute** (the GPU trade-off of §5.0a, moved off the hot path):
+  - Document encoding goes through a provider chain like the embedder's: a GPU inference server, a ZDR API, or the built-in CPU encoder. Every provider must serve the index's model (or its shared-space family).
+  - A one-off (re)index can run on a GPU that is released afterwards. Daily increments (a few blocks) are cheap on CPU. VRAM is therefore never held permanently for this stage.
+- **Coverage gaps never hide memories.** A candidate whose token vectors are missing (written since the last index pass, or the index is mid-rebuild) bypasses the cut and goes on to the next stage. A missing or stale index degrades to "no late interaction", never to dropping blocks.
+- **Calibration** is per model, like the cross-encoder's, when its score is the last cutoff.
+
+```toml
+[retrieval.late]
+enabled = false
+model = "..."                 # the document-side model; the index belongs to it
+query_model = ""              # default: model; may be a smaller model sharing its space
+top_n = 20                    # candidates passed on to the cross-encoder
+recall_lane = false           # also run exhaustive MaxSim as a recall lane (§4)
+chain = ["gpu", "builtin"]    # document encoding providers, all serving `model`
+```
+
 ### 5.0c Model survey and measurements (to do before implementation)
 
-A companion `spec/MEMORY-RETRIEVAL-SURVEY.md`, like DECISION-MODEL-SURVEY.md. For re-rankers and embedders it records:
+A companion `spec/MEMORY-RETRIEVAL-SURVEY.md`, like DECISION-MODEL-SURVEY.md. For re-rankers (cross-encoder and late interaction) and embedders it records:
 - **Open-weights candidates:** quality on retrieval benchmarks and languages, size, VRAM at the serving precision, GPU latency, CPU latency on ONNX, and licence.
 - **API candidates:** quality, price, latency, rate limits, and **ZDR status, verified per provider and route** (direct and through aggregators).
-- **Measurements on the deployment's own hardware** for the shortlist: latency for ~60 × ~400-token pairs, VRAM held, CPU time.
+- **Measurements on the deployment's own hardware** for the shortlist: latency for ~60 × ~400-token pairs, VRAM held, CPU time; for late interaction, index build time (GPU and CPU), index size and query-side CPU time.
+- **Corpus shape:** the share of blocks longer than each shortlisted model's input window (the only segmentation question left, §5.0).
 - **Offline quality** on the §9 labelled items.
 
 ## 5. Relevance judgement: the `memory` decision point
@@ -338,13 +387,15 @@ There is **no corpus pass and no backfill**.
 ```toml
 [retrieval.auto]
 judge = true                  # use the memory decision point when [decisions] is on
-candidates = 24
+candidates = 60
 candidate_min_score = 0.25
 user_lane_candidates = 8
 query_messages = 6
 max_results = 4
 max_tokens = 2000
 excerpt_max_tokens = 400
+
+# [retrieval.late] (§5.0d), [retrieval.rerank] (§5.0a), embedder chain (§5.0b)
 
 [decisions.memory]            # usual point settings: enabled, model, timeout_ms, thresholds
 enabled = true
@@ -365,7 +416,6 @@ pending = "show"              # unevaluated blocks on non-judged surfaces
 - Summary pre-expansion (DECISION-MODEL §5.5, second half).
 - Session records in the retrieval corpus, so that a follow-up asking "why did you say that" finds the records an earlier reply used. This is related, but records have their own selection point today.
 - The user profile system.
-- Changing the embedding model. A stronger remote embedder is already supported by config (`[retrieval.embedding.remote]`), but diary text derives from user messages and would need a ZDR provider. Worth evaluating separately once the judged pipeline exists, because recall then matters more than precision.
 
 ## 12. Owner decisions (2026-10-08) and remaining questions
 
@@ -386,6 +436,8 @@ Also decided (rev 5):
    - an always-available CPU rung keeps working when the GPU's memory is needed elsewhere.
 
 10. **The re-ranker stage is implemented regardless** (owner): the pipeline always has it, and a deployment that finds no worthwhile re-ranker disables it. Model choices (re-ranker and embedder) therefore do NOT block implementing any of the code. The built-in CPU re-ranker may be added later, once a model is chosen.
+11. **Late interaction is a re-ranking stage** (owner, 2026-10-08, §5.0d): it uses precomputed token vectors, sits before the cross-encoder, and can also be a recall lane. As with the cross-encoder, its code is implemented regardless of the model choice.
+12. **Segmentation is not a problem here** (owner): memories are discrete blocks, so every stage scores whole blocks (§5.0).
 
 Remaining:
 - **The survey and measurements of §5.0c,** which choose the models: GPU primary, API fallback (or primary), and the built-in CPU models. These run in parallel with the implementation.
