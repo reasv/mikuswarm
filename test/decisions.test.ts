@@ -8,6 +8,7 @@ import {
   DecisionEngine,
   NoFittingMemberError,
   applyDecisionRateLimitGroups,
+  attemptSlot,
   calibratedThreshold,
   decisionsFor,
   memberMisfit,
@@ -185,21 +186,75 @@ for (const status of [429, 503, 529]) {
   });
 }
 
-test("client: a per-attempt timeout is environmental and falls over", async () => {
-  const hang = (_c: FakeCall, signal?: AbortSignal) =>
-    new Promise<Response>((_resolve, reject) => {
-      signal?.addEventListener("abort", () => {
-        const e = new Error("aborted");
-        e.name = "AbortError";
-        reject(e);
-      });
+function hang(_c: FakeCall, signal?: AbortSignal) {
+  return new Promise<Response>((_resolve, reject) => {
+    signal?.addEventListener("abort", () => {
+      const e = new Error("aborted");
+      e.name = "AbortError";
+      reject(e);
     });
+  });
+}
+
+test("client: a stalled head times out within its slot, is struck, and falls over", async () => {
   const { fn, calls } = fakeFetch([hang, () => json(200, okBody())]);
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 1 } } as any);
   const models: any = { a: decider({ id: "vendor/a", fallback: ["b"] }), b: decider({ id: "vendor/b" }) };
+  const client = new DecisionClient({ models, fetchImpl: fn, scheduler });
+  const started = Date.now();
+  const result = await client.decide("a", request(), { ...callOpts, timeoutMs: 300 });
+  assert.equal(result.logicalId, "b");
+  assert.deepEqual(calls.map((c) => c.body.model), ["vendor/a", "vendor/b"]);
+  assert.ok(Date.now() - started < 300, "the head got two thirds of the deadline, not all of it");
+  assert.equal(scheduler.modelHealth("https://gw.example/decisions::vendor/a"), "unhealthy", "a full-slot stall is a strike");
+  scheduler.stop?.();
+});
+
+test("client: attempt_timeout_ms caps a member's slot while a later member remains", async () => {
+  const { fn, calls } = fakeFetch([hang, () => json(200, okBody())]);
+  const models: any = {
+    a: decider({ id: "vendor/a", fallback: ["b"], decision: { attempt_timeout_ms: 100 } }),
+    b: decider({ id: "vendor/b" }),
+  };
   const client = new DecisionClient({ models, fetchImpl: fn });
-  // The call deadline (2 s) bounds the whole chain; the head hangs until it.
-  await assert.rejects(() => client.decide("a", request(), { ...callOpts, timeoutMs: 150 }), /AbortError|aborted/);
-  assert.equal(calls.length, 1, "deadline reached on the head: nothing left to try");
+  const started = Date.now();
+  assert.equal((await client.decide("a", request(), { ...callOpts, timeoutMs: 2000 })).logicalId, "b");
+  assert.ok(Date.now() - started < 1000);
+  assert.equal(calls.length, 2);
+});
+
+test("client: a single member gets the whole deadline and a stall there is a strike", async () => {
+  const { fn, calls } = fakeFetch([hang]);
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 1 } } as any);
+  const models: any = { a: decider({ id: "vendor/a" }) };
+  const client = new DecisionClient({ models, fetchImpl: fn, scheduler });
+  const started = Date.now();
+  await assert.rejects(() => client.decide("a", request(), { ...callOpts, timeoutMs: 150 }));
+  assert.ok(Date.now() - started >= 140, "not cut to two thirds: nothing after it");
+  assert.equal(calls.length, 1);
+  assert.equal(scheduler.modelHealth("https://gw.example/decisions::vendor/a"), "unhealthy");
+  scheduler.stop?.();
+});
+
+test("client: a fallback member whose slot the deadline cut short is not struck", async () => {
+  const { fn, calls } = fakeFetch([hang, hang]);
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 1 } } as any);
+  const models: any = { a: decider({ id: "vendor/a", fallback: ["b"] }), b: decider({ id: "vendor/b" }) };
+  const client = new DecisionClient({ models, fetchImpl: fn, scheduler });
+  await assert.rejects(() => client.decide("a", request(), { ...callOpts, timeoutMs: 300 }), /AbortError|aborted/);
+  assert.equal(calls.length, 2);
+  assert.equal(scheduler.modelHealth("https://gw.example/decisions::vendor/a"), "unhealthy");
+  assert.equal(scheduler.modelHealth("https://gw.example/decisions::vendor/b"), "healthy", "a third of the deadline proves nothing");
+  scheduler.stop?.();
+});
+
+test("attemptSlot: cap only while a later candidate remains", () => {
+  const m = (logicalId: string, decision?: any) => ({ logicalId, config: { decision } }) as any;
+  assert.deepEqual(attemptSlot(m("a"), ["a", "b"], 3000, 3000), { ms: 2000, full: true });
+  assert.deepEqual(attemptSlot(m("a", { attempt_timeout_ms: 500 }), ["a", "b"], 3000, 3000), { ms: 500, full: true });
+  assert.deepEqual(attemptSlot(m("b"), ["a", "b"], 1000, 3000), { ms: 1000, full: false });
+  assert.deepEqual(attemptSlot(m("a"), ["a"], 3000, 3000), { ms: 3000, full: true });
+  assert.deepEqual(attemptSlot(m("a"), ["a", "b"], 1500, 3000), { ms: 1500, full: false }, "less than the cap left: no room to fall over anyway");
 });
 
 test("client: a malformed answer is billed and falls over", async () => {

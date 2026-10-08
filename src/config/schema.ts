@@ -595,6 +595,11 @@ const DecisionFitsSchema = StrictObject({
   // Image transport: "state_parts" (default; labelled image_url parts after the
   // state) or "images_field" (a top-level `images` array, the native Cloudflare shape).
   images: Type.Optional(Type.Union([Type.Literal("state_parts"), Type.Literal("images_field")])),
+  // Longest wait (ms) for this member while a later chain member could still
+  // answer, so a stalled member leaves time to fall over. A timeout after the full
+  // slot is a health strike. Unset = two thirds of the call's timeout. The last
+  // candidate always gets whatever is left of the call's timeout.
+  attempt_timeout_ms: Type.Optional(Type.Integer({ minimum: 100 })),
 });
 
 const ModelSchema = StrictObject({

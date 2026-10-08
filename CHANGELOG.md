@@ -61,8 +61,10 @@ Unreleased section; it is not part of any release's notes.
   counts, state budget, billing mode) skip members that cannot serve a request, and the state
   is clamped to each member's budget. `compat.openrouter_routing` is sent as the request's
   `provider` object (e.g. `{ zdr = true }`); a data-policy 404 skips that member without a
-  health strike. Each decision model gets its own rate-limit group, so its 429s never pause
-  chat. Spend is recorded as usage class `decision` (with OpenRouter's reported cost), billed
+  health strike. While a later member could still answer, a member waits at most its
+  `attempt_timeout_ms` (default two thirds of the call's timeout), so a stalled member is
+  struck and the call falls over instead of spending the whole timeout on it. Each decision
+  model gets its own rate-limit group, so its 429s never pause chat. Spend is recorded as usage class `decision` (with OpenRouter's reported cost), billed
   to the session's payee like a tool call, and `[[limits]].classes` accepts `"decision"`.
   Every evaluation logs `decision_evaluated` and is stored in the `decision_evaluations` table
   with its verdict, its answers and probabilities, the state and questions sent (capped), the

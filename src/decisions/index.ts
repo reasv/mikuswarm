@@ -1,6 +1,7 @@
 export {
   DecisionClient,
   NoFittingMemberError,
+  attemptSlot,
   memberMisfit,
   memberStateBudget,
   jsonTokens,

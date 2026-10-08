@@ -30,6 +30,7 @@ import {
   runFetchWithFallback,
   type FetchAttemptOutcome,
   type FetchChainMember,
+  type ModelChainEntry,
 } from "../agent/model-fallback.js";
 import { parseRetryAfterMs, type LlmScheduler, type PriorityClass } from "../agent/scheduler.js";
 import { computeUsageCost } from "../agent/usage.js";
@@ -192,6 +193,36 @@ export function memberMisfit(
   return undefined;
 }
 
+/** Slack after the call's deadline so an attempt's own timer always fires first. */
+const DEADLINE_GRACE_MS = 50;
+/** A non-last member's default wait, as a share of the call's timeout. */
+const DEFAULT_ATTEMPT_SHARE = 2 / 3;
+
+interface AttemptSlot {
+  ms: number;
+  /** The member got its whole slot, so timing out is its own failure. */
+  full: boolean;
+}
+
+/**
+ * How long one member may take. While a later candidate could still answer, a
+ * member gets at most its `attempt_timeout_ms` (default two thirds of the call's
+ * timeout), so a stall leaves time to fall over; the last candidate gets whatever
+ * remains. Later candidates may still be skipped as unhealthy at their turn.
+ */
+export function attemptSlot(
+  member: ModelChainEntry,
+  candidates: readonly string[],
+  remainingMs: number,
+  callTimeoutMs: number,
+): AttemptSlot {
+  const cap = member.config.decision?.attempt_timeout_ms ?? Math.ceil(callTimeoutMs * DEFAULT_ATTEMPT_SHARE);
+  const index = candidates.indexOf(member.logicalId);
+  const hasLater = index >= 0 && index < candidates.length - 1;
+  if (hasLater && remainingMs > cap) return { ms: cap, full: true };
+  return { ms: remainingMs, full: remainingMs >= Math.min(cap, callTimeoutMs) };
+}
+
 /** The largest state a member reads: `state_budget_tokens`, else `context_window`. */
 export function memberStateBudget(config: ModelConfig): number {
   return config.decision?.state_budget_tokens ?? config.context_window ?? Number.POSITIVE_INFINITY;
@@ -259,11 +290,27 @@ export class DecisionClient {
       if (options.signal.aborted) controller.abort();
       else options.signal.addEventListener("abort", onCallerAbort, { once: true });
     }
-    const deadlineTimer = setTimeout(() => controller.abort(), Math.max(0, options.timeoutMs));
+    // Every attempt's own timer ends within the deadline; the grace lets that timer,
+    // not this teardown, decide whether a stalled member is struck.
+    const deadlineTimer = setTimeout(() => controller.abort(), Math.max(0, options.timeoutMs) + DEADLINE_GRACE_MS);
+    const memberFilter = (member: ModelChainEntry): boolean =>
+      member.config.api === "system-one" &&
+      memberMisfit(
+        member.config,
+        shape,
+        effectiveBudget(member.config),
+        request.minStateTokens,
+        request.stateShape,
+        request.images !== undefined,
+      ) === undefined;
+    const chain = this.chain(modelKey);
+    const candidates = chain
+      .filter((member) => memberFilter(member) && (options.isModelAvailable?.(member.logicalId) ?? true))
+      .map((member) => member.logicalId);
     let result: DecisionResult | undefined;
     try {
       await runFetchWithFallback<DecisionResult>(
-        this.chain(modelKey),
+        chain,
         {
           consumer: options.consumer,
           priority: options.priority,
@@ -272,20 +319,12 @@ export class DecisionClient {
           probeBackoffMaxMs: (cfg) => cfg.llm_probe_backoff_max_ms,
           signal: controller.signal,
           logger: this.options.logger,
-          memberFilter: (member) =>
-            member.config.api === "system-one" &&
-            memberMisfit(
-              member.config,
-              shape,
-              effectiveBudget(member.config),
-              request.minStateTokens,
-              request.stateShape,
-              request.images !== undefined,
-            ) === undefined,
+          memberFilter,
         },
         async (member) => {
           const remaining = deadline - Date.now();
           if (remaining <= 0) throw abortError();
+          const slot = attemptSlot(member, candidates, remaining, options.timeoutMs);
           let images: DecisionImage[] | undefined;
           if (request.images) {
             images = await imagesForMember(member.config, request.images);
@@ -313,7 +352,7 @@ export class DecisionClient {
             member,
             request.questions,
             wire.state,
-            remaining,
+            slot,
             controller.signal,
             options,
             wire.images,
@@ -338,7 +377,7 @@ export class DecisionClient {
     member: FetchChainMember,
     questions: Record<string, DecisionQuestion>,
     state: unknown,
-    timeoutMs: number,
+    slot: AttemptSlot,
     callSignal: AbortSignal,
     options: DecisionCallOptions,
     imagesField?: string[],
@@ -352,6 +391,7 @@ export class DecisionClient {
 
     const attemptController = new AbortController();
     let timedOut = false;
+    const timeoutMs = slot.ms;
     const timer = setTimeout(() => {
       timedOut = true;
       attemptController.abort();
@@ -372,13 +412,13 @@ export class DecisionClient {
           signal: attemptController.signal,
         });
       } catch (error) {
-        return this.thrownOutcome(error, timedOut, callSignal, timeoutMs);
+        return this.thrownOutcome(error, timedOut, slot, callSignal);
       }
       let text: string;
       try {
         text = await readCapped(response);
       } catch (error) {
-        return this.thrownOutcome(error, timedOut, callSignal, timeoutMs);
+        return this.thrownOutcome(error, timedOut, slot, callSignal);
       }
       if (!response.ok) return this.statusOutcome(member, response, text);
 
@@ -438,13 +478,16 @@ export class DecisionClient {
   private thrownOutcome(
     error: unknown,
     timedOut: boolean,
+    slot: AttemptSlot,
     callSignal: AbortSignal,
-    timeoutMs: number,
   ): FetchAttemptOutcome<never> {
-    // The whole call's deadline or the caller's signal is a neutral teardown
-    // (never a health strike); this attempt's own timeout is environmental.
+    // The caller's signal is a neutral teardown (never a health strike). This
+    // attempt's own timeout is environmental (a strike, falls over) when the member
+    // had its full slot; a slot the call's deadline cut short proves nothing about
+    // the member, so it ends the call neutrally.
     if (callSignal.aborted && !timedOut) throw abortError();
-    if (timedOut) return environmental(undefined, `timed out after ${timeoutMs}ms`);
+    if (timedOut && !slot.full) throw abortError();
+    if (timedOut) return environmental(undefined, `timed out after ${slot.ms}ms`);
     return environmental(undefined, error instanceof Error ? error.message : String(error));
   }
 
