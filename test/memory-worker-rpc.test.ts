@@ -12,8 +12,13 @@ test("worker rpc: an aborted request the child never acknowledges kills the wedg
   const child = (rpc as unknown as { child: { kill(s: string): void } }).child;
   try {
     const a = new AbortController();
+    // The child runs requests in order, so once `sleep` replies it is already inside `hang`.
+    // Aborting earlier can land the cancel before `hang` starts (both messages in one IPC
+    // read on a loaded host); the child then rightly skips it and nothing is wedged.
+    const before = rpc.call("sleep", { ms: 20 });
     const hung = rpc.call("hang", null, a.signal).catch((e: Error) => e.name);
-    setTimeout(() => a.abort(), 30);
+    assert.equal(await before, "slept");
+    a.abort();
     assert.equal(await hung, "AbortError");
     // A trivial op queued behind the wedged one is rejected once the watchdog fires.
     const queued = rpc.call("ping", null).catch((e: Error) => e.message);
