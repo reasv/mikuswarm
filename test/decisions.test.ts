@@ -202,10 +202,12 @@ test("client: a stalled head times out within its slot, is struck, and falls ove
   const models: any = { a: decider({ id: "vendor/a", fallback: ["b"] }), b: decider({ id: "vendor/b" }) };
   const client = new DecisionClient({ models, fetchImpl: fn, scheduler });
   const started = Date.now();
-  const result = await client.decide("a", request(), { ...callOpts, timeoutMs: 300 });
+  // A wide deadline so the fallback's third (500 ms) survives a loaded host; the head's slot is 1000 ms.
+  const result = await client.decide("a", request(), { ...callOpts, timeoutMs: 1500 });
   assert.equal(result.logicalId, "b");
   assert.deepEqual(calls.map((c) => c.body.model), ["vendor/a", "vendor/b"]);
-  assert.ok(Date.now() - started < 300, "the head got two thirds of the deadline, not all of it");
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed >= 950 && elapsed < 1500, "the head got two thirds of the deadline, not all of it");
   assert.equal(scheduler.modelHealth("https://gw.example/decisions::vendor/a"), "unhealthy", "a full-slot stall is a strike");
   scheduler.stop?.();
 });
