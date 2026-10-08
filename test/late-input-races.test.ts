@@ -395,3 +395,43 @@ test("late input races: a cancel undoes the session's reaction before discarding
     await h.stop();
   }
 });
+
+test("late input races: after a partial compensation, an undone reaction is never undone again", async () => {
+  const unreacts: string[] = [];
+  let n = 0;
+  let edits = 0;
+  const h = await startHarness({
+    toml: LATE({ hold_ms: 0 }),
+    channelClient: {
+      react: async (_id: string, emoji: string) => ({ display: emoji }),
+      unreact: async (_id: string, emoji: string) => {
+        unreacts.push(emoji);
+        if (emoji === "👀") throw new Error("forbidden");
+        return { removed: 1 };
+      },
+    },
+    script: (req) => {
+      if (isRecordTurnRequest(req)) return { text: "NO_REPLY" };
+      n += 1;
+      if (n === 1) return { toolCalls: [{ name: "react", args: { message_id: "$user1", emoji: "👀" } }] };
+      if (n === 2) return { toolCalls: [{ name: "react", args: { message_id: "$user1", emoji: "👍" } }] };
+      if (n <= 4) return { ...send("slow"), delayMs: 700 };
+      return { toolCalls: [{ name: "no_reply", args: {} }] };
+    },
+  });
+  try {
+    const id = h.say("hi bot", { mention: true });
+    for (const body of ["hi bot!", "hi bot!!"]) {
+      const want = ++edits;
+      await h.until(() => h.llm.requests.filter((r) => !isRecordTurnRequest(r)).length >= 2 + want, `request ${2 + want}`);
+      h.edit(id, body, { mention: true });
+      const applied = (l: Record<string, unknown>) =>
+        l.message === "late_input_redo_impossible" || (l.message === "late_input_interjected" && l.reason === "compensation_failed");
+      await h.until(() => h.logs.filter(applied).length >= want, `correction ${want} applied`);
+    }
+    await h.until(settledAll(h), "settled");
+    assert.equal(unreacts.filter((e) => e === "👍").length, 1, "the compensated reaction is undone once");
+  } finally {
+    await h.stop();
+  }
+});
