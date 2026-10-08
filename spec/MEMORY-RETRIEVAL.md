@@ -385,6 +385,8 @@ Also decided (rev 5):
    - the API is otherwise a fallback;
    - an always-available CPU rung keeps working when the GPU's memory is needed elsewhere.
 
+10. **The re-ranker stage is implemented regardless** (owner): the pipeline always has it, and a deployment that finds no worthwhile re-ranker disables it. Model choices (re-ranker and embedder) therefore do NOT block implementing any of the code. The built-in CPU re-ranker may be added later, once a model is chosen.
+
 Remaining:
-- **The survey and measurements of §5.0c,** which choose the models: GPU primary, API fallback (or primary), and the built-in CPU models.
+- **The survey and measurements of §5.0c,** which choose the models: GPU primary, API fallback (or primary), and the built-in CPU models. These run in parallel with the implementation.
 - **Whether the built-in CPU re-ranker ships enabled by default,** like the embedder. Proposed yes (§5.0a), pending its measured quality.
