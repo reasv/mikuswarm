@@ -106,11 +106,15 @@ test("v30→v31 migration marks rows the old deletion path wiped, and nothing el
       // Wiped by the old path: empty body, no attachments, edit time = deletion time.
       [event("discord:a:1", "1", "discord:a:room:c", "", { provider: "discord" }), 7_000],
       [event("matrix:miku:$w", "$w", ROOM_TK, "", { attachments: [] }), 8_000],
-      // Not wiped: a message with content, an edit, an attachment-only edit, a bot
-      // message, an empty message never edited, one already marked.
+      // The agent's own message, wiped when someone deleted it (its sends always have a body).
+      [event("matrix:miku:$own", "$own", ROOM_TK, "", { role: "assistant", sender: { id: "@miku:example.org", displayName: "Miku", isSelf: true, isBot: true } }), 6_500],
+      // Not wiped: a message with content, an edit, an attachment-only edit, another
+      // bot's or a webhook's edited embed-only message, an empty message never
+      // edited, one already marked.
       [event("matrix:miku:$e", "$e", ROOM_TK, "edited text"), 6_000],
       [event("matrix:miku:$att", "$att", ROOM_TK, "", { attachments: [{ id: "x", mediaType: "image" }] }), 6_000],
-      [event("matrix:miku:$bot", "$bot", ROOM_TK, "", { role: "assistant" }), 6_000],
+      [event("discord:a:900", "900", "discord:a:room:c", "", { provider: "discord", sender: { id: "4242", displayName: "MusicBot", isBot: true } }), 6_000],
+      [event("discord:a:901", "901", "discord:a:room:c", "", { provider: "discord", sender: { id: "4343", displayName: "Hook", isBot: true, isWebhook: true } }), 6_000],
       [event("matrix:miku:$empty", "$empty", ROOM_TK, ""), null],
       [event("matrix:miku:$done", "$done", ROOM_TK, "", { deleted: { at: 1, by: "@u:example.org" } }), 6_000],
     ];
@@ -130,14 +134,66 @@ test("v30→v31 migration marks rows the old deletion path wiped, and nothing el
         const deletedOf = (id: string) => (JSON.parse(row(reopened, id).event_json) as CanonicalChatEvent).deleted;
         assert.deepEqual(deletedOf("discord:a:1"), { at: 7_000 }, "time = last_edit_timestamp, deleter unknown");
         assert.deepEqual(deletedOf("matrix:miku:$w"), { at: 8_000 });
+        assert.deepEqual(deletedOf("matrix:miku:$own"), { at: 6_500 }, "the agent's own wiped message");
         assert.equal(deletedOf("matrix:miku:$e"), undefined);
         assert.equal(deletedOf("matrix:miku:$att"), undefined);
-        assert.equal(deletedOf("matrix:miku:$bot"), undefined);
+        assert.equal(deletedOf("discord:a:900"), undefined, "another bot's edited embed-only message");
+        assert.equal(deletedOf("discord:a:901"), undefined, "a webhook's edited embed-only message");
         assert.equal(deletedOf("matrix:miku:$empty"), undefined);
         assert.deepEqual(deletedOf("matrix:miku:$done"), { at: 1, by: "@u:example.org" }, "an existing marker is kept");
         for (const [id, body] of bodies) assert.equal(row(reopened, id).body, body, "no body changes");
         // Re-stamp so the second pass runs the step again: idempotent.
         if (pass === 0) await reopened.write((db) => db.pragma("user_version = 30"));
+      } finally {
+        reopened.close();
+      }
+    }
+  });
+});
+
+test("v31→v32 removes the false markers the first v31 step put on bot and webhook rows, marks the agent's own wiped rows", async () => {
+  await withStorage(async (storage, dbPath) => {
+    const bot = { id: "4242", displayName: "MusicBot", isBot: true };
+    const rows: Array<[CanonicalChatEvent, number | null]> = [
+      // What the first v31 step did: a marker (at = last edit, no deleter) on a bot's and a webhook's edited embed-only message.
+      [event("discord:a:900", "900", "discord:a:room:c", "", { provider: "discord", sender: bot, deleted: { at: 6_000 } }), 6_000],
+      [event("discord:a:901", "901", "discord:a:room:c", "", { provider: "discord", sender: { ...bot, isWebhook: true }, deleted: { at: 6_100 } }), 6_100],
+      // A live deletion of a bot message (receipt time, never the edit time): kept.
+      [event("discord:a:902", "902", "discord:a:room:c", "", { provider: "discord", sender: bot, deleted: { at: 9_000 } }), 6_200],
+      // A bot message with content and a live marker: kept.
+      [event("discord:a:903", "903", "discord:a:room:c", "now playing", { provider: "discord", sender: bot, deleted: { at: 9_100 } }), null],
+      // A marker naming a deleter on a bot row: kept.
+      [event("matrix:miku:$bm", "$bm", ROOM_TK, "", { sender: { id: "@bridge:example.org", displayName: "Bridge", isBot: true }, deleted: { at: 6_300, by: "@mod:example.org" } }), 6_300],
+      // A human's wiped row the first v31 step marked: kept.
+      [event("discord:a:904", "904", "discord:a:room:c", "", { provider: "discord", deleted: { at: 6_400 } }), 6_400],
+      // The agent's own message, wiped and skipped by the first v31 step: marked now.
+      [event("matrix:miku:$own", "$own", ROOM_TK, "", { role: "assistant", sender: { id: "@miku:example.org", displayName: "Miku", isSelf: true } }), 6_500],
+      // The agent's own message with content: untouched.
+      [event("matrix:miku:$own2", "$own2", ROOM_TK, "hi", { role: "assistant", sender: { id: "@miku:example.org", displayName: "Miku", isSelf: true } }), 6_600],
+    ];
+    for (const [r] of rows) await storage.appendTimelineEvent(r, "skipped");
+    await storage.write((db) => {
+      const setEdited = db.prepare(`update timeline_events set last_edit_timestamp = ? where id = ?`);
+      for (const [r, ts] of rows) if (ts !== null) setEdited.run(ts, r.id);
+      db.pragma("user_version = 31");
+    });
+    const bodies = new Map(rows.map(([r]) => [r.id, row(storage, r.id).body]));
+    storage.close();
+    for (let pass = 0; pass < 2; pass++) {
+      const reopened = await Storage.open({ databasePath: dbPath });
+      try {
+        assert.equal(reopened.read((db) => Number(db.pragma("user_version", { simple: true }))), LATEST_SCHEMA_VERSION);
+        const deletedOf = (id: string) => (JSON.parse(row(reopened, id).event_json) as CanonicalChatEvent).deleted;
+        assert.equal(deletedOf("discord:a:900"), undefined, "a bot's false marker is removed");
+        assert.equal(deletedOf("discord:a:901"), undefined, "a webhook's false marker is removed");
+        assert.deepEqual(deletedOf("discord:a:902"), { at: 9_000 }, "a live deletion's marker is kept");
+        assert.deepEqual(deletedOf("discord:a:903"), { at: 9_100 });
+        assert.deepEqual(deletedOf("matrix:miku:$bm"), { at: 6_300, by: "@mod:example.org" });
+        assert.deepEqual(deletedOf("discord:a:904"), { at: 6_400 }, "a human's marker is kept");
+        assert.deepEqual(deletedOf("matrix:miku:$own"), { at: 6_500 }, "the agent's own wiped message is marked");
+        assert.equal(deletedOf("matrix:miku:$own2"), undefined);
+        for (const [id, body] of bodies) assert.equal(row(reopened, id).body, body, "no body changes");
+        if (pass === 0) await reopened.write((db) => db.pragma("user_version = 31"));
       } finally {
         reopened.close();
       }

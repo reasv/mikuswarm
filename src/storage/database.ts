@@ -12788,7 +12788,7 @@ ${EXA_RESEARCH_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 31;
+export const LATEST_SCHEMA_VERSION = 32;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -13779,27 +13779,68 @@ function addLateInputColumns(db: Database.Database): void {
 }
 
 /**
- * v30→v31 (data-only, ARCHITECTURE.md §6 "Message edits"): messages wiped by the
- * old deletion path. A deletion used to go through the edit path as an empty
- * replacement, leaving the row with an empty body, no attachments and
- * `last_edit_timestamp` set to the deletion's time; the content is gone. Each
- * such user message gets the deletion marker (`deleted.at` = that time, deleter
- * unknown), so the recent tiers show the deletion placeholder instead of an
- * empty message. Nothing else on the row changes. Idempotent: a row already
- * marked is left alone.
+ * The rows the old deletion path wiped (ARCHITECTURE.md §6 "Message edits"): a
+ * deletion used to go through the edit path as an empty replacement, leaving
+ * the row with an empty body, no attachments and `last_edit_timestamp` set to
+ * the deletion's time. A human's message (a webhook's and another bot's
+ * excluded: an embed-only message such a sender edits looks the same) or the
+ * agent's own (its sends always have a body, and `edit_message` refuses empty
+ * text). The SQL condition, shared by the v31 and v32 steps.
  */
-function markWipedDeletions(db: Database.Database): void {
-  const exists = (db.prepare(`select count(*) as n from sqlite_master where type = 'table' and name = 'timeline_events'`).get() as { n: number }).n > 0;
-  if (!exists) return;
+const WIPED_ROW_CONDITION = `body = ''
+       and last_edit_timestamp is not null
+       and coalesce(json_array_length(json_extract(event_json, '$.attachments')), 0) = 0`;
+const HUMAN_OR_OWN_CONDITION = `(role = 'assistant'
+            or (role = 'user' and coalesce(sender_is_bot, 0) = 0 and coalesce(sender_is_webhook, 0) = 0))`;
+
+function hasTimelineEvents(db: Database.Database): boolean {
+  return (db.prepare(`select count(*) as n from sqlite_master where type = 'table' and name = 'timeline_events'`).get() as { n: number }).n > 0;
+}
+
+/** Mark every wiped row (`WIPED_ROW_CONDITION`) of a human or the agent: `deleted.at` = that time, deleter unknown. */
+function markWipedRows(db: Database.Database): void {
   db.prepare(
     `update timeline_events
      set event_json = json_set(event_json, '$.deleted', json_object('at', last_edit_timestamp))
-     where role = 'user'
-       and body = ''
-       and last_edit_timestamp is not null
-       and coalesce(json_array_length(json_extract(event_json, '$.attachments')), 0) = 0
+     where ${WIPED_ROW_CONDITION}
+       and ${HUMAN_OR_OWN_CONDITION}
        and json_extract(event_json, '$.deleted') is null`,
   ).run();
+}
+
+/**
+ * v30→v31 (data-only, ARCHITECTURE.md §6 "Message edits"): messages wiped by the
+ * old deletion path get the deletion marker, so the recent tiers show the
+ * deletion placeholder instead of an empty message. Nothing else on the row
+ * changes. Idempotent: a row already marked is left alone.
+ */
+function markWipedDeletions(db: Database.Database): void {
+  if (!hasTimelineEvents(db)) return;
+  markWipedRows(db);
+}
+
+/**
+ * v31→v32 (data-only): repairs what the first v31 step did. It also marked
+ * another bot's or a webhook's edited embed-only message (an empty body, no
+ * attachments, edited), which was never deleted: those markers are removed,
+ * and only markers that step could have made (no deleter, `at` equal to the
+ * row's `last_edit_timestamp`, a wiped row), never one a live deletion set. It
+ * skipped the agent's own messages, wiped when someone deleted them: those are
+ * marked now. Idempotent.
+ */
+function repairWipedDeletionMarkers(db: Database.Database): void {
+  if (!hasTimelineEvents(db)) return;
+  db.prepare(
+    `update timeline_events
+     set event_json = json_remove(event_json, '$.deleted')
+     where role = 'user'
+       and (coalesce(sender_is_bot, 0) = 1 or coalesce(sender_is_webhook, 0) = 1)
+       and ${WIPED_ROW_CONDITION}
+       and json_type(event_json, '$.deleted') = 'object'
+       and json_type(event_json, '$.deleted.by') is null
+       and json_extract(event_json, '$.deleted.at') = last_edit_timestamp`,
+  ).run();
+  markWipedRows(db);
 }
 
 // Ordered migration steps, indexed so the step at index `i` migrates a database
@@ -13841,6 +13882,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   (db) => db.exec(EXA_RESEARCH_SCHEMA),  // v28→v29 durable Exa research
   addLateInputColumns,                  // v29→v30 late input
   markWipedDeletions,                   // v30→v31 deletion markers on wiped rows
+  repairWipedDeletionMarkers,           // v31→v32 bot/webhook false markers out, own rows in
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write
