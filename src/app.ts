@@ -99,6 +99,7 @@ import type { Agent, AgentMessage, AgentTool } from "@earendil-works/pi-agent-co
 import {
   HELD_CALL_CANCELLED,
   LateInputSession,
+  mergeRestart,
   resolveLateInputSettings,
   takeQueuedSteers,
   type CorrectionFallback,
@@ -8540,7 +8541,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       void storage.setAgentSessionRefusalPin(session.id, null).catch(() => undefined);
       // Corrections arriving while the context is rebuilt join the rebuild (no
       // request is sent for a build they made stale); interjections are parked.
-      lateCtl!.markRebuilding();
+      // One filed while this redo compensated or forked joins it now.
+      const absorbed = lateCtl!.markRebuilding();
+      if (absorbed) request = mergeRestart(request, absorbed);
       let next: CreatedAgent;
       let unapplied: RestartRequest | undefined;
       for (;;) {
@@ -8654,7 +8657,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         suppressTyping: proactive,
         endings: binding.created.gate,
         ...sessionRedoOptions(binding.created, binding.capture),
-        ...(lateCtl ? { lateInput: { next: lateInputNext, ended: onRunEnded } } : {}),
+        ...(lateCtl ? { lateInput: { next: lateInputNext, pending: () => lateCtl.hasPendingStep(), ended: onRunEnded } } : {}),
       });
       // drainCalled: the success path releases the timeline slot itself (before the
       // record turn), so the .finally drains only on the error path.

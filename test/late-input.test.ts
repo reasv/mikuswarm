@@ -281,3 +281,37 @@ test("redo: a correction while a redo rebuilds joins the rebuild instead of a se
   assert.equal(ctl.peekPending(), undefined, "no step for the new agent's first request to trip on");
   assert.deepEqual(ctl.takeRebuildBeforeStart()?.causeEventIds, ["e2"]);
 });
+
+test("redo: a restart filed while the redo was being applied joins the rebuild", () => {
+  const ctl = session();
+  const req = (id: string) => ({ reason: "edit_redo" as const, causeEventIds: [id], fallbacks: [], addedEventIds: [], removedEventIds: [] });
+  ctl.bind({ signal: undefined, abort: () => undefined } as unknown as Agent, undefined);
+  ctl.requestRestart(req("e1"));
+  ctl.takePending();
+  // The runner compensates and forks the old rollout: still running.
+  ctl.requestRestart(req("e2"));
+  assert.deepEqual(ctl.markRebuilding()?.causeEventIds, ["e2"], "handed to the rebuild");
+  assert.equal(ctl.peekPending(), undefined, "nothing left for the rebuilt agent to trip on");
+  assert.equal(ctl.hasPendingStep(), false);
+});
+
+test("redo: a step filed while the agent was idle is pending for the runner, and a later correction still aborts", async () => {
+  const ctl = session();
+  let aborts = 0;
+  const agent = { signal: undefined as AbortSignal | undefined, abort: () => (aborts += 1) };
+  const progress = new RequestProgress(false);
+  ctl.bind(agent as unknown as Agent, progress);
+  const req = (id: string) => ({ reason: "edit_redo" as const, causeEventIds: [id], fallbacks: [], addedEventIds: [], removedEventIds: [] });
+  ctl.requestRestart(req("e1"));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(aborts, 0, "nothing in flight to abort");
+  assert.equal(ctl.hasPendingStep(), true, "the runner applies it before its next request");
+  // A request went out anyway (a path that did not check): the next correction aborts it.
+  agent.signal = new AbortController().signal;
+  progress.begin();
+  progress.noteAttemptEvent();
+  ctl.requestRestart(req("e2"));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(aborts, 1);
+  assert.deepEqual((ctl.takePending() as { request: { causeEventIds: string[] } }).request.causeEventIds, ["e1", "e2"]);
+});

@@ -498,3 +498,46 @@ min_chars = 1
     await h.stop();
   }
 });
+
+test("late input races: a correction while a redo compensates joins the rebuild, no stale rollout runs", async () => {
+  let reacted = false;
+  let compensating = false;
+  const allText = (req: FakeLlmRequest) => req.body.messages.map((m) => messageText(m)).join("\n");
+  const h = await startHarness({
+    toml: LATE({ hold_ms: 0, extend_ms: 0, max_hold_ms: 0, first_event_wait_ms: 100 }),
+    channelClient: {
+      react: async (_id: string, emoji: string) => ({ display: emoji }),
+      unreact: async () => {
+        compensating = true;
+        await new Promise((r) => setTimeout(r, 1000));
+        return { removed: 1 };
+      },
+    },
+    script: (req) => {
+      if (isRecordTurnRequest(req)) return { text: "NO_REPLY" };
+      const t = allText(req);
+      if (!reacted) {
+        reacted = true;
+        return { toolCalls: [{ name: "react", args: { message_id: "$user1", emoji: "👀" } }] };
+      }
+      if (t.includes("not executed: the request changed")) return { text: "NO_REPLY" };
+      const v = t.includes("v3") ? "v3" : t.includes("v2") ? "v2" : "v1";
+      return { ...send(`answer ${v}`), delayMs: v === "v1" ? 1500 : 300 };
+    },
+  });
+  try {
+    const id = h.say("v1 hi bot", { mention: true });
+    await h.until(() => reacted && h.llm.requests.length >= 2, "reacted, next request in flight");
+    h.edit(id, "v2 hi bot", { mention: true });
+    await h.until(() => compensating, "compensation running");
+    await new Promise((r) => setTimeout(r, 200));
+    h.edit(id, "v3 hi bot", { mention: true });
+    await h.until(settledAll(h), "settled", 15_000);
+    assert.deepEqual(bodies(h), ["answer v3"]);
+    const stale = h.llm.requests.filter((r) => !isRecordTurnRequest(r) && allText(r).includes("not executed: the request changed"));
+    assert.equal(stale.length, 0, "no rebuilt rollout ran with a redo pending");
+    assert.equal(h.logs.filter((l) => l.message === "late_input_redo" && l.phase !== "building").length, 1, "one redo");
+  } finally {
+    await h.stop();
+  }
+});

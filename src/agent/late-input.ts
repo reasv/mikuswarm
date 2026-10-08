@@ -419,6 +419,9 @@ export class LateInputSession {
     }
     if (this.pending?.kind === "restart") {
       this.pending = { kind: "restart", request: mergeRestart(this.pending.request, request) };
+      // The first abort may have found nothing to abort (the agent idle between
+      // steps); a request issued since then is aborted now.
+      void this.abortForStep();
       return;
     }
     if (this.pending?.kind === "cancel") return;
@@ -466,6 +469,15 @@ export class LateInputSession {
     return this.pending;
   }
 
+  /**
+   * A redo or cancel is pending: the runner applies it instead of issuing a
+   * request that it would make stale (a step filed while the agent was idle
+   * between steps finds nothing to abort).
+   */
+  hasPendingStep(): boolean {
+    return this.pending !== undefined && this.pending.kind !== "interject";
+  }
+
   /** A correction arrived while building: the caller rebuilds before starting. */
   takeRebuildBeforeStart(): RestartRequest | undefined {
     const r = this.rebuildBeforeStart;
@@ -478,6 +490,7 @@ export class LateInputSession {
     if (this.pending?.kind !== "cancel") return undefined;
     const p = this.pending;
     this.pending = undefined;
+    this.aborting = false;
     return p;
   }
 
@@ -490,9 +503,21 @@ export class LateInputSession {
     this.phase = "running";
   }
 
-  /** A redo rebuilds the context: corrections meanwhile join the rebuild (no branch, no request). */
-  markRebuilding(): void {
+  /**
+   * A redo rebuilds the context: corrections meanwhile join the rebuild (no
+   * branch, no request). A restart filed while the redo was being applied (the
+   * old rollout compensated or forked, the phase still `running`) is returned
+   * for the rebuild to absorb: it has not read the timeline yet. A pending
+   * interjection is dropped (the rebuild redelivers the steers); a pending
+   * cancel stays for the rebuild to honour.
+   */
+  markRebuilding(): RestartRequest | undefined {
     this.phase = "building";
+    this.aborting = false;
+    const pending = this.pending;
+    if (pending?.kind === "cancel") return undefined;
+    this.pending = undefined;
+    return pending?.kind === "restart" ? pending.request : undefined;
   }
 
   /**
@@ -696,9 +721,9 @@ export class LateInputSession {
    */
   private async abortForStep(): Promise<void> {
     if (this.aborting) return;
-    this.aborting = true;
     const agent = this.agent;
     if (!agent) return;
+    this.aborting = true;
     const progress = this.progress;
     for (;;) {
       if (progress?.phase === "awaiting_first_event") {
@@ -720,20 +745,16 @@ export class LateInputSession {
     }
     const step = this.pending;
     if (!step || this.agent !== agent) return;
-    if (agent.signal !== undefined) {
-      if (step.kind === "interject") {
-        this.logger?.info("turn_aborted_for_interjection", { sessionId: this.sessionId, phase: progress?.phase });
-      }
-      agent.abort();
+    if (agent.signal === undefined) {
+      // Nothing in flight: the runner applies the step before its next request
+      // (`hasPendingStep`); a later correction may abort again.
+      this.aborting = false;
+      return;
     }
-  }
-
-  /**
-   * After a rebuild bound a new agent: a step filed meanwhile (one the rebuild
-   * did not absorb) aborts the new agent's first request under the abort rule.
-   */
-  reapplyPending(): void {
-    if (this.pending && this.pending.kind !== "interject") void this.abortForStep();
+    if (step.kind === "interject") {
+      this.logger?.info("turn_aborted_for_interjection", { sessionId: this.sessionId, phase: progress?.phase });
+    }
+    agent.abort();
   }
 }
 
