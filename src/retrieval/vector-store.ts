@@ -27,6 +27,10 @@ function toBuffer(vec: Float32Array): Buffer {
  */
 export class VectorStore {
   private loaded = false;
+  /** The vec0 table: `memory_vec` (built-in index) or `memory_vec_<slug>` (primary, §9d). */
+  readonly table: string;
+  private readonly dimKey: string;
+  private readonly modelKey: string;
   /**
    * Once-per-process guard so a genuine vec0 corruption/binding failure (which makes
    * the semantic half silently no-op) is surfaced exactly once rather than spammed on
@@ -37,7 +41,14 @@ export class VectorStore {
   constructor(
     private readonly storage: Storage,
     private readonly logger?: Logger,
-  ) {}
+    /** Index name: undefined = the built-in index (`memory_vec`); else a slug. */
+    indexSlug?: string,
+  ) {
+    if (indexSlug !== undefined && !/^[a-z0-9_]+$/.test(indexSlug)) throw new Error(`invalid vector index slug ${indexSlug}`);
+    this.table = indexSlug ? `memory_vec_${indexSlug}` : "memory_vec";
+    this.dimKey = indexSlug ? `${ACTIVE_DIM_KEY}:${indexSlug}` : ACTIVE_DIM_KEY;
+    this.modelKey = indexSlug ? `${ACTIVE_MODEL_KEY}:${indexSlug}` : ACTIVE_MODEL_KEY;
+  }
 
   /** Warn once per process when a read path swallows an error into a graceful empty result (#17). */
   private warnVectorError(op: string, error: unknown): void {
@@ -69,8 +80,8 @@ export class VectorStore {
     modelId: string,
   ): Promise<{ recreated: boolean; modelChanged: boolean }> {
     await this.load();
-    const priorDim = this.storage.getIndexMeta(ACTIVE_DIM_KEY);
-    const priorModel = this.storage.getIndexMeta(ACTIVE_MODEL_KEY);
+    const priorDim = this.storage.getIndexMeta(this.dimKey);
+    const priorModel = this.storage.getIndexMeta(this.modelKey);
     // A same-dim model swap still crosses vector spaces → caller must re-embed.
     const modelChanged = priorModel !== undefined && priorModel !== modelId;
     const tableExists = this.storage.read(
@@ -78,22 +89,22 @@ export class VectorStore {
         (
           db
             .prepare(
-              `select count(*) as n from sqlite_master where type = 'table' and name = 'memory_vec'`,
+              `select count(*) as n from sqlite_master where type = 'table' and name = ?`,
             )
-            .get() as { n: number }
+            .get(this.table) as { n: number }
         ).n > 0,
     );
 
     let recreated = false;
     if (tableExists && priorDim !== String(dim)) {
-      await this.storage.write((db) => db.exec(`drop table if exists memory_vec`));
+      await this.storage.write((db) => db.exec(`drop table if exists ${this.table}`));
       this.logger?.warn("vector_index_dim_changed", { from: priorDim, to: dim, model: modelId });
       recreated = true;
     }
 
     await this.storage.write((db) =>
       db.exec(
-        `create virtual table if not exists memory_vec using vec0(
+        `create virtual table if not exists ${this.table} using vec0(
            chunk_id integer primary key,
            embedding float[${dim}] distance_metric=cosine,
            source text partition key
@@ -111,20 +122,20 @@ export class VectorStore {
     // (The dim-change branch above already dropped+recreated the table, so this only
     // matters for the same-dim case where the table survived.)
     if (modelChanged && !recreated) {
-      await this.storage.write((db) => db.exec(`delete from memory_vec`));
+      await this.storage.write((db) => db.exec(`delete from ${this.table}`));
       this.logger?.warn("vector_index_model_changed", { from: priorModel, to: modelId, dim });
     }
 
-    if (priorModel !== modelId) await this.storage.setIndexMeta(ACTIVE_MODEL_KEY, modelId);
-    if (priorDim !== String(dim)) await this.storage.setIndexMeta(ACTIVE_DIM_KEY, String(dim));
+    if (priorModel !== modelId) await this.storage.setIndexMeta(this.modelKey, modelId);
+    if (priorDim !== String(dim)) await this.storage.setIndexMeta(this.dimKey, String(dim));
     return { recreated, modelChanged };
   }
 
   /** Insert/replace a chunk's vector. `chunkId` = `memory_chunks.rowid`. */
   async upsert(chunkId: number, source: string, vec: Float32Array): Promise<void> {
     await this.storage.write((db) => {
-      db.prepare(`delete from memory_vec where chunk_id = ?`).run(BigInt(chunkId));
-      db.prepare(`insert into memory_vec(chunk_id, embedding, source) values (?, ?, ?)`).run(
+      db.prepare(`delete from ${this.table} where chunk_id = ?`).run(BigInt(chunkId));
+      db.prepare(`insert into ${this.table}(chunk_id, embedding, source) values (?, ?, ?)`).run(
         BigInt(chunkId),
         toBuffer(vec),
         source,
@@ -141,7 +152,7 @@ export class VectorStore {
     if (!this.loaded || chunkIds.length === 0) return out;
     try {
       this.storage.read((db) => {
-        const sel = db.prepare(`select embedding from memory_vec where chunk_id = ?`);
+        const sel = db.prepare(`select embedding from ${this.table} where chunk_id = ?`);
         for (const id of chunkIds) {
           const row = sel.get(BigInt(id)) as { embedding: Buffer | Uint8Array } | undefined;
           if (!row) continue;
@@ -160,7 +171,7 @@ export class VectorStore {
   /** Remove a chunk's vector (chunk deleted from the corpus). */
   async remove(chunkId: number): Promise<void> {
     await this.storage.write((db) =>
-      db.prepare(`delete from memory_vec where chunk_id = ?`).run(BigInt(chunkId)),
+      db.prepare(`delete from ${this.table} where chunk_id = ?`).run(BigInt(chunkId)),
     );
   }
 
@@ -178,9 +189,9 @@ export class VectorStore {
           (
             db
               .prepare(
-                `select count(*) as n from sqlite_master where type = 'table' and name = 'memory_vec'`,
+                `select count(*) as n from sqlite_master where type = 'table' and name = ?`,
               )
-              .get() as { n: number }
+              .get(this.table) as { n: number }
           ).n > 0;
         if (!exists) return [];
         // `k` is interpolated (a validated integer) for the same reason chunk_id is
@@ -190,7 +201,7 @@ export class VectorStore {
           source !== undefined ? [toBuffer(queryVec), source] : [toBuffer(queryVec)];
         const rows = db
           .prepare(
-            `select chunk_id as chunkId, distance from memory_vec
+            `select chunk_id as chunkId, distance from ${this.table}
              where embedding match ? and k = ${safeK}${sourceClause} order by distance`,
           )
           .all(...params) as VecHit[];

@@ -1096,7 +1096,7 @@ export const DecisionEvaluation = Schema.Struct({
 	id: Schema.Number,
 	ts: Schema.Number,
 	decisionGroup: Schema.String,
-	point: Schema.String,              // 'routing' | 'records' | 'checks' | 'audit'
+	point: Schema.String,              // 'routing' | 'records' | 'memory' | 'checks' | 'audit'
 	agent: Schema.NullOr(Schema.String),
 	timelineKey: Schema.NullOr(Schema.String),
 	agentSessionId: Schema.NullOr(Schema.String),
@@ -1134,6 +1134,93 @@ export const SessionDecisionsResponse = Schema.Struct({
 	evaluations: Schema.Array(DecisionEvaluation)
 });
 export type SessionDecisionsResponse = Schema.Schema.Type<typeof SessionDecisionsResponse>;
+
+// ===========================================================================
+// Memory retrieval (spec MEMORY-RETRIEVAL §7.4, §9; ARCHITECTURE.md §9d
+// "Observability", §9c "Memory filters"). Rows of `memory_retrievals` and
+// `memory_filter_hits` (schema v34), camelCased like the store's readers
+// (src/storage/memory-retrieval-store.ts). An older backend without the tables
+// or the routes degrades to empty in the query layer, never an error.
+// ===========================================================================
+
+/**
+ * One `memory_retrievals` row: one auto-retrieval build. `reportJson` is the
+ * pipeline's `RetrievalReport` (src/retrieval/auto/types.ts) kept as a string and
+ * parsed defensively by `$lib/memory-retrieval`.
+ */
+export const MemoryRetrieval = Schema.Struct({
+	id: Schema.String,
+	agentSessionId: Schema.NullOr(Schema.String),
+	agent: Schema.NullOr(Schema.String),
+	timelineKey: Schema.NullOr(Schema.String),
+	ts: Schema.Number,
+	source: Schema.String, // 'model' | 'fallback' | 'unjudged' | 'none'
+	decisionGroup: Schema.NullOr(Schema.String),
+	candidates: Schema.Number,
+	judged: Schema.Number,
+	kept: Schema.Number,
+	hidden: Schema.Number,
+	tokens: Schema.Number,
+	ms: Schema.Number,
+	reportJson: Schema.NullOr(Schema.String),
+	followUpAt: Schema.NullOr(Schema.Number),
+	followUpKind: Schema.NullOr(Schema.String)
+});
+export type MemoryRetrieval = Schema.Schema.Type<typeof MemoryRetrieval>;
+
+/** GET /api/sessions/:id/memory-retrievals — the session's builds in `ts` order. */
+export const SessionMemoryRetrievalsResponse = Schema.Struct({
+	retrievals: Schema.Array(MemoryRetrieval)
+});
+export type SessionMemoryRetrievalsResponse = Schema.Schema.Type<typeof SessionMemoryRetrievalsResponse>;
+
+/** One `memory_filter_hits` row: a block a filter has hidden (the audit trail). */
+export const MemoryFilterHit = Schema.Struct({
+	agent: Schema.String, // '' = legacy single-agent mode
+	contentHash: Schema.String,
+	filterKey: Schema.String,
+	filterHash: Schema.String,
+	kind: Schema.String, // 'keyword' | 'pattern' | 'judged'
+	detail: Schema.NullOr(Schema.String),
+	probability: Schema.NullOr(Schema.Number),
+	path: Schema.NullOr(Schema.String),
+	startLine: Schema.NullOr(Schema.Number),
+	endLine: Schema.NullOr(Schema.Number),
+	surface: Schema.String,
+	firstHiddenAt: Schema.Number,
+	lastHiddenAt: Schema.Number,
+	hideCount: Schema.Number
+});
+export type MemoryFilterHit = Schema.Schema.Type<typeof MemoryFilterHit>;
+
+/** GET /api/memory/filter-hits?limit= — newest `lastHiddenAt` first. */
+export const MemoryFilterHitsResponse = Schema.Struct({
+	hits: Schema.Array(MemoryFilterHit)
+});
+export type MemoryFilterHitsResponse = Schema.Schema.Type<typeof MemoryFilterHitsResponse>;
+
+/**
+ * One window of GET /api/memory/stats. The follow-up figures are
+ * `MemoryRetrievalStore.followUpStats(sinceTs)`: distinct sessions with a build
+ * that kept something, and how many of them followed up. `builds` / `sources`
+ * count every build row since `sinceTs` by its `source`.
+ */
+export const MemoryStatsWindow = Schema.Struct({
+	days: Schema.Number,
+	sinceTs: Schema.Number,
+	sessionsWithBlock: Schema.Number,
+	followedUp: Schema.Number,
+	rate: Schema.NullOr(Schema.Number),
+	builds: Schema.Number,
+	sources: Schema.Record({ key: Schema.String, value: Schema.Number })
+});
+export type MemoryStatsWindow = Schema.Schema.Type<typeof MemoryStatsWindow>;
+
+/** GET /api/memory/stats — the 7- and 30-day windows. */
+export const MemoryStatsResponse = Schema.Struct({
+	windows: Schema.Array(MemoryStatsWindow)
+});
+export type MemoryStatsResponse = Schema.Schema.Type<typeof MemoryStatsResponse>;
 
 // ===========================================================================
 // Model behaviour page (spec REFUSAL-HANDLING §12.3, §12.4). Wire shapes of

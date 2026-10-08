@@ -15,6 +15,10 @@ export const keys = {
 	session: (id: string) => ['sessions', id] as const,
 	sessionRecord: (id: string) => ['sessions', id, 'record'] as const,
 	sessionDecisions: (id: string) => ['sessions', id, 'decisions'] as const,
+	sessionMemoryRetrievals: (id: string) => ['sessions', id, 'memory-retrievals'] as const,
+	// Memory page (spec MEMORY-RETRIEVAL §7.4, §9): the filters audit and the stats.
+	memoryFilterHits: (limit: number) => ['memory', 'filter-hits', limit] as const,
+	memoryStats: () => ['memory', 'stats'] as const,
 	summary: (id: string) => ['summaries', id] as const,
 	// Pipeline monitor (ARCHITECTURE.md §11). `pipelines()` is the dashboard feed;
 	// `pipelineItems(pool, filters)` a filtered list; `pipelineItem(pool, id)` one

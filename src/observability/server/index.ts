@@ -47,6 +47,7 @@ import {
   promoteBackfetchCaptions,
 } from "./backfetch-handlers.js";
 import { modelBehaviour, modelBehaviourIncidents } from "./model-behaviour-handlers.js";
+import { memoryFilterHits, memoryStats, sessionMemoryRetrievals } from "./memory-handlers.js";
 import type { ConsoleServerDeps } from "./types.js";
 
 export type { ConsoleServerDeps } from "./types.js";
@@ -99,6 +100,9 @@ export function createObservabilityServer(deps: ConsoleServerDeps): ConsoleServe
     .add("GET", "/api/sessions/:id", sessionDetail)
     .add("GET", "/api/sessions/:id/record", sessionRecord)
     .add("GET", "/api/sessions/:id/decisions", sessionDecisions)
+    .add("GET", "/api/sessions/:id/memory-retrievals", sessionMemoryRetrievals)
+    .add("GET", "/api/memory/filter-hits", memoryFilterHits)
+    .add("GET", "/api/memory/stats", memoryStats)
     .add("GET", "/api/sessions/:id/stream", sessionStream)
     .add("POST", "/api/sessions/:id/abort", abortSession)
     .add("POST", "/api/sessions/:id/resume", resumeSession)

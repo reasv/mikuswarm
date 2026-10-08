@@ -8,6 +8,7 @@
 		answerLabel,
 		fallbackReasonsLabel,
 		parseAnswers,
+		parseMemoryVerdict,
 		parseRecordsVerdict,
 		routingLabelAnswers,
 		rowVerdictLabel,
@@ -101,11 +102,18 @@
 				{@const answers = Object.entries(parseAnswers(row.answersJson))}
 				{@const recordsVerdict = row.point === 'records' ? parseRecordsVerdict(row.verdictJson) : null}
 				{@const labels = row.point === 'routing' ? routingLabelAnswers(row) : null}
+				{@const memoryVerdict = row.point === 'memory' ? parseMemoryVerdict(row.verdictJson) : null}
 				<div class="space-y-1.5">
 					<div class="flex flex-wrap items-center gap-x-2 font-mono text-[11px]">
 						{#if row.candidateSessionId}
 							<span class="text-muted-foreground">candidate</span>
 							<span class="text-foreground">{row.candidateSessionId}</span>
+						{/if}
+						{#if memoryVerdict}
+							<span class="text-foreground" data-testid="memory-citation">{memoryVerdict.citation}</span>
+							{#if memoryVerdict.kind === 'filter'}
+								<span class="text-[10px] text-muted-foreground">{memoryVerdict.surface}</span>
+							{/if}
 						{/if}
 						<span class="rounded bg-muted px-1 text-[10px]">{rowVerdictLabel(row) ?? '—'}</span>
 						{#if recordsVerdict}

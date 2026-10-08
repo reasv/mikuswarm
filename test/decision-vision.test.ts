@@ -210,7 +210,7 @@ test("validateDecisionsConfig: vision chains must be system-one with image input
     /implicit_reply\.min_confidence is not used/,
   );
   const warnings: string[] = [];
-  validateDecisionsConfig(baseConfig({ enabled: true, model: "decider", late_addition: { enabled: true, vision: "always" } }), {
+  validateDecisionsConfig(baseConfig({ enabled: true, model: "decider", memory: { enabled: false }, late_addition: { enabled: true, vision: "always" } }), {
     warn: (event) => warnings.push(event),
   });
   assert.deepEqual(warnings, ["decisions_vision_without_chain"]);

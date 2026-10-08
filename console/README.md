@@ -83,6 +83,8 @@ MIKUSWARM_CONSOLE_DEMO=1 pnpm dev
 #   /?room=matrix%3Aaria%3Aroom%3A%21general%3Amatrix.example.org&session=ses_au4d1t  → an old session the offline audit judged
 #   /?room=matrix%3Aaria%3Aroom%3A%21general%3Amatrix.example.org&session=ses_li5e2d  → late input: edit/addition redos, aborted turn, revival, holds
 #   /models                                      → model behaviour page
+#   /memory                                      → memory follow-up rate, source mix, filters audit
+#   (session ses_op4kq2 also carries a memory retrieval card; ses_li5e2d a fallback build)
 ```
 
 Demo mode swaps the BFF's `AgentApiClient` for a fixture-backed layer (spec

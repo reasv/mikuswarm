@@ -29,7 +29,9 @@
 							? 'usage-cost'
 							: page.url.pathname.startsWith('/models')
 								? 'models'
-								: 'conversations'
+								: page.url.pathname.startsWith('/memory')
+									? 'memory'
+									: 'conversations'
 	);
 
 	// ── Agent chip in the conversations breadcrumb (spec CONSOLE-MULTI-AGENT §4) ──
@@ -150,6 +152,17 @@
 		>
 			Models
 		</a>
+		<a
+			href="/memory"
+			class={cn(
+				'rounded px-2 py-0.5 transition-colors',
+				area === 'memory'
+					? 'bg-background font-medium text-foreground shadow-sm'
+					: 'text-muted-foreground hover:text-foreground'
+			)}
+		>
+			Memory
+		</a>
     <a href="/research" class={cn('rounded px-2 py-0.5 transition-colors', area === 'research' ? 'bg-background font-medium text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground')}>Research</a>
 	</nav>
 
@@ -176,6 +189,10 @@
 	{:else if area === 'models'}
 		<nav class="flex min-w-0 items-center gap-1 text-muted-foreground">
 			<span>model behaviour</span>
+		</nav>
+	{:else if area === 'memory'}
+		<nav class="flex min-w-0 items-center gap-1 text-muted-foreground">
+			<span>memory retrieval &amp; filters</span>
 		</nav>
 	{:else if area === 'conversations'}
 		<nav class="flex min-w-0 items-center gap-1 text-muted-foreground">

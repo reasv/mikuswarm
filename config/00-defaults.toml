@@ -963,14 +963,37 @@ mmr_enabled = false               # §8a diversity re-rank (off, like OpenClaw)
 mmr_lambda = 0.7
 temporal_decay_enabled = true     # §8b — ON (diary recency matters; real timestamps)
 temporal_decay_half_life_days = 45
+excerpt_max_chars = 600           # recall_memory excerpt length (match-centred, §9d "Excerpts")
 
+# Auto-retrieval (§9d "Judged retrieval"): wide recall (the trigger, trigger +
+# reply target, and the conversation window as queries, plus user lanes and
+# person-cued recall), operator filters, the optional re-rank stages
+# ([retrieval.late], [retrieval.rerank]), then the `memory` decision point as the
+# final filter, one passage per request. Started at session launch, in parallel
+# with routing. Without a decision model (or judge = false) the selection is
+# today's ranking with readable excerpts. The point's own settings live under
+# [decisions.memory] (on by default whenever [decisions] is on):
+#   enabled = true, relevance_threshold = 0.7 (calibrate per member under
+#   [decisions.calibration.<member>] "memory.relevance_threshold"),
+#   conversation_messages = 8, plus the usual model / timeout_ms.
 [retrieval.auto]
-max_results = 3                   # §8c — small on purpose
-# Tighter absolute floor than the tool — see [retrieval.query].min_score. With the
-# saturating BM25 transform this reliably excludes weak common-word-only matches.
+judge = true                      # use the memory decision point when [decisions] is on
+max_results = 4                   # items in the block (judged or not)
+# Unjudged selection floor (no decision model): see [retrieval.query].min_score.
+# With the saturating BM25 transform this reliably excludes weak common-word-only matches.
 min_score = 0.45
-max_tokens = 600                  # whole injected block budget
-dedup_against_recency = true      # §8c — skip blocks already in the §10a recency layer
+max_tokens = 2000                 # whole injected block budget
+excerpt_max_tokens = 400          # a kept block up to this size is shown whole
+candidates = 60                   # wide recall: candidates after fusing every query and lane
+candidate_min_score = 0.25        # pre-decay relevance floor of the recall lanes
+user_lane_candidates = 8          # candidate slots reserved for user-lane hits
+query_messages = 6                # messages of the conversation-window query
+person_recent = 2                 # person-cued recall: newest tagged entries per active person
+person_recent_max = 8             # ... in total; these skip the re-rank cuts
+fallback_min_score = 0.6          # decision chain down: hybrid floor of the fallback selection
+fallback_max_results = 2          # ... and its cap
+max_judged = 12                   # most passages judged per build (person-cued included); the rest fall back
+dedup_against_recency = true      # skip blocks already in the §10a recency layer
 # User lane (§9d): a lexical-only sub-search keyed on the trigger user's display
 # name(s), reserving slots for "my recent history with this person" alongside the
 # topical results. Additive to max_results; the combined block still obeys max_tokens.
@@ -1027,6 +1050,90 @@ dim = 384
 # output = 0
 # cache_read = 0
 # cache_write = 0
+
+# Optional primary embedder with its own vector index (§9d "Two vector indexes").
+# The built-in index above is always maintained; a query uses the primary index
+# when it is complete and its embedder answers within timeout_ms, else the
+# built-in one. `model` is a [models.*] block (an OpenAI-compatible /embeddings
+# endpoint) whose fallback members serve the SAME model. Diary text derives from
+# user messages: set zdr = true or self_hosted = true.
+# [retrieval.embedding.primary]
+# model = "embed-gpu"
+# dim = 1024
+# timeout_ms = 1000
+# self_hosted = true
+
+# Cross-encoder re-rank stage (§9d "Re-rank stages"). Providers are tried in
+# order with health and fallover; a slow member (timeout_ms) falls over to the
+# next. kind = "remote" POSTs the open /rerank shape (TEI, Infinity, vLLM,
+# llama.cpp, hosted APIs; request_format "documents" or "texts") and needs
+# zdr = true or self_hosted = true; kind = "local" runs an ONNX cross-encoder in
+# process (weights from a Hugging Face repo, cached under the data dir, loaded in
+# the background; no built-in default model is shipped yet). min_score is that
+# provider's calibrated cutoff (used when the decision chain is down).
+[retrieval.rerank]
+enabled = false
+top_n = 8                         # survivors passed to the decision model
+timeout_ms = 1500                 # per member
+query_max_chars = 1200            # request + short conversation tail
+# chain = ["gpu", "cpu"]
+# [retrieval.rerank.providers.gpu]
+# kind = "remote"
+# endpoint = "${RERANK_URL}"
+# model = "..."
+# self_hosted = true
+# min_score = 0.3
+# [retrieval.rerank.providers.cpu]
+# kind = "local"
+# model = "<hf-org>/<onnx-reranker-repo>"
+# onnx_file = "onnx/model.onnx"
+
+# Late interaction (§9d "Late interaction"): token vectors per block, indexed in
+# the background on CPU (low priority); at query time the newest exhaustive_blocks
+# indexed blocks outside the recency layer are scanned (TurboQuant codes in the
+# native kernel, or exact fp32), older recall candidates are re-scored exactly,
+# and the merged list is cut to top_n. query_chain: query encoders in order, any
+# member of the index model's shared-space family. Size exhaustive_blocks with
+# `npx tsx scripts/bench-late.ts`.
+[retrieval.late]
+enabled = false
+# model = "<hf-org>/<late-interaction-model>"   # the index belongs to this model
+# family = []                     # other model ids sharing its space
+query_max_tokens = 64
+exhaustive_blocks = 0             # newest N blocks scanned exhaustively; "all"; 0 = re-rank only
+top_n = 20
+timeout_ms = 300                  # query encode + MaxSim; past it the stage is skipped
+resident = true                   # keep the window's scan codes in memory
+quantization = "turboquant"       # "turboquant" (native kernel) | "none" (exact fp32)
+bits = 4                          # TurboQuant bits per coordinate (2-4)
+rescore = 60                      # blocks re-scored exactly after a quantised scan
+dtype = "fp16"                    # stored vectors: "fp16" | "int8"
+index_batch_size = 4
+# chain = ["cpu"]
+# query_chain = ["cpu"]
+# [retrieval.late.providers.cpu]
+# kind = "local"
+# model = "<hf-org>/<late-interaction-model>"
+
+# Operator memory filters (§9c "Memory filters"): keep unwanted memories out of
+# what the harness pushes into context (auto-retrieval, the recency layer, the
+# diary writer's continuity window) and out of recall_memory / search_memory.
+# Direct file reads are not filtered. Judged filters run on the memory decision
+# point's chain (or `model`), lazily, cached per block; keyword and pattern
+# filters are mechanical. Any filter may be limited by after/before.
+[retrieval.filters]
+pending = "show"                  # judged verdict unavailable: "show" | "hide"
+# model = "decider"
+# [retrieval.filters.unwanted_habit]
+# description = "The entry describes the assistant <doing the unwanted thing>."
+# examples = { hide = ["..."], keep = ["..."] }
+# threshold = 0.8
+# [retrieval.filters.old_nickname]
+# keywords = ["some phrase"]
+# [retrieval.filters.that_week]
+# patterns = ['(?i)\bsome\s+regex\b']
+# after = "2026-05-10"
+# before = "2026-05-18T12:00"
 
 # Chat-history search & recap (ARCHITECTURE.md §9e). The FTS5 + metadata index that
 # backs the search_messages / recap / user_activity tools is ALWAYS built (plain

@@ -14,6 +14,7 @@
     "dev": "tsx watch src/index.ts"
   },
   "dependencies": {
+    "@anush008/tokenizers": "0.0.0",
     "@earendil-works/pi-agent-core": "0.84.2",
     "@earendil-works/pi-ai": "0.84.2",
     "@modelcontextprotocol/sdk": "^1.29.0",
@@ -27,6 +28,7 @@
     "gpt-tokenizer": "^3.4.0",
     "irc-framework": "^4.14.0",
     "nanoid": "5.1.11",
+    "onnxruntime-node": "1.21.0",
     "playwright-core": "1.60.0",
     "png-chunk-text": "^1.0.0",
     "png-chunks-encode": "^1.0.0",

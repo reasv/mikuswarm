@@ -5,7 +5,9 @@ import { DecisionEvaluation } from '$lib/schemas';
 import {
 	fallbackReasonsLabel,
 	groupDecisions,
+	memoryVerdictLabel,
 	parseAnswers,
+	parseMemoryVerdict,
 	parseRecordsVerdict,
 	parseRoutingVerdict,
 	routingLabelAnswers,
@@ -126,5 +128,75 @@ describe('defensive parsing', () => {
 		expect(s.verdict).toBe('other | other');
 		expect(s.topConfidence).toBeNull();
 		expect(fallbackReasonsLabel(s)).toBe('timeout ×2');
+	});
+});
+
+describe('memory rows (spec MEMORY-RETRIEVAL §5, §7)', () => {
+	const memoryRow = (verdict: unknown, extra: Partial<DecisionEvaluation> = {}): DecisionEvaluation => ({
+		...routing,
+		point: 'memory',
+		decisionGroup: 'dg-memory',
+		verdictJson: typeof verdict === 'string' ? verdict : JSON.stringify(verdict),
+		answersJson: JSON.stringify({ relevant: { type: 'noul', noul: 0.82 } }),
+		...extra
+	});
+	const passage = (o: Record<string, unknown>) => ({
+		citation: 'memory/2025-01-02.md:3-9 · general',
+		contentHash: 'abc',
+		keep: true,
+		relevant: 0.82,
+		aboutParticipant: 0.3,
+		scores: { hybrid: 0.5, late: null, rerank: 0.4 },
+		...o
+	});
+
+	it('labels relevance rows: keep, drop, hidden, not judged', () => {
+		expect(rowVerdictLabel(memoryRow(passage({})))).toBe('keep p=0.82');
+		expect(rowVerdictLabel(memoryRow(passage({ keep: false, relevant: 0.1 })))).toBe('drop p=0.10');
+		expect(rowVerdictLabel(memoryRow(passage({ hiddenBy: ['habit'] })))).toBe('hidden by habit');
+		expect(rowVerdictLabel(memoryRow(passage({ keep: false, relevant: null, aboutParticipant: null })))).toBe(
+			'not judged'
+		);
+		expect(parseMemoryVerdict(JSON.stringify(passage({ scores: { hybrid: 0.5, late: null, bad: 'x' } })))).toMatchObject({
+			kind: 'relevance',
+			scores: { hybrid: 0.5, late: null }
+		});
+	});
+
+	it('labels filter-only rows: hidden, shown, unjudged', () => {
+		const filterRow = (filters: unknown) =>
+			memoryRow({ citation: 'memory/a.md:1-4', contentHash: 'h', surface: 'recency_layer', filters });
+		expect(rowVerdictLabel(filterRow({ habit: { probability: 0.9, hidden: true }, other: { probability: 0.1, hidden: false } }))).toBe(
+			'hidden by habit'
+		);
+		expect(rowVerdictLabel(filterRow({ habit: { probability: 0.2, hidden: false } }))).toBe('shown');
+		expect(rowVerdictLabel(filterRow(null))).toBe('unjudged');
+		const v = parseMemoryVerdict(filterRow({ habit: { probability: 'x' } }).verdictJson);
+		expect(v).toEqual({ kind: 'filter', citation: 'memory/a.md:1-4', contentHash: 'h', surface: 'recency_layer', filters: {} });
+		expect(memoryVerdictLabel(v!)).toBe('shown');
+	});
+
+	it('summarizes a retrieval group as kept of judged, plus hidden', () => {
+		const s = summarizeDecisionGroup([
+			memoryRow(passage({})),
+			memoryRow(passage({ keep: false, relevant: 0.2 }), { id: 2 }),
+			memoryRow(passage({ hiddenBy: ['habit'] }), { id: 3 })
+		]);
+		expect(s.point).toBe('memory');
+		expect(s.verdict).toBe('kept 1 of 3, 1 hidden');
+		expect(s.candidates).toBe(3);
+		const filters = summarizeDecisionGroup([
+			memoryRow({ citation: 'a', contentHash: 'h', surface: 'recall_memory', filters: { k: { probability: 0.9, hidden: true } } }),
+			memoryRow({ citation: 'b', contentHash: 'i', surface: 'recall_memory', filters: {} }, { id: 2 })
+		]);
+		expect(filters.verdict).toBe('hid 1 of 2');
+	});
+
+	it('degrades malformed memory verdicts to null', () => {
+		expect(parseMemoryVerdict(null)).toBeNull();
+		expect(parseMemoryVerdict('{oops')).toBeNull();
+		expect(parseMemoryVerdict('{"citation":"x"}')).toBeNull();
+		expect(rowVerdictLabel(memoryRow('{oops'))).toBeNull();
+		expect(summarizeDecisionGroup([memoryRow('[]')]).verdict).toBe('—');
 	});
 });

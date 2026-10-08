@@ -12,3 +12,10 @@ resolver = "2"
 # §5.2 (build caveat). The §6.3 perf gate must confirm this took effect.
 [profile.dev.package."*"]
 opt-level = 3
+
+# Our own crate too: the TurboQuant MaxSim kernel (src/turboquant/, ARCHITECTURE.md
+# §9d "Late interaction") is a tight SIMD loop that runs ~67× slower at opt-level 0
+# (a full-corpus 4-bit scan: ~13 ms optimised vs ~876 ms). `build:native` is a debug
+# napi build, so the crate itself must be optimised here as well.
+[profile.dev.package.openclaw-matrix-native]
+opt-level = 3

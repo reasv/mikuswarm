@@ -7,6 +7,7 @@
 	import type {
 		CheckInfo,
 		DecisionEvaluation,
+		MemoryRetrieval,
 		RefusalEvent,
 		SessionBranch,
 		SessionInterjection,
@@ -34,7 +35,8 @@
 		refusalEvents = [],
 		contract,
 		checks = [],
-		interjections = []
+		interjections = [],
+		memoryRetrievals = []
 	}: {
 		sessionId: string;
 		onEnd?: () => void;
@@ -46,6 +48,7 @@
 		contract?: SessionContract;
 		checks?: readonly CheckInfo[];
 		interjections?: readonly SessionInterjection[];
+		memoryRetrievals?: readonly MemoryRetrieval[];
 	} = $props();
 
 	let messages = $state<RolloutMsg[]>([]);
@@ -244,6 +247,7 @@
 	{contract}
 	{checks}
 	{interjections}
+	{memoryRetrievals}
 />
 {#if !streaming && tentative}
 	<div class="px-3 opacity-60" title="Tentative — this attempt has not committed yet">

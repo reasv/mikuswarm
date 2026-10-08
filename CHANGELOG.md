@@ -25,6 +25,65 @@ Unreleased section; it is not part of any release's notes.
 
 ### Added
 
+- **Judged memory retrieval** (spec MEMORY-RETRIEVAL): the `<retrieved_memory>` block
+  is now chosen by a judge that reads the conversation. Recall widens
+  (the trigger, the trigger with its reply target and the conversation window as
+  queries; user lanes with display-name history; ~60 candidates), and the new
+  **`memory` decision point** judges each surviving passage in its own request, with
+  the conversation, the request and the participants in view: only passages judged
+  relevant are shown, and "none" means no block. It is on by default whenever
+  `[decisions]` is on (`[decisions.memory]`, `[retrieval.auto].judge`), starts at
+  session launch in parallel with routing, covers every session (proactive,
+  bot-triggered and any session type; a redo replans), and falls back to a stricter
+  hybrid selection (at most 2 items) when the decision chain is down, or for the
+  passages it did not answer in time (never silently dropped). At most
+  `[retrieval.auto].max_judged` (default 12) passages are judged per build, and the
+  requests queue below routing, records and checks, so they never delay those; the
+  build waits for the block at most the point's timeout plus a short grace.
+- **Readable memory excerpts**: a kept diary block is shown whole up to 400 tokens,
+  else its heading plus a window around the best-matching part; citations are compact
+  (`[memory/<file>.md:<lines> · room]`, the date only when the file name lacks it) and
+  heading residue is stripped. `recall_memory` gets the same excerpts (~600 characters).
+- **Participant tags from provenance**: every pipeline-written diary block is tagged
+  with the human sender ids of the conversation it was written from (a one-off
+  backfill runs in the background). They drive a presence lane, **person-cued recall**
+  (the newest entries with each person active in the conversation go straight to the
+  judge) and the new `recall_memory` **`user`** argument.
+- **Operator memory filters** (`[retrieval.filters.<key>]`): keep unwanted memories out
+  of what the harness pushes into context (auto-retrieval, the recent-diary layer, the
+  diary writer's continuity window) and out of `recall_memory` / `search_memory`. Judged
+  (a description judged lazily by the memory decision point and cached), keyword or
+  pattern filters, optionally scoped to a time range; direct file reads stay unfiltered.
+  An audit trail of hidden blocks is kept.
+- **Re-rank stages** (both off by default): a cross-encoder stage
+  (`[retrieval.rerank]`: remote `/rerank` servers and APIs or local ONNX models, as a
+  provider chain with health and fallover) and **late interaction**
+  (`[retrieval.late]`: background token-vector indexing; at query time an exhaustive
+  scan of the newest blocks with a native TurboQuant kernel plus exact re-scoring of
+  older candidates; `scripts/bench-late.ts` sizes the window). The window is updated
+  incrementally in the background and vectors are decoded off the event loop; the
+  index is keyed by the model and its document-side settings, so changing one
+  re-indexes. Local models can be pinned (`revision`, `sha256`). Remote providers must be
+  marked zero-data-retention or self-hosted.
+- **Primary embedder** (`[retrieval.embedding.primary]`, optional): a second vector
+  index served by a GPU or API embedder, used while it covers every block and answers
+  first; the built-in index keeps serving otherwise. Failed blocks are retried after a
+  backoff, never dropped.
+- Retrieval observability: a `memory_retrieval` log line per build, per-build rows
+  with every candidate's fate (shown as a retrieval card in the console's session
+  view, with the items the fallback rule chose marked; kept for
+  `[retrieval].retrievals_retention_days`, 90 by default), the follow-up rate (sessions
+  that open a cited memory), and memory-point calibration and a recall-ceiling audit
+  in `scripts/calibrate-checks.ts`. Its `--point filter --filter <key>` mode calibrates
+  a judged memory filter's threshold over the agent's diary blocks (every block
+  matching an enrichment set plus a seeded sample of the rest, reported per stratum
+  and as a population estimate), and accepts a filter defined only in a side file
+  (`--filter-file`). A new **`/memory` console page** shows the
+  follow-up rate, the source mix (judged, judged plus fallback, fallback, unjudged)
+  and the filters audit, read through three new agent routes:
+  `GET /api/sessions/:id/memory-retrievals`, `GET /api/memory/filter-hits` and
+  `GET /api/memory/stats`.
+
 - **Late input** (`[agent.sessions.late_input]`, on by default): a person's request can be
   corrected after its chat session started. While the session has done nothing
   irreversible, an edit of the triggering message (or a part grouped with it), a late
@@ -367,6 +426,17 @@ Unreleased section; it is not part of any release's notes.
   model's style revisions, also when an observed refusal check fired beside it.
 
 ### Changed
+
+- **Upgrade note: memory judging sends diary text to the decision chain.** The
+  `memory` decision point is on by default whenever `[decisions]` is on, and each
+  request carries one diary entry with the conversation, the same class of data the
+  routing, records and check points already send there. `[decisions.memory].enabled =
+  false` turns the point off entirely; `[retrieval.auto].judge = false` stops
+  auto-retrieval from using it (judged memory filters, when configured, still do).
+- `[retrieval.auto]` defaults: `max_results` 3 → 4, `max_tokens` 600 → 2000; the
+  `<retrieved_memory>` note now says whether the items were judged relevant.
+- Schema v34 (v33 reserved): memory-retrieval tables and two sender indexes on
+  `timeline_events` (by sender, and by display name).
 
 - **The local embedder uses each model's trained prefixes.** fastembed added the e5
   prefixes `query: ` and `passage: ` for every model. bge-small-en-v1.5, the default,

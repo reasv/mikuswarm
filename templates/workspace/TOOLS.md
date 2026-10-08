@@ -48,7 +48,7 @@ something is gone. Entries marked with a skill live behind it; load it first.
 | A specific message, link, image, or quote | `search_messages` (filters: `from`, `mentions`, `has_link`, `attachment_type`, `after`/`before`/`last`; `rooms:"all"` to span channels) |
 | A topic in the rolling conversation summaries | `search_summaries` (each hit cites an `id` for `expand_summary`) |
 | Messages that pinged a user while they were gone | `search_messages` with `mentions:[id]` + `since_user_absence:[id]` |
-| Your own past thoughts/decisions (meaning-based) | `recall_memory` |
+| Your own past thoughts/decisions (meaning-based) | `recall_memory` (`user` = only conversations with that person) |
 | An exact string in your diary (a URL, exact phrase) | `search_memory` (ripgrep) |
 | Raw room history, or one event by id | `read_messages` (paginate with `limit` + `before`/`after` tokens, or pass `message_id`; `room` = another channel/DM; `anchor:"last_self"` = window around your last message there) |
 | DM someone / deliver a message privately | `send_dm` — contacts skill |

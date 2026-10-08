@@ -2,8 +2,19 @@ import { render } from 'vitest-browser-svelte';
 import { page } from '@vitest/browser/context';
 import { expect, test, vi } from 'vitest';
 import { Schema } from 'effect';
-import { SessionDetailResponse, SessionDecisionsResponse, SessionRecordResponse } from '$lib/schemas';
-import { DEMO_AUDITED_SESSION, DEMO_FEATURED_SESSION, DEMO_REFUSAL_SESSION, resolveFixture } from '$lib/server/api/demo/fixtures';
+import {
+	SessionDetailResponse,
+	SessionDecisionsResponse,
+	SessionMemoryRetrievalsResponse,
+	SessionRecordResponse
+} from '$lib/schemas';
+import {
+	DEMO_AUDITED_SESSION,
+	DEMO_FEATURED_SESSION,
+	DEMO_LATE_INPUT_SESSION,
+	DEMO_REFUSAL_SESSION,
+	resolveFixture
+} from '$lib/server/api/demo/fixtures';
 import Fixture from './session-view-fixture.svelte';
 
 // The remote queries, answered from the demo fixtures in the shape `fresh()` reads.
@@ -21,6 +32,12 @@ vi.mock('$lib/api/sessions-record.remote', () => ({
 }));
 vi.mock('$lib/api/sessions-decisions.remote', () => ({
 	getSessionDecisions: (id: string) => remote(fixture(SessionDecisionsResponse, `/api/sessions/${id}/decisions`))
+}));
+vi.mock('$lib/api/memory.remote', () => ({
+	getSessionMemoryRetrievals: (id: string) =>
+		remote(fixture(SessionMemoryRetrievalsResponse, `/api/sessions/${id}/memory-retrievals`)),
+	getMemoryFilterHits: vi.fn(),
+	getMemoryStats: vi.fn()
 }));
 vi.mock('$lib/api/admin.remote', () => ({ abortSession: vi.fn(), resumeSession: vi.fn() }));
 
@@ -86,4 +103,47 @@ test('SessionView renders an audited old session: the audit findings on its card
 	} finally {
 		window.removeEventListener('error', onError);
 	}
+});
+
+// Judged memory retrieval (spec MEMORY-RETRIEVAL §7.4, §9): the build's card replaces
+// its `memory` decision card; expanded, it groups the candidates and names the
+// filter that hid a block.
+test('SessionView renders the memory retrieval card with kept, dropped, hidden and cut', async () => {
+	const errors: unknown[] = [];
+	const onError = (event: ErrorEvent) => errors.push(event.error ?? event.message);
+	window.addEventListener('error', onError);
+	try {
+		render(Fixture, { sessionId: DEMO_FEATURED_SESSION });
+		const card = page.getByTestId('memory-retrieval-card');
+		await expect.element(card).toBeInTheDocument();
+		expect(card.elements()).toHaveLength(1);
+		await expect.element(card).toHaveTextContent(/kept 2 of 9, 2 hidden/);
+		await expect.element(card).toHaveTextContent(/followed up: recall_memory/);
+		await card.getByRole('button').first().click();
+		await expect.element(page.getByTestId('memory-kept')).toHaveTextContent(/relevant 0\.91/);
+		await expect.element(page.getByTestId('memory-dropped')).toHaveTextContent(/relevant 0\.12/);
+		await expect
+			.element(page.getByTestId('memory-hidden'))
+			.toHaveTextContent(/hidden by old_running_joke \(judged p=0\.93\)/);
+		await expect.element(page.getByTestId('memory-hidden')).toHaveTextContent(/hidden by old_nickname \(keyword "captain"\)/);
+		await expect.element(page.getByTestId('memory-cut')).toHaveTextContent(/cut at rerank/);
+		await expect.element(page.getByText('Decision rows')).toBeInTheDocument();
+		expect(errors).toEqual([]);
+	} finally {
+		window.removeEventListener('error', onError);
+	}
+});
+
+// A build with no decision rows (the decision chain timed out) still gets its card.
+test('SessionView renders a fallback memory build that has no decision rows', async () => {
+	render(Fixture, { sessionId: DEMO_LATE_INPUT_SESSION });
+	const card = page.getByTestId('memory-retrieval-card');
+	await expect.element(card).toHaveTextContent(/fallback/);
+	await expect.element(card).toHaveTextContent(/timeout/);
+	await expect.element(card).toHaveTextContent(/kept 1 of 3/);
+	// Fallback-selected items are marked: on the header and on the item.
+	await expect.element(page.getByTestId('memory-fell-back')).toHaveTextContent(/1 fell back/);
+	await card.getByRole('button').first().click();
+	await expect.element(page.getByTestId('memory-selected-by')).toHaveTextContent(/fallback/);
+	await expect.element(card).toHaveTextContent(/3 unjudged/);
 });

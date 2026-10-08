@@ -11,6 +11,7 @@ import { DEFAULT_MIN_STATE_TOKENS } from "./client.js";
 // The scheduler's per-group default: decision models get an implicit
 // `decision:<key>` group with no settings, so this is their real cap.
 import { DEFAULT_MAX_IN_FLIGHT } from "../agent/scheduler.js";
+import { judgedPerBuildMax, resolveRetrievalConfig } from "../retrieval/config.js";
 
 type ModelConfig = AppConfig["models"]["default"];
 
@@ -19,7 +20,14 @@ export const DEFAULT_TIMEOUT_MS = 3000;
 export const DEFAULT_MIN_CONFIDENCE = 0.6;
 export const DEFAULT_STATE_MAX_TOKENS = 8000;
 
-export type DecisionPointName = "routing" | "records" | "checks" | "audit" | "late_addition" | "implicit_reply";
+export type DecisionPointName =
+  | "routing"
+  | "records"
+  | "checks"
+  | "audit"
+  | "late_addition"
+  | "implicit_reply"
+  | "memory";
 export const DECISION_POINT_NAMES: readonly DecisionPointName[] = [
   "routing",
   "records",
@@ -27,7 +35,22 @@ export const DECISION_POINT_NAMES: readonly DecisionPointName[] = [
   "audit",
   "late_addition",
   "implicit_reply",
+  "memory",
 ];
+
+/**
+ * Points that run by default whenever `[decisions]` is on and a chain resolves
+ * (`[decisions.<point>].enabled = false` turns one off). Every other point
+ * needs `enabled = true`. The memory point is the spec's default for judged
+ * retrieval (ARCHITECTURE.md §9d).
+ */
+const DEFAULT_ON_POINTS: ReadonlySet<DecisionPointName> = new Set(["memory"]);
+
+/** True when a point is switched on in an effective decisions table. */
+export function pointSwitchedOn(decisions: DecisionsRawConfig, point: DecisionPointName): boolean {
+  const enabled = decisions[point]?.enabled;
+  return DEFAULT_ON_POINTS.has(point) ? enabled !== false : enabled === true;
+}
 
 // Vision decision chain defaults (DECISION-MODEL §3.5).
 export const DEFAULT_VISION_TIMEOUT_MS = 8000;
@@ -52,6 +75,7 @@ export const DEFAULT_VISION_MODES: Record<DecisionPointName, VisionMode> = {
   audit: "off",
   late_addition: "always",
   implicit_reply: "off",
+  memory: "off",
 };
 
 // `[decisions.checks]` defaults (spec REFUSAL-HANDLING §6.3, §6.4, §16.2).
@@ -154,8 +178,8 @@ export interface PointVisionSettings {
  */
 export function pointSettings(decisions: DecisionsRawConfig, point: DecisionPointName): PointSettings | undefined {
   if (decisions.enabled !== true) return undefined;
-  const raw = decisions[point];
-  if (!raw || raw.enabled !== true) return undefined;
+  if (!pointSwitchedOn(decisions, point)) return undefined;
+  const raw = decisions[point] ?? {};
   const model = raw.model ?? decisions.model;
   if (!model) return undefined;
   const base: PointSettings = {
@@ -175,6 +199,9 @@ export function pointSettings(decisions: DecisionsRawConfig, point: DecisionPoin
       base.injectThreshold = recordsRaw.inject_threshold;
     }
   }
+  if (point === "memory") {
+    base.threshold = (raw as { relevance_threshold?: number }).relevance_threshold ?? DEFAULT_MEMORY_RELEVANCE_THRESHOLD;
+  }
   if (point === "late_addition" || point === "implicit_reply") {
     const thresholdRaw = (raw as { threshold?: number }).threshold;
     base.threshold =
@@ -193,6 +220,24 @@ export function pointSettings(decisions: DecisionsRawConfig, point: DecisionPoin
     };
   }
   return base;
+}
+
+// `[decisions.memory]` defaults (ARCHITECTURE.md §9d "Judged retrieval").
+export const DEFAULT_MEMORY_RELEVANCE_THRESHOLD = 0.7;
+export const DEFAULT_MEMORY_CONVERSATION_MESSAGES = 8;
+
+/** The `[decisions.memory]` point-specific knobs, defaults applied. */
+export interface MemoryPointKnobs {
+  relevanceThreshold: number;
+  conversationMessages: number;
+}
+
+export function memoryPointKnobs(decisions: DecisionsRawConfig): MemoryPointKnobs {
+  const raw = decisions.memory ?? {};
+  return {
+    relevanceThreshold: raw.relevance_threshold ?? DEFAULT_MEMORY_RELEVANCE_THRESHOLD,
+    conversationMessages: raw.conversation_messages ?? DEFAULT_MEMORY_CONVERSATION_MESSAGES,
+  };
 }
 
 // `[decisions.late_addition]` defaults (spec LATE-INPUT §5.2, §8, §11).
@@ -352,6 +397,9 @@ function collectChatModelRefs(config: AppConfig, decisionKeys: Set<string>): Arr
   const refs: Array<{ key: string; path: string }> = [];
   const MODEL_FIELDS = new Set(["model", "deep_model", "image", "video", "audio", "pro", "flash"]);
   const walk = (value: unknown, path: string, field: string | undefined): void => {
+    // `[retrieval.filters].model` names the DECISION model that judges
+    // filters; it is checked by validateFilterModels.
+    if (/(^|\.)retrieval\.filters\.model$/.test(path)) return;
     if (typeof value === "string") {
       if (field !== undefined && (MODEL_FIELDS.has(field) || field === "models" || field === "session_types") && decisionKeys.has(value)) {
         refs.push({ key: value, path });
@@ -426,6 +474,7 @@ export function validateDecisionsConfig(config: AppConfig, opts: DecisionValidat
       `${ref.path} = "${ref.key}" names a system-one decision model; decision models can only be used from [decisions]`,
     );
   }
+  validateFilterModels(config, decisionKeys);
 
   const agentNames: Array<string | null> = [null, ...Object.keys(config.agents ?? {})];
   for (const agentName of agentNames) {
@@ -468,6 +517,75 @@ function warnRecordsCapacity(
       needed,
       hint: `raise [rate_limits.llm.${group}].max_in_flight to at least ${needed}`,
     });
+  }
+}
+
+/**
+ * One auto-retrieval build sends up to `judgedPerBuildMax` memory requests
+ * (ARCHITECTURE.md §9d: the re-rank survivors plus person-cued candidates,
+ * capped by `[retrieval.auto].max_judged`), on top of routing and records in
+ * the same group. Memory requests queue below those, so a short group delays
+ * only the memory block; warn when the group cannot carry one trigger's whole
+ * demand in parallel (the excess waits inside the point's timeout and may fall
+ * back). Skipped when auto-retrieval or its judge is off.
+ */
+function warnMemoryCapacity(
+  config: AppConfig,
+  decisions: DecisionsRawConfig,
+  where: string,
+  opts: DecisionValidationOptions,
+): void {
+  const settings = pointSettings(decisions, "memory");
+  if (!settings || !config.models[settings.model]) return;
+  let resolved: ReturnType<typeof resolveRetrievalConfig>;
+  try {
+    resolved = resolveRetrievalConfig(config.retrieval);
+  } catch {
+    return;
+  }
+  if (!resolved.enabled || !resolved.autoRetrieval || !resolved.auto.judge) return;
+  const memory = judgedPerBuildMax(resolved);
+  if (memory <= 0) return;
+  const groupOf = (key: string) => config.models[key]?.rate_limit_group ?? `decision:${key}`;
+  const group = groupOf(settings.model);
+  let needed = memory;
+  const routing = pointSettings(decisions, "routing");
+  if (routing && groupOf(routing.model) === group) needed += 1;
+  const records = pointSettings(decisions, "records");
+  if (records && groupOf(records.model) === group) needed += (decisions.records?.candidates ?? 3) + 1;
+  const maxInFlight = config.rate_limits?.llm?.[group]?.max_in_flight ?? DEFAULT_MAX_IN_FLIGHT;
+  if (maxInFlight >= needed) return;
+  opts.warn?.("decisions_memory_capacity_low", {
+    where,
+    group,
+    maxInFlight,
+    needed,
+    memory,
+    hint: `raise [rate_limits.llm.${group}].max_in_flight to at least ${needed} so a build's passages are judged in parallel, or lower [retrieval.auto].max_judged`,
+  });
+}
+
+/**
+ * `[retrieval.filters].model` (global and per agent) names the decision model
+ * that judges memory filters: it must be a `[models.*]` block with
+ * `api = "system-one"`.
+ */
+function validateFilterModels(config: AppConfig, decisionKeys: Set<string>): void {
+  const check = (filters: unknown, path: string) => {
+    if (!isPlainObject(filters) || filters.model === undefined) return;
+    const key = filters.model;
+    if (typeof key !== "string" || !config.models[key]) {
+      throw new Error(`${path} = ${JSON.stringify(key)} does not name a [models.*] block; set it to a decision model (api = "system-one")`);
+    }
+    if (!decisionKeys.has(key)) {
+      throw new Error(`${path} = "${key}" is a chat model; memory filters are judged by a decision model (api = "system-one")`);
+    }
+  };
+  const retrieval = (config as { retrieval?: { filters?: unknown } }).retrieval;
+  check(retrieval?.filters, "retrieval.filters.model");
+  for (const [name, block] of Object.entries(config.agents ?? {})) {
+    const agentRetrieval = (block as { retrieval?: { filters?: unknown } } | undefined)?.retrieval;
+    check(agentRetrieval?.filters, `agents.${name}.retrieval.filters.model`);
   }
 }
 
@@ -572,6 +690,11 @@ function validateEffective(
       `${where}.checks.min_confidence is not used by the checks point; set each question's threshold under [checks.<code>] instead`,
     );
   }
+  if (decisions.memory?.min_confidence !== undefined) {
+    throw new Error(
+      `${where}.memory.min_confidence is not used by the memory point; set ${where}.memory.relevance_threshold instead`,
+    );
+  }
   for (const point of ["late_addition", "implicit_reply"] as const) {
     if (decisions[point]?.min_confidence !== undefined) {
       // One `noul` question gated by `threshold`; a confidence floor would be a
@@ -588,6 +711,8 @@ function validateEffective(
     }
     warnRecordsCapacity(config, decisions, where, opts);
   }
+
+  warnMemoryCapacity(config, decisions, where, opts);
 
   const routing = decisions.routing;
   if (!routing) return;

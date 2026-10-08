@@ -8,6 +8,7 @@ import type { ExaUsageRecord } from "./exa/accounting.js";
 import { createExaRetrievalTools } from "./tools/exa.js";
 import { recentRecordCandidates } from "./decisions/points/records-select.js";
 import { ageLabel } from "./decisions/state.js";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { accessSync, constants as fsConstants } from "node:fs";
 import { mkdir, unlink, writeFile } from "node:fs/promises";
@@ -226,7 +227,20 @@ import type { RefusedCaptionAttempt } from "./captioning/inference-client.js";
 import { buildInferenceImageOptions } from "./media/index.js";
 import { McpClientPool, adaptMcpTools, type McpServerEntry } from "./mcp/index.js";
 import { SummarizationIndexer, SummarizationWorkerPool, createEscalateSummary, MirrorWorker, buildMirrorTopology } from "./summarization/index.js";
-import { DiaryWorkerPool } from "./diary/index.js";
+import { DiaryWorkerPool, recentDayFiles } from "./diary/index.js";
+import { MemoryRetrievalPipeline } from "./retrieval/auto/pipeline.js";
+import { buildPlanInput } from "./retrieval/auto/input.js";
+import type { MemoryPlanTicket } from "./retrieval/auto/types.js";
+import {
+  MemoryFilterService,
+  filterMemoryFileText,
+  validateMemoryFilters,
+  warnFiltersWithoutDecisions,
+} from "./retrieval/filters/index.js";
+import { MemoryRetrievalStore } from "./storage/memory-retrieval-store.js";
+import { resolveUserScope } from "./retrieval/user-scope.js";
+import type { FilterBlock } from "./retrieval/filters/index.js";
+import { buildRecentDiaryContent } from "./context/diary-layer.js";
 import { ChannelVisibilityResolver, validateVisibilityChannels, type VisibilityConfig } from "./visibility/index.js";
 import { ProactiveScheduler } from "./proactive/index.js";
 import { parseTimelineKey, buildTimelineKey, timelineKindOf } from "./storage/timeline-key.js";
@@ -244,7 +258,7 @@ import { MessageBackfetchCoordinator, type MessageBackfetchConfig } from "./back
 import { RedecryptionSweeper, resolveMultiAccountRetry } from "./redecryption/index.js";
 import { SandboxManager, type ExecBackend, createSharedExecBackend, computeCommonAncestor } from "./sandbox/index.js";
 import { BrowserSession } from "./browser/index.js";
-import { getConfiguredTimezone } from "./time/index.js";
+import { agentDateStamp, getConfiguredTimezone } from "./time/index.js";
 
 export interface MikuAgentRuntime {
   stop(): Promise<void>;
@@ -875,6 +889,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   let zeroCostModelIds = new Set<string>();
   const userLimitResolutions = new Map<string, { resolution: UserLimitResolution; ctx: UserLimitContext }>();
 
+  /** An agent's workspace root (null = legacy / the single workspace). */
+  const workspaceRootForAgent = (agent: string | null): string =>
+    (agent ? agentWorkspaces.find((w) => w.agentName === agent)?.workspaceRoot : undefined) ?? workspaceRoot;
+
   const retrievalConfig = resolveRetrievalConfig(config.retrieval);
   let retrieval: RetrievalSubsystem | undefined;
   if (retrievalConfig.enabled) {
@@ -896,6 +914,19 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // agent gets its own MemoryIndexer; in legacy mode this is empty and the
       // subsystem creates a single indexer with agentName=null.
       agentWorkspaces: agentWorkspaces.length > 0 ? agentWorkspaces : undefined,
+      // Judged retrieval (ARCHITECTURE.md §9d): participant-tag provenance needs the
+      // owning agent and the diary's room label of a summary's timeline; the late
+      // stage needs the recency layer's day files per agent.
+      agentForTimeline: (timelineKey) => agentNameForTimeline(timelineKey),
+      roomLabelFor: (timelineKey) => resolveChannelLabel(timelineKey),
+      recencyPaths: async (agent) => {
+        const root = workspaceRootForAgent(agent);
+        const files = await recentDayFiles(root, agentDateStamp(Date.now()), config.diary?.recency_file_count ?? 2);
+        return new Set(files);
+      },
+      primaryEmbeddingChain: retrievalConfig.embedding.primary
+        ? resolveModelChain(retrievalConfig.embedding.primary.model, config.models)
+        : undefined,
       logger: logger.child("retrieval"),
     });
     // Wire each agent's memoryWriter to its own indexer (§7.1). In agents mode
@@ -1187,6 +1218,104 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     }
   }
 
+  // Operator memory filters (ARCHITECTURE.md §9c "Memory filters"): validated at
+  // startup (patterns compile, bounds parse); judged filters run on the memory
+  // decision point's chain, read per call (the engine is built further down).
+  validateMemoryFilters(config, (event, fields) => logger.warn(event, fields));
+  const memoryStore = retrieval?.store ?? new MemoryRetrievalStore(storage);
+  const memoryFilters = new MemoryFilterService({
+    config,
+    store: memoryStore,
+    engine: () => decisionEngine,
+    logger: logger.child("memory_filters"),
+  });
+  /** A memory file's text with filter-hidden blocks removed, for a non-retrieval surface. */
+  // One build reads the recency layer twice (the build's diary layer and the
+  // memory plan's recency exclusion): a short-lived memo of the filtered day
+  // file makes the second read reuse the first's verdicts instead of judging
+  // the same blocks again.
+  const recencyFilterMemo = new Map<string, { at: number; text: Promise<string> }>();
+  const RECENCY_FILTER_MEMO_MS = 60_000;
+  const RECENCY_FILTER_MEMO_MAX = 64;
+  const filterMemoryFile = (
+    agent: string | null,
+    surface: "recency_layer" | "diary_writer",
+    attribution: { timelineKey?: string | null; agentSessionId?: string | null; sessionType?: string | null },
+  ) =>
+    (relPath: string, text: string): Promise<string> => {
+      const run = () =>
+        filterMemoryFileText(memoryFilters, agent, relPath, text, {
+          surface,
+          attribution,
+          priority: surface === "diary_writer" ? "background" : "interactive",
+        });
+      if (surface !== "recency_layer" || !memoryFilters?.hasFilters(agent)) return run();
+      const now = Date.now();
+      const key = `${agent ?? ""}\0${relPath}\0${createHash("sha1").update(text).digest("hex")}`;
+      const hit = recencyFilterMemo.get(key);
+      if (hit && now - hit.at < RECENCY_FILTER_MEMO_MS) return hit.text;
+      for (const [k, v] of recencyFilterMemo) if (now - v.at >= RECENCY_FILTER_MEMO_MS) recencyFilterMemo.delete(k);
+      while (recencyFilterMemo.size >= RECENCY_FILTER_MEMO_MAX) recencyFilterMemo.delete(recencyFilterMemo.keys().next().value!);
+      const out = run();
+      recencyFilterMemo.set(key, { at: now, text: out });
+      out.catch(() => recencyFilterMemo.delete(key));
+      return out;
+    };
+  /**
+   * The follow-up metric (ARCHITECTURE.md §9d "Observability"): the first time a
+   * session that was shown memories searches its memory or opens a cited path,
+   * its retrieval row records it. Best-effort, never fails a tool.
+   */
+  const noteMemoryFollowUp = (sessionId: string, kind: string): void => {
+    void memoryStore.markFollowUp(sessionId, kind, Date.now()).catch(() => undefined);
+  };
+  /** True when `text` names a memory path the session's retrieval block cited. */
+  const citesRetrievedPath = (sessionId: string, text: string): boolean => {
+    if (!text.includes("memory/")) return false;
+    for (const row of memoryStore.retrievalsForSession(sessionId)) {
+      if (!row.reportJson || row.kept === 0) continue;
+      try {
+        const report = JSON.parse(row.reportJson) as { items?: Array<{ stage: string; citation: string }> };
+        for (const item of report.items ?? []) {
+          if (item.stage !== "kept") continue;
+          const p = item.citation.split(":")[0];
+          if (p && text.includes(p)) return true;
+        }
+      } catch {
+        // a malformed report is ignored
+      }
+    }
+    return false;
+  };
+
+  // The auto-retrieval pipeline (ARCHITECTURE.md §9d "Judged retrieval").
+  const memoryPipeline =
+    retrieval && retrievalConfig.autoRetrieval
+      ? new MemoryRetrievalPipeline({
+          search: retrieval.search,
+          store: retrieval.store,
+          config: retrievalConfig,
+          filters: memoryFilters,
+          engine: () => decisionEngine,
+          late: retrieval.late,
+          rerank: retrieval.rerank,
+          recencyContent: async (agent, timelineKey, now, attribution) =>
+            buildRecentDiaryContent({
+              workspaceRoot: workspaceRootForAgent(agent),
+              anchorDay: agentDateStamp(now),
+              ceilingTokens: config.diary?.recency_max_tokens ?? 6000,
+              fileCount: config.diary?.recency_file_count ?? 2,
+              filterFile: filterMemoryFile(agent, "recency_layer", {
+                timelineKey,
+                agentSessionId: attribution.agentSessionId ?? null,
+                sessionType: attribution.sessionType ?? null,
+              }),
+            }),
+          usernameAliases: (provider, senderId, limit) => storage.getUserIdentityAliases(provider, senderId, limit),
+          logger: logger.child("memory_retrieval"),
+        })
+      : undefined;
+
   const echo = new AssistantEchoResolver(timeline);
   const contextBuilder = new ContextBuilder(
     timeline,
@@ -1194,9 +1323,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     storage,
     logger,
     // Auto-retrieval (§8c): only when retrieval is enabled AND auto_retrieval is on.
-    retrieval && retrievalConfig.autoRetrieval
-      ? { search: retrieval.search, config: retrievalConfig }
-      : undefined,
+    memoryPipeline ? { pipeline: memoryPipeline, config: retrievalConfig } : undefined,
     // Claim registry for `<handled_by_session>` markers (DUPLICATE-REPLY-MITIGATION §4).
     sessionClaims,
   );
@@ -1211,6 +1338,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     resolveWorkspaceForTimeline(timelineKey)?.workspaceRoot;
   // Per-session agent name resolver (spec MULTI-AGENT-SUPPORT §7.1): scopes
   // auto-retrieval to the calling session's agent corpus. Returns null in legacy mode.
+  // Memory filters on the recency layer (§9c): hidden blocks are dropped per day file.
+  // A build without a session is a room preview: its filter judging is attributed to it.
+  contextBuilder.filterDiaryFile = (timelineKey, sessionId) =>
+    filterMemoryFile(agentNameForTimeline(timelineKey), "recency_layer", {
+      timelineKey,
+      agentSessionId: sessionId ?? null,
+      ...(sessionId ? {} : { sessionType: "preview" }),
+    });
   contextBuilder.resolveAgentName = (timelineKey) => {
     const entry = resolveWorkspaceForTimeline(timelineKey);
     if (!entry) return null;
@@ -2065,6 +2200,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         logger: logger.child("decisions"),
       })
     : undefined;
+  // Judged memory filters need the memory decision point (§9c): warn when they
+  // are configured for an agent that cannot judge them (they then do not apply).
+  warnFiltersWithoutDecisions(config, (agent) => decisionEngine?.isEnabled("memory", agent) ?? false, logger.child("memory_filters"));
   if (decisionEngine) {
     logger.info("decisions_active", {
       model: config.decisions?.model,
@@ -2937,6 +3075,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // The diary header needs a human room label. The worker retries this and
         // falls back to the room id, so it never blocks a job.
         resolveChannelLabel,
+        filterContinuityFile: (timelineKey) =>
+          filterMemoryFile(agentNameForTimeline(timelineKey), "diary_writer", { timelineKey, sessionType: "diary" }),
         onComplete: (summaryId) => logger.info("diary_job_complete", { summaryId }),
         onError: (summaryId, error) => logger.error("diary_failed", { summaryId, error: error.message }),
         activityBus: pipelineActivityBus,
@@ -6559,6 +6699,23 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // Per-session sandbox and browser (§10/§10a): resolved from the per-agent maps
     // in agents mode, or from the global legacy variables in legacy mode.
     const sessionSandbox = resolveAgentSandbox(sessionAgentName);
+    // Memory filters on the search tools (§9c) and the follow-up metric (§9d).
+    const memoryToolHooks = {
+      ...(memoryFilters.hasFilters(sessionAgentName)
+        ? {
+            hiddenBlocks: async (blocks: FilterBlock[]) => {
+              const states = await memoryFilters.enforce(sessionAgentName, blocks, {
+                surface: "search_memory",
+                attribution: { agentSessionId: sessionId, sessionType, timelineKey: inbound.timelineKey, triggerSenderId: inbound.event.sender?.id ?? null },
+                priority: "interactive",
+                signal: drainAbort.signal,
+              });
+              return new Set(blocks.filter((b) => states.get(b.contentHash)?.hidden).map((b) => b.contentHash));
+            },
+          }
+        : {}),
+      onFollowUp: (kind: "recall_memory" | "search_memory") => noteMemoryFollowUp(sessionId, kind),
+    };
     const sessionBrowserSession = resolveAgentBrowserSession(sessionAgentName);
     // The exec timeout to pass to createBashTool: per-agent sandbox config in strict
     // mode, or the global config in shared/legacy mode.
@@ -6966,7 +7123,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           : undefined,
       }),
       ...(replyModelSeesImages ? [createReadImageTool({ workspaceRoot: sessionWsRoot, maxImageBytes: resolveReadImageMaxBytes(config, replyModelConfig.image_input_bytes), inferenceImageOptions })] : []),
-      createSearchMemoryTool({ workspaceRoot: sessionWsRoot }),
+      createSearchMemoryTool({ workspaceRoot: sessionWsRoot, ...memoryToolHooks }),
       ...(retrieval
         ? [
             createRecallMemoryTool({
@@ -6976,6 +7133,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
                 minScore: retrievalConfig.query.minScore,
               },
               agentName: sessionAgentName,
+              excerptMaxChars: retrievalConfig.query.excerptMaxChars,
+              userScope: (user) => resolveUserScope(storage, retrieval.store, user, sessionAgentName),
+              chunksByHash: (hashes) => retrieval.store.chunksByContentHashes(hashes, sessionAgentName),
+              hooks: memoryToolHooks,
             }),
           ]
         : []),
@@ -7175,7 +7336,32 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       if (names.has("exa_fetch")) return selected.filter((tool) => tool.name !== "web_fetch" && tool.name !== "mcp_exa_web_fetch_exa");
       if (names.has("mcp_exa_web_fetch_exa")) return selected.filter((tool) => tool.name !== "web_fetch");
     }
-    return selected;
+    return trackMemoryViews(selected, sessionId);
+  }
+
+  /**
+   * The follow-up metric's third signal (§9d "Observability"): a file view or a
+   * bash command naming a memory path the session's retrieval block cited. Wraps
+   * the editor and bash tools' execute; observation only.
+   */
+  function trackMemoryViews<T extends { name: string; execute: (...args: never[]) => unknown }>(tools: T[], sessionId: string): T[] {
+    return tools.map((tool) => {
+      if (tool.name !== "str_replace_based_edit_tool" && tool.name !== "bash") return tool;
+      const execute = tool.execute as (...args: unknown[]) => unknown;
+      return {
+        ...tool,
+        execute: (...args: unknown[]) => {
+          try {
+            const params = (args[1] ?? {}) as { command?: unknown; path?: unknown };
+            const text = tool.name === "bash" ? String(params.command ?? "") : params.command === "view" ? String(params.path ?? "") : "";
+            if (text && citesRetrievedPath(sessionId, text)) noteMemoryFollowUp(sessionId, tool.name === "bash" ? "bash_view" : "file_view");
+          } catch {
+            // observation only
+          }
+          return execute(...args);
+        },
+      } as T;
+    });
   }
 
   /**
@@ -7511,10 +7697,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // the context fresh and re-run the session like a launch, reusing the
       // same row. The rebuild sees the timeline as of NOW (including messages
       // that arrived after the crash), which a launch would too.
+      // A fresh rebuild is a build like a launch's: it gets its own memory plan.
+      const memoryPlan = planMemoryRetrieval(inbound, record, isProactiveResume);
       try {
         created = await factory.create(record, tools, {
           proactive: isProactiveResume ? true : undefined,
           recordTurnGate: recoveryRecordHandles.gate,
+          ...(memoryPlan ? { memoryRetrieval: memoryPlan } : {}),
           abortSignal: drainAbort.signal,
           usage,
           userLimit: recoveryGate?.userLimit,
@@ -7523,6 +7712,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         ({ agent, kickoff, snapshot, tokenEstimate } = created);
         if (!kickoff) throw new Error("context build produced no final user turn");
       } catch (error) {
+        memoryPlan?.abandon();
         const message = error instanceof Error ? error.message : String(error);
         // A build-wait timeout is environmental (an outage backing up summary
         // coverage) — mechanical, so the manual resume re-parks instead of
@@ -8568,6 +8758,85 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     };
   }
 
+  /**
+   * Start a session's auto-retrieval plan at launch (ARCHITECTURE.md §9d "Judged
+   * retrieval"): recall, the re-rank stages and the memory decision point run in
+   * parallel with routing, records planning and the context build, which awaits
+   * the plan only when it assembles the final user turn. Every session build
+   * gets one (any trigger, any session type; a proactive session's conversation
+   * stands in for the request), and each records a `memory_retrievals` row
+   * under the session id. The ticket's `abandon` aborts the plan: called when
+   * the build stops waiting, a redo replaces it, or the session ends. Never
+   * rejects.
+   */
+  function planMemoryRetrieval(
+    inbound: InboundChatEvent,
+    session: { id: string; sessionType: string; timelineKey: string },
+    proactive: boolean,
+  ): MemoryPlanTicket | undefined {
+    if (!memoryPipeline) return undefined;
+    const agentName = agentNameForTimeline(session.timelineKey);
+    const maxWaitMs = config.recovery?.llm_request_max_wait_ms ?? 120_000;
+    const abandoned = new AbortController();
+    const signal = AbortSignal.any([drainAbort.signal, abandoned.signal, AbortSignal.timeout(maxWaitMs)]);
+    const plan = (async () => {
+      const queryMessages = retrievalConfig.auto.queryMessages;
+      let triggerEvents: CanonicalChatEvent[] = [];
+      let replyTarget: CanonicalChatEvent | undefined;
+      let anchor = inbound.event.timestamp;
+      if (!proactive) {
+        const ids = [inbound.event.id, ...(inbound.trigger?.groupedEventIds ?? [])];
+        triggerEvents = ids
+          .map((id) => (id === inbound.event.id ? timeline.getById(id) ?? inbound.event : timeline.getById(id)))
+          .filter((e): e is CanonicalChatEvent => e !== undefined)
+          .sort((a, b) => a.timestamp - b.timestamp);
+        anchor = Math.max(...triggerEvents.map((e) => e.timestamp), inbound.event.timestamp);
+        const replyExternalId = inbound.event.replyTo?.externalId;
+        replyTarget = replyExternalId
+          ? timeline.getByExternalId(inbound.provider, replyExternalId, inbound.timelineKey)
+          : undefined;
+      }
+      const triggerIds = new Set(triggerEvents.map((e) => e.id));
+      const before = timeline
+        .query({ timelineKey: session.timelineKey, toTimestamp: anchor, limit: 16 + triggerIds.size })
+        .filter((e) => !triggerIds.has(e.id));
+      // Deleted messages show as placeholders, quotes of deleted messages too.
+      const recent = markDeletedReplyTargets(hydrateEvents(storage, before), (timelineKey, ids) =>
+        storage.getDeletedMessages(timelineKey, ids),
+      );
+      const input = buildPlanInput({
+        agentName,
+        timelineKey: session.timelineKey,
+        attribution: {
+          agentSessionId: session.id,
+          sessionType: session.sessionType,
+          timelineKey: session.timelineKey,
+          triggerSenderId: proactive ? null : (inbound.event.sender?.id ?? null),
+        },
+        triggerEventId: proactive ? null : inbound.event.id,
+        proactive,
+        now: anchor,
+        triggerEvents,
+        replyTarget,
+        recent,
+        queryMessages,
+        signal,
+      });
+      return memoryPipeline.plan(input);
+    })().catch((error) => {
+      logger.warn("memory_retrieval_plan_failed", {
+        sessionId: session.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    });
+    return {
+      plan,
+      waitMs: memoryPipeline.waitBudgetMs(agentName),
+      abandon: () => abandoned.abort(),
+    };
+  }
+
   async function launchSession(
     inbound: InboundChatEvent,
     duplicate: boolean,
@@ -8806,6 +9075,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     let snapshot: ContextMessage[] | undefined;
     let tokenEstimate: number | undefined;
     let unappliedRebuild: RestartRequest | undefined;
+    let memoryPlan: MemoryPlanTicket | undefined;
+    const replanMemory = (): void => {
+      memoryPlan?.abandon();
+      memoryPlan = planMemoryRetrieval(inbound, session, proactive);
+    };
     try {
       // §4.3: buildSessionTools throws when agents mode + unresolvable account.
       // Placed INSIDE the try block so the existing catch handles it identically
@@ -8823,6 +9097,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // caught by this same block → `markDiscarded` → settle releases the claim +
       // drains the next trigger, exactly like a factory failure. For a proactive /
       // synthetic trigger (no persisted event, no media) this is a fast no-op.
+      // Auto-retrieval starts now (§9d), in parallel with the readiness wait,
+      // routing and the build, for every session (bot-triggered and any session
+      // type included). A redo replans on the corrected trigger and aborts the
+      // stale plan; a cancelled or discarded session aborts it.
+      memoryPlan = planMemoryRetrieval(inbound, session, proactive);
       await awaitTriggerReadiness(inbound);
 
       // Session records to start with (spec SESSION-RECORDS §6/§7): planned in
@@ -8850,6 +9129,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
               return [] as SyntheticCallSpec[];
             }),
         recordTurnGate: recordHandles.gate,
+        ...(memoryPlan ? { memoryRetrieval: memoryPlan } : {}),
         proactive: proactive ? true : undefined,
         usage,
         // Per-user selection input + dynamic ceiling (spec PER-USER-LIMITS §6).
@@ -8875,6 +9155,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         const cancelled = lateCtl.takeCancelBeforeStart();
         if (cancelled) {
           created.gate?.dispose();
+          memoryPlan?.abandon();
           lateCtl.markSettled();
           sessions.markDiscarded(session.id, { error: `cancelled: ${cancelled.reason}` });
           logger.info("late_input_cancelled", { sessionId: session.id, reason: cancelled.reason, phase: "building" });
@@ -8892,6 +9173,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         lateCtl.redoCount += 1;
         void storage.bumpAgentSessionRedoCount(session.id).catch(() => undefined);
         refreshTriggerFromStore(inbound);
+        replanMemory();
         logger.info("late_input_redo", { sessionId: session.id, reason: rebuild.reason, phase: "building", causes: rebuild.causeEventIds });
         await awaitTriggerReadiness(inbound);
       }
@@ -8905,6 +9187,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // no snapshot/transcript yet, so there is genuinely nothing to park; the
       // waited job is untouched and completes when its model recovers.
       const buildTimeout = error instanceof Error && error.name === "BuildWaitTimeoutError";
+      memoryPlan?.abandon();
       // Not correctable any more: a correction still in flight takes its native fate.
       lateCtl?.markSettled();
       sessions.markDiscarded(session.id, {
@@ -9042,6 +9325,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         lateCtl!.redoCount += 1;
         void storage.bumpAgentSessionRedoCount(session.id).catch(() => undefined);
         refreshTriggerFromStore(inbound);
+        replanMemory();
         await awaitTriggerReadiness(inbound);
         lateCtl!.markBuildStarted();
         next = await factory.create(session, sessionTools, createOpts!(firstPin));
