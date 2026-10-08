@@ -315,7 +315,25 @@ export interface InboundChatEvent {
    * An edit of `targetExternalId` (the replacement rides on `event`). `deleted`
    * marks a deletion routed through the edit path as a tombstone (empty body).
    */
-  edit?: { targetExternalId: string; deleted?: true };
+  edit?: {
+    targetExternalId: string;
+    deleted?: true;
+    /**
+     * Who deleted the message, when the provider knows it (a Matrix redaction's
+     * sender). Only a deletion by the message's own sender withdraws it (late
+     * input); anyone else's is a content update only. Absent: unknown (a
+     * Discord deletion), taken as the sender's.
+     */
+    deletedBy?: string;
+    /**
+     * The provider cannot tell whether the target is a stored message (a Matrix
+     * redaction names only its room and the redacted event, which may be a
+     * reaction or a state event): the timelines it may be stored in, each
+     * searched with its threads. Applied only to a stored message, never parked
+     * for a target that has not arrived.
+     */
+    lookupTimelineKeys?: string[];
+  };
 }
 
 export interface OutboundTarget {

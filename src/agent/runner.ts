@@ -108,6 +108,12 @@ export interface SessionRunnerOptions {
   lateInput?: {
     next(agent: Agent): Promise<LateInputStep | undefined>;
     /**
+     * A redo or cancel is pending. Checked before the runner issues a request
+     * after an await: the step is applied (by `next`) instead of sending a
+     * request it would make stale.
+     */
+    pending?(): boolean;
+    /**
      * The run is past its last `next` check (called first thing when it settles,
      * however it ends): a correction from now on finds the run ended.
      */
@@ -212,17 +218,6 @@ export class SessionRunner {
         }, TYPING_KEEPALIVE_MS);
       }
 
-      // Kick the loop with the frozen final user turn (the rich `triggerGroup` popped
-      // off the prefix by the factory, §2b). It becomes the first turn of the
-      // transcript — delivered once, not echoed as a separate raw user message.
-      // Continue-mode (resume, §6.2): no new turn — re-issue from the seeded
-      // transcript's tail.
-      if (kickoff !== undefined) {
-        await promptAgent(agent, kickoff);
-      } else {
-        await continueAgent(agent);
-      }
-
       // Hand a redo request to `onRedo` and apply its outcome: undefined =
       // continue the loop (the agent was continued from the forked transcript),
       // else the run's result. A `park` outcome throws.
@@ -237,8 +232,8 @@ export class SessionRunner {
         // The nudge counter resets on a refusal redo; a contract redo starts its
         // own budget (spec §8.4 "Forced completion", §7.5).
         retries = 0;
-        await continueAgent(agent);
-        return undefined;
+        const late = await issueOrApplyLateInput(() => continueAgent(agent));
+        return late === true ? undefined : late;
       };
       // A redo the ending hook filed (a refusal judged at an ending, spec §5.4).
       const takeRedo = (): RedoRequest | undefined =>
@@ -247,24 +242,64 @@ export class SessionRunner {
       // Late input (§8 "Late input"): a pending step is applied before anything
       // reads the settled turn. Returns a result to end the run with, true to
       // re-enter the loop, or false when nothing was pending.
-      const applyLateInput = async (): Promise<SessionRunResult | boolean> => {
+      const lateStepPending = (): boolean =>
+        this.options.lateInput?.pending?.() === true && !lifecycle?.isInterrupted();
+      // `unsent`: the kickoff of an agent not prompted yet (the run's first).
+      const applyLateInput = async (unsent?: AgentMessage | AgentMessage[]): Promise<SessionRunResult | boolean> => {
         if (!this.options.lateInput || lifecycle?.isInterrupted()) return false;
-        const step = await this.options.lateInput.next(agent);
-        if (!step) return false;
-        if (step.kind === "end") {
-          return { sessionId: session.id, noReply: step.noReply, retries: nudges, cancelled: step.cancelled, agent };
+        let applied = false;
+        // The kickoff the agent still has to be prompted with (a rebuilt agent's).
+        let rebuiltKickoff = unsent;
+        // Applying a step awaits (a redo compensates, forks and rebuilds): one
+        // filed meanwhile is applied before any request is issued.
+        for (;;) {
+          const step = await this.options.lateInput.next(agent);
+          if (!step) break;
+          if (step.kind === "end") {
+            return { sessionId: session.id, noReply: step.noReply, retries: nudges, cancelled: step.cancelled, agent };
+          }
+          applied = true;
+          if (step.agent !== agent) {
+            agent = step.agent;
+            rebuiltKickoff = undefined;
+            if (step.redo) this.redoBinding = step.redo;
+            this.endingsBinding = step.endings;
+            contractRedone.clear();
+          }
+          if (step.kickoff !== undefined) rebuiltKickoff = step.kickoff;
+          if (!lateStepPending()) break;
         }
-        if (step.agent !== agent) {
-          agent = step.agent;
-          if (step.redo) this.redoBinding = step.redo;
-          this.endingsBinding = step.endings;
-          contractRedone.clear();
-        }
+        if (!applied) return false;
         retries = 0;
-        if (step.kickoff !== undefined) await promptAgent(agent, step.kickoff);
+        if (rebuiltKickoff !== undefined) await promptAgent(agent, rebuiltKickoff);
         else await continueAgent(agent);
         return true;
       };
+      // Issue a request, unless a late-input step is pending: then the step is
+      // applied instead (it issues its own request). True = issued or applied.
+      const issueOrApplyLateInput = async (
+        issue: () => Promise<void>,
+        unsent?: AgentMessage | AgentMessage[],
+      ): Promise<SessionRunResult | true> => {
+        if (lateStepPending()) {
+          const late = await applyLateInput(unsent);
+          if (late !== false) return late;
+        }
+        await issue();
+        return true;
+      };
+
+      // Kick the loop with the frozen final user turn (the rich `triggerGroup` popped
+      // off the prefix by the factory, §2b). It becomes the first turn of the
+      // transcript — delivered once, not echoed as a separate raw user message.
+      // Continue-mode (resume, §6.2): no new turn — re-issue from the seeded
+      // transcript's tail. A correction filed before it (the run's setup awaits)
+      // is applied first.
+      const first = await issueOrApplyLateInput(
+        () => (kickoff !== undefined ? promptAgent(agent, kickoff) : continueAgent(agent)),
+        kickoff,
+      );
+      if (first !== true) return first;
 
       for (;;) {
         await waitForAgentIdle(agent);

@@ -17,6 +17,7 @@ import {
   takeQueuedSteers,
 } from "../src/agent/late-input.js";
 import { RequestProgress } from "../src/agent/request-progress.js";
+import { NotExecutedError } from "../src/tools/side-effects.js";
 
 function tool(name: string, onRun: (args: unknown) => void = () => undefined, text = "ok"): AgentTool {
   return {
@@ -199,6 +200,16 @@ test("effects: a visible call counts while it executes, and after it threw", asy
   assert.equal(ctl.hasIrreversibleEffect(), true, "a throw may have delivered");
 });
 
+test("effects: a call a wrapper stopped before it ran (the gate's block) leaves no effect", async () => {
+  const ctl = session({ holdMs: 0 });
+  const blocked = { ...tool("send_message"), execute: async () => { throw new NotExecutedError("revise first"); } } as unknown as AgentTool;
+  const [send] = ctl.wrapHoldTools([blocked]);
+  await assert.rejects(send!.execute("c1", { message: "hi" }, undefined, undefined), /revise first/, "the agent sees the same error");
+  assert.equal(ctl.hasIrreversibleEffect(), false);
+  assert.equal(ctl.canRedo(), true);
+  assert.equal(ctl.holdActive(), true, "the next visible call is held again");
+});
+
 test("effects: a no-op undoable call is not compensated", async () => {
   const ctl = session({ holdMs: 0 });
   const noop = { ...tool("react"), execute: async () => ({ content: [{ type: "text", text: "removed 0 reaction(s)" }], details: { changed: false } }) } as unknown as AgentTool;
@@ -269,4 +280,38 @@ test("redo: a correction while a redo rebuilds joins the rebuild instead of a se
   ctl.requestRestart(req("e2"));
   assert.equal(ctl.peekPending(), undefined, "no step for the new agent's first request to trip on");
   assert.deepEqual(ctl.takeRebuildBeforeStart()?.causeEventIds, ["e2"]);
+});
+
+test("redo: a restart filed while the redo was being applied joins the rebuild", () => {
+  const ctl = session();
+  const req = (id: string) => ({ reason: "edit_redo" as const, causeEventIds: [id], fallbacks: [], addedEventIds: [], removedEventIds: [] });
+  ctl.bind({ signal: undefined, abort: () => undefined } as unknown as Agent, undefined);
+  ctl.requestRestart(req("e1"));
+  ctl.takePending();
+  // The runner compensates and forks the old rollout: still running.
+  ctl.requestRestart(req("e2"));
+  assert.deepEqual(ctl.markRebuilding()?.causeEventIds, ["e2"], "handed to the rebuild");
+  assert.equal(ctl.peekPending(), undefined, "nothing left for the rebuilt agent to trip on");
+  assert.equal(ctl.hasPendingStep(), false);
+});
+
+test("redo: a step filed while the agent was idle is pending for the runner, and a later correction still aborts", async () => {
+  const ctl = session();
+  let aborts = 0;
+  const agent = { signal: undefined as AbortSignal | undefined, abort: () => (aborts += 1) };
+  const progress = new RequestProgress(false);
+  ctl.bind(agent as unknown as Agent, progress);
+  const req = (id: string) => ({ reason: "edit_redo" as const, causeEventIds: [id], fallbacks: [], addedEventIds: [], removedEventIds: [] });
+  ctl.requestRestart(req("e1"));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(aborts, 0, "nothing in flight to abort");
+  assert.equal(ctl.hasPendingStep(), true, "the runner applies it before its next request");
+  // A request went out anyway (a path that did not check): the next correction aborts it.
+  agent.signal = new AbortController().signal;
+  progress.begin();
+  progress.noteAttemptEvent();
+  ctl.requestRestart(req("e2"));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(aborts, 1);
+  assert.deepEqual((ctl.takePending() as { request: { causeEventIds: string[] } }).request.causeEventIds, ["e1", "e2"]);
 });

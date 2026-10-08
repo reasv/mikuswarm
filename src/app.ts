@@ -99,6 +99,7 @@ import type { Agent, AgentMessage, AgentTool } from "@earendil-works/pi-agent-co
 import {
   HELD_CALL_CANCELLED,
   LateInputSession,
+  mergeRestart,
   resolveLateInputSettings,
   takeQueuedSteers,
   type CorrectionFallback,
@@ -3520,8 +3521,23 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
    * re-armed only when the recomputed status warrants it and the target's timeline
    * isn't inactive — mirroring the live append and re-decryption gating.
    */
-  async function applyEdit(inbound: InboundChatEvent): Promise<void> {
+  async function applyEdit(edit: InboundChatEvent): Promise<void> {
+    let inbound = edit;
     const targetExternalId = inbound.edit!.targetExternalId;
+    // A deletion whose provider cannot place its target (a Matrix redaction):
+    // applied to the stored message in one of the candidate timelines (with
+    // their threads), else dropped (a reaction, a state event, a message this
+    // store never had); never parked.
+    const lookup = inbound.edit!.lookupTimelineKeys;
+    if (lookup) {
+      let storedKey: string | undefined;
+      for (const key of lookup) {
+        storedKey = timeline.resolveEditTargetTimelineKey(inbound.provider, targetExternalId, key);
+        if (storedKey) break;
+      }
+      if (!storedKey) return;
+      inbound = { ...inbound, timelineKey: storedKey, event: { ...inbound.event, timelineKey: storedKey } };
+    }
     // Late input (§8 "Late input"): the message before the edit, for the request
     // correction (before/after text, the no-op filter, mention changes).
     const prior = lateInputSettings.enabled
@@ -4065,11 +4081,29 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   const STEERED_EVENT_ID_CAP = 1024;
   function markSteered(eventId: string): void {
     steeredEventIds.add(eventId);
+    releasedEventIds.delete(eventId);
     if (steeredEventIds.size > STEERED_EVENT_ID_CAP) {
       // `Set` preserves insertion order — evict the oldest id.
       const oldest = steeredEventIds.values().next().value;
       if (oldest !== undefined) steeredEventIds.delete(oldest);
     }
+  }
+  // Steered ids released to their native fate (a late addition judged not to
+  // belong, a fold whose owner settled): still marked, so their twins stay
+  // suppressed, but not consumed by any session (a released request is a
+  // request of its own for causality routing). Bounded like `steeredEventIds`.
+  const releasedEventIds = new Set<string>();
+  function markReleased(eventId: string): void {
+    if (!steeredEventIds.has(eventId)) return;
+    releasedEventIds.add(eventId);
+    if (releasedEventIds.size > STEERED_EVENT_ID_CAP) {
+      const oldest = releasedEventIds.values().next().value;
+      if (oldest !== undefined) releasedEventIds.delete(oldest);
+    }
+  }
+  /** Consumed by a session: steered and not released to its native fate. */
+  function consumedBySession(eventId: string): boolean {
+    return steeredEventIds.has(eventId) && !releasedEventIds.has(eventId);
   }
 
   function steerReplyToActiveSession(inbound: InboundChatEvent): boolean {
@@ -4932,6 +4966,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
    * as a normal timeline event, so there is nothing to do (= today, no loss).
    */
   function revertFollowUpToNativeFate(inbound: InboundChatEvent, reason: string): void {
+    for (const id of triggerGroupOf(inbound)) markReleased(id);
     if (inbound.trigger) {
       logger.info("follow_up_native_redispatch", {
         reason,
@@ -5279,7 +5314,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         e.timestamp > after &&
         e.sender.id === senderId &&
         !group.has(e.id) &&
-        !steeredEventIds.has(e.id) &&
+        !consumedBySession(e.id) &&
         (dm ||
           e.mentions?.mentionedSelf === true ||
           (e.externalId !== undefined && sessionClaims.claimantOf(entry.timelineKey, e.externalId) !== undefined)),
@@ -5545,6 +5580,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       if (!deleted) maybeTriggerOnAddedMention(inbound, prior, after);
       return;
     }
+    // A deletion by someone else (a moderator's redaction) only updates the
+    // stored message; one by an unknown deleter (a Discord deletion) is the sender's.
+    if (deleted && inbound.edit?.deletedBy !== undefined && inbound.edit.deletedBy !== prior.sender.id) {
+      logger.info("late_input_ignored", { sessionId: entry.sessionId, kind: "delete", reason: "deleted_by_other" });
+      return;
+    }
     if (!deleted) {
       if (inbound.event.sender.id !== prior.sender.id || !isHumanSender(inbound.event.sender)) return;
       if (sameRequestContent(prior, after) && Boolean(prior.mentions?.mentionedSelf) === Boolean(after.mentions?.mentionedSelf)) {
@@ -5654,29 +5695,32 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     if (pointSettings && entry.judged < knobs.maxJudged) {
       entry.judged += 1;
       markSteered(inbound.event.id);
-      // The held call waits for the verdict AND the join it leads to (the redo is
-      // filed before the hold may let the call go), bounded: a verdict later than
-      // max_hold_ms plus the point's timeout counts as unjudged.
-      const boundAt =
-        entry.ctl.triggerReceivedAt +
-        lateInputSettings.maxHoldMs +
-        Math.max(pointSettings.timeoutMs, pointSettings.vision?.timeoutMs ?? 0);
-      const verdict = boundedVerdict(judgeLateAddition(entry, inbound), boundAt, entry.sessionId);
-      const decided = verdict.then((v) => {
+      // The verdict always decides the candidate, whenever it arrives (the
+      // decision call is bounded by its own timeout). The held call waits for
+      // the verdict AND the join it leads to (the redo is filed before the hold
+      // may let the call go), but only until the later of the hold's bound and
+      // the candidate's arrival, plus the point's timeout (the vision timeout
+      // for an image candidate): a verdict after that still joins, by
+      // interjection once the held call went out.
+      const timeoutMs = hasImageAttachment(inbound.event) && pointSettings.vision ? pointSettings.vision.timeoutMs : pointSettings.timeoutMs;
+      const holdBoundAt = Math.max(entry.ctl.triggerReceivedAt + lateInputSettings.maxHoldMs, Date.now()) + timeoutMs;
+      const decided = judgeLateAddition(entry, inbound).then((v) => {
         if (v.judged) {
           if (v.belongs) return joinLateAddition(entry, inbound, form, "judged");
           logger.info("late_input_ignored", { sessionId: entry.sessionId, kind: "addition", reason: "judged_not_belonging", probability: v.probability });
           revertFollowUpToNativeFate(inbound, "late_addition_rejected");
           return;
         }
-        // No verdict (point failed or too late): the quick fold windows decide, as without the point.
+        // No verdict (the point failed): the quick fold windows decide, as without the point.
         if (quickFoldPasses(entry, inbound, form)) return joinLateAddition(entry, inbound, form, "quick_window");
         revertFollowUpToNativeFate(inbound, "late_addition_unjudged");
       }).catch((error) => {
         logger.error("late_input_addition_failed", { sessionId: entry.sessionId, error: error instanceof Error ? error.message : String(error) });
         revertFollowUpToNativeFate(inbound, "late_addition_failed");
       });
-      entry.ctl.trackVerdict(raceDeadline(decided, boundAt));
+      entry.ctl.trackVerdict(
+        raceDeadline(decided, holdBoundAt, () => logger.info("late_input_verdict_timeout", { sessionId: entry.sessionId, eventId: inbound.event.id })),
+      );
       return true;
     }
     if (!quickFoldPasses(entry, inbound, form)) return false;
@@ -5687,10 +5731,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     return true;
   }
 
-  /** `promise`, or undefined at `deadline` (wall clock) if it has not settled by then. */
-  function raceDeadline<T>(promise: Promise<T>, deadline: number): Promise<T | undefined> {
+  /** `promise`, or undefined at `deadline` (wall clock) if it has not settled by then (`onTimeout` is called). */
+  function raceDeadline<T>(promise: Promise<T>, deadline: number, onTimeout?: () => void): Promise<T | undefined> {
     return new Promise((resolve) => {
-      const timer = setTimeout(() => resolve(undefined), Math.max(0, deadline - Date.now()));
+      const timer = setTimeout(() => {
+        onTimeout?.();
+        resolve(undefined);
+      }, Math.max(0, deadline - Date.now()));
       timer.unref?.();
       promise.then(
         (value) => {
@@ -5703,14 +5750,6 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         },
       );
     });
-  }
-
-  /** A late-addition verdict, or "not judged" when it is not in by `deadline`. */
-  async function boundedVerdict(verdict: Promise<LateAdditionVerdict>, deadline: number, sessionId: string): Promise<LateAdditionVerdict> {
-    const settled = await raceDeadline(verdict, deadline);
-    if (settled !== undefined) return settled;
-    logger.info("late_input_verdict_timeout", { sessionId });
-    return LATE_ADDITION_NOT_JUDGED;
   }
 
   function quickFoldPasses(entry: LateInputEntry, inbound: InboundChatEvent, form: FollowUpForm): boolean {
@@ -5791,6 +5830,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       return;
     }
     entry.folded += 1;
+    // A join that delivered nothing gives its slot back (once).
+    let released = false;
+    const releaseSlot = (): void => {
+      if (released) return;
+      released = true;
+      entry.folded = Math.max(0, entry.folded - 1);
+    };
     const gapMs = Math.abs(inbound.event.timestamp - entry.inbound.event.timestamp);
     // A trigger-bearing addition brings its trigger hold's group with it.
     const added = triggerGroupOf(inbound);
@@ -5816,6 +5862,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       delivery: { inbound, form: form === "reply" ? "reply" : form },
       added,
       onUndelivered: () => {
+        releaseSlot();
         if (undelivered) return;
         undelivered = true;
         revertFollowUpToNativeFate(inbound, "late_addition_undelivered");
@@ -5824,7 +5871,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     logger.info("late_input_addition", { sessionId: entry.sessionId, eventId: inbound.event.id, form, admittedBy, outcome });
     if (outcome === "ignored") {
       // It did not join: the budget is not used.
-      entry.folded = Math.max(0, entry.folded - 1);
+      releaseSlot();
       if (!undelivered) {
         undelivered = true;
         revertFollowUpToNativeFate(inbound, "late_addition_after_run_end");
@@ -8542,7 +8589,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       void storage.setAgentSessionRefusalPin(session.id, null).catch(() => undefined);
       // Corrections arriving while the context is rebuilt join the rebuild (no
       // request is sent for a build they made stale); interjections are parked.
-      lateCtl!.markRebuilding();
+      // One filed while this redo compensated or forked joins it now.
+      const absorbed = lateCtl!.markRebuilding();
+      if (absorbed) request = mergeRestart(request, absorbed);
       let next: CreatedAgent;
       let unapplied: RestartRequest | undefined;
       for (;;) {
@@ -8656,7 +8705,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         suppressTyping: proactive,
         endings: binding.created.gate,
         ...sessionRedoOptions(binding.created, binding.capture),
-        ...(lateCtl ? { lateInput: { next: lateInputNext, ended: onRunEnded } } : {}),
+        ...(lateCtl ? { lateInput: { next: lateInputNext, pending: () => lateCtl.hasPendingStep(), ended: onRunEnded } } : {}),
       });
       // drainCalled: the success path releases the timeline slot itself (before the
       // record turn), so the .finally drains only on the error path.

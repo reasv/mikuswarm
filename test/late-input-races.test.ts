@@ -435,3 +435,142 @@ test("late input races: after a partial compensation, an undone reaction is neve
     await h.stop();
   }
 });
+
+test("late input races: an addition arriving after the trigger's hold bound still gets its verdict honoured", async () => {
+  let first = true;
+  const h = await startHarness({
+    toml: LATE({ hold_ms: 300, extend_ms: 200, max_hold_ms: 800 }) + DECIDER({ timeout_ms: 500 }),
+    decideNoul: () => new Promise((r) => setTimeout(() => r(0.95), 100)),
+    script: (req) => {
+      if (isRecordTurnRequest(req)) return { text: "NO_REPLY" };
+      const reply = send(userText(req).includes("in Celsius") ? "20 C" : "68 F");
+      if (first) {
+        first = false;
+        return { ...reply, delayMs: 3000 };
+      }
+      return reply;
+    },
+  });
+  try {
+    h.say("temperature in Rome?", { mention: true });
+    await h.until(() => h.llm.requests.length >= 1, "first request");
+    // Inside the candidate window and before any delivery, but after the
+    // trigger's arrival + max_hold_ms + timeout_ms (1.3 s).
+    await new Promise((r) => setTimeout(r, 1600));
+    h.say("in Celsius please");
+    await h.until(() => h.sends.length >= 1, "a send", 15_000);
+    await new Promise((r) => setTimeout(r, 500));
+    assert.ok(!hasLog(h, "late_input_verdict_timeout"), "a 100 ms verdict is not discarded as a timeout");
+    assert.deepEqual(bodies(h), ["20 C"]);
+  } finally {
+    await h.stop();
+  }
+});
+
+test("late input races: a send the output gate blocked does not stop a later edit from redoing", async () => {
+  let n = 0;
+  const h = await startHarness({
+    toml: LATE({ hold_ms: 0, extend_ms: 0, max_hold_ms: 0 }) + `
+[checks.style_vocab]
+kind = "style"
+remedy = "revise"
+agent_explanation = "Uses stock vocabulary ({matched})."
+words = ["delve"]
+min_chars = 1
+`,
+    script: (req) => {
+      if (isRecordTurnRequest(req)) return { text: "NO_REPLY" };
+      n += 1;
+      if (req.body.messages.some((m) => messageText(m).includes("in Kyoto"))) return send("Kyoto answer");
+      if (n === 1) return send("let us delve into Tokyo time");
+      return { ...send("Tokyo answer"), delayMs: 1500 };
+    },
+  });
+  try {
+    const id = h.say("what time is it in Tokyo", { mention: true });
+    await h.until(() => h.llm.requests.filter((r) => !isRecordTurnRequest(r)).length >= 2, "blocked once, the revised request in flight");
+    h.edit(id, "what time is it in Kyoto", { mention: true });
+    await h.until(settledAll(h), "settled", 15_000);
+    assert.ok(hasLog(h, "late_input_redo"), "the edit redid the session");
+    assert.ok(!hasLog(h, "late_input_interjected"), "the blocked send is no effect to interject after");
+    assert.deepEqual(bodies(h), ["Kyoto answer"]);
+  } finally {
+    await h.stop();
+  }
+});
+
+test("late input races: a correction while a redo compensates joins the rebuild, no stale rollout runs", async () => {
+  let reacted = false;
+  let compensating = false;
+  const allText = (req: FakeLlmRequest) => req.body.messages.map((m) => messageText(m)).join("\n");
+  const h = await startHarness({
+    toml: LATE({ hold_ms: 0, extend_ms: 0, max_hold_ms: 0, first_event_wait_ms: 100 }),
+    channelClient: {
+      react: async (_id: string, emoji: string) => ({ display: emoji }),
+      unreact: async () => {
+        compensating = true;
+        await new Promise((r) => setTimeout(r, 1000));
+        return { removed: 1 };
+      },
+    },
+    script: (req) => {
+      if (isRecordTurnRequest(req)) return { text: "NO_REPLY" };
+      const t = allText(req);
+      if (!reacted) {
+        reacted = true;
+        return { toolCalls: [{ name: "react", args: { message_id: "$user1", emoji: "👀" } }] };
+      }
+      if (t.includes("not executed: the request changed")) return { text: "NO_REPLY" };
+      const v = t.includes("v3") ? "v3" : t.includes("v2") ? "v2" : "v1";
+      return { ...send(`answer ${v}`), delayMs: v === "v1" ? 1500 : 300 };
+    },
+  });
+  try {
+    const id = h.say("v1 hi bot", { mention: true });
+    await h.until(() => reacted && h.llm.requests.length >= 2, "reacted, next request in flight");
+    h.edit(id, "v2 hi bot", { mention: true });
+    await h.until(() => compensating, "compensation running");
+    await new Promise((r) => setTimeout(r, 200));
+    h.edit(id, "v3 hi bot", { mention: true });
+    await h.until(settledAll(h), "settled", 15_000);
+    assert.deepEqual(bodies(h), ["answer v3"]);
+    const stale = h.llm.requests.filter((r) => !isRecordTurnRequest(r) && allText(r).includes("not executed: the request changed"));
+    assert.equal(stale.length, 0, "no rebuilt rollout ran with a redo pending");
+    assert.equal(h.logs.filter((l) => l.message === "late_input_redo" && l.phase !== "building").length, 1, "one redo");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("late input races: a follow-up to a newer request judged not to belong does not join the older session", async () => {
+  let first = true;
+  let judged = 0;
+  const h = await startHarness({
+    toml: LATE({ hold_ms: 0, extend_ms: 0, max_hold_ms: 0 }) + DECIDER(),
+    // The first candidate (the new request) does not belong; the second would.
+    decideNoul: () => (++judged === 1 ? 0.05 : 0.95),
+    script: (req) => {
+      if (isRecordTurnRequest(req)) return { text: "NO_REPLY" };
+      const t = userText(req);
+      if (first) {
+        first = false;
+        return { ...send("sunny"), delayMs: 1500 };
+      }
+      if (t.includes("translate")) return send(t.includes("into German") ? "Hallo" : "hello");
+      return send(t.includes("into German") ? "weather+German?!" : "sunny");
+    },
+  });
+  try {
+    h.say("weather in Rome?", { mention: true });
+    await h.until(() => h.llm.requests.length >= 1, "first request");
+    h.say("translate 'hello'", { mention: true });
+    await h.until(() => hasLog(h, "follow_up_native_redispatch"), "the new request is rejected and redispatched");
+    h.say("into German");
+    await h.until(() => h.sends.length >= 2 && settledAll(h)(), "both answered", 15_000);
+    const weather = h.llm.requests.filter((r) => !isRecordTurnRequest(r) && userText(r).includes("weather in Rome") && !userText(r).includes("translate"));
+    assert.ok(weather.every((r) => !userText(r).includes("into German")), "the follow-up never joined the weather request");
+    assert.ok(!bodies(h).includes("weather+German?!"));
+  } finally {
+    await h.stop();
+  }
+});

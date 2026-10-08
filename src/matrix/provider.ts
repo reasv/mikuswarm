@@ -22,7 +22,7 @@ import type {
   MatrixNativeConfig,
   MatrixNativeEvent,
 } from "./native-types.js";
-import { normalizeMatrixInboundEvent } from "./inbound.js";
+import { matrixRedactionDeletion, normalizeMatrixInboundEvent } from "./inbound.js";
 import { adaptMatrixReactionEvent } from "./reaction-ingest.js";
 import { recordInboundEmojiUsage } from "./emoji-resolve.js";
 import type { EnrichmentCapabilities } from "../enrichment/index.js";
@@ -283,6 +283,11 @@ export class MatrixProvider implements IChatProvider {
         // ReactionStreamEvent; buildMatrixHost.onReaction can call ingestReactionEvent
         // directly with no further cast.
         this.host?.onReaction(adaptMatrixReactionEvent(account.accountId, nativeEvent.event), { accountId: account.accountId });
+        // Every redaction arrives here (a reaction's or a message's): a message
+        // redaction is also a deletion, routed like a Discord one (the app
+        // applies it only when the target is a stored message).
+        const deletion = matrixRedactionDeletion(account.accountId, nativeEvent.event);
+        if (deletion) this.host?.onEvent(deletion);
         continue;
       }
       if (nativeEvent.type !== "inbound") {

@@ -1,5 +1,5 @@
 import { nanoid } from "nanoid";
-import type { MatrixInboundEvent, MatrixInboundMedia } from "./native-types.js";
+import type { MatrixInboundEvent, MatrixInboundMedia, MatrixReactionStreamEvent } from "./native-types.js";
 import type {
   AttachmentMeta,
   CanonicalChatEvent,
@@ -127,6 +127,44 @@ export function normalizeMatrixInboundEvent(
       roomId: event.roomId,
       threadId: event.threadRootId,
       replyToId: event.eventId,
+    },
+  };
+}
+
+/**
+ * A Matrix redaction as a message deletion (ARCHITECTURE.md §7 "Message edits",
+ * §8 "Late input"): the same tombstone-through-the-edit-path a Discord deletion
+ * takes. The native layer forwards every `m.room.redaction` on the reaction
+ * stream (as a `remove` of the redacted id), since it cannot tell a reaction's
+ * redaction from a message's; the edit carries the timelines the target may be
+ * stored in (the room with its threads, or the DM) and applies only to a stored
+ * message. The redaction's own server time is the deletion's time, and its
+ * sender (the redacting user) is `deletedBy`.
+ */
+export function matrixRedactionDeletion(accountId: string, redaction: MatrixReactionStreamEvent): InboundChatEvent | undefined {
+  if (redaction.action !== "remove" || !redaction.reactionEventId) return undefined;
+  const roomKey = `matrix:${accountId}:room:${redaction.roomId}`;
+  const dmKey = `matrix:${accountId}:dm:${redaction.roomId}`;
+  const timestamp = redaction.reactedAtMs > 0 ? redaction.reactedAtMs : Date.now();
+  const sender = { id: redaction.senderId || "system", ...(redaction.senderDisplay ? { displayName: redaction.senderDisplay } : {}) };
+  return {
+    provider: "matrix",
+    timelineKey: roomKey,
+    event: {
+      id: `matrix:${accountId}:${redaction.reactionEventId}:delete:${nanoid()}`,
+      timelineKey: roomKey,
+      provider: "matrix",
+      role: "user",
+      sender,
+      body: "",
+      timestamp,
+      receivedAt: Date.now(),
+    },
+    edit: {
+      targetExternalId: redaction.reactionEventId,
+      deleted: true,
+      ...(redaction.senderId ? { deletedBy: redaction.senderId } : {}),
+      lookupTimelineKeys: [roomKey, dmKey],
     },
   };
 }

@@ -14,7 +14,7 @@
  */
 
 import { unlink } from "node:fs/promises";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type {
   AttachmentMeta,
@@ -148,9 +148,48 @@ function resolveSelf(ctx: CrossChannelToolContext): SenderInfo {
 }
 
 /**
+ * A multi-chunk send failed after some chunks were delivered: what went out,
+ * and the text that did not.
+ */
+class PartialSendError extends Error {
+  constructor(
+    readonly deliveredIds: string[],
+    readonly totalChunks: number,
+    readonly unsentBody: string,
+    cause: unknown,
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause));
+  }
+}
+
+/**
+ * The tool result of a send that delivered some chunks before it failed. Not
+ * an `error:` result: part of the message reached the chat (a tool error would
+ * tell the harness, and the agent, that nothing was sent).
+ */
+function partialSendResult(
+  err: PartialSendError,
+  destination: string,
+  stash: ReturnType<typeof makeMessageStash>,
+): AgentToolResult<unknown> {
+  const ref = stash.store(err.unsentBody);
+  const sent = err.deliveredIds.length;
+  return {
+    content: [{
+      type: "text",
+      text:
+        `partially sent: ${sent} of ${err.totalChunks} chunks reached ${destination} (${err.deliveredIds.join(", ")}), ` +
+        `then the send failed: ${err.message}. The rest was not sent (message_ref: "${ref}" holds it).`,
+    }],
+    details: { event_id: err.deliveredIds.at(-1) ?? null, partial: true },
+  };
+}
+
+/**
  * Send a message to `destTarget` (which may be any channel or DM the bot is in),
  * store cross_channel metadata, and ingest into the timeline.
- * Returns the result text or throws on provider error.
+ * Returns the result text or throws on provider error: a {@link PartialSendError}
+ * when a later chunk failed after earlier ones were delivered.
  * `attachments` are forwarded to the provider's send call (m4, spec §4.1/§4.2).
  */
 async function sendWithCrossChannelNote(
@@ -177,30 +216,39 @@ async function sendWithCrossChannelNote(
   };
 
   let lastEventId: string | null = null;
-  for (let i = 0; i < chunks.length; i++) {
-    const receipt = await destProvider.send(destTarget, {
-      body: chunks[i],
-      agentSessionId: ctx.sessionId,
-      // Attach media only on the first chunk (multi-chunk sends are text-only after the first).
-      attachments: i === 0 && attachments?.length ? attachments : undefined,
-    });
-    const event: CanonicalChatEvent = {
-      id: `assistant:${ctx.sessionId}:${receipt.externalId ?? Date.now()}:${i}`,
-      externalId: receipt.externalId,
-      timelineKey: destTarget.timelineKey,
-      provider: destProvider.id,
-      agentSessionId: ctx.sessionId,
-      agentSessionGeneration: ctx.agentSessionGeneration,
-      role: "assistant",
-      sender: resolveSelf(ctx),
-      body: chunks[i],
-      timestamp: receipt.deliveredAt,
-      receivedAt: Date.now(),
-      crossChannel: i === 0 ? crossChannel : undefined,
-      attachments: i === 0 && attachments?.length ? attachments : undefined,
-    };
-    await ctx.timeline.ingestAssistantSend(event);
-    lastEventId = receipt.externalId ?? null;
+  const deliveredIds: string[] = [];
+  try {
+    for (let i = 0; i < chunks.length; i++) {
+      const receipt = await destProvider.send(destTarget, {
+        body: chunks[i],
+        agentSessionId: ctx.sessionId,
+        // Attach media only on the first chunk (multi-chunk sends are text-only after the first).
+        attachments: i === 0 && attachments?.length ? attachments : undefined,
+      });
+      deliveredIds.push(receipt.externalId ?? "local");
+      const event: CanonicalChatEvent = {
+        id: `assistant:${ctx.sessionId}:${receipt.externalId ?? Date.now()}:${i}`,
+        externalId: receipt.externalId,
+        timelineKey: destTarget.timelineKey,
+        provider: destProvider.id,
+        agentSessionId: ctx.sessionId,
+        agentSessionGeneration: ctx.agentSessionGeneration,
+        role: "assistant",
+        sender: resolveSelf(ctx),
+        body: chunks[i],
+        timestamp: receipt.deliveredAt,
+        receivedAt: Date.now(),
+        crossChannel: i === 0 ? crossChannel : undefined,
+        attachments: i === 0 && attachments?.length ? attachments : undefined,
+      };
+      await ctx.timeline.ingestAssistantSend(event);
+      lastEventId = receipt.externalId ?? null;
+    }
+  } catch (err) {
+    // Nothing delivered: the caller reports a clean failure. Otherwise part of
+    // the message is in the chat (a failure storing a delivered chunk included).
+    if (deliveredIds.length === 0) throw err;
+    throw new PartialSendError(deliveredIds, chunks.length, chunks.slice(deliveredIds.length).join("\n"), err);
   }
   return {
     text: `sent: ${lastEventId ?? "local"}`,
@@ -599,6 +647,7 @@ function createSendDmTool(
       try {
         sendResult = await sendWithCrossChannelNote(ctx, dmTarget, body, args.context_note, resolvedAttachments.length ? resolvedAttachments : undefined);
       } catch (err) {
+        if (err instanceof PartialSendError) return partialSendResult(err, `the DM with ${userId}`, stash);
         const ref = stash.store(body, mediaRefs, asVoice);
         const msg = err instanceof Error ? err.message : String(err);
         return {
@@ -869,6 +918,7 @@ function createSendToChannelTool(
       try {
         sendResult = await sendWithCrossChannelNote(ctx, destTarget, body, args.context_note, resolvedAttachments.length ? resolvedAttachments : undefined);
       } catch (err) {
+        if (err instanceof PartialSendError) return partialSendResult(err, channelKey, stash);
         const ref = stash.store(body, mediaRefs, asVoice);
         const msg = err instanceof Error ? err.message : String(err);
         // N1(b): translate "not in room" send failures into an actionable error.

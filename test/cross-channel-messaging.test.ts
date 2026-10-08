@@ -1511,3 +1511,34 @@ test("send_dm: a failed DM is reported as an error (late input does not count it
     assert.ok(text.includes("message_ref"), "the retry handle is kept");
   });
 });
+
+test("send_to_channel: a send that fails after delivering a chunk is reported as partial, never as an error", async () => {
+  await withStorage(async (storage, timeline) => {
+    let sends = 0;
+    const provider: IChatProvider = {
+      ...stubProvider("matrix"),
+      capabilities: { maxAttachmentsPerMessage: 1, maxMessageChars: 20 },
+      listJoinedChannels: () => ["matrix:default:room:!other:s"],
+      send: async (target) => {
+        sends += 1;
+        if (sends > 1) throw new Error("rate limited");
+        return { provider: "matrix", target, externalId: `$c${sends}`, deliveredAt: Date.now() };
+      },
+    };
+    const ctx = makeCcCtx({ storage, timeline, provider, providers: new Map([["matrix", provider]]) });
+    const tool = createCrossChannelTools(ctx).find((t) => t.name === "send_to_channel")!;
+    const long = "first part of it.\n\nsecond part of it.\n\nthird part.";
+    const result = await tool.execute("call1", { channel: "matrix:default:room:!other:s", message: long, context_note: "test" }, undefined as never);
+    const text = result.content[0]!.text as string;
+    assert.ok(sends >= 2, "chunked");
+    assert.ok(!/^error\b/i.test(text), `delivered chunks are not an error result: ${text}`);
+    assert.match(text, /partially sent: 1 of \d+ chunks/);
+    assert.match(text, /\$c1/);
+    assert.match(text, /rate limited/);
+
+    // Nothing delivered: still a clean error.
+    sends = 1;
+    const failed = await tool.execute("call2", { channel: "matrix:default:room:!other:s", message: "short", context_note: "test" }, undefined as never);
+    assert.match(failed.content[0]!.text as string, /^error: failed to send/);
+  });
+});

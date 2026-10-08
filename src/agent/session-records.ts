@@ -438,7 +438,8 @@ export class SessionRecordService {
     const startIndex = agent.state.messages.length;
     let abortReason: AbortReason | undefined;
     entry.abort = (reason) => {
-      if (abortReason) return;
+      // A revival or shutdown overrides the turn cap (the record must not be written).
+      if (abortReason && !(abortReason === "max_turns" && reason !== "max_turns")) return;
       abortReason = reason;
       agent.abort();
     };
@@ -462,17 +463,21 @@ export class SessionRecordService {
     handles.gate.active = true;
     // The record's soft-refusal verdict (spec REFUSAL-HANDLING §5.2.3), when judged.
     let judged: "accept" | "exhausted" | undefined;
+    // An abort that ends the turn without a record. The turn cap stopping a
+    // finalized turn that kept looping is not one: that record is still judged
+    // and written.
+    const stopped = (): boolean => this.stopping || (abortReason !== undefined && !(abortReason === "max_turns" && finalized));
     try {
       for (;;) {
         await agent.prompt(buildKickoff());
         await agent.waitForIdle();
-        if (!params.judgeRecord || abortReason || !finalized || this.stopping) break;
+        if (!params.judgeRecord || !finalized || stopped()) break;
         const draftText = handles.draft.isCreated() ? handles.draft.getContent() : "";
         if (draftText.trim().length === 0) break;
         const verdict = await params.judgeRecord(draftText);
         // A revival or shutdown that landed while the judge ran ends the turn:
         // no rerun, no write.
-        if (abortReason || this.stopping) break;
+        if (stopped()) break;
         if (verdict === undefined) break;
         if (verdict !== "rerun") {
           judged = verdict;
@@ -485,6 +490,8 @@ export class SessionRecordService {
         handles.draft.reset();
         finalized = false;
         turns = 0;
+        // The rerun is a new loop: the cap that stopped the discarded one does not carry over.
+        if (abortReason === "max_turns") abortReason = undefined;
         logger.info("session_record_refusal_redo", { sessionId });
       }
     } catch (error) {

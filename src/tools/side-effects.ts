@@ -233,6 +233,21 @@ export function isPostingTool(name: string): boolean {
   return POSTING_TOOLS.has(name);
 }
 
+/**
+ * Thrown by a wrapper that stops a tool call before it executes, so nothing was
+ * delivered (the output gate's block of a send). The agent sees the message as
+ * the tool error, as for any throw; late input (ARCHITECTURE.md §8 "Late
+ * input") reads it as a clean failure, never as an effect that happened.
+ */
+export class NotExecutedError extends Error {
+  readonly notExecuted = true;
+}
+
+/** The call threw a {@link NotExecutedError}: it never ran. */
+export function isNotExecutedError(error: unknown): boolean {
+  return error instanceof NotExecutedError || (error as { notExecuted?: unknown } | null)?.notExecuted === true;
+}
+
 function nonBlank(value: unknown): value is string {
   return typeof value === "string" && value.trim() !== "";
 }

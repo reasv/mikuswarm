@@ -25,7 +25,7 @@ import type { Agent, AgentMessage, AgentTool, AgentToolResult } from "@earendil-
 import type { AppConfig } from "../config/index.js";
 import type { Logger } from "../observability/logger.js";
 import type { SessionBranchReason } from "../storage/database.js";
-import { compensationFor, isPostingTool, toolEffect } from "../tools/side-effects.js";
+import { compensationFor, isNotExecutedError, isPostingTool, toolEffect } from "../tools/side-effects.js";
 import type { RequestProgress } from "./request-progress.js";
 
 type LateInputRaw = NonNullable<NonNullable<AppConfig["agent"]["sessions"]>["late_input"]>;
@@ -229,7 +229,9 @@ export interface EffectRecord {
   /**
    * The call reported a failure cleanly (a posting call that failed delivered
    * nothing). An effect is recorded before its call executes, so a call still
-   * executing, or one that threw (an abort included), counts as having happened.
+   * executing, or one that threw (an abort included), counts as having
+   * happened; a call a wrapper stopped before it ran (`NotExecutedError`) is
+   * removed.
    */
   failed: boolean;
   /** An undoable effect the tool reported as a no-op (nothing to compensate). */
@@ -417,6 +419,9 @@ export class LateInputSession {
     }
     if (this.pending?.kind === "restart") {
       this.pending = { kind: "restart", request: mergeRestart(this.pending.request, request) };
+      // The first abort may have found nothing to abort (the agent idle between
+      // steps); a request issued since then is aborted now.
+      void this.abortForStep();
       return;
     }
     if (this.pending?.kind === "cancel") return;
@@ -464,6 +469,15 @@ export class LateInputSession {
     return this.pending;
   }
 
+  /**
+   * A redo or cancel is pending: the runner applies it instead of issuing a
+   * request that it would make stale (a step filed while the agent was idle
+   * between steps finds nothing to abort).
+   */
+  hasPendingStep(): boolean {
+    return this.pending !== undefined && this.pending.kind !== "interject";
+  }
+
   /** A correction arrived while building: the caller rebuilds before starting. */
   takeRebuildBeforeStart(): RestartRequest | undefined {
     const r = this.rebuildBeforeStart;
@@ -476,6 +490,7 @@ export class LateInputSession {
     if (this.pending?.kind !== "cancel") return undefined;
     const p = this.pending;
     this.pending = undefined;
+    this.aborting = false;
     return p;
   }
 
@@ -488,9 +503,21 @@ export class LateInputSession {
     this.phase = "running";
   }
 
-  /** A redo rebuilds the context: corrections meanwhile join the rebuild (no branch, no request). */
-  markRebuilding(): void {
+  /**
+   * A redo rebuilds the context: corrections meanwhile join the rebuild (no
+   * branch, no request). A restart filed while the redo was being applied (the
+   * old rollout compensated or forked, the phase still `running`) is returned
+   * for the rebuild to absorb: it has not read the timeline yet. A pending
+   * interjection is dropped (the rebuild redelivers the steers); a pending
+   * cancel stays for the rebuild to honour.
+   */
+  markRebuilding(): RestartRequest | undefined {
     this.phase = "building";
+    this.aborting = false;
+    const pending = this.pending;
+    if (pending?.kind === "cancel") return undefined;
+    this.pending = undefined;
+    return pending?.kind === "restart" ? pending.request : undefined;
   }
 
   /**
@@ -580,14 +607,27 @@ export class LateInputSession {
             this.emitChange();
           }
         }
+        const wasReleased = this.holdReleased;
         this.holdReleased = true;
         // Recorded before the call executes: a correction arriving while it runs
         // (a send on its way out) must not redo or cancel the session. Only a
-        // clean failure the tool reports downgrades it; a throw (an abort
-        // included) may have delivered, so it still counts.
+        // clean failure downgrades it: an error the tool reports. A call a
+        // wrapper stopped before it ran (the output gate's block) leaves no
+        // effect at all, and the hold applies again to the next visible call.
+        // Any other throw (an abort included) may have delivered, so it counts.
         const record: EffectRecord = { toolCallId, name: tool.name, args: params, effect, failed: false };
         this.effects.push(record);
-        const result = await original.call(tool, toolCallId, params, signal, onUpdate);
+        let result: Awaited<ReturnType<typeof original>>;
+        try {
+          result = await original.call(tool, toolCallId, params, signal, onUpdate);
+        } catch (error) {
+          if (isNotExecutedError(error)) {
+            const at = this.effects.indexOf(record);
+            if (at >= 0) this.effects.splice(at, 1);
+            this.holdReleased = wasReleased || this.effects.length > 0;
+          }
+          throw error;
+        }
         if (isErrorResult(result)) record.failed = true;
         else if ((result as { details?: { changed?: unknown } } | undefined)?.details?.changed === false) record.noop = true;
         if (!record.failed && isPostingTool(tool.name) && this.firstDeliveryAt === undefined) this.firstDeliveryAt = this.now();
@@ -681,9 +721,9 @@ export class LateInputSession {
    */
   private async abortForStep(): Promise<void> {
     if (this.aborting) return;
-    this.aborting = true;
     const agent = this.agent;
     if (!agent) return;
+    this.aborting = true;
     const progress = this.progress;
     for (;;) {
       if (progress?.phase === "awaiting_first_event") {
@@ -705,20 +745,16 @@ export class LateInputSession {
     }
     const step = this.pending;
     if (!step || this.agent !== agent) return;
-    if (agent.signal !== undefined) {
-      if (step.kind === "interject") {
-        this.logger?.info("turn_aborted_for_interjection", { sessionId: this.sessionId, phase: progress?.phase });
-      }
-      agent.abort();
+    if (agent.signal === undefined) {
+      // Nothing in flight: the runner applies the step before its next request
+      // (`hasPendingStep`); a later correction may abort again.
+      this.aborting = false;
+      return;
     }
-  }
-
-  /**
-   * After a rebuild bound a new agent: a step filed meanwhile (one the rebuild
-   * did not absorb) aborts the new agent's first request under the abort rule.
-   */
-  reapplyPending(): void {
-    if (this.pending && this.pending.kind !== "interject") void this.abortForStep();
+    if (step.kind === "interject") {
+      this.logger?.info("turn_aborted_for_interjection", { sessionId: this.sessionId, phase: progress?.phase });
+    }
+    agent.abort();
   }
 }
 

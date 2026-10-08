@@ -11,6 +11,7 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import { loadConfig } from "../../src/config/index.js";
 import { startMikuAgent } from "../../src/app.js";
+import { matrixRedactionDeletion } from "../../src/matrix/inbound.js";
 import type {
   AttachmentMeta,
   ChannelClient,
@@ -44,6 +45,8 @@ export interface AppHarness {
   edit(targetExternalId: string, body: string, opts?: { mention?: boolean; sender?: { id: string; displayName: string; username?: string }; timestamp?: number }): void;
   /** Delete a stored message (a tombstone through the edit path). */
   remove(targetExternalId: string): void;
+  /** A Matrix redaction of `targetExternalId`, as the Matrix provider emits it (default: by its sender, alice). */
+  redact(targetExternalId: string, opts?: { by?: string; timestamp?: number; dm?: boolean }): void;
   /** Poll until `predicate` holds (default 10 s). */
   until(predicate: () => boolean, what: string, timeoutMs?: number): Promise<void>;
   /** Read-only query against the app's database. */
@@ -324,6 +327,17 @@ export async function startHarness(opts: {
         },
         edit: { targetExternalId, deleted: true },
       } as InboundChatEvent);
+    },
+    redact(targetExternalId, redactOpts = {}) {
+      seq += 1;
+      const deletion = matrixRedactionDeletion("test", {
+        action: "remove",
+        reactionEventId: targetExternalId,
+        roomId: redactOpts.dm ? "!dm" : "!room",
+        senderId: redactOpts.by ?? "@alice:fake",
+        reactedAtMs: redactOpts.timestamp ?? Date.now() + seq,
+      });
+      host!.onEvent(deletion!);
     },
     async until(predicate, what, timeoutMs = 10_000) {
       const deadline = Date.now() + timeoutMs;
