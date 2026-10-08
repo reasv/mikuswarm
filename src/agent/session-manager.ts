@@ -149,6 +149,24 @@ export class SessionManager {
     return record;
   }
 
+  /**
+   * The session's request was re-rooted in place (§8 "Late input": its trigger
+   * deleted by its sender, the first surviving part of its group became the
+   * trigger): persist the new trigger on the durable row.
+   */
+  noteTriggerRerooted(sessionId: string): void {
+    const event = this.sessions.get(sessionId)?.trigger.event;
+    if (!event) return;
+    this.persist("session trigger reroot", sessionId, (storage) =>
+      storage.updateAgentSessionTrigger(sessionId, {
+        eventId: event.id,
+        ...(event.externalId !== undefined ? { externalId: event.externalId } : {}),
+        ...(event.body !== undefined ? { body: event.body.slice(0, MAX_TRIGGER_BODY) } : {}),
+        timestamp: event.timestamp,
+      }),
+    );
+  }
+
   markRunning(sessionId: string): void {
     const startedAt = Date.now();
     this.update(sessionId, (session) => ({

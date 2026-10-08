@@ -49,7 +49,10 @@ Unreleased section; it is not part of any release's notes.
   sender's own redaction withdraws a request; a moderator's leaves the request alone),
   and a session evicted by a restart cannot be revived. A trigger deleted before its
   session launched (during the trigger hold, while queued, during activation) is
-  never answered, and a part deleted by then leaves the request.
+  never answered, and a part deleted by then leaves the request. A message deleted
+  and sent again, corrected, inside one trigger hold is answered: a deleted trigger
+  message whose grouped parts still stand leaves the request like a part, and the
+  first surviving part becomes its trigger.
   A message that reached a running session outside its request (a reply to its
   message, a co-reply, an interjected addition) and that its sender then deletes
   is taken back while unread, otherwise followed by a short deletion note (or a

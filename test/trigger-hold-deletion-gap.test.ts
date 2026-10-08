@@ -202,3 +202,173 @@ test("a queued reply deleted before it launches is never resumed nor answered", 
     await h.stop();
   }
 });
+
+// A message deleted and sent again, corrected, inside one trigger hold (the
+// same sender, so one grouped request): the request goes on with the surviving
+// part, re-rooted on it, whichever arrives first.
+const lastUserText = (req: FakeLlmRequest) => JSON.stringify(req.body.messages.at(-1));
+
+for (const order of ["delete then resend", "resend then delete"] as const) {
+  test(`trigger hold, ${order}: the corrected message is answered, re-rooted on it`, async () => {
+    const seen: FakeLlmRequest[] = [];
+    const h = await startHarness({
+      toml: LATE,
+      triggerHoldMs: 600,
+      script: (req) => {
+        if (isRecordTurnRequest(req)) return { text: "NO_REPLY" };
+        seen.push(req);
+        return send(`answer ${h.sends.length + 1}`);
+      },
+    });
+    try {
+      h.say("hello", { mention: true, sender: { id: "@bob:fake", displayName: "Bob", username: "bob" } });
+      await h.until(() => h.sends.length === 1 && settled(h)(), "first answered");
+      const typo = h.say("whats teh tiem in tokyo", { mention: true });
+      await h.until(() => h.query("select 1 from timeline_events where external_id = ?", typo).length === 1, "typo stored");
+      let fixed: string;
+      if (order === "delete then resend") {
+        h.redact(typo);
+        await h.until(marked(h), "marked");
+        fixed = h.say("what's the time in Tokyo?", { mention: true });
+      } else {
+        fixed = h.say("what's the time in Tokyo?", { mention: true });
+        await new Promise((r) => setTimeout(r, 50));
+        h.redact(typo);
+        await h.until(marked(h), "marked");
+      }
+      await h.until(() => h.sends.length === 2 && rows(h).length === 2 && settled(h)(), "the corrected message answered", 8000);
+      const second = rows(h)[1]!;
+      assert.equal(second.status, "completed");
+      assert.equal(second.trigger_event_id, `evt-${fixed}`, "re-rooted on the surviving part");
+      const final = lastUserText(seen.at(-1)!);
+      assert.ok(final.includes("Tokyo?"), final);
+      assert.ok(!final.includes("teh tiem"), `the deleted message is no part of the request: ${final}`);
+      assert.ok(h.logs.some((l) => l.message === "late_input_rerooted" && l.to === `evt-${fixed}`));
+    } finally {
+      await h.stop();
+    }
+  });
+}
+
+test("trigger hold: every part of a grouped request deleted by its sender: nothing is answered", async () => {
+  const h = await startHarness({
+    toml: LATE,
+    triggerHoldMs: 600,
+    script: (req) => (isRecordTurnRequest(req) ? { text: "NO_REPLY" } : send(`answer ${h.sends.length + 1}`)),
+  });
+  try {
+    h.say("hello", { mention: true, sender: { id: "@bob:fake", displayName: "Bob", username: "bob" } });
+    await h.until(() => h.sends.length === 1 && settled(h)(), "first answered");
+    const a = h.say("first try", { mention: true });
+    const b = h.say("second try", { mention: true });
+    await h.until(() => h.query("select 1 from timeline_events where external_id in (?, ?)", a, b).length === 2, "both stored");
+    h.redact(a);
+    h.redact(b);
+    await h.until(marked(h, 2), "both marked");
+    await h.until(() => h.logs.some((l) => l.message === "late_input_ignored" && l.reason === "deleted_before_launch"), "dropped");
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(h.sends.length, 1);
+    assert.equal(rows(h).length, 1);
+  } finally {
+    await h.stop();
+  }
+});
+
+for (const order of ["delete then resend", "resend then delete"] as const) {
+  test(`queued, ${order}: the corrected message is answered once its slot frees, re-rooted on it`, async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let firstSeen = false;
+    const seen: FakeLlmRequest[] = [];
+    const h = await startHarness({
+      toml: LATE,
+      triggerHoldMs: 400,
+      script: async (req) => {
+        if (isRecordTurnRequest(req)) return { text: "NO_REPLY" };
+        if (!firstSeen) {
+          firstSeen = true;
+          await gate;
+          return send("first answer");
+        }
+        seen.push(req);
+        return send("second answer");
+      },
+    });
+    try {
+      h.say("first question", { mention: true, sender: { id: "@bob:fake", displayName: "Bob", username: "bob" } });
+      await h.until(() => firstSeen, "first session running");
+      const typo = h.say("whats teh tiem in tokyo", { mention: true });
+      await h.until(() => h.query("select 1 from timeline_events where external_id = ?", typo).length === 1, "typo stored");
+      let fixed: string;
+      if (order === "delete then resend") {
+        // Deleted within the hold: the request is re-rooted before it is queued.
+        h.redact(typo);
+        await h.until(marked(h), "marked");
+        fixed = h.say("what's the time in Tokyo?", { mention: true });
+        await h.until(() => h.logs.some((l) => l.message === "trigger_not_spawned"), "queued");
+      } else {
+        // Deleted while queued: the request is re-rooted when it launches.
+        fixed = h.say("what's the time in Tokyo?", { mention: true });
+        await h.until(() => h.logs.some((l) => l.message === "trigger_not_spawned"), "queued with its group");
+        h.redact(typo);
+        await h.until(marked(h), "marked");
+      }
+      release();
+      await h.until(() => rows(h).length === 2 && settled(h)(), "both settled", 8000);
+      assert.ok(bodies(h).some((b) => b.includes("second answer")), `the corrected message is answered: ${bodies(h).join(" | ")}`);
+      const second = h.query<{ status: string; trigger_event_id: string; trigger_body: string; redo_count: number }>(
+        "select status, trigger_event_id, trigger_body, redo_count from agent_sessions order by created_at, rowid",
+      )[1]!;
+      assert.equal(second.status, "completed");
+      assert.equal(second.trigger_event_id, `evt-${fixed}`);
+      assert.equal(second.trigger_body, "what's the time in Tokyo?");
+      assert.equal(second.redo_count, 0, "re-rooted before anything was built");
+      const final = lastUserText(seen[0]!);
+      assert.ok(final.includes("Tokyo?") && !final.includes("teh tiem"), final);
+      // The request resolves through its new root (a reply to it belongs to it).
+      assert.equal(
+        h.query<{ trigger_group_id: string | null }>("select trigger_group_id from timeline_events where external_id = ?", fixed)[0]!.trigger_group_id,
+        `evt-${fixed}`,
+      );
+    } finally {
+      await h.stop();
+    }
+  });
+}
+
+test("running: the trigger message deleted while its corrected resend stands redoes the request on the survivor", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  let blocked = false;
+  const seen: FakeLlmRequest[] = [];
+  const h = await startHarness({
+    toml: LATE,
+    triggerHoldMs: 400,
+    script: async (req) => {
+      if (isRecordTurnRequest(req)) return { text: "NO_REPLY" };
+      seen.push(req);
+      if (!blocked) {
+        blocked = true;
+        await gate;
+      }
+      return send(`answer ${seen.length}`);
+    },
+  });
+  try {
+    const typo = h.say("whats teh tiem in tokyo", { mention: true });
+    const fixed = h.say("what's the time in Tokyo?", { mention: true });
+    await h.until(() => blocked, "the grouped request is running");
+    h.redact(typo);
+    await h.until(() => h.logs.some((l) => l.message === "late_input_redo_requested" && l.kind === "delete_part"), "redo requested");
+    release();
+    await h.until(() => h.sends.length >= 1 && settled(h)(), "answered", 8000);
+    assert.equal(h.sends.length, 1, bodies(h).join(" | "));
+    const row = rows(h)[0]!;
+    assert.equal(row.status, "completed", "not cancelled: a part survives");
+    assert.equal(row.trigger_event_id, `evt-${fixed}`);
+    const final = lastUserText(seen.at(-1)!);
+    assert.ok(final.includes("Tokyo?") && !final.includes("teh tiem"), final);
+  } finally {
+    await h.stop();
+  }
+});

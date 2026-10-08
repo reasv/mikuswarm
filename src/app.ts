@@ -3303,10 +3303,18 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
 
     // A message its sender deleted before it got here (a trigger delivered after
     // its trigger hold, a re-dispatch) is no request any more (§8 "Late input"):
-    // stored and marked, never handled. Synchronous (no await before accept).
-    if (inputWithdrawn(inbound)) {
-      logger.info("late_input_ignored", { timelineKey: inbound.timelineKey, eventId: inbound.event.id, kind: "delete", reason: "deleted_before_launch" });
-      return;
+    // stored and marked, never handled. A grouped trigger whose other parts still
+    // stand (a message deleted and sent again, corrected, within the hold) is
+    // answered without it: the first surviving part becomes its trigger.
+    // Synchronous (no await before accept).
+    const survivors = survivingParts(inbound);
+    if (survivors !== undefined) {
+      const withdrawnId = inbound.event.id;
+      if (survivors.length === 0 || !rerootRequest(inbound, survivors)) {
+        logger.info("late_input_ignored", { timelineKey: inbound.timelineKey, eventId: withdrawnId, kind: "delete", reason: "deleted_before_launch" });
+        return;
+      }
+      logger.info("late_input_rerooted", { timelineKey: inbound.timelineKey, from: withdrawnId, to: inbound.event.id, phase: "hold" });
     }
 
     // Identity upsert (§6.5 + §8.4 cross-channel prerequisite): data-presence-driven.
@@ -5360,6 +5368,45 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     return !!stored && deletedBySender(stored);
   }
 
+  /** A stored part of a request that its own human sender has not deleted (a moderator's deletion leaves it standing). */
+  function partStands(eventId: string): boolean {
+    const stored = timeline.getById(eventId);
+    return !!stored && !(isHumanSender(stored.sender) && deletedBySender(stored));
+  }
+
+  /**
+   * When `inbound`'s trigger message was withdrawn by its own sender (late input
+   * on, {@link inputWithdrawn}): the other parts of its trigger group that still
+   * stand, in group order (empty = the whole request is withdrawn). Undefined
+   * when the trigger message stands.
+   */
+  function survivingParts(inbound: InboundChatEvent): string[] | undefined {
+    if (!inputWithdrawn(inbound)) return undefined;
+    return triggerGroupOf(inbound).slice(1).filter(partStands);
+  }
+
+  /**
+   * Re-root a request in place (§8 "Late input"): its trigger message was
+   * deleted and the first of `ids` (stored) becomes the trigger message, `ids`
+   * its trigger group. The inbound object is the session's trigger (shared with
+   * its record and late-input entry), so a build or redo reads the new root.
+   * Returns the old trigger message, or undefined when the new root is not stored.
+   */
+  function rerootRequest(inbound: InboundChatEvent, ids: readonly string[]): CanonicalChatEvent | undefined {
+    const stored = ids[0] !== undefined ? timeline.getById(ids[0]) : undefined;
+    if (!stored) return undefined;
+    const old = inbound.event;
+    const trigger: TriggerInfo = {
+      ...(inbound.trigger ?? { type: "mention", reason: "late input", triggeredBy: old.sender }),
+      groupedEventIds: [...ids],
+    };
+    // The trigger in memory never carries a marker (a moderator's deletion leaves the request its content).
+    const { deleted: _marker, ...event } = stored;
+    inbound.event = { ...event, trigger };
+    inbound.trigger = trigger;
+    return old;
+  }
+
   /**
    * Deletions marked before this entry existed (during the trigger hold, the
    * queue, the activation hold, a re-dispatch, the readiness wait) never reached
@@ -5499,13 +5546,31 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     inbound.event.mentions = stored.mentions;
   }
 
-  /** A late addition joins the request; a deleted grouped part leaves it. */
+  /**
+   * A late addition joins the request; a deleted grouped part leaves it. A
+   * deleted trigger message whose group has surviving parts leaves it too: the
+   * first surviving part becomes the trigger message (the session row, the
+   * claim and the persisted group follow).
+   */
   function applyTriggerGroupChange(entry: LateInputEntry, added: readonly string[], removed: readonly string[]): void {
     if (added.length === 0 && removed.length === 0) return;
     const group = new Set(triggerGroupOf(entry.inbound));
     for (const id of added) group.add(id);
     for (const id of removed) group.delete(id);
     const ids = [...group];
+    if (removed.includes(entry.inbound.event.id) && ids.length > 0) {
+      const old = rerootRequest(entry.inbound, ids);
+      if (old) {
+        sessions.noteTriggerRerooted(entry.sessionId);
+        if (old.externalId) sessionClaims.releaseExternalId(entry.timelineKey, old.externalId);
+        const rootExternalId = entry.inbound.event.externalId;
+        if (rootExternalId) {
+          addClaim(entry.inbound);
+          sessionClaims.attachSession(entry.timelineKey, rootExternalId, entry.sessionId);
+        }
+        logger.info("late_input_rerooted", { sessionId: entry.sessionId, timelineKey: entry.timelineKey, from: old.id, to: entry.inbound.event.id });
+      }
+    }
     const trigger: TriggerInfo = { ...(entry.inbound.trigger ?? { type: "mention", reason: "late input", triggeredBy: entry.inbound.event.sender }), groupedEventIds: ids };
     entry.inbound.trigger = trigger;
     entry.inbound.event.trigger = trigger;
@@ -5773,7 +5838,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       entry.inbound.trigger?.type === "mention" &&
       prior.mentions?.mentionedSelf === true &&
       after.mentions?.mentionedSelf !== true;
-    const kind: CorrectionPlan["kind"] = deleted ? (isTrigger ? "delete_trigger" : "delete_part") : unmention ? "unmention" : "edit";
+    // A deleted trigger message whose group has other parts still standing (a
+    // message deleted and sent again, corrected) leaves the request like a
+    // deleted part: the request goes on with the survivors (re-rooted).
+    const survives = deleted && isTrigger && triggerGroupOf(entry.inbound).some((id) => id !== prior.id && partStands(id));
+    const kind: CorrectionPlan["kind"] = deleted ? (isTrigger && !survives ? "delete_trigger" : "delete_part") : unmention ? "unmention" : "edit";
     const who = senderLabel(prior.sender);
     const beforeText = escapeXml(prior.body ?? "");
     const afterText = escapeXml(after.body ?? "");

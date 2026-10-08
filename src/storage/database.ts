@@ -8487,6 +8487,34 @@ export class Storage {
   }
 
   /**
+   * A session's request was re-rooted (ARCHITECTURE.md §8 "Late input"): its
+   * trigger message was deleted by its sender and the first surviving part of
+   * its trigger group became the trigger. The row's trigger columns follow, so
+   * `getSessionIdForRequestEvent` and the duplicate check read the new root;
+   * the reply-resume upper bound never moves back.
+   */
+  updateAgentSessionTrigger(
+    id: string,
+    trigger: { eventId: string; externalId?: string; body?: string; timestamp: number },
+  ): Promise<void> {
+    return this.write((db) => {
+      db.prepare(
+        `update agent_sessions
+            set trigger_event_id = @eventId, trigger_external_id = @externalId, trigger_body = @body,
+                chat_upper_bound_ts = max(coalesce(chat_upper_bound_ts, 0), @timestamp), updated_at = @updatedAt
+          where id = @id`,
+      ).run({
+        id,
+        eventId: trigger.eventId,
+        externalId: trigger.externalId ?? null,
+        body: trigger.body ?? null,
+        timestamp: trigger.timestamp,
+        updatedAt: Date.now(),
+      });
+    });
+  }
+
+  /**
    * Update a session's status and any of the lifecycle timestamps/flags. Only
    * the fields provided in `opts` are written; `updated_at` is always bumped
    * (defaulting to now). Mirrors `markRunning/markCompleted/markDiscarded` from
