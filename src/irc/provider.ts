@@ -1512,8 +1512,14 @@ export class IrcProvider implements IChatProvider {
   // ── Trigger hold (spec §7.5, mirrors Matrix/Discord providers) ───────────────
 
   /**
-   * Dispatch an inbound event, applying the trigger-hold debounce when
-   * `trigger_hold_ms` is non-zero and the event carries a trigger (spec §7.5).
+   * Dispatch an inbound event through the trigger hold (spec §7.5), with the
+   * Matrix and Discord providers' same-sender semantics: with
+   * `trigger_hold_ms > 0` every message is emitted at once without its trigger
+   * (stored as it arrives), and a trigger is delivered once at the hold's end,
+   * grouping the sender's messages that arrived meanwhile (`groupedEventIds`).
+   * One hold per timeline and sender; a trigger-bearing follow-up extends it
+   * (capped at TRIGGER_HOLD_MAX_MULTIPLIER × `trigger_hold_ms` from its start),
+   * a non-triggering one joins without extending it. IRC has no deletions.
    *
    * With default (trigger_hold_ms absent or 0) the call is byte-identical to
    * `this.host?.onEvent(inbound)`.
@@ -1521,40 +1527,49 @@ export class IrcProvider implements IChatProvider {
   private applyTriggerHoldOrEmit(inbound: import("../types.js").InboundChatEvent): void {
     const holdMs = this.config.trigger_hold_ms ?? 0;
 
-    if (!inbound.trigger || !holdMs) {
+    if (!holdMs) {
       this.host?.onEvent(inbound);
       return;
     }
 
-    const key = inbound.timelineKey;
+    this.host?.onEvent({ ...inbound, trigger: undefined, event: { ...inbound.event, trigger: undefined } });
+
+    const key = `${inbound.timelineKey}:${inbound.event.sender.id}`;
     const existing = this.pendingTriggers.get(key);
 
     if (existing) {
-      // Extend hold — reset timer, but cap total hold at MULTIPLIER × holdMs
-      // from the first trigger so a steady drip cannot extend indefinitely.
-      clearTimeout(existing.timer);
-      const now = Date.now();
-      const startedAt = existing.event.trigger?.holdStartedAt ?? now;
-      const maxEnd = startedAt + holdMs * TRIGGER_HOLD_MAX_MULTIPLIER;
-      const remaining = Math.max(0, Math.min(holdMs, maxEnd - now));
-      existing.event = inbound;
-      existing.timer = setTimeout(() => {
-        this.pendingTriggers.delete(key);
-        if (!this.stopped) this.host?.onEvent(existing.event);
-      }, remaining);
+      const heldTrigger = existing.event.trigger!;
+      const grouped = { ...heldTrigger, groupedEventIds: [...(heldTrigger.groupedEventIds ?? []), inbound.event.id] };
+      existing.event.trigger = grouped;
+      existing.event.event.trigger = grouped;
+      if (inbound.trigger) {
+        const now = Date.now();
+        const startedAt = heldTrigger.holdStartedAt ?? now;
+        const maxEnd = startedAt + holdMs * TRIGGER_HOLD_MAX_MULTIPLIER;
+        clearTimeout(existing.timer);
+        existing.timer = setTimeout(() => this.flushTriggerHold(key), Math.max(0, Math.min(now + holdMs, maxEnd) - now));
+      }
       return;
     }
 
-    // New hold.
-    if (inbound.trigger) {
-      inbound.trigger.holdStartedAt = Date.now();
-    }
-    const pending: PendingTrigger = { event: inbound, timer: undefined! };
-    pending.timer = setTimeout(() => {
-      this.pendingTriggers.delete(key);
-      if (!this.stopped) this.host?.onEvent(pending.event);
-    }, holdMs);
+    // No open hold: only a trigger opens one.
+    if (!inbound.trigger) return;
+    const trigger = { ...inbound.trigger, holdStartedAt: Date.now(), groupedEventIds: [inbound.event.id] };
+    const pending: PendingTrigger = {
+      event: { ...inbound, trigger, event: { ...inbound.event, trigger } },
+      timer: setTimeout(() => this.flushTriggerHold(key), holdMs),
+    };
     this.pendingTriggers.set(key, pending);
+  }
+
+  private flushTriggerHold(key: string): void {
+    const pending = this.pendingTriggers.get(key);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pendingTriggers.delete(key);
+    if (this.stopped) return;
+    const trigger = { ...pending.event.trigger!, holdEndedAt: Date.now() };
+    this.host?.onEvent({ ...pending.event, trigger, event: { ...pending.event.event, trigger } });
   }
 
   /** Drain all pending echo promises with their synthetic ids (on disconnect). */

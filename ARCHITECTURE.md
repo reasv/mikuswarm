@@ -1318,7 +1318,7 @@ Events handled: `privmsg` (PRIVMSG + CTCP ACTION via the library's `action` even
 
 **Trigger detection**: `dm` for any query message; `mention` for a channel message that matches the bot's nick (recognized as a `nick: text` / `nick, text` / `nick text` addressing prefix at line start — the space separator overlaps with the bare-nick form — OR a bare-nick word-boundary occurrence anywhere in the message, casemapped per the network's CASEMAPPING). Notices never trigger.
 
-**Trigger hold**: mirrors the Matrix/Discord hold mechanism — `trigger_hold_ms` (optional config field) delays dispatch; a second trigger in the same timeline (from any sender — the hold is keyed by timeline, with no per-sender discriminant) resets the timer, capped at `4 × trigger_hold_ms` from the first trigger's `holdStartedAt`.
+**Trigger hold** (`applyTriggerHoldOrEmit`): the Matrix and Discord hold, same semantics (§6 "Trigger hold"). With `trigger_hold_ms` (optional config field) above 0, every message is emitted at once without its trigger, so it is stored as it arrives; a trigger opens a hold keyed by timeline **and sender**, every further message of that sender in that timeline joins the held trigger's `groupedEventIds` (a trigger-bearing one resets the timer, capped at `4 × trigger_hold_ms` from the hold's `holdStartedAt`; a non-triggering one rides the timer), and the flush delivers the trigger once, rooted on the hold's first message, with `holdEndedAt`. Another sender's trigger opens its own hold (before, the hold was keyed by timeline and kept only the newest trigger, so earlier held messages were never stored). IRC has no message deletions (`capabilities.deletes = false`), so nothing ever leaves a held group.
 
 ### Send and byte-accurate chunking
 

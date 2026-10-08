@@ -461,6 +461,11 @@ Unreleased section; it is not part of any release's notes.
   Discord hold now works like the Matrix one: every message is stored as it arrives,
   each sender has their own hold, and the trigger is delivered once with that sender's
   held messages grouped. Discord ships with `trigger_hold_ms = 0`.
+- **IRC: with `trigger_hold_ms` set, held messages were lost.** The same defect as
+  on Discord: the hold was kept per channel and kept only the newest trigger, so earlier
+  held messages were never stored. The IRC hold now stores every message as it arrives,
+  holds each sender separately and delivers one trigger with that sender's held messages
+  grouped, as on Matrix and Discord.
 - **A fresh install could not download the local embedding model.** fastembed 2.1.0
   fetched models from a Google Cloud Storage bucket that now returns HTTP 403, so a new
   data directory got no semantic memory search. The bge v1.5 English models now download

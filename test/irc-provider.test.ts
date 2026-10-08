@@ -598,40 +598,88 @@ test("F5: trigger_hold_ms=0 → host.onEvent fires immediately for trigger-beari
   );
 });
 
-test("F5: trigger_hold_ms>0 → rapid trigger-bearing messages coalesce; flush emits last event", () => {
+function holdHarness(holdMs: number) {
+  const client = new MockClient();
+  client.network.cap.enabled = ["server-time", "message-tags", "echo-message"];
+  const mockHost = makeMockHost();
+  const { rt } = injectRuntime("acc", client, { host: mockHost, triggerHoldMs: holdMs });
+  rt.registered = true;
+  let seq = 0;
+  const privmsg = (message: string, nick = "alice") =>
+    client.emit("privmsg", {
+      from_server: false,
+      nick,
+      ident: nick,
+      hostname: `${nick}.example.net`,
+      target: "#general",
+      message,
+      tags: { msgid: `m${++seq}` },
+      time: Date.now(),
+    });
+  type Ev = { event: { id: string; body: string; trigger?: unknown }; trigger?: { groupedEventIds?: string[]; holdEndedAt?: number } };
+  const events = () => mockHost.events as Ev[];
+  const triggers = () => events().filter((e) => e.trigger);
+  return { privmsg, events, triggers };
+}
+
+test("F5: trigger_hold_ms>0 → every held message is emitted (stored) at once; one trigger groups the sender's messages", () => {
   mock.timers.enable({ apis: ["setTimeout"] });
   try {
-    const client = new MockClient();
-    client.network.cap.enabled = ["server-time", "message-tags", "echo-message"];
-    const mockHost = makeMockHost();
-    const { rt } = injectRuntime("acc", client, { host: mockHost, triggerHoldMs: 200 });
-    rt.registered = true;
+    const t = holdHarness(200);
+    t.privmsg("testbot: first");
+    t.privmsg("and a detail"); // not addressed: joins the hold
+    t.privmsg("testbot: second");
 
-    const privmsg = (message: string) =>
-      client.emit("privmsg", {
-        from_server: false,
-        nick: "alice",
-        ident: "alice",
-        hostname: "alice.example.net",
-        target: "#general",
-        message,
-        tags: {},
-        time: Date.now(),
-      });
+    // Every message is emitted untriggered as it arrives (never lost to a newer one).
+    assert.deepEqual(t.events().map((e) => [e.event.body, e.trigger]), [
+      ["testbot: first", undefined],
+      ["and a detail", undefined],
+      ["testbot: second", undefined],
+    ]);
+    assert.equal(t.triggers().length, 0, "no trigger before the hold expires");
 
-    privmsg("testbot: first");
-    privmsg("testbot: second");
-
-    // No flush yet — still inside the hold window.
-    assert.equal(mockHost.events.length, 0, "no event before hold expires");
-
-    // Advance past the hold.
     mock.timers.tick(250);
 
-    assert.equal(mockHost.events.length, 1, "exactly one event flushed after hold");
-    const flushed = mockHost.events[0] as { event: { body: string }; trigger: unknown };
-    assert.ok(flushed.trigger, "flushed event must have a trigger");
-    assert.match(flushed.event.body, /second/, "last event body must be preserved on flush");
+    assert.equal(t.triggers().length, 1, "exactly one trigger after the hold");
+    const [held] = t.triggers();
+    assert.match(held!.event.body, /first/, "rooted on the hold's first message");
+    assert.deepEqual(held!.trigger!.groupedEventIds, t.events().slice(0, 3).map((e) => e.event.id));
+    assert.equal(held!.event.trigger, held!.trigger);
+    assert.ok(held!.trigger!.holdEndedAt);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("F5: trigger_hold_ms>0 → each sender has their own hold: another sender's trigger never replaces a held one", () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const t = holdHarness(200);
+    t.privmsg("testbot: alice asks", "alice");
+    t.privmsg("testbot: bob asks", "bob");
+    mock.timers.tick(250);
+    assert.deepEqual(t.triggers().map((e) => e.event.body).sort(), ["testbot: alice asks", "testbot: bob asks"]);
+    assert.ok(t.triggers().every((e) => e.trigger!.groupedEventIds!.length === 1));
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("F5: trigger_hold_ms>0 → a trigger-bearing follow-up extends the hold, capped from its start", () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const t = holdHarness(200);
+    t.privmsg("testbot: one");
+    mock.timers.tick(150);
+    t.privmsg("testbot: two");
+    mock.timers.tick(150);
+    assert.equal(t.triggers().length, 0, "extended by the second trigger");
+    mock.timers.tick(100);
+    assert.equal(t.triggers().length, 1);
+    // A non-addressed message alone never opens a hold.
+    t.privmsg("just chatting", "carol");
+    mock.timers.tick(1000);
+    assert.equal(t.triggers().length, 1);
   } finally {
     mock.timers.reset();
   }
