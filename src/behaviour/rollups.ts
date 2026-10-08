@@ -23,6 +23,11 @@ export interface RollupContext {
   agentForTimelineKey(timelineKey: string | null): string | null;
   /** Kind of a check code for the agent (`style` counts toward the style metrics). */
   checkKind?(code: string, agent: string | null): string | undefined;
+  /**
+   * Remedy of a check code for the agent (`revise` checks are the ones a revise
+   * or an override is about); unknown = judged by kind (a refusal never revises).
+   */
+  checkRemedy?(code: string, agent: string | null): string | undefined;
   /** Message tokenizer; defaults to the context tokenizer. */
   countTokens?(text: string): number;
 }
@@ -450,7 +455,10 @@ function accumulateSession(
   // Per judged call: its outcome and the kinds of every check fired on it. A
   // duplicate block is no model style issue (another session posted first), so it
   // counts apart (`duplicate_revisions` / `duplicate_overrides`).
-  const outcomes = new Map<string, { model: string | null; revise: boolean; overridden: boolean; kinds: Set<string> }>();
+  // `revisable`: a check other than the duplicate check fired that a revise is
+  // about (remedy `revise`; by kind, anything but a refusal, which never revises:
+  // one fired beside a revise was observed, no rule acted on it).
+  const outcomes = new Map<string, { model: string | null; revise: boolean; overridden: boolean; kinds: Set<string>; revisable: boolean }>();
   const intentAnchors = new Set<string>();
   for (const d of rows.decisions) {
     if (d.branch_no !== null && excludedBranches.has(d.branch_no)) continue;
@@ -466,11 +474,15 @@ function accumulateSession(
       add(model, "no_reply_intent_judged");
     }
     const fired = firedChecks(d.verdict_json);
-    const outcome = outcomes.get(anchor) ?? { model, revise: false, overridden: false, kinds: new Set<string>() };
+    const outcome = outcomes.get(anchor) ?? { model, revise: false, overridden: false, kinds: new Set<string>(), revisable: false };
     outcomes.set(anchor, outcome);
     for (const f of fired) {
       const kind = f.kind ?? ctx.checkKind?.(f.code, agent) ?? (f.code === DUPLICATE_CHECK_CODE ? "duplicate" : undefined);
       outcome.kinds.add(kind ?? "");
+      if (kind !== "duplicate") {
+        const remedy = ctx.checkRemedy?.(f.code, agent);
+        if (remedy !== undefined ? remedy === "revise" : kind !== "refusal") outcome.revisable = true;
+      }
       const key = `${anchor}\u0000${f.code}`;
       if (seenCodes.has(key)) continue;
       seenCodes.add(key);
@@ -499,8 +511,10 @@ function accumulateSession(
 
   for (const o of outcomes.values()) {
     const duplicate = o.kinds.has("duplicate");
-    // Anything else fired (or nothing recorded): the model's own output was revised.
-    const other = o.kinds.size === 0 || [...o.kinds].some((k) => k !== "duplicate");
+    // The model's own output was revised: the duplicate check did not fire (or
+    // nothing was recorded), or a revisable check fired beside it. An observed
+    // refusal beside a duplicate block is no revision.
+    const other = !duplicate || o.revisable;
     if (o.revise) {
       if (other) add(o.model, "revisions");
       if (duplicate) add(o.model, "duplicate_revisions");
@@ -532,7 +546,7 @@ function accumulateSession(
  * dirty once (stored as `model_behaviour_rollup_version` in `metadata`), so the
  * background drain recomputes history with the new definitions.
  */
-export const MODEL_BEHAVIOUR_ROLLUP_VERSION = 3;
+export const MODEL_BEHAVIOUR_ROLLUP_VERSION = 4;
 const ROLLUP_VERSION_KEY = "model_behaviour_rollup_version";
 
 /**

@@ -364,7 +364,7 @@ Unreleased section; it is not part of any release's notes.
   them on pairs of sessions that sent close together. Check questions may now
   carry a `name`, and any check accepts `thresholds` by question name. The
   model behaviour statistics count its rejections and overrides apart from the
-  model's style revisions.
+  model's style revisions, also when an observed refusal check fired beside it.
 
 ### Changed
 

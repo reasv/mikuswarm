@@ -62,10 +62,12 @@ export class ModelBehaviourService implements ModelBehaviourApi {
 
   constructor(private readonly options: ModelBehaviourServiceOptions) {
     const checkKind = (code: string, agent: string | null) => options.catalogue.get(code, agent)?.kind;
+    const checkRemedy = (code: string, agent: string | null) => options.catalogue.get(code, agent)?.remedy;
     this.rollups = new ModelBehaviourRollups({
       storage: options.storage,
       agentForTimelineKey: options.agentForTimelineKey,
       checkKind,
+      checkRemedy,
       logger: options.logger,
       intervalMs: options.rollupIntervalMs,
     });

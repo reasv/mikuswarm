@@ -353,3 +353,51 @@ test("a duplicate block is no style revision: it counts apart", async () => {
     assert.equal(v("check_revisions:style_x"), 2);
   });
 });
+
+test("an observed refusal fired beside a duplicate block is no style revision: the block counts under the duplicate counters", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession({ id: "s10", timelineKey: KEY_A, sessionType: "default", status: "completed", createdAt: H, updatedAt: H });
+    await addRequest(storage, "s10", H + 1, "model_a", { key: KEY_A });
+    const row = (tool_call_id: string, fired: Array<string | { code: string; kind: string }>, consequence: string) =>
+      storage.insertDecisionEvaluation({
+        ts: H + 2, decision_group: "g", point: "checks", agent_session_id: "s10", source: "model",
+        verdict_json: JSON.stringify({ fired }), checkpoint: "send", tool_call_id, branch_no: 0, consequence,
+      });
+    // The refusal check (no rule acts on it: observed) and the duplicate stage of one send.
+    await row("dup-ref", [{ code: "refusal_canned", kind: "refusal" }], "revise");
+    await row("dup-ref", ["duplicate"], "revise");
+    await row("dup-ref-over", [{ code: "refusal_canned", kind: "refusal" }], "overridden");
+    await row("dup-ref-over", ["duplicate"], "overridden");
+    // A revisable check of another kind beside the duplicate block still counts as a revision.
+    await row("dup-style", [{ code: "style_x", kind: "style" }, "duplicate"], "revise");
+    await rollups(storage).flush();
+    const rows = table(storage);
+    const v = (metric: string) => value(rows, { hour: H, model: "model_a", metric });
+    assert.equal(v("revisions"), 1, "only the send a style check fired on");
+    assert.equal(v("duplicate_revisions"), 2);
+    assert.equal(v("overrides"), 0);
+    assert.equal(v("duplicate_overrides"), 1);
+  });
+});
+
+test("with the catalogue's remedies, an observe-only check beside a duplicate block is no revision either", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession({ id: "s11", timelineKey: KEY_A, sessionType: "default", status: "completed", createdAt: H, updatedAt: H });
+    await addRequest(storage, "s11", H + 1, "model_a", { key: KEY_A });
+    await storage.insertDecisionEvaluation({
+      ts: H + 2, decision_group: "g", point: "checks", agent_session_id: "s11", source: "model",
+      verdict_json: JSON.stringify({ fired: ["style_watch", "duplicate"] }), checkpoint: "send", tool_call_id: "c", branch_no: 0, consequence: "revise",
+    });
+    const kinds: Record<string, string> = { style_watch: "style", duplicate: "duplicate" };
+    const remedies: Record<string, string> = { style_watch: "observe", duplicate: "revise" };
+    await new ModelBehaviourRollups({
+      storage,
+      agentForTimelineKey: () => null,
+      checkKind: (code) => kinds[code],
+      checkRemedy: (code) => remedies[code],
+    }).flush();
+    const v = (metric: string) => value(table(storage), { hour: H, model: "model_a", metric });
+    assert.equal(v("revisions"), 0);
+    assert.equal(v("duplicate_revisions"), 1);
+  });
+});
