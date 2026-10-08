@@ -4033,7 +4033,7 @@ query set ─► wide recall (hybrid lanes + user lanes + person-cued, fused, ~6
 ### Excerpts (`src/retrieval/excerpt.ts`)
 
 - **Whole blocks by default**: a kept block of up to `auto.excerpt_max_tokens` (400) is shown whole, cleaned.
-- **Longer blocks** show the block's own heading text plus a window around its best-matching region: the line (or sentence of a long line) with the most query-term overlap, else the best unit by a semantic scorer when the caller provides one, expanded over whole units in both directions and marked `…` where cut; a single overlong unit gets a word window around its first matching term.
+- **Longer blocks** show the block's own heading text plus a window around its best-matching region: the line (or sentence of a long line) with the most query-term overlap, else (no shared term) the unit closest to the query on the built-in embedder (`QueryVectorIndex.similarity`, used by auto-retrieval and `recall_memory` whenever an embedder is up), expanded over whole units in both directions and marked `…` where cut; a single overlong unit gets a word window around its first matching term.
 - **Cleaning**: the diary header line is dropped (its room and date are in the citation), markdown heading markers are stripped, and a heading that only restates the time (`### Evening Events (~7:33 PM)`) is dropped.
 - **Compact citation** (`formatCitation`): `memory/<file>.md:<start>-<end>`, then `· <room>` when known, then `· <date>` only when the file name does not already carry it.
 

@@ -544,7 +544,12 @@ export class MemoryRetrievalPipeline {
         itemStage.set(c.chunk.contentHash, "budget");
         continue;
       }
-      const excerpt = await makeExcerpt(c.chunk.text, { queries: excerptQueries, budget: { tokens: auto.excerptMaxTokens } });
+      const scorer = this.deps.search.unitScorer;
+      const excerpt = await makeExcerpt(c.chunk.text, {
+        queries: excerptQueries,
+        budget: { tokens: auto.excerptMaxTokens },
+        ...(scorer && excerptQueries.length > 0 ? { scoreUnits: (units: string[]) => scorer(excerptQueries.join("\n"), units) } : {}),
+      });
       const line = `- [${formatCitation(c.chunk)}] ${indentContinuation(escapeAngleBrackets(excerpt))}`;
       const cost = estimateTokens(line) + 1;
       if (cost > budget) {

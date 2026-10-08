@@ -64,7 +64,7 @@ src/
   captioning/       Caption worker pool (image captioning)
   summarization/    Hierarchical summarization worker pool + eager-enqueue reconciliation indexer (see ARCHITECTURE.md §9b)
   diary/            Diary memory worker pool: first-person journal (see ARCHITECTURE.md §9c)
-  retrieval/        Memory retrieval: reconciliation indexer, chunker, embedding providers, sqlite-vec store, embed worker, hybrid search (see ARCHITECTURE.md §9d)
+  retrieval/        Memory retrieval: reconciliation indexer, chunker, embedding providers (built-in + optional primary index), sqlite-vec store, embed worker, hybrid search; judged auto-retrieval pipeline (auto/), excerpts, participant tags, memory filters (filters/), re-rank provider chains (models/), local ONNX providers in child processes (onnx/), late interaction with the TurboQuant/exact MaxSim scorers (late/) (see ARCHITECTURE.md §9d, §9c)
   search/           Chat-history search: chat_index reconciliation indexer, FTS5 query builder, summary-content FTS search (search_summaries), absence-gap resolver, summary coverage selection (see ARCHITECTURE.md §9e)
   proactive/        Proactive posting: per-channel self-rescheduling scheduler, eligibility gate, cadence math, synthetic-inbound builder (see ARCHITECTURE.md §9g)
   saucenao/         SauceNAO reverse-image lookup: shared per-account short-window rate limiter backing the find_source tool (see ARCHITECTURE.md §10)

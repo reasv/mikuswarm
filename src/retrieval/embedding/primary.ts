@@ -15,7 +15,7 @@
 import type { Storage } from "../../storage/index.js";
 import type { MemoryRetrievalStore } from "../../storage/memory-retrieval-store.js";
 import type { Logger } from "../../observability/logger.js";
-import type { QueryVectorIndex } from "../search.js";
+import { textSimilarity, type QueryVectorIndex } from "../search.js";
 import type { VectorStore } from "../vector-store.js";
 import type { EmbeddingProvider } from "./provider.js";
 
@@ -213,5 +213,7 @@ export function dualVectorIndex(
       return { hits: builtin.store.knn(vector, k, "memory"), store: builtin.store, index: "builtin", vector };
     },
     vectors: (store, rowids) => store.getVectors(rowids),
+    // Excerpt windows use the built-in embedder (local, no network wait).
+    ...(builtin ? { similarity: (query: string, texts: string[], signal?: AbortSignal) => textSimilarity(builtin.provider, query, texts, signal) } : {}),
   };
 }

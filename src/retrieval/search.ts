@@ -145,6 +145,11 @@ export interface QueryVectorIndex {
   ): Promise<{ hits: VecHit[]; store: VectorStore; index: string; vector: Float32Array } | null>;
   /** Stored vectors of the index last used for `query` (MMR). */
   vectors(store: VectorStore, rowids: number[]): Map<number, Float32Array>;
+  /**
+   * Cosine similarity of a query to some short texts on the built-in embedder
+   * (excerpt windows, §9d "Excerpts"); absent when no embedder is wired.
+   */
+  similarity?(query: string, texts: string[], signal?: AbortSignal): Promise<number[]>;
 }
 
 export interface MemorySearchDeps {
@@ -199,6 +204,12 @@ export class MemorySearch {
       deps?.vectorIndex ??
       (deps?.provider && deps.vectorStore ? singleVectorIndex(deps.provider, deps.vectorStore) : undefined);
     this.logger = deps?.logger;
+  }
+
+  /** Semantic unit scores for excerpt windows (undefined without an embedder). */
+  get unitScorer(): ((query: string, texts: string[]) => Promise<number[]>) | undefined {
+    const index = this.vectorIndex;
+    return index?.similarity ? (query, texts) => index.similarity!(query, texts) : undefined;
   }
 
   /** True when a semantic half is wired (the index may still be empty). */
@@ -477,7 +488,11 @@ export class MemorySearch {
       date: agentDateStamp(hit.entryTs),
       entryTs: hit.entryTs,
       score: hit.score,
-      snippet: await makeExcerpt(hit.text, { queries, budget: { chars: snippetMaxChars } }),
+      snippet: await makeExcerpt(hit.text, {
+        queries,
+        budget: { chars: snippetMaxChars },
+        ...(this.unitScorer ? { scoreUnits: (units: string[]) => this.unitScorer!(queries.join("\n"), units) } : {}),
+      }),
     };
   }
 
@@ -580,7 +595,20 @@ export function singleVectorIndex(provider: EmbeddingProvider, store: VectorStor
       return { hits: store.knn(vector, k, "memory"), store, index: "builtin", vector };
     },
     vectors: (s, rowids) => s.getVectors(rowids),
+    similarity: (query, texts, signal) => textSimilarity(provider, query, texts, signal),
   };
+}
+
+/** Cosine of a query to texts on one embedder (L2-normalized vectors → dot). */
+export async function textSimilarity(
+  provider: EmbeddingProvider,
+  query: string,
+  texts: string[],
+  signal?: AbortSignal,
+): Promise<number[]> {
+  const q = await provider.embedQuery(query, signal);
+  const docs = await provider.embedDocuments(texts, signal);
+  return docs.map((d) => dot(q, d));
 }
 
 /**
