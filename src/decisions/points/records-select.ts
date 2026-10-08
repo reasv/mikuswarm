@@ -85,6 +85,12 @@ export interface SelectRecordsInput {
   candidates: RecordsCandidate[];
   /** The effective `[decisions]` table for this agent (from decisionsFor()). */
   rawDecisions: DecisionsRawConfig;
+  /**
+   * `[session_records].inject_on_reply` (default true). The per-candidate
+   * fallback is the 6.1 rule: a failed reply-target evaluation injects only
+   * when this is on.
+   */
+  injectOnReply?: boolean;
 }
 
 export interface SelectRecordsContext {
@@ -112,7 +118,8 @@ export interface SelectRecordsResult {
  * off or the whole engine fails):
  *   - Point off / whole batch failure → inject only the reply target's record
  *     (if any), i.e. the 6.1 rule.
- *   - Per-candidate failure / low confidence → inject reply target, skip others.
+ *   - Per-candidate failure / low confidence → inject reply target (when
+ *     `injectOnReply`), skip others.
  *
  * The records point's own `fallback()` handles per-candidate heuristics, so
  * the fallback rules above emerge naturally: the reply target gets
@@ -120,7 +127,7 @@ export interface SelectRecordsResult {
  */
 export async function selectRecordsToInject(
   engine: DecisionEngine,
-  { candidates, rawDecisions }: SelectRecordsInput,
+  { candidates, rawDecisions, injectOnReply = true }: SelectRecordsInput,
   ctx: SelectRecordsContext,
 ): Promise<SelectRecordsResult> {
   const decisionGroup = nanoid();
@@ -152,6 +159,7 @@ export async function selectRecordsToInject(
         record: candidate.record,
         candidateSessionId: candidate.sessionId,
         isReplyTarget: candidate.isReplyTarget,
+        injectOnReply,
       };
       return engine.evaluate(recordsPoint, input, {
         ...evalCtx,
@@ -168,12 +176,13 @@ export async function selectRecordsToInject(
     } else {
       // A rejected promise means an unhandled throw from evaluate() — should
       // not happen since evaluate() catches internally, but handle defensively.
-      // Apply the CONTRACT decision 8 fallback: reply target → inject.
-      const isReplyTarget = candidates[i]!.isReplyTarget;
+      // Apply the CONTRACT decision 8 fallback (the 6.1 rule): reply target →
+      // inject, when inject_on_reply is on.
+      const inject = candidates[i]!.isReplyTarget && injectOnReply;
       outcomes.set(sessionId, {
         verdict: {
-          inject: isReplyTarget,
-          relevance: isReplyTarget ? 1 : 0,
+          inject,
+          relevance: inject ? 1 : 0,
           candidateSessionId: sessionId,
         },
         source: "heuristic",

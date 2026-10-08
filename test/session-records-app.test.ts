@@ -11,7 +11,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { startHarness, type AppHarness } from "./helpers/app-harness.js";
+import { HARNESS_TK, startHarness, type AppHarness } from "./helpers/app-harness.js";
 import { isRecordTurnRequest, messageText, requestToolNames, type FakeLlmReply, type FakeLlmRequest } from "./helpers/fake-llm.js";
 
 type Msg = FakeLlmRequest["body"]["messages"][number];
@@ -751,6 +751,56 @@ test("app: routing and records write decision rows with separate groups; the jud
     );
     assert.ok(injected, "the judged record was injected");
     assert.equal(injected.harness.decisionGroup, recs[0]!.decision_group);
+  } finally {
+    await h.stop();
+  }
+});
+
+test("app: a record of an isolated channel never reaches the records point or an injection", async () => {
+  const SECRET_TK = "matrix:test:room:!secret";
+  const h = await startHarness({
+    script: (req) => {
+      if (isRecordTurnRequest(req)) return finalize("SECRET RECORD of the isolated room");
+      const last = lastCallName(req);
+      if (last === "search_memory") {
+        // A cross-channel send: the group's timeline gets a bot message whose session is the isolated one.
+        return { toolCalls: [{ name: "send_to_channel", args: { channel: HARNESS_TK, message: "psst", context_note: "relay" } }] };
+      }
+      if (last === "send_to_channel") return { toolCalls: [{ name: "send_message", args: { message: "sent", is_reply: false, final: true } }] };
+      if (triggerText(req).includes("[xsend]")) return { toolCalls: [{ name: "search_memory", args: { pattern: "x" } }] };
+      return { toolCalls: [{ name: "send_message", args: { message: "hi", is_reply: false, final: true } }] };
+    },
+    toml: `${DECISIONS}
+[[visibility.channels]]
+timeline_key = "${SECRET_TK}"
+mode = "isolated"
+`,
+    decideNoul: () => 0.9,
+  });
+  try {
+    h.say("[xsend] tell the group", { mention: true, timelineKey: SECRET_TK, roomId: "!secret" });
+    const [secret] = await settled(h, 1);
+    assert.equal(records(h)[0]?.session_id, secret!.id, "the isolated session wrote its record");
+    const relayed = h.sends.find((s) => s.target.timelineKey === HARNESS_TK);
+    assert.ok(relayed, "the cross-channel message reached the group");
+    // In the group: a trigger with the relayed message in its recent chat, then a reply to it.
+    h.say("what's new?", { mention: true });
+    await settled(h, 2);
+    h.say("what was that about?", { mention: true, replyTo: relayed!.externalId });
+    const rows = await settled(h, 3);
+    for (const group of rows.slice(1)) {
+      const evals = h.query<{ candidate_session_id: string | null; state_json: string | null }>(
+        "select candidate_session_id, state_json from decision_evaluations where agent_session_id = ? and point = 'records'",
+        group.id,
+      );
+      assert.equal(evals.some((e) => e.candidate_session_id === secret!.id), false, "not a records candidate");
+      assert.equal(evals.some((e) => (e.state_json ?? "").includes("SECRET RECORD")), false, "not in a decision state");
+      assert.equal(
+        transcript(group).some((m) => m.harness?.kind === "injection" && JSON.stringify(m).includes(secret!.id)),
+        false,
+        "not injected",
+      );
+    }
   } finally {
     await h.stop();
   }

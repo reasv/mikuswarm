@@ -37,9 +37,50 @@ export interface ReadSessionRecordToolContext {
 // message names the exact next call that recovers (CLAUDE.md "Errors as
 // backstop and UX").
 
+/** The fields of {@link ReadSessionRecordToolContext} the read gate needs. */
+export type SessionReadGate = Pick<
+  ReadSessionRecordToolContext,
+  "currentTimelineKey" | "visibilityResolver" | "resolveAgentForTimeline" | "currentAgentName"
+>;
+
 /**
- * Resolve a session by id and apply the `read_messages` visibility gate plus
- * the own-agent filter. Metadata only: the transcript blob is never loaded here.
+ * Why a session (by its timeline key) is not readable from the calling
+ * session, or undefined when it is: the `read_messages` visibility gate (a
+ * session of an isolated channel is readable only from that channel) plus the
+ * own-agent filter. The one gate for the read tools and for the harness's
+ * record injection (`planRecordInjections`), so a record the agent could not
+ * read is never injected nor shown to the records decision model.
+ */
+export function sessionReadDenial(
+  session: { timeline_key: string },
+  gate: SessionReadGate,
+): "isolated" | "other_agent" | undefined {
+  if (gate.visibilityResolver && gate.currentTimelineKey) {
+    const mode = gate.visibilityResolver.modeFor(session.timeline_key);
+    if (mode === "isolated" && !gate.visibilityResolver.sameChannel(session.timeline_key, gate.currentTimelineKey)) {
+      return "isolated";
+    }
+  }
+  if (gate.currentAgentName != null && gate.resolveAgentForTimeline) {
+    const sessionAgent = gate.resolveAgentForTimeline(session.timeline_key);
+    if (sessionAgent !== null && sessionAgent !== gate.currentAgentName) return "other_agent";
+  }
+  return undefined;
+}
+
+/** True when the session exists and passes {@link sessionReadDenial}. Metadata only. */
+export function canReadSession(
+  sessionId: string,
+  storage: Pick<Storage, "getAgentSessionMeta">,
+  gate: SessionReadGate,
+): boolean {
+  const session = storage.getAgentSessionMeta(sessionId);
+  return !!session && sessionReadDenial(session, gate) === undefined;
+}
+
+/**
+ * Resolve a session by id and apply {@link sessionReadDenial}. Metadata only:
+ * the transcript blob is never loaded here.
  */
 function resolveReadableSession(sessionId: string, context: ReadSessionRecordToolContext) {
   const session = context.storage.getAgentSessionMeta(sessionId);
@@ -49,25 +90,15 @@ function resolveReadableSession(sessionId: string, context: ReadSessionRecordToo
         `as shown (<message ... agent_session_id="...">, also on <reply_to> quotes and in read_messages output).`,
     );
   }
-  if (context.visibilityResolver && context.currentTimelineKey) {
-    const mode = context.visibilityResolver.modeFor(session.timeline_key);
-    if (
-      mode === "isolated" &&
-      !context.visibilityResolver.sameChannel(session.timeline_key, context.currentTimelineKey)
-    ) {
-      throw new Error(
-        `Session "${sessionId}" belongs to an isolated channel this session is not in; ` +
-          "its record and transcript are private to that channel.",
-      );
-    }
+  const denial = sessionReadDenial(session, context);
+  if (denial === "isolated") {
+    throw new Error(
+      `Session "${sessionId}" belongs to an isolated channel this session is not in; ` +
+        "its record and transcript are private to that channel.",
+    );
   }
-  if (context.currentAgentName != null && context.resolveAgentForTimeline) {
-    const sessionAgent = context.resolveAgentForTimeline(session.timeline_key);
-    if (sessionAgent !== null && sessionAgent !== context.currentAgentName) {
-      throw new Error(
-        `Session "${sessionId}" was run by another agent; only your own sessions can be read.`,
-      );
-    }
+  if (denial === "other_agent") {
+    throw new Error(`Session "${sessionId}" was run by another agent; only your own sessions can be read.`);
   }
   return session;
 }
