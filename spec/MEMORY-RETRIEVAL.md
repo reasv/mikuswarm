@@ -1,6 +1,6 @@
 # Memory retrieval: judged candidates, readable excerpts, operator filters
 
-**Status**: PROPOSAL, draft rev 4 (2026-10-08: owner answers, §12; keyword/pattern/time-scoped filters, §7; the cross-encoder stage, §5.0a; batched vs split judging, §5). Not implemented.
+**Status**: PROPOSAL, draft rev 5 (2026-10-08: owner answers, §12; filters, §7; cross-encoder and embedder provider chains, §5.0a–c; one passage per judgement, §5). Not implemented.
 **Supersedes**: spec/DECISION-MODEL.md §5.5, first half (re-ranking and richer excerpts). Summary pre-expansion (the second half of §5.5) stays out of scope.
 **Builds on**: ARCHITECTURE.md §9c (diary memory, recency layer), §9d (hybrid search, `recall_memory`, auto-retrieval), §8h (decision engine, chains, calibration), spec/DECISION-MODEL.md §3 (client, fits, billing).
 **Target ARCHITECTURE.md home once implemented**: §9d (auto-retrieval, `recall_memory`), §9c (recency layer filtering), §8h (the `memory` decision point).
@@ -99,70 +99,126 @@ The decision model is one option among several. They differ in what they answer 
 | Query rewriting / hypothetical-entry generation (an LLM writes the search query or a fake diary entry to embed) | better recall on terse follow-ups | an LLM call per session | remote, needs a ZDR model | Addresses problem 3 differently from §4's conversation-window query. |
 | Provenance participant tags (§4a) | exact "was in the conversation" tags | free | local | Fixes the user lane at the source, not per query. |
 
-**Recommended combination** (rev 4: the cross-encoder is part of the design, not deferred):
+**The pipeline** (owner, 2026-10-08):
 
 ```
-wide recall (§4, ~60 blocks) ─► cross-encoder scores every candidate (§5.0a) ─► top ~12
-   ─► decision model keep/drop with the conversation in view (§5) ─► excerpts (§6)
+wide recall (§4, ~60 blocks) ─► cross-encoder ranks and eliminates (§5.0a) ─► the few survivors
+   ─► decision model as the FINAL FILTER, one passage per request (§5) ─► excerpts (§6)
 ```
 
-- **The cross-encoder is the ranker.** It reads each query–passage pair together, so it is far better at "does this passage answer this" than vector or BM25 similarity. Because it is cheap per pair, recall can be widened to ~60 candidates without sending 60 passages to the decision model.
-- **The decision model is the judge.** It sees what the cross-encoder cannot: the conversation, the reply target and the participants. It makes the keep/drop call, including "none".
-- **The fallback improves too.** When the decision chain is down, the cross-encoder's calibrated score with a cutoff selects the items in place of hybrid similarity.
-- **Every stage is optional and degrades in order:** no cross-encoder → the decision model judges the hybrid top ~24; no decision model → the cross-encoder cutoff; neither → the hybrid ranking with the higher floor.
-- **Compare offline first** with the §9 harness: hybrid alone, cross-encoder alone, decision model alone, and the combination, scored against ZDR-labelled relevance; plus an embedding-model swap as a separate axis. The measurements choose the cut-offs and `top_n`, not the shape.
+- **The cross-encoder ranks and eliminates.** It reads each query–passage pair together, so it is far better at "does this passage answer this" than vector or BM25 similarity. Because each pair is cheap, recall can widen to ~60 candidates, and most are cut here.
+- **The decision model is the final filter, not a re-ranker.** It only sees the cross-encoder's survivors, one passage per request, with the conversation, the reply target and the participants in view. It keeps or drops each, and "none" is a valid outcome.
+- **The fallback improves too.** When the decision chain is down, the cross-encoder's calibrated cutoff selects the items in place of hybrid similarity.
+- **Every stage is optional and degrades in order:** no cross-encoder → the decision model filters the hybrid top ~12; no decision model → the cross-encoder cutoff; neither → the hybrid ranking with the higher floor.
+- **Measure offline first** with the §9 harness (hybrid alone, cross-encoder alone, cross-encoder + filter, scored against ZDR-labelled relevance), plus the embedding axis (§5.0b). The measurements set cut-offs and `top_n`; they do not change the shape.
 
-### 5.0a The cross-encoder stage
+### 5.0a The cross-encoder: a provider chain
 
-- **Config** `[retrieval.rerank]`: `enabled`, `provider = "local" | "remote"`, `model`, `top_n` (default 12), `min_score` (the fallback cutoff, calibrated), `timeout_ms`, `max_passage_tokens`.
-  - **`local`:** an ONNX cross-encoder in the agent process, the same way the local embedder runs today (fastembed / onnxruntime-node). CPU only.
-  - **`remote`:** an HTTP re-rank endpoint (`POST {endpoint}/rerank` with a query and a list of texts, as served by common open inference servers), so the model can run on a GPU host. Passages are diary text derived from user messages, so a remote endpoint must be self-hosted or ZDR. Startup refuses a remote endpoint without an explicit `zdr = true` acknowledgement.
+Re-ranker scores are not stored anywhere, so providers can be swapped per request. That makes a fallback chain straightforward, as with chat models.
+
+**Trade-offs between the kinds of provider** (owner, 2026-10-08):
+
+| Provider | Quality | Latency | Standing cost | Risks |
+|---|---|---|---|---|
+| Self-hosted GPU (an inference server with a `/rerank` endpoint) | best open models at full size | lowest, typically tens of ms | VRAM held permanently, even though GPU time is small | the GPU may be needed for other work; another service to run |
+| API (hosted re-rank) | can include proprietary or too-large-to-host models | network round trip plus long-tail latency; parallel requests do not slow it, but rate limits can | per-call cost, nothing idle | another vendor, another outage source; must be ZDR (diary text derives from user messages), and free routes usually are not |
+| CPU, in process (ONNX) | smaller models, likely worse | slower, possibly much slower for large models | none worth counting: spare cores, memory to spare | none external |
+
+**Decision rule.**
+- **Primary: self-hosted GPU,** unless an API exists that is ZDR, meaningfully better than anything self-hostable (proprietary, or too large to host), and acceptable in cost and latency. Only if all of that holds does the API become primary.
+- **API otherwise a fallback** for when the GPU is busy or down.
+- **CPU always the last rung.** It is always available, so the GPU's memory can be reclaimed for other work at any time.
+
+**Built-in CPU re-ranker (proposal):** ship it the way the embedder ships today.
+- A small model that is lazy-loaded on first use, with weights cached under the data dir and the download in the background (never on a trigger).
+- Present on every deployment that enables `[retrieval.rerank]`, even with no other provider configured. So a deployment can turn re-ranking on without running anything else, and a GPU outage never removes it.
+- Pick the model by measured quality per CPU-millisecond (§5.0c).
+
+**Config:**
+
+```toml
+[retrieval.rerank]
+enabled = true
+chain = ["gpu", "api", "builtin"]   # tried in order; health and fallback as for chat models
+top_n = 8                           # survivors passed to the filter
+timeout_ms = 1500                   # per member; a slow member falls over to the next
+
+[retrieval.rerank.providers.gpu]
+kind = "remote"                     # POST {endpoint}/rerank, open inference-server shape
+endpoint = "${RERANK_GPU_URL}"
+model = "..."
+self_hosted = true                  # or zdr = true for an external API
+
+[retrieval.rerank.providers.api]
+kind = "remote"
+endpoint = "..."
+model = "..."
+zdr = true                          # required for a non-self-hosted remote provider
+
+[retrieval.rerank.providers.builtin]
+kind = "local"                      # in-process ONNX, CPU; the shipped default model
+```
+
+- **Per-provider calibration.** Scores from different models are not comparable, so the fallback cutoff (`min_score`) and any score-based logic are calibrated per provider, like per-member decision calibration.
+- **Taking the GPU away.** Stopping or pausing the GPU server is enough: its health fails and the chain moves on. To skip it without waiting for a failure, set `enabled = false` on that provider and reload the config.
 - **Query.** The request plus a short conversation tail, clipped to the model's input budget alongside the passage.
-- **Cost and latency** (to be measured on the deployment's hardware):
-  - a large multilingual cross-encoder over ~60 passages of ~400 tokens is likely ~1 s or more of CPU per build;
-  - on a GPU, tens of milliseconds;
-  - a small English model is much cheaper on CPU but weaker.
+- **Placement.** The stage starts at launch, in parallel with routing. Only the filter waits for it.
 
-  The stage runs at launch, in parallel with routing, and its time adds to the decision model's only because the judge needs its `top_n`.
-- **Unavailable or slow** (timeout, error, not configured): the stage is skipped and the next stage takes the hybrid top ~24.
+### 5.0b The embedding model: the same trade-offs, plus an index constraint
+
+The embedder has the same three kinds of provider and the same decision rule. One constraint changes the fallback design: **query vectors and document vectors must come from the same model** (the single-active-model invariant, ARCHITECTURE.md §9d). Swapping embedders per request, the way the re-ranker does, would compare vectors across spaces.
+
+- **Proposal: two indexes.**
+  - The **built-in CPU embedder's index is always maintained** (cheap: a few thousand chunks).
+  - An optional **primary embedder** (GPU or API) keeps a second vector index (`memory_vec_<model>`).
+  - A query uses the primary index when its embedder answers in time, otherwise the built-in index.
+  - Lexical search is unaffected either way.
+- **Re-embedding** on a primary-model change works as today, for that index only. The built-in index keeps serving meanwhile.
+- **Quality.** Today's built-in model is small, English-only and capped at 512 tokens. Choose the built-in by measured quality per CPU-millisecond and language coverage, and the primary by the same decision rule as the re-ranker (§5.0c).
+- **With a cross-encoder in the pipeline,** the embedder's job is recall, not precision. A stronger embedder matters less than before, but still sets the ceiling on what the cross-encoder can see.
+
+### 5.0c Model survey and measurements (to do before implementation)
+
+A companion `spec/MEMORY-RETRIEVAL-SURVEY.md`, like DECISION-MODEL-SURVEY.md. For re-rankers and embedders it records:
+- **Open-weights candidates:** quality on retrieval benchmarks and languages, size, VRAM at the serving precision, GPU latency, CPU latency on ONNX, and licence.
+- **API candidates:** quality, price, latency, rate limits, and **ZDR status, verified per provider and route** (direct and through aggregators).
+- **Measurements on the deployment's own hardware** for the shortlist: latency for ~60 × ~400-token pairs, VRAM held, CPU time.
+- **Offline quality** on the §9 labelled items.
 
 ## 5. Relevance judgement: the `memory` decision point
 
 **When.** Every human-triggered chat-lane session build that runs auto-retrieval. Proactive sessions too, with the conversation window standing in for the request. It starts at launch, as soon as the trigger group is known: candidate recall needs only the trigger, the window and the local index. It runs in parallel with routing, records planning and the context build.
 
-**State** (one object; long fields clipped; candidates packed to the member's state budget, highest hybrid score first):
+**One request per surviving passage**, all sent in parallel (bounded by the member's concurrency). Putting several passages in one state would degrade every answer (the decision model's documented weakness with irrelevant material), and cost is not a reason to accept that.
+
+**State** (per request; long fields clipped):
 
 ```json
 { "conversation": [ { "from": "alice", "text": "..." } ],
   "request": { "from": "alice", "text": "...", "reply_to": { "from": "bob", "text": "..." } },
   "participants": [ "alice", "bob" ],
-  "passages": [ { "i": 0, "date": "2026-05-14", "room": "general", "text": "<the whole block>" } ] }
+  "passage": { "date": "2026-05-14", "room": "general", "text": "<the whole block>" } }
 ```
 
 - `conversation` is the last ~8 messages, newest last, in the recent-tier rendering. Deleted messages show as placeholders (ARCHITECTURE.md §9 "Deleted messages").
 - `participants` are the display names the lanes searched.
 - The persona and the system prompt are left out.
 
-**Questions** (independent `noul`s, two per passage):
+**Questions** (two independent `noul`s per request):
 
-- `relevant_<i>`: "`passages[i]` contains information that would help respond to `request` in this `conversation`: facts, history or earlier events about the people, things or topics being discussed."
-- `about_participant_<i>`: "`passages[i]` describes one of `participants` or an interaction with them."
+- `relevant`: "`passage` contains information that would help respond to `request` in this `conversation`: facts, history or earlier events about the people, things or topics being discussed."
+- `about_participant`: "`passage` describes one of `participants` or an interaction with them."
 
 Phrasing follows the documented weaknesses (§2 of DECISION-MODEL): literal, no negation, no counting.
 
 **Verdict.**
-- Keep passages with `relevant_<i> ≥ relevance_threshold`. The default is 0.7, calibrated per member like the other points.
-- Order by `relevant` probability. `about_participant` (and §4a presence) only breaks near-ties (within 0.1): it never outranks a clearly more relevant passage, and reserves no slots.
+- Keep passages with `relevant ≥ relevance_threshold`. The default is 0.7, calibrated per member like the other points.
+- Order the kept passages by `relevant` probability (ties broken by the cross-encoder score). `about_participant` (and §4a presence) only breaks near-ties (within 0.1): it never outranks a clearly more relevant passage, and reserves no slots.
 - Pack up to `auto.max_results` (default 4) items and `auto.max_tokens` (default 2000) tokens.
 - **Zero kept means no block.**
 - `about_participant` never admits a passage on its own. Participant-tied and other relevant memories are wanted alike.
 
-**How it is asked: two layouts.** A decision request is one `state` plus a map of independent questions. Each question is answered in isolation over the same state and refers to a field by path (`passages[3].text`).
-- **Batched:** one request whose state holds all candidates in `passages[]`, with `relevant_<i>` and `about_participant_<i>` per candidate (2 × 12 = 24 questions). On a per-request-billed member (Jev) the state is billed once, about 6k tokens, roughly $0.0003.
-  - The documented weakness: accuracy degrades with irrelevant material in the state. Each question sees the other 11 passages as noise.
-- **Split:** one request per candidate, each with state `{conversation, request, participants, passage}` and that passage's two questions, at bounded concurrency. This costs ~12 × 2k tokens, about $0.001 on Jev, with roughly the same wall time as one call. It is the natural layout for per-question-billed members (Perplexity, D1) and avoids the noise problem.
-- Both need the client's "split by item" mode: the point declares its item list, and the client chooses whole or split per member, or by a per-point `layout = "batched" | "split"` setting.
-- **The default is decided by the §9 offline comparison:** batched vs split accuracy on the same labelled items. Until measured, `split` is the safer default given the documented weakness. The cross-encoder's `top_n` is what keeps the split layout's call count small.
+**Cost.** About 8 requests of ~2k tokens each, roughly $0.0007 per session on Jev. Per-question-billed members cost a few times more. Wall time is one request, since they run in parallel. Judged-filter questions (§7) ride in the same per-passage requests.
 
 **Fallback** (the whole chain failed, timed out or is budget-blocked; owner, 2026-10-08): today's hybrid ranking with a higher floor (`auto.fallback_min_score`, default 0.6), at most `auto.fallback_max_results` (default 2) items, with the §6 excerpts. The candidates are always available, so a fallback never costs latency.
 
@@ -322,6 +378,13 @@ Decided:
 6. **Participant tags** come from provenance only (§4a). There are no model-assisted "about" tags.
 7. **Snippets** were noise because they were too short to understand and wasted space on repeated citation parts, more than because they were the wrong part of the block (§1, §6).
 
+Also decided (rev 5):
+8. **One passage per judgement request.** Batching passages degrades accuracy; cost does not justify it. The decision model is the final filter on the cross-encoder's survivors, not a re-ranker.
+9. **Re-ranker and embedder provider chains** (§5.0a, §5.0b):
+   - the self-hosted GPU is primary unless a ZDR API is meaningfully better and acceptable in cost and latency;
+   - the API is otherwise a fallback;
+   - an always-available CPU rung keeps working when the GPU's memory is needed elsewhere.
+
 Remaining:
-- **Cross-encoder placement and model.** It is now part of the design (§5.0a). Still to measure on the deployment's hardware: local CPU cost vs a remote GPU endpoint, the model choice, and `top_n`.
-- **Judging layout.** Batched vs split (§5), decided by the offline comparison.
+- **The survey and measurements of §5.0c,** which choose the models: GPU primary, API fallback (or primary), and the built-in CPU models.
+- **Whether the built-in CPU re-ranker ships enabled by default,** like the embedder. Proposed yes (§5.0a), pending its measured quality.
