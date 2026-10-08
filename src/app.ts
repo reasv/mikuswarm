@@ -5877,6 +5877,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     if (!replyExternalId) return false;
     const sender = inbound.event.sender;
     if (!isHumanSender(sender)) return false;
+    // A trigger-bearing message (a DM, a mention) is decided on its post-hold
+    // delivery: consumed on the raw one, a native-fate fallback would have no
+    // trigger to redispatch and the twin would be suppressed (the message lost).
+    const wouldTrigger = channelTypeOf(inbound) === "dm" || (inbound.event.mentions?.mentionedSelf ?? false);
+    if (wouldTrigger && !inbound.trigger) return false;
     if (steeredEventIds.has(inbound.event.id)) return true;
     const target = timeline.getByExternalId(inbound.provider, replyExternalId, inbound.timelineKey);
     if (!target || target.timelineKey !== inbound.timelineKey || target.sender.isSelf) return false;
@@ -5894,7 +5899,6 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     }
     // After the run end: a bare group reply to the request triggers like a reply
     // to the bot's message. A DM or a mention triggers natively anyway.
-    const wouldTrigger = channelTypeOf(inbound) === "dm" || (inbound.event.mentions?.mentionedSelf ?? false);
     if (wouldTrigger || inbound.trigger) return false;
     const requestSession = storage.getSessionIdForRequestEvent(target.id);
     if (!requestSession || !inbound.outboundTarget) return false;

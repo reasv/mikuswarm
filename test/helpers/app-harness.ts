@@ -24,6 +24,8 @@ import { FAKE_CAPABILITIES } from "./fake-provider.js";
 import { startFakeLlm, type DecideNoul, type FakeLlm, type FakeLlmReply, type FakeLlmRequest } from "./fake-llm.js";
 
 export const HARNESS_TK = "matrix:test:room:!room";
+/** The DM timeline `say(…, { dm: true })` posts to. */
+export const HARNESS_DM_TK = "matrix:test:dm:!dm";
 export const BOT_ID = "@bot:fake";
 
 export interface HarnessSend {
@@ -36,7 +38,7 @@ export interface AppHarness {
   llm: FakeLlm;
   sends: HarnessSend[];
   /** Deliver a user message; `mention` makes it a trigger. Returns its external id. */
-  say(body: string, opts?: { mention?: boolean; replyTo?: string; id?: string; attachments?: AttachmentMeta[]; sender?: { id: string; displayName: string; username?: string }; timestamp?: number }): string;
+  say(body: string, opts?: { mention?: boolean; dm?: boolean; replyTo?: string; id?: string; attachments?: AttachmentMeta[]; sender?: { id: string; displayName: string; username?: string }; timestamp?: number }): string;
   /** Edit a stored message (`m.replace`); `mention` = the new content mentions the bot. */
   edit(targetExternalId: string, body: string, opts?: { mention?: boolean; sender?: { id: string; displayName: string; username?: string }; timestamp?: number }): void;
   /** Delete a stored message (a tombstone through the edit path). */
@@ -125,6 +127,13 @@ export async function startHarness(opts: {
   onTyping?: (on: boolean) => Promise<void> | void;
   /** Awaited after a send was delivered (recorded), before the provider returns. */
   onSend?: (msg: OutboundMessage) => Promise<void> | void;
+  /**
+   * Emulate the providers' trigger hold (opt-in): every message is delivered at
+   * once without its trigger, and a trigger (a mention, a DM) is delivered again
+   * after this many ms as its trigger-bearing twin, grouping the same sender's
+   * messages that arrived meanwhile. Unset: one delivery per message.
+   */
+  triggerHoldMs?: number;
 }): Promise<AppHarness> {
   const llm = await startFakeLlm(opts.script, opts.decideNoul);
   const root = await mkdtemp(path.join(os.tmpdir(), "miku-app-harness-"));
@@ -201,6 +210,32 @@ export async function startHarness(opts: {
   }
   const db = new Database(path.join(root, "var", "miku.sqlite"), { readonly: true, fileMustExist: true });
   let seq = 0;
+  // The trigger-hold emulation (`triggerHoldMs`): one open hold per timeline and sender.
+  const holds = new Map<string, InboundChatEvent>();
+  const deliver = (inbound: InboundChatEvent): void => {
+    const holdMs = opts.triggerHoldMs;
+    if (holdMs === undefined) {
+      host!.onEvent(inbound);
+      return;
+    }
+    host!.onEvent({ ...inbound, trigger: undefined, event: { ...inbound.event, trigger: undefined } });
+    const key = `${inbound.timelineKey}:${inbound.event.sender.id}`;
+    const open = holds.get(key);
+    if (open) {
+      const grouped = { ...open.trigger!, groupedEventIds: [...(open.trigger!.groupedEventIds ?? []), inbound.event.id] };
+      open.trigger = grouped;
+      open.event.trigger = grouped;
+      return;
+    }
+    if (!inbound.trigger) return;
+    const trigger = { ...inbound.trigger, groupedEventIds: [inbound.event.id] };
+    const held: InboundChatEvent = { ...inbound, trigger, event: { ...inbound.event, trigger } };
+    holds.set(key, held);
+    setTimeout(() => {
+      holds.delete(key);
+      host?.onEvent(held);
+    }, holdMs);
+  };
   const harness: AppHarness = {
     llm,
     sends,
@@ -211,14 +246,15 @@ export async function startHarness(opts: {
       const sentAt = sayOpts.timestamp ?? now;
       const externalId = sayOpts.id ?? `$user${seq}`;
       const sender = sayOpts.sender ?? { id: "@alice:fake", displayName: "Alice", username: "alice" };
+      const tk = sayOpts.dm ? HARNESS_DM_TK : HARNESS_TK;
       const inbound: InboundChatEvent = {
         provider: "matrix",
-        timelineKey: HARNESS_TK,
-        channelType: "group",
+        timelineKey: tk,
+        channelType: sayOpts.dm ? "dm" : "group",
         event: {
           id: `evt-${externalId}`,
           externalId,
-          timelineKey: HARNESS_TK,
+          timelineKey: tk,
           provider: "matrix",
           role: "user",
           sender,
@@ -229,12 +265,14 @@ export async function startHarness(opts: {
           ...(sayOpts.replyTo ? { replyTo: { externalId: sayOpts.replyTo } } : {}),
           ...(sayOpts.attachments ? { attachments: sayOpts.attachments } : {}),
         },
-        ...(sayOpts.mention
-          ? { trigger: { type: "mention" as const, reason: "mention", triggeredBy: sender } }
-          : {}),
-        outboundTarget: { provider: "matrix", timelineKey: HARNESS_TK, accountId: "test", roomId: "!room" },
+        ...(sayOpts.dm
+          ? { trigger: { type: "dm" as const, reason: "direct message", triggeredBy: sender } }
+          : sayOpts.mention
+            ? { trigger: { type: "mention" as const, reason: "mention", triggeredBy: sender } }
+            : {}),
+        outboundTarget: { provider: "matrix", timelineKey: tk, accountId: "test", roomId: sayOpts.dm ? "!dm" : "!room" },
       } as InboundChatEvent;
-      host!.onEvent(inbound);
+      deliver(inbound);
       return externalId;
     },
     edit(targetExternalId, body, editOpts = {}) {
