@@ -1827,9 +1827,12 @@ export class ContextBuilder {
       const maxYotsubaBlocks = yotCfg.preview.triggerGroupFiles;
       const yotPreviews = this.storage.getYotsubaPreviewsForTriggerGroup(trigger.id);
       let yotsubaBlocksAdded = 0;
+      let deletedReplies: Set<string> | undefined;
       for (const { row, assets } of yotPreviews) {
         if (yotsubaBlocksAdded >= maxYotsubaBlocks) break;
         if (row.fetch_status !== "complete") continue;
+        // A quoted message's preview is no input when that message was deleted.
+        if (row.context === "reply" && (deletedReplies ??= this.deletedReplyEventIds(trigger)).has(row.event_id)) continue;
         const payload = parseYotsubaPreviewPayload(row.payload_json ?? null);
         if (!payload?.upgrade?.processedAssetIds?.length) continue;
         if (payload.upgrade.triggerGroupId !== trigger.id) continue;
@@ -1870,12 +1873,13 @@ export class ContextBuilder {
     trigger: CanonicalChatEvent,
   ): Array<{ eventId: string; attachment: AttachmentMeta }> {
     // A quote of a deleted message shows the placeholder, so its images never
-    // become pixels either: drop the reply media of members replying to one.
+    // become pixels either: drop the reply media (its attachments, the images
+    // its text links, its link previews' images) of members replying to one.
     let deletedReplies: Set<string> | undefined;
     const deletedReplyEventIds = () => (deletedReplies ??= this.deletedReplyEventIds(trigger));
     const triggerGroupAssets = this.storage
       .getMediaAssetsForTriggerGroup(trigger.id)
-      .filter((a) => !(a.role === "reply_attachment" && deletedReplyEventIds().has(a.event_id)));
+      .filter((a) => !(isReplyMediaRole(a.role) && deletedReplyEventIds().has(a.event_id)));
     if (triggerGroupAssets.length > 0) {
       return this.applyImagePriorityCascade(trigger.id, triggerGroupAssets);
     }
@@ -1932,6 +1936,11 @@ export class ContextBuilder {
 
     return [];
   }
+}
+
+/** Media of a member's quoted message (`reply_attachment`, `reply_linked_media`, `reply_preview_media`). */
+function isReplyMediaRole(role: string): boolean {
+  return role.startsWith("reply_");
 }
 
 function imageAttachments(event: CanonicalChatEvent): NonNullable<CanonicalChatEvent["attachments"]> {

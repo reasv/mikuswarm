@@ -257,3 +257,40 @@ test("images of a deleted quoted message never become image blocks", async () =>
     storage.close();
   }
 });
+
+for (const role of ["reply_linked_media", "reply_preview_media"]) {
+  test(`${role} of a grouped member quoting a deleted message never becomes an image block`, async () => {
+    const storage = await Storage.open({ databasePath: ":memory:" });
+    try {
+      const timeline = new TimelineStore(storage);
+      const builder = new ContextBuilder(timeline, config(), storage);
+      await timeline.append(event("pic", "see https://img.example/x.png", 1_000, "@bob:x"));
+      const trigger = event("t", "what about this", 2_000, "@alice:x");
+      trigger.trigger = { type: "mention", reason: "mention", triggeredBy: trigger.sender, groupedEventIds: ["t", "m2"] };
+      await timeline.append(trigger);
+      const member = event("m2", "and this one", 2_050, "@alice:x");
+      member.replyTo = { externalId: "$pic" };
+      await timeline.append(member);
+      await timeline.setTriggerGroup("t", ["t", "m2"]);
+      await storage.insertMediaAsset({
+        id: "m2:quoted:0",
+        event_id: "m2",
+        role,
+        media_type: "image",
+        local_path: "/tmp/quoted.png",
+        caption_status: "complete",
+        download_status: "complete",
+        created_at: 1_000,
+      });
+      const select = () =>
+        (builder as unknown as { selectImageAttachments(t: CanonicalChatEvent): Array<{ attachment: { id: string } }> })
+          .selectImageAttachments(trigger)
+          .map((i) => i.attachment.id);
+      assert.deepEqual(select(), ["m2:quoted:0"], "a live quoted message's media is a candidate");
+      await storage.markTimelineEventDeleted("matrix", "$pic", TK, { at: 1_500 });
+      assert.deepEqual(select(), [], "once the quoted message is deleted, its media is not");
+    } finally {
+      storage.close();
+    }
+  });
+}

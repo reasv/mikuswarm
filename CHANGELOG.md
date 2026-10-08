@@ -64,8 +64,9 @@ Unreleased section; it is not part of any release's notes.
   `[message deleted]` (`[message deleted by <moderator>]` when someone else deleted
   it), never its text, attachments or captions. Quotes of it, the decision points'
   recent chat, and a level-1 summary written after the deletion show the same
-  placeholder. Search, `read_messages` and the other history tools still show the
-  message, and summaries written before the deletion are never remade. Messages
+  placeholder, and none of its images (attachments, linked images, link-preview
+  images) reaches the model as pixels through a quote. Search, `read_messages`
+  and the other history tools still show the message, and summaries written before the deletion are never remade. Messages
   an earlier build wiped on deletion are marked by the v31 migration (a human's
   or the bot's own; another bot's or a webhook's edited embed-only message is
   not deleted), and schema v32 removes the markers the first v31 step wrongly

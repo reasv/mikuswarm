@@ -505,3 +505,56 @@ test("selectImageBlocks: yotsuba blocks included when triggerGroupId matches tri
     await rm(tmpDir, { recursive: true, force: true });
   }
 });
+
+test("selectImageBlocks: yotsuba lane skips a reply-context preview of a deleted quoted message", async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "yot-builder-"));
+  try {
+    const assetPath = path.join(tmpDir, "quoted.jpg");
+    await writeTinyJpeg(assetPath);
+    const previewRow: LinkPreviewRow = {
+      id: "prev-q",
+      event_id: "trigger-q",
+      context: "reply",
+      url: "https://boards.4chan.org/g/thread/100000",
+      source_kind: YOTSUBA_SOURCE_KIND,
+      site_name: "4chan",
+      fetch_status: "complete",
+      preview_index: 0,
+      created_at: Date.now(),
+      payload_json: JSON.stringify({
+        v: 1,
+        kind: "thread",
+        board: "g",
+        asOf: Date.now(),
+        upgrade: { triggerGroupId: "trigger-q", includedNos: [1], processedAssetIds: ["asset-q"] },
+      }),
+    };
+    const assetRow: MediaAssetRow = {
+      id: "asset-q",
+      event_id: "trigger-q",
+      role: "reply_preview_media",
+      link_preview_id: "prev-q",
+      media_type: "image",
+      mime_type: "image/jpeg",
+      local_path: assetPath,
+      download_status: "complete",
+      caption_status: "pending",
+      created_at: Date.now(),
+    };
+    const trigger = { ...makeTrigger("trigger-q"), replyTo: { externalId: "$quoted" } };
+    const blocksWith = async (deleted: boolean) => {
+      const storage = {
+        ...(makeStorage([{ row: previewRow, assets: [assetRow] }]) as unknown as Record<string, unknown>),
+        getTriggerGroupMemberIds: () => [],
+        getDeletedMessages: (_tk: string, ids: readonly string[]) =>
+          new Map(deleted && ids.includes("$quoted") ? [["$quoted", { at: 1 }]] : []),
+      } as unknown as Storage;
+      const builder = new ContextBuilder(makeStore(), makeConfig({ visionModel: true }), storage);
+      return (await (builder as any).selectImageBlocks(trigger, true)).map((b: any) => b.attachmentId);
+    };
+    assert.deepEqual(await blocksWith(false), ["asset-q"], "a live quoted message's preview is a candidate");
+    assert.deepEqual(await blocksWith(true), [], "once the quoted message is deleted, its preview is not");
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
