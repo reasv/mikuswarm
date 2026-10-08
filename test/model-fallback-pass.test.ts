@@ -211,6 +211,49 @@ test("background probe: recovers the head out of band, and live traffic returns 
   scheduler.stop();
 });
 
+test("background probe: sends the member's configured thinking level", async () => {
+  // A reasoning model that rejects thinking off (effort "none") but serves
+  // real traffic fine must still be recoverable by its probe.
+  const R: ModelChainEntry = {
+    logicalId: "R",
+    config: { ...modelCfg("wire-R", "https://gw/x"), reasoning: true, thinking_level: "medium" },
+  };
+  const R_KEY = "https://gw/x::wire-R";
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 1, probeBackoffBaseMs: 30, probeBackoffMaxMs: 30 } });
+  const probeReasoning: unknown[] = [];
+  const makeBase = () => ((model, _ctx, opts) => {
+    const reasoning = (opts as { reasoning?: unknown }).reasoning;
+    probeReasoning.push(reasoning);
+    const stream = createAssistantMessageEventStream();
+    queueMicrotask(() => {
+      if (reasoning === undefined) {
+        const err = message(model, "error", "OpenAI API error (400): Unsupported value: 'none'");
+        stream.push({ type: "error", reason: "error", error: err });
+        stream.end(err);
+      } else {
+        const done = message(model, "stop");
+        stream.push({ type: "done", reason: "stop", message: done });
+        stream.end(done);
+      }
+    });
+    return stream;
+  }) as StreamFn;
+  buildModelFallback([R, Y], {
+    consumer: "test",
+    makeBase,
+    makeModel,
+    scheduler,
+    admission: { priority: "interactive" },
+    backgroundProbe: true,
+  });
+  scheduler.noteOutcome("default", R_KEY, "environmental");
+  assert.equal(scheduler.modelHealth(R_KEY), "unhealthy");
+  await new Promise((r) => setTimeout(r, 120));
+  assert.deepEqual(probeReasoning.slice(0, 1), ["medium"], "the probe carries the member's thinking level");
+  assert.equal(scheduler.modelHealth(R_KEY), "healthy", "the probe recovers the model");
+  scheduler.stop();
+});
+
 test("background probe: a 4xx answer to the synthetic request is a FAILED probe (backoff grows)", async () => {
   const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 1, probeBackoffBaseMs: 20, probeBackoffMaxMs: 10_000 } });
   let probes = 0;

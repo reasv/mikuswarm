@@ -206,6 +206,12 @@ interface Candidate {
   apiKey: string;
   healthKey: string;
   supportsThinking: boolean;
+  /**
+   * The member's own configured `thinking_level` when it is on (undefined = off):
+   * the background prober sends it, so a probe has the same reasoning shape as
+   * the member's real traffic.
+   */
+  thinkingLevel?: SimpleStreamOptions["reasoning"];
   /** The bare (unadmitted) stream fn — used by the background prober. */
   base: StreamFn;
   dispatch: StreamFn;
@@ -304,6 +310,10 @@ export function buildModelFallback(
       apiKey: entry.config.api_key,
       healthKey: modelHealthKey(model),
       supportsThinking: entry.config.reasoning ?? true,
+      thinkingLevel:
+        entry.config.reasoning !== false && entry.config.thinking_level && entry.config.thinking_level !== "off"
+          ? entry.config.thinking_level
+          : undefined,
       base,
       dispatch,
       operativeWindow: memberWindow,
@@ -444,9 +454,12 @@ export function buildModelFallback(
 
 /**
  * Background prober for one member (spec §4.2): a minimal synthetic request —
- * no tools, no thinking, a tiny output cap — through the member's BARE stream
- * fn (outside admission: the scheduler owns the probe slot itself). Any clean
- * `done` (including a `length` stop) is a healthy answer.
+ * no tools, a tiny output cap, and the member's own configured thinking level —
+ * through the member's BARE stream fn (outside admission: the scheduler owns the
+ * probe slot itself). The thinking level matters: a reasoning model that rejects
+ * thinking off (an effort of "none") would fail every probe while serving real
+ * traffic fine, and never recover. Any clean `done` (including a `length` stop)
+ * is a healthy answer.
  */
 function makeProber(candidate: Candidate): ModelProber {
   return async (signal) => {
@@ -454,7 +467,12 @@ function makeProber(candidate: Candidate): ModelProber {
       systemPrompt: "Reply with OK.",
       messages: [{ role: "user", content: "ping", timestamp: Date.now() }],
     };
-    const probeOptions = { apiKey: candidate.apiKey, signal, maxTokens: PROBE_MAX_TOKENS };
+    const probeOptions: SimpleStreamOptions = {
+      apiKey: candidate.apiKey,
+      signal,
+      maxTokens: PROBE_MAX_TOKENS,
+      ...(candidate.thinkingLevel ? { reasoning: candidate.thinkingLevel } : {}),
+    };
     const stream = await candidate.base(
       candidate.model,
       context as Parameters<StreamFn>[1],
