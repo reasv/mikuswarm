@@ -3,7 +3,8 @@ import type { Storage } from "../storage/index.js";
 import type { TimelineStore } from "../timeline/index.js";
 import { applyEditToCanonical, editStatus, needsEnrichment, type EditReplacement } from "../timeline/index.js";
 import { parseTimelineKey, buildTimelineKey } from "../storage/timeline-key.js";
-import type { CanonicalChatEvent, HistorySummary, InboundChatEvent, TimelineState } from "../types.js";
+import { roomKeyOf } from "../timeline/pending-deletions.js";
+import type { CanonicalChatEvent, DeletionMarker, HistorySummary, InboundChatEvent, TimelineState } from "../types.js";
 import { classifyForRoom } from "./classify.js";
 import {
   paginateBackward,
@@ -439,6 +440,39 @@ export class GapBackfetchCoordinator {
     const room = this.unitOf(inbound.timelineKey);
     if (!room || !this.isActivePhase(room.phase)) return;
     room.liveBuf.push(inbound);
+  }
+
+  /**
+   * A deletion of a message this coordinator still holds (a buffered live
+   * event, or a fetched gap message not committed yet): the marker is set on
+   * the buffered copy, so the message is stored already marked (§6 "Message
+   * edits"). Matched by provider, external id and the room of one of
+   * `timelineKeys` (threads included). True when a buffered copy was found.
+   */
+  markBufferedDeleted(
+    provider: string,
+    externalId: string,
+    timelineKeys: readonly string[],
+    marker: DeletionMarker,
+  ): boolean {
+    const rooms = new Set(timelineKeys.map(roomKeyOf));
+    const matches = (event: CanonicalChatEvent): boolean =>
+      event.provider === provider && event.externalId === externalId && rooms.has(roomKeyOf(event.timelineKey));
+    let found = false;
+    for (const room of this.rooms.values()) {
+      if (room.provider !== provider || !this.isActivePhase(room.phase)) continue;
+      for (const inbound of room.liveBuf) {
+        if (!matches(inbound.event)) continue;
+        found = true;
+        if (!inbound.event.deleted) inbound.event = { ...inbound.event, deleted: marker };
+      }
+      for (const item of room.backfillBuf) {
+        if (item.kind !== "event" || !matches(item.event)) continue;
+        found = true;
+        if (!item.event.deleted) item.event = { ...item.event, deleted: marker };
+      }
+    }
+    return found;
   }
 
   private isActivePhase(phase: RoomPhase): boolean {

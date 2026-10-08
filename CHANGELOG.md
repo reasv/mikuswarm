@@ -70,6 +70,10 @@ Unreleased section; it is not part of any release's notes.
   or the bot's own; another bot's or a webhook's edited embed-only message is
   not deleted), and schema v32 removes the markers the first v31 step wrongly
   put on such bot and webhook messages and marks the bot's own wiped messages.
+  A deletion that arrives before its message is stored (still held by the startup
+  gap backfetch or the Discord trigger hold, or simply overtaking it) is applied
+  when the message lands, and a deleted Discord trigger still in its hold starts
+  no session.
   See ARCHITECTURE.md §6 "Message edits" and §9 "Deleted messages".
 - **Tool effect classes.** Every tool is classified as `redo_safe` (no external
   effect), `repeatable` (no visible effect, but repeating it costs money or time),

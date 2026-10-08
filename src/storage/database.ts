@@ -3926,24 +3926,48 @@ export class Storage {
    * edits"): sets `deleted = marker` in its `event_json` and changes nothing
    * else (not the body, attachments, other columns, `updated_at`, quotes or any
    * index; no trigger watches `event_json`). Located like an edit target, by
-   * `(provider, externalId, timelineKey)`. Idempotent: an already-deleted message
-   * keeps its first marker (`changed: false`). `undefined` when no such message
-   * is stored: a deletion is never parked.
+   * `(provider, externalId, timelineKey)`, else (`options.lookupTimelineKeys`,
+   * a deletion whose provider cannot place its target) in the first of those
+   * timelines, with its threads, that holds it. Idempotent: an already-deleted
+   * message keeps its first marker (`changed: false`). `undefined` when no such
+   * message is stored; `options.onMissing` then runs inside the same write, so
+   * a deletion it parks can never miss an append queued after the lookup.
    */
   markTimelineEventDeleted(
     provider: string,
     externalId: string,
     timelineKey: string,
     marker: DeletionMarker,
+    options: { lookupTimelineKeys?: readonly string[]; onMissing?: () => void } = {},
   ): Promise<{ event: CanonicalChatEvent; changed: boolean } | undefined> {
     return this.write((db) => {
-      const row = db
+      let row = db
         .prepare(
           `select id, event_json from timeline_events
            where provider = ? and external_id = ? and timeline_key = ? limit 1`,
         )
         .get(provider, externalId, timelineKey) as { id: string; event_json: string } | undefined;
-      if (!row) return undefined;
+      for (const key of options.lookupTimelineKeys ?? []) {
+        if (row) break;
+        const parsed = parseTimelineKey(key);
+        if (!parsed) continue;
+        const roomKey = buildTimelineKey({ ...parsed, threadId: undefined });
+        row = db
+          .prepare(
+            `select id, event_json from timeline_events
+             where provider = @provider and external_id = @externalId
+               and (timeline_key = @roomKey or timeline_key like @threadPrefix escape '\\')
+             order by case when timeline_key = @roomKey then 0 else 1 end, timeline_key
+             limit 1`,
+          )
+          .get({ provider, externalId, roomKey, threadPrefix: threadKeyLikePattern(roomKey) }) as
+          | { id: string; event_json: string }
+          | undefined;
+      }
+      if (!row) {
+        options.onMissing?.();
+        return undefined;
+      }
       const existing = JSON.parse(row.event_json) as CanonicalChatEvent;
       if (existing.deleted) return { event: existing, changed: false };
       const deleted: DeletionMarker = { at: marker.at, ...(marker.by !== undefined ? { by: marker.by } : {}) };

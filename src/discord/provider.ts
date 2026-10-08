@@ -1134,8 +1134,20 @@ export class DiscordProvider implements IChatProvider {
     const externalId = message.id;
     const canonicalId = buildDiscordEventId(runtime.accountId, externalId);
 
-    // Route as a delete — use the same path Matrix redactions use: an inbound event
-    // with a delete marker so the timeline store removes the target.
+    const now = Date.now();
+    // A trigger still in its hold was never stored (the Discord hold emits the
+    // message only at its flush): it is flushed now, without its trigger (so it
+    // starts no session) and already marked deleted (§6 "Message edits").
+    const held = this.pendingTriggers.get(timelineKey);
+    if (held && held.event.event.externalId === externalId) {
+      clearTimeout(held.timer);
+      this.pendingTriggers.delete(timelineKey);
+      const { trigger: _dropped, ...event } = held.event.event;
+      this.host!.onEvent({ ...held.event, trigger: undefined, event: { ...event, deleted: { at: now } } });
+    }
+
+    // Route as a delete — the same path Matrix redactions use: an inbound event
+    // with a delete marker, so the timeline store marks the target deleted.
     const deleteEvent: CanonicalChatEvent = {
       id: `${canonicalId}:delete:${nanoid()}`,
       timelineKey,
@@ -1143,8 +1155,8 @@ export class DiscordProvider implements IChatProvider {
       role: "user",
       sender: { id: "system" },
       body: "",
-      timestamp: Date.now(),
-      receivedAt: Date.now(),
+      timestamp: now,
+      receivedAt: now,
     };
 
     this.host!.onEvent({

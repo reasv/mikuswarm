@@ -361,6 +361,38 @@ test("live events arriving during the freeze are buffered and replayed after com
   h.storage.close();
 });
 
+test("a deletion of a message the freeze still holds marks the buffered copy (live and fetched), stored marked", async () => {
+  let h!: Harness;
+  // The fetched $c is deleted while the fill is still paging (second read).
+  const client = new (class extends ScriptedClient {
+    override async readMessages(request: HistoryPageRequest): Promise<HistoryPageResult> {
+      if (this.calls.length === 1) {
+        assert.equal(h.coordinator.markBufferedDeleted("matrix", "$c", [ROOM_TK], { at: 7_000, by: "@mod:example.org" }), true);
+      }
+      return super.readMessages(request);
+    }
+  })([
+    page([summary({ externalId: "$d", timestamp: 4000 }), summary({ externalId: "$c", timestamp: 3000 })], "tok1"),
+    page([summary({ externalId: "$b", timestamp: 2000 }), summary({ externalId: "$a", timestamp: 1000 })], null),
+  ]);
+  h = await makeHarness([], {}, undefined, client);
+  await seedFloor(h.timeline, h.storage, "$a", 1000);
+  h.coordinator.prepare();
+  h.coordinator.bufferLive(makeInbound("$live1", 5000));
+  h.coordinator.bufferLive(makeInbound("$live2", 6000));
+  assert.equal(h.coordinator.markBufferedDeleted("matrix", "$live1", [`${ROOM_TK}:thread:$x`], { at: 6_500 }), true, "a thread key of the room matches");
+  assert.equal(h.coordinator.markBufferedDeleted("matrix", "$unknown", [ROOM_TK], { at: 6_500 }), false);
+  assert.equal(h.coordinator.markBufferedDeleted("matrix", "$live2", ["matrix:miku:room:!other:example.org"], { at: 6_500 }), false, "another room");
+  await h.coordinator.run();
+  assert.deepEqual(h.replayed.map((i) => [i.event.externalId, i.event.deleted]), [["$live1", { at: 6_500 }], ["$live2", undefined]]);
+  assert.deepEqual(h.storage.getTimelineEventById(`matrix:${ACCOUNT}:$c`)?.deleted, { at: 7_000, by: "@mod:example.org" });
+  assert.equal(h.storage.getTimelineEventById(`matrix:${ACCOUNT}:$c`)?.body, "hello", "content kept");
+  assert.equal(h.storage.getTimelineEventById(`matrix:${ACCOUNT}:$d`)?.deleted, undefined);
+  // Unfrozen: nothing is held any more.
+  assert.equal(h.coordinator.markBufferedDeleted("matrix", "$live2", [ROOM_TK], { at: 8_000 }), false);
+  h.storage.close();
+});
+
 test("cap leaves a hole below the oldest committed gap message and logs capped", async () => {
   const h = await makeHarness(
     [

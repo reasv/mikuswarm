@@ -42,7 +42,10 @@ test("deletions mark the stored message, keep its content, and touch nothing els
     h.redact(own, { timestamp: 7_000 });
     h.redact(moderated, { by: "@mod:fake", timestamp: 8_000 });
     h.redact("$not-a-stored-message");
-    await h.until(() => h.logs.filter((l) => l.message === "message_deletion_observed").length === 3, "all deletions observed");
+    await h.until(() => h.logs.filter((l) => l.message === "message_deletion_observed").length === 4, "all deletions observed");
+    // A deletion of a message not stored (yet) is parked, never stored as anything.
+    assert.equal(deletionLogs(h, "$not-a-stored-message")[0]?.parked, true);
+    assert.equal(h.query("select 1 from timeline_events where external_id = '$not-a-stored-message'").length, 0);
 
     const a = storedOf(h, plain);
     assert.equal(a.body, "a message that gets deleted");
@@ -53,7 +56,7 @@ test("deletions mark the stored message, keep its content, and touch nothing els
     assert.deepEqual(storedOf(h, own).event.deleted, { at: 7_000, by: "@alice:fake" });
     assert.deepEqual(storedOf(h, moderated).event.deleted, { at: 8_000, by: "@mod:fake" });
     assert.equal(storedOf(h, moderated).body, "a message a moderator redacts");
-    assert.equal(h.query("select * from pending_edits").length, 0, "an unknown target is dropped, never parked");
+    assert.equal(h.query("select * from pending_edits").length, 0, "a deletion is never a pending edit");
 
     // Nothing re-indexed, re-enriched, re-summarized.
     assert.ok(!h.logs.some((l) => l.message === "edit_applied"));

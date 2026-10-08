@@ -3551,38 +3551,35 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   async function applyEdit(edit: InboundChatEvent): Promise<void> {
     let inbound = edit;
     const targetExternalId = inbound.edit!.targetExternalId;
-    // A deletion whose provider cannot place its target (a Matrix redaction):
-    // applied to the stored message in one of the candidate timelines (with
-    // their threads), else dropped (a reaction, a state event, a message this
-    // store never had); never parked.
     const lookup = inbound.edit!.lookupTimelineKeys;
-    if (lookup) {
-      let storedKey: string | undefined;
-      for (const key of lookup) {
-        storedKey = timeline.resolveEditTargetTimelineKey(inbound.provider, targetExternalId, key);
-        if (storedKey) break;
-      }
-      if (!storedKey) return;
-      inbound = { ...inbound, timelineKey: storedKey, event: { ...inbound.event, timelineKey: storedKey } };
-    }
     // A deletion only marks the stored message (when, and by whom when the
     // provider says), keeping its content (§6 "Message edits"): the recent tiers
     // render it as a placeholder, search and summaries keep it. Nothing is
     // re-indexed, re-summarized or re-enriched, and no quote is touched. A
-    // message the store does not have is dropped, never parked. It also corrects
-    // a request still being answered (late input); `after` is the deleted view,
-    // built in memory. A repeated deletion changes nothing.
+    // deletion whose provider cannot place its target (a Matrix redaction) is
+    // applied to the stored message in one of the candidate timelines (with
+    // their threads). A message not stored yet is marked in the gap-backfetch
+    // buffer that holds it, else the deletion is parked and lands when it is
+    // appended (bounded TTL and size, so the deletion of something never
+    // stored, a reaction or a state event, does not accumulate). It also
+    // corrects a request still being answered (late input); `after` is the
+    // deleted view, built in memory. A repeated deletion changes nothing.
     if (inbound.edit!.deleted === true) {
       const deletedBy = inbound.edit!.deletedBy;
-      const marked = await timeline.markDeleted(inbound.provider, targetExternalId, inbound.timelineKey, {
-        at: inbound.event.timestamp,
-        ...(deletedBy !== undefined ? { by: deletedBy } : {}),
+      const marker = { at: inbound.event.timestamp, ...(deletedBy !== undefined ? { by: deletedBy } : {}) };
+      const candidates = lookup ?? [inbound.timelineKey];
+      let buffered = false;
+      const result = await timeline.markDeleted(inbound.provider, targetExternalId, inbound.timelineKey, marker, {
+        ...(lookup ? { lookupTimelineKeys: lookup } : {}),
+        markElsewhere: () => (buffered = gapBackfetch.markBufferedDeleted(inbound.provider, targetExternalId, candidates, marker)),
       });
+      const marked = "event" in result ? result : undefined;
+      if (marked) inbound = { ...inbound, timelineKey: marked.event.timelineKey, event: { ...inbound.event, timelineKey: marked.event.timelineKey } };
       logger.info("message_deletion_observed", {
         timelineKey: inbound.timelineKey,
         targetExternalId,
         stored: marked !== undefined,
-        ...(marked ? { marked: marked.changed } : {}),
+        ...(marked ? { marked: marked.changed } : buffered ? { buffered: true } : { parked: true }),
       });
       if (!marked?.changed) return;
       const { deleted: _marker, ...prior } = marked.event;

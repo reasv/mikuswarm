@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 import type { Storage, TimelineCompactionState, TimelineCursor } from "../storage/index.js";
 import type { CanonicalChatEvent, DeletionMarker, TimelineState } from "../types.js";
 import { applyEditToCanonical, editStatus, type EditReplacement } from "./edits.js";
+import { PendingDeletions } from "./pending-deletions.js";
 
 export interface TimelineQuery {
   timelineKey: string;
@@ -18,7 +19,15 @@ export function needsEnrichment(event: CanonicalChatEvent): boolean {
 }
 
 export class TimelineStore {
-  constructor(private readonly storage: Storage) {}
+  /** Deletions of messages not stored yet, applied when they are appended (§6 "Message edits"). */
+  readonly pendingDeletions: PendingDeletions;
+
+  constructor(
+    private readonly storage: Storage,
+    options: { pendingDeletions?: PendingDeletions } = {},
+  ) {
+    this.pendingDeletions = options.pendingDeletions ?? new PendingDeletions();
+  }
 
   append(event: CanonicalChatEvent, enrichmentStatus?: string): Promise<void> {
     return this.storage.appendTimelineEvent(event, enrichmentStatus);
@@ -103,7 +112,11 @@ export class TimelineStore {
       const replayed = event.externalId
         ? this.#applyPendingEdit(db, event)
         : undefined;
-      return { event: replayed ?? event, duplicate: false };
+      // A deletion that arrived before this message was stored (it was still
+      // buffered): its marker lands in the same transaction, so the message is
+      // never handled as live input.
+      const deleted = event.externalId ? this.#applyPendingDeletion(db, replayed ?? event) : undefined;
+      return { event: deleted ?? replayed ?? event, duplicate: false };
     });
   }
 
@@ -162,6 +175,20 @@ export class TimelineStore {
       updatedAt: Date.now(),
     });
     this.storage.deletePendingEdit(db, event.provider, externalId, event.timelineKey);
+    return updated;
+  }
+
+  /** Set a parked deletion's marker on a just-inserted message (its content unchanged). */
+  #applyPendingDeletion(db: Database.Database, event: CanonicalChatEvent): CanonicalChatEvent | undefined {
+    if (!event.externalId) return undefined;
+    const marker = this.pendingDeletions.take(event.provider, event.externalId, event.timelineKey);
+    // A message stored already marked (marked in its buffer) keeps its marker.
+    if (!marker || event.deleted) return undefined;
+    const updated: CanonicalChatEvent = { ...event, deleted: marker };
+    db.prepare(`update timeline_events set event_json = @eventJson where id = @id`).run({
+      id: updated.id,
+      eventJson: JSON.stringify(updated),
+    });
     return updated;
   }
 
@@ -480,15 +507,35 @@ export class TimelineStore {
 
   /**
    * Mark a stored message deleted, keeping its content (see
-   * {@link Storage.markTimelineEventDeleted}). `undefined` when it is not stored.
+   * {@link Storage.markTimelineEventDeleted}). A message not stored is marked
+   * where `markElsewhere` finds it (a buffer), else its deletion is parked and
+   * lands when it is appended ({@link PendingDeletions}); both run inside the
+   * write that found nothing, so no append slips in between.
    */
   markDeleted(
     provider: string,
     externalId: string,
     timelineKey: string,
     marker: DeletionMarker,
-  ): Promise<{ event: CanonicalChatEvent; changed: boolean } | undefined> {
-    return this.storage.markTimelineEventDeleted(provider, externalId, timelineKey, marker);
+    options: {
+      /** Candidate timelines (with their threads) when the provider cannot place the target. */
+      lookupTimelineKeys?: readonly string[];
+      /** Not stored: true when it marked the target somewhere else (a buffer), so nothing is parked. */
+      markElsewhere?: () => boolean;
+    } = {},
+  ): Promise<{ event: CanonicalChatEvent; changed: boolean } | { parked: boolean }> {
+    const lookup = options.lookupTimelineKeys;
+    let parked = false;
+    return this.storage
+      .markTimelineEventDeleted(provider, externalId, timelineKey, marker, {
+        ...(lookup ? { lookupTimelineKeys: lookup } : {}),
+        onMissing: () => {
+          if (options.markElsewhere?.()) return;
+          this.pendingDeletions.park(provider, externalId, lookup ?? [timelineKey], marker);
+          parked = true;
+        },
+      })
+      .then((result) => result ?? { parked });
   }
 
   setTriggerGroup(triggerEventId: string, eventIds: string[]): Promise<void> {
