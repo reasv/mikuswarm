@@ -967,6 +967,14 @@ export class DiscordProvider implements IChatProvider {
         this.host?.onError(error, { accountId, phase: "messageDelete" });
       });
     });
+
+    // ── Bulk delete (a purge): one deletion per message, the same path ───────
+
+    client.on("messageDeleteBulk", (messages) => {
+      if (this.stopped) return;
+      if (!this.host) return;
+      void this.handleMessageDeleteBulk(runtime, [...messages.values()]);
+    });
   }
 
   // ── Inbound handlers ─────────────────────────────────────────────────────
@@ -1165,6 +1173,27 @@ export class DiscordProvider implements IChatProvider {
       event: deleteEvent,
       edit: { targetExternalId: externalId, deleted: true }, // reuse edit marker for delete routing
     });
+  }
+
+  /**
+   * `messageDeleteBulk` (a purge): each deleted message goes through
+   * {@link handleMessageDelete} in turn, so it is a deletion like any other
+   * (deleter unknown, as for a single Discord deletion). One message's failure
+   * does not stop the others.
+   */
+  private async handleMessageDeleteBulk(
+    runtime: AccountRuntime,
+    messages: ReadonlyArray<Message | PartialMessage>,
+  ): Promise<void> {
+    for (const message of messages) {
+      if (this.stopped || !this.host) return;
+      if (!this.isAllowed(runtime, message)) continue;
+      try {
+        await this.handleMessageDelete(runtime, message);
+      } catch (error) {
+        this.host?.onError(error, { accountId: runtime.accountId, phase: "messageDeleteBulk" });
+      }
+    }
   }
 
   // ── Filtering ─────────────────────────────────────────────────────────────

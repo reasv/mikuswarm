@@ -128,3 +128,68 @@ describe("Discord deletion of a held trigger", () => {
     assert.equal(flushed[0]!.event.deleted, undefined);
   });
 });
+
+describe("Discord bulk deletion (a purge)", () => {
+  it("messageDeleteBulk emits one deletion per message, deleter unknown, through the single-delete path", async () => {
+    const storage = await Storage.open({ databasePath: ":memory:" });
+    try {
+      const timeline = new TimelineStore(storage);
+      const router = new TimelineRouter(timeline);
+      const provider = new DiscordProvider(makeDiscordConfig(), callbacks);
+      const emitted: InboundChatEvent[] = [];
+      (provider as unknown as Record<string, unknown>).host = {
+        onEvent: (inbound: InboundChatEvent) => emitted.push(inbound),
+        onError: (error: unknown) => assert.fail(String(error)),
+        resolveReplyTrigger: () => undefined,
+      };
+      // Store the purged messages first, so the deletions find them.
+      for (const id of ["111111111111111121", "111111111111111122"]) {
+        await router.route(
+          {
+            provider: "discord",
+            timelineKey: `discord:main:dm:${CHANNEL}`,
+            event: {
+              id: `discord:main:${id}`,
+              externalId: id,
+              timelineKey: `discord:main:dm:${CHANNEL}`,
+              provider: "discord",
+              role: "user",
+              sender: { id: "400000000000000001" },
+              body: `purged ${id}`,
+              timestamp: 1,
+              receivedAt: 1,
+            },
+          },
+          "skipped",
+        );
+      }
+      const listeners = new Map<string, (...args: unknown[]) => void>();
+      const runtime = makeRuntime() as { client: Record<string, unknown> };
+      runtime.client.on = (name: string, fn: (...args: unknown[]) => void) => listeners.set(name, fn);
+      runtime.client.rest = { on() {} };
+      (provider as unknown as { attachListeners(r: unknown): void }).attachListeners(runtime);
+      const bulk = listeners.get("messageDeleteBulk");
+      assert.ok(bulk, "messageDeleteBulk is handled");
+      const purged = new Map([
+        ["111111111111111121", { id: "111111111111111121", channelId: CHANNEL, guildId: null }],
+        ["111111111111111122", { id: "111111111111111122", channelId: CHANNEL, guildId: null }],
+      ]);
+      bulk(purged, { id: CHANNEL });
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      const deletions = emitted.filter((i) => i.edit?.deleted === true);
+      assert.deepEqual(deletions.map((i) => i.edit!.targetExternalId), ["111111111111111121", "111111111111111122"]);
+      assert.ok(deletions.every((i) => i.edit!.deletedBy === undefined && i.timelineKey === `discord:main:dm:${CHANNEL}`));
+    } finally {
+      storage.close();
+    }
+  });
+
+  it("skips messages the account does not handle (DMs disabled)", async () => {
+    const provider = new DiscordProvider(makeDiscordConfig(), callbacks);
+    const emitted: InboundChatEvent[] = [];
+    (provider as unknown as Record<string, unknown>).host = { onEvent: (inbound: InboundChatEvent) => emitted.push(inbound) };
+    const runtime = { ...(makeRuntime() as Record<string, unknown>), dmEnabled: false };
+    await (provider as unknown as Handlers).handleMessageDeleteBulk!(runtime, [{ id: "1", channelId: CHANNEL, guildId: null }]);
+    assert.equal(emitted.length, 0);
+  });
+});
