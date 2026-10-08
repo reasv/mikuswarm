@@ -71,44 +71,83 @@ function rgLineRef(line: string): { file: string; line: number } | null {
   return m ? { file: m[1]!, line: Number(m[2]) } : null;
 }
 
+/** Blocks sent to the filter hook per call (bounds concurrent judged-filter requests). */
+const SEARCH_MEMORY_FILTER_BATCH = 8;
+/** Most blocks one search_memory call checks against the filters; the output stops before the rest. */
+const SEARCH_MEMORY_MAX_FILTERED_BLOCKS = 48;
+
 /**
  * Drop ripgrep lines that fall inside blocks hidden by the operator's filters
- * (ARCHITECTURE.md §9c): each file with hits is split into its diary blocks
- * (the index's boundaries) and the hidden blocks' line ranges are removed.
+ * (ARCHITECTURE.md §9c). Only the blocks the output shows (a matched or
+ * context line inside them) are checked, in output order and in batches of
+ * {@link SEARCH_MEMORY_FILTER_BATCH}, and only until `maxResults` lines are
+ * kept or {@link SEARCH_MEMORY_MAX_FILTERED_BLOCKS} blocks were checked; the
+ * output stops before the first unchecked block (`truncated`).
  */
 async function filterRipgrepLines(
   workspaceRoot: string,
   lines: string[],
   hiddenBlocks: NonNullable<MemoryToolHooks["hiddenBlocks"]>,
-): Promise<string[]> {
-  const files = new Set<string>();
+  maxResults: number,
+): Promise<{ lines: string[]; truncated: boolean }> {
+  const blocksOf = new Map<string, FilterBlock[]>();
   for (const l of lines) {
     const ref = rgLineRef(l);
-    if (ref) files.add(ref.file);
-  }
-  const hiddenRanges = new Map<string, Array<[number, number]>>();
-  for (const file of files) {
+    if (!ref || blocksOf.has(ref.file)) continue;
     let text: string;
     try {
-      text = await readFile(path.join(workspaceRoot, file), "utf8");
+      text = await readFile(path.join(workspaceRoot, ref.file), "utf8");
     } catch {
+      blocksOf.set(ref.file, []);
       continue;
     }
-    const blocks = splitFileBlocks(file, text);
-    const hidden = await hiddenBlocks(blocks);
-    const ranges = blocks.filter((b) => hidden.has(b.contentHash)).map((b) => [b.startLine, b.endLine] as [number, number]);
-    if (ranges.length > 0) hiddenRanges.set(file, ranges);
+    blocksOf.set(ref.file, splitFileBlocks(ref.file, text));
   }
-  if (hiddenRanges.size === 0) return lines;
-  const out: string[] = [];
-  for (const l of lines) {
+  // Each output line's block (undefined: a line outside any block, or a separator).
+  const lineBlock = lines.map((l) => {
     const ref = rgLineRef(l);
-    const ranges = ref ? hiddenRanges.get(ref.file) : undefined;
-    if (ranges && ranges.some(([a, b]) => ref!.line >= a && ref!.line <= b)) continue;
-    out.push(l);
+    return ref ? blocksOf.get(ref.file)?.find((b) => ref.line >= b.startLine && ref.line <= b.endLine) : undefined;
+  });
+  const order: FilterBlock[] = [];
+  const seen = new Set<FilterBlock>();
+  for (const b of lineBlock) if (b && !seen.has(b)) (seen.add(b), order.push(b));
+
+  const decided = new Set<FilterBlock>();
+  const hidden = new Set<FilterBlock>();
+  const keptDecided = (): number => {
+    let n = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const b = lineBlock[i];
+      if (b && !decided.has(b)) break;
+      if (!b || !hidden.has(b)) n += lines[i] === "--" ? 0 : 1;
+    }
+    return n;
+  };
+  for (let i = 0; i < order.length && i < SEARCH_MEMORY_MAX_FILTERED_BLOCKS; i += SEARCH_MEMORY_FILTER_BATCH) {
+    const batch = order.slice(i, Math.min(i + SEARCH_MEMORY_FILTER_BATCH, SEARCH_MEMORY_MAX_FILTERED_BLOCKS));
+    const hiddenHashes = await hiddenBlocks(batch);
+    for (const b of batch) {
+      decided.add(b);
+      if (hiddenHashes.has(b.contentHash)) hidden.add(b);
+    }
+    if (keptDecided() >= maxResults) break;
+  }
+  const out: string[] = [];
+  let truncated = false;
+  for (let i = 0; i < lines.length; i++) {
+    const b = lineBlock[i];
+    if (b && !decided.has(b)) {
+      truncated = true;
+      break;
+    }
+    if (b && hidden.has(b)) continue;
+    out.push(lines[i]!);
   }
   // Collapse separator runs left by dropped context groups.
-  return out.filter((l, i) => !(l === "--" && (i === 0 || out[i - 1] === "--" || i === out.length - 1)));
+  return {
+    lines: out.filter((l, i) => !(l === "--" && (i === 0 || out[i - 1] === "--" || i === out.length - 1))),
+    truncated,
+  };
 }
 
 export function createSearchMemoryTool(context: SearchMemoryToolContext): AgentTool {
@@ -154,15 +193,16 @@ export function createSearchMemoryTool(context: SearchMemoryToolContext): AgentT
         max_results: SEARCH_MEMORY_RAW_CAP,
       });
       const rawLines = raw.text === "No matches." ? [] : raw.text.split("\n").filter(Boolean);
-      const kept = await filterRipgrepLines(context.workspaceRoot, rawLines, context.hiddenBlocks);
       const maxResults = args.max_results ?? 100;
+      const filtered = await filterRipgrepLines(context.workspaceRoot, rawLines, context.hiddenBlocks, maxResults);
+      const kept = filtered.lines;
       const selected = kept.slice(0, maxResults);
       return {
         content: [{ type: "text", text: selected.join("\n") || "No matches." }],
         details: {
           ...raw.details,
           count: kept.length,
-          truncated: kept.length > selected.length || raw.details.truncated,
+          truncated: kept.length > selected.length || filtered.truncated || raw.details.truncated,
         },
       };
     },

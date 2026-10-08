@@ -267,3 +267,56 @@ test("surfaces: search_memory drops lines inside hidden blocks; direct reads are
     assert.deepEqual(followUps, ["search_memory"]);
   });
 });
+
+test("search_memory checks only the blocks its output shows, in bounded batches, up to max_results", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "search-memory-filters-"));
+  try {
+    configureAgentTimezone(TZ);
+    await mkdir(path.join(dir, "memory"));
+    for (let f = 0; f < 3; f++) {
+      let text = "";
+      for (let b = 0; b < 20; b++) {
+        const ts = Date.UTC(2026, 4, 10 + f, b);
+        text += `${buildDiaryHeader({ earliestTimestamp: ts, latestTimestamp: ts + 600_000, room: "lobby", timezone: "UTC" })}\n`;
+        text += b === 7 || b === 12 ? `We talked about the zebra exhibit ${b}.\n\n` : `Ordinary block ${b} about nothing special.\n\n`;
+      }
+      await writeFile(path.join(dir, "memory", `2026-05-${10 + f}.md`), text);
+    }
+    const batches: number[] = [];
+    const tool = createSearchMemoryTool({
+      workspaceRoot: dir,
+      hiddenBlocks: async (blocks) => {
+        batches.push(blocks.length);
+        // The first zebra block of each file is hidden.
+        return new Set(blocks.filter((b) => b.text.includes("zebra exhibit 7")).map((b) => b.contentHash));
+      },
+    });
+    const res: any = await tool.execute("t1", { pattern: "zebra" } as any, undefined as any, undefined as any);
+    const out = res.content[0].text as string;
+    assert.equal(out.split("\n").filter(Boolean).length, 3, out);
+    assert.ok(!out.includes("exhibit 7"));
+    // 6 blocks hold a match (2 per file): 60 blocks in the files, 6 checked.
+    assert.equal(batches.reduce((a, b) => a + b, 0), 6);
+    assert.ok(batches.every((n) => n <= 8));
+
+    // max_results stops the checking early: one kept line needs only the first blocks.
+    batches.length = 0;
+    const one: any = await tool.execute("t2", { pattern: "zebra", max_results: 1 } as any, undefined as any, undefined as any);
+    assert.equal(one.content[0].text.split("\n").filter(Boolean).length, 1);
+    assert.equal(batches.length, 1);
+
+    // A pattern hitting 54 blocks: max_results 2 checks one batch; the default checks at most 48 blocks.
+    batches.length = 0;
+    const two: any = await tool.execute("t3", { pattern: "Ordinary", max_results: 2 } as any, undefined as any, undefined as any);
+    assert.equal(two.content[0].text.split("\n").filter(Boolean).length, 2);
+    assert.deepEqual(batches, [8]);
+    batches.length = 0;
+    const many: any = await tool.execute("t4", { pattern: "Ordinary" } as any, undefined as any, undefined as any);
+    assert.equal(batches.reduce((a, b) => a + b, 0), 48);
+    assert.equal(many.content[0].text.split("\n").filter(Boolean).length, 48);
+    assert.equal(many.details.truncated, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    resetAgentTimezone();
+  }
+});
