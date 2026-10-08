@@ -371,6 +371,11 @@ function modelBlock(mode: Mode, port: number) {
     : { id: "oai-wire", provider: "test", api: "openai-completions", endpoint: `http://127.0.0.1:${port}/v1` };
 }
 
+/** The most an aborted run may bill as output: its streamed deltas, or the per-second floor for the wall time it took. */
+function floorBound(streamed: number, elapsedMs: number): number {
+  return Math.max(streamed, Math.ceil((elapsedMs / 1000) * ABORTED_OUTPUT_TOKENS_PER_SECOND));
+}
+
 async function runAborted(mode: Mode, text: string) {
   const server = await hangingServer(mode, text);
   const root = await mkdtemp(path.join(os.tmpdir(), "miku-abort-"));
@@ -434,12 +439,15 @@ async function runAborted(mode: Mode, text: string) {
       createdAt: 0,
     } as unknown as AgentSessionRecord;
     const created = await factory.create(session, []);
+    // Wall time around the whole run: the stream ran no longer, so it bounds the per-second floor.
+    const startedAt = performance.now();
     const run = created.agent.prompt(created.finalTurn as any);
     await server.sent;
     await new Promise((r) => setTimeout(r, 60));
     created.agent.abort();
     await run;
-    return { recorded: recorded.filter((r) => r.class === "agent_loop"), logs, usage: created.usage.snapshot() };
+    const elapsedMs = performance.now() - startedAt;
+    return { recorded: recorded.filter((r) => r.class === "agent_loop"), logs, usage: created.usage.snapshot(), elapsedMs };
   } finally {
     await server.close();
     await rm(root, { recursive: true, force: true });
@@ -448,7 +456,7 @@ async function runAborted(mode: Mode, text: string) {
 
 test("factory: an Anthropic stream aborted mid-way records one estimated row (reported input, estimated output)", async () => {
   const text = "Hello there, this is the beginning of a long answer";
-  const { recorded, logs, usage } = await runAborted("anthropic", text);
+  const { recorded, logs, usage, elapsedMs } = await runAborted("anthropic", text);
   assert.equal(recorded.length, 1);
   const row = recorded[0];
   const out = estimateTokens(text);
@@ -456,8 +464,10 @@ test("factory: an Anthropic stream aborted mid-way records one estimated row (re
   assert.equal(row.logicalModelId, "default");
   assert.deepEqual([row.inputTokens, row.cacheReadTokens, row.cacheWriteTokens], [40, 1000, 0]);
   // At least the streamed deltas; the per-second floor can win on a loaded host (the test aborts
-  // after real wall time), so the exact count is not pinned here.
+  // after real wall time), so the exact count is not pinned here, but it never exceeds the floor
+  // for the wall time the run took.
   assert.ok(row.outputTokens >= out);
+  assert.ok(row.outputTokens <= floorBound(out, elapsedMs), `${row.outputTokens} output tokens in ${Math.round(elapsedMs)} ms`);
   assert.ok(Math.abs(row.costUsd - (40 * 3 + row.outputTokens * 15 + 1000 * 0.3) / 1e6) < 1e-12);
   // The session tracker (cost ceiling) counted it too.
   assert.equal(usage.llmRequests, 1);
@@ -472,13 +482,14 @@ test("factory: an Anthropic stream aborted mid-way records one estimated row (re
 
 test("factory: an OpenAI stream without usage is billed on the estimated context and the streamed output", async () => {
   const text = "partial answer text";
-  const { recorded } = await runAborted("openai", text);
+  const { recorded, elapsedMs } = await runAborted("openai", text);
   assert.equal(recorded.length, 1);
   const row = recorded[0];
   assert.equal(row.estimated, true);
   assert.ok(row.inputTokens > 0, "input estimated from the running context");
   assert.equal(row.cacheReadTokens, 0, "no prior request: no cache credit");
   assert.ok(row.outputTokens >= estimateTokens(text), "at least the streamed deltas (the time floor can win under load)");
+  assert.ok(row.outputTokens <= floorBound(estimateTokens(text), elapsedMs), `${row.outputTokens} output tokens in ${Math.round(elapsedMs)} ms`);
   assert.ok(row.costUsd > 0);
 });
 
