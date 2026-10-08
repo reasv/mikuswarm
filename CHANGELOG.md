@@ -321,7 +321,9 @@ Unreleased section; it is not part of any release's notes.
   gate's revise bounds apply. Messages a rejection quoted count as seen, so the
   next draft is compared only with newer ones; deleted messages never count. If
   another session posts while the send waits for its verdict, the draft is
-  judged once more, new messages included, within the same deadline. Its chain is
+  judged once more, new messages included, within the same deadline, unless a
+  check that blocks the send already fired; a recheck that misses the deadline
+  leaves the verdict already in hand in force. Its chain is
   `[decisions.checks.duplicate].model` (default `[decisions].model`); per-question
   thresholds (default 0.8) go in `[checks.duplicate].thresholds`, and
   `scripts/calibrate-checks.ts --check duplicate --question <name>` calibrates

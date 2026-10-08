@@ -59,6 +59,8 @@ interface SetupOpts {
   storage?: Storage;
   /** Awaited before a duplicate call is answered (n = 1 for the first). */
   onDuplicateCall?: (n: number, state: any) => Promise<void> | void;
+  /** Probability for non-duplicate question ids (default 0.01). */
+  otherAnswer?: (id: string) => number;
 }
 
 function event(id: string, body: string, over: Partial<CanonicalChatEvent> = {}): CanonicalChatEvent {
@@ -162,7 +164,7 @@ async function setup(opts: SetupOpts = {}) {
     const answers: Record<string, unknown> = {};
     for (const id of Object.keys(body.questions)) {
       const name = id.replace(/^duplicate__/, "");
-      answers[id] = { noul: duplicateCall ? (opts.answer?.(name, body.state) ?? 0.1) : 0.01 };
+      answers[id] = { noul: duplicateCall ? (opts.answer?.(name, body.state) ?? 0.1) : (opts.otherAnswer?.(id) ?? 0.01) };
     }
     return new Response(JSON.stringify({ model: "vendor/decider-1", answers, usage: { input_tokens: 10, output_tokens: 1, cost: 0 } }), {
       status: 200,
@@ -512,5 +514,66 @@ test("a recheck past the checkpoint deadline takes the normal late path: the sen
   assert.equal(t.decisions.length, 2);
   await new Promise((r) => setTimeout(r, 700));
   assert.deepEqual((await t.consequences()).map(([, c]) => c), ["sent_unjudged"]);
+  storage.close();
+});
+
+const styleQuestion = { source: "message", instructions: "`message` is figurative.", criteria: { true: "t", false: "f" }, threshold: 0.8 };
+
+test("a blocking verdict in hand is never rechecked: a style flag judged in time blocks even when a message arrives meanwhile", async () => {
+  const storage = await newStorage();
+  await botMessage(storage, "e1", "Let me check.", CUTOFF + 1000);
+  const t = await setup({
+    storage,
+    knobs: { send_deadline_ms: 400 },
+    checks: { duplicate: { enabled: true }, style_q: { kind: "style", min_chars: 0, questions: [styleQuestion] } },
+    otherAnswer: (id) => (id.startsWith("style_q") ? 0.95 : 0.01),
+    onDuplicateCall: async (n) => {
+      // Another session posts during the first judgement; a recheck would miss the deadline.
+      if (n === 1) await botMessage(storage, "e2", "unrelated", Date.now());
+      if (n === 2) await new Promise((r) => setTimeout(r, 600));
+    },
+  });
+  assert.match(await t.call({ message: "The answer is 42." }), /style_q/);
+  assert.equal(t.decisions.length, 1, "no recheck once a blocking check fired");
+  assert.ok(!t.lines.some(([e]) => e === "check_duplicate_rechecked"));
+  assert.deepEqual((await t.consequences()).map(([, c]) => c), ["revise"]);
+  storage.close();
+});
+
+test("a recheck that misses the deadline acts on the verdict in hand, never on pattern hits alone", async () => {
+  const storage = await newStorage();
+  await botMessage(storage, "e1", "Let me check.", CUTOFF + 1000);
+  const t = await setup({
+    storage,
+    knobs: { send_deadline_ms: 400 },
+    checks: { duplicate: { enabled: true }, style_q: { kind: "style", min_chars: 0, questions: [styleQuestion] } },
+    otherAnswer: (id) => (id.startsWith("style_q") ? 0.95 : 0.01),
+    onDuplicateCall: async () => {
+      await new Promise((r) => setTimeout(r, 600));
+    },
+  });
+  const id = "direct-settle-1";
+  const args = { message: "The answer is 42." };
+  t.messages.push({ role: "assistant", content: [{ type: "toolCall", id, name: "send_message", arguments: args }], timestamp: 2 });
+  const evaluation = t.gate.begin("send", id, t.gate.subjectForCall("send_message", id, args))!;
+  // A recheck that extends the evaluation past its deadline (the slow duplicate call).
+  const verdict = await t.gate.settle(id, {
+    held: true,
+    recheck: () =>
+      t.gate.evaluator.extendDuplicate(
+        evaluation,
+        {
+          targetTimelineKey: OWN,
+          ownTimelineKey: OWN,
+          draftAt: Date.now(),
+          earlier: [{ eventIds: ["e1"], sessionId: "s-other001", receivedAt: CUTOFF + 1000, text: "Let me check.", answering: "unprompted" }],
+          draftAnswering: "unprompted",
+          earlierMaxTokens: 1500,
+        },
+        { rerun: true },
+      ),
+  });
+  assert.equal(verdict.late, false);
+  assert.deepEqual(verdict.revise.map((f) => f.code), ["style_q"], "the in-hand style verdict is kept");
   storage.close();
 });

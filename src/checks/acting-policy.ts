@@ -144,8 +144,10 @@ export function createActingPolicy(deps: ActingPolicyDeps): ActingGatePolicy {
 
     act(info, verdict): GateAction {
       // In time, the decision was taken when the verdict was recorded; past the
-      // deadline this is the first look (pattern hits only).
-      const act = decideRefusal(info, verdict, !refusalActs.has(info));
+      // deadline this is the first look (pattern hits only). A verdict judged in
+      // time but acted on before it is recorded (a duplicate recheck that missed
+      // the deadline, `late: false`) is decided on in full.
+      const act = decideRefusal(info, verdict, verdict.late ?? !refusalActs.has(info));
       if (act) return actOnRefusal(info, verdict, act);
       const decision = decideRevise(info, verdict);
       if (decision?.kind === "block") return { kind: "block", message: decision.message };

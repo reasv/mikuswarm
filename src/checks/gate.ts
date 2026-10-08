@@ -74,6 +74,11 @@ export interface GateVerdict {
   revise: FiredCheck[];
   /** No verdict in time (deadline) or a judged call fell back. */
   unjudged: boolean;
+  /**
+   * The verdict missed its deadline (only pattern hits are in it); false when
+   * it was judged in time. Absent = unknown (a policy decides as before).
+   */
+  late?: boolean;
   latencyMs: number;
 }
 
@@ -306,8 +311,24 @@ export class OutputGate implements SessionEndingHook {
     };
     let inTime = await waitDone();
     // One more look before the verdict acts (the duplicate check, at most once):
-    // an extension runs within the same deadline; past it, the normal late path.
-    if (inTime && opts.recheck?.()) inTime = await waitDone();
+    // an extension runs within the same deadline. The verdict in hand is never
+    // thrown away: when the extension misses the deadline, the output is acted
+    // on with it (and the whole evaluation is recorded when it completes).
+    const inHand = inTime ? evaluation.result : undefined;
+    if (inHand && opts.recheck?.()) {
+      inTime = await waitDone();
+      if (!inTime) {
+        void this.recordEntry(key, entry, { held, heldMs: held ? this.now() - heldFrom : 0 });
+        return {
+          evaluationIds: [],
+          fired: [...inHand.fired],
+          ...strongest(inHand.fired),
+          unjudged: inHand.unjudgedReason !== undefined,
+          late: false,
+          latencyMs: inHand.latencyMs,
+        };
+      }
+    }
     if (inTime) return this.recordEntry(key, entry, { held, heldMs: held ? this.now() - heldFrom : 0 });
     const heldMs = held ? this.now() - heldFrom : 0;
     // The output proceeds unjudged; the evaluation still completes and is recorded.
@@ -317,6 +338,7 @@ export class OutputGate implements SessionEndingHook {
       fired: [...evaluation.patternFired],
       ...strongest(evaluation.patternFired),
       unjudged: true,
+      late: true,
       latencyMs: this.now() - evaluation.startedAt,
     };
   }
@@ -339,6 +361,7 @@ export class OutputGate implements SessionEndingHook {
         fired: result.fired,
         ...strongest(result.fired),
         unjudged: late || result.unjudgedReason !== undefined,
+        late,
         latencyMs: result.latencyMs,
       };
       if (evaluation.canceled) return base;
@@ -417,9 +440,10 @@ export class OutputGate implements SessionEndingHook {
   /**
    * After the verdict of a held send (called once, from {@link settle}): when
    * other sessions of the same agent posted to the target timeline while the
-   * call waited and the duplicate check has not fired, judge the draft once more
-   * against every unseen message, new ones included, in the same evaluation
-   * (its deadline unchanged). True = the evaluation was extended.
+   * call waited and no check that blocks (a `revise` or `redo` remedy, the
+   * duplicate check included) has fired, judge the draft once more against
+   * every unseen message, new ones included, in the same evaluation (its
+   * deadline unchanged). True = the evaluation was extended.
    */
   private recheckDuplicate(
     toolName: string,
@@ -428,7 +452,8 @@ export class OutputGate implements SessionEndingHook {
     entry: Entry,
   ): boolean {
     const fired = entry.evaluation.result?.fired ?? [];
-    if (fired.some((f) => f.kind === "duplicate")) return false;
+    // A blocking verdict is already in hand: the output is not sent as is anyway.
+    if (fired.some((f) => f.kind === "duplicate" || f.remedy === "revise" || f.remedy === "redo")) return false;
     return this.duplicateStage(toolName, toolCallId, args, entry, true);
   }
 
