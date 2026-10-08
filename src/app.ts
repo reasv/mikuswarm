@@ -5809,6 +5809,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       return;
     }
     entry.folded += 1;
+    // A join that delivered nothing gives its slot back (once).
+    let released = false;
+    const releaseSlot = (): void => {
+      if (released) return;
+      released = true;
+      entry.folded = Math.max(0, entry.folded - 1);
+    };
     const gapMs = Math.abs(inbound.event.timestamp - entry.inbound.event.timestamp);
     // A trigger-bearing addition brings its trigger hold's group with it.
     const added = triggerGroupOf(inbound);
@@ -5834,6 +5841,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       delivery: { inbound, form: form === "reply" ? "reply" : form },
       added,
       onUndelivered: () => {
+        releaseSlot();
         if (undelivered) return;
         undelivered = true;
         revertFollowUpToNativeFate(inbound, "late_addition_undelivered");
@@ -5842,7 +5850,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     logger.info("late_input_addition", { sessionId: entry.sessionId, eventId: inbound.event.id, form, admittedBy, outcome });
     if (outcome === "ignored") {
       // It did not join: the budget is not used.
-      entry.folded = Math.max(0, entry.folded - 1);
+      releaseSlot();
       if (!undelivered) {
         undelivered = true;
         revertFollowUpToNativeFate(inbound, "late_addition_after_run_end");
