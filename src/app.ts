@@ -5142,6 +5142,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   interface LateInputEntry {
     sessionId: string;
     timelineKey: string;
+    sessionType: string;
     /** The session's trigger inbound; its group grows and shrinks with corrections. */
     inbound: InboundChatEvent;
     ctl: LateInputSession;
@@ -5179,7 +5180,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     });
   }
 
-  function registerLateInputEntry(entry: Pick<LateInputEntry, "sessionId" | "timelineKey" | "inbound" | "ctl">): LateInputEntry {
+  function registerLateInputEntry(entry: Pick<LateInputEntry, "sessionId" | "timelineKey" | "sessionType" | "inbound" | "ctl">): LateInputEntry {
     const registered: LateInputEntry = { ...entry, revive: async () => false, judged: 0, folded: 0, parked: [] };
     lateInputEntries.set(entry.sessionId, registered);
     // A session that ends any other way than completed (discarded before it ran,
@@ -5636,7 +5637,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       agentName,
       attribution: {
         agentSessionId: entry.sessionId,
-        sessionType: "default",
+        sessionType: entry.sessionType,
         timelineKey: entry.timelineKey,
         triggerSenderId: inbound.event.sender.id,
       },
@@ -8022,7 +8023,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // applies to the default chat lane only.
     const lateCtl = createLateInputSession(inbound, session, { proactive, isBotTriggered });
     const lateEntry = lateCtl
-      ? registerLateInputEntry({ sessionId: session.id, timelineKey: session.timelineKey, inbound, ctl: lateCtl })
+      ? registerLateInputEntry({ sessionId: session.id, timelineKey: session.timelineKey, sessionType: session.sessionType, inbound, ctl: lateCtl })
       : undefined;
     let userLimitForCreate: UserLimitGate["userLimit"];
     let userCeilingOverride: number | undefined;
