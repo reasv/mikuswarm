@@ -481,6 +481,7 @@ const memoryPipeline = {
     block: '<retrieved_memory note="n">\n- [memory/x.md:1-2 · R] An older decision.\n</retrieved_memory>',
     report: { source: "unjudged", candidates: 1, judged: 0, kept: 1, hidden: 0, tokens: 10, ms: 1, stages: { recallMs: 1 }, items: [] },
   }),
+  waitBudgetMs: () => 1000,
 } as unknown as MemoryRetrievalPipeline;
 const EXPECT = "TAIL-MD\n</tail_instructions>\n\n<X/>\n\n<session_instruction>\nSI\n</session_instruction>\n</system>";
 
