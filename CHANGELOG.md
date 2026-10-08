@@ -75,6 +75,8 @@ Unreleased section; it is not part of any release's notes.
   bad block never holds its neighbours back, an outage blames no block, and a block
   that keeps failing on its own is given up for that model (it stays findable through
   the built-in index). The late-interaction index handles failures the same way.
+  `query_prefix` / `document_prefix` give instruction-trained embedders (Qwen3-Embedding,
+  EmbeddingGemma) their prompts; they key the index, so changing one re-embeds.
 - Retrieval observability: a `memory_retrieval` log line per build, per-build rows
   with every candidate's fate (shown as a retrieval card in the console's session
   view, with the items the fallback rule chose marked; written once the build's kickoff

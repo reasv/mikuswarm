@@ -269,6 +269,11 @@ const RetrievalEmbeddingPrimarySchema = StrictObject({
   zdr: Type.Optional(Type.Boolean()),
   self_hosted: Type.Optional(Type.Boolean()),
   chars_per_token: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),
+  // Text prepended to the query / to each document before embedding, for models
+  // trained with instructions (Qwen3-Embedding, EmbeddingGemma). Both are part
+  // of the primary index's model id, so changing either re-embeds. Default "".
+  query_prefix: Type.Optional(Type.String()),
+  document_prefix: Type.Optional(Type.String()),
 });
 
 const RetrievalEmbeddingSchema = StrictObject({

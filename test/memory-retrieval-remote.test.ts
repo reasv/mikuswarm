@@ -16,6 +16,7 @@ import {
   createRetrievalSubsystem,
   resolveRetrievalConfig,
 } from "../src/retrieval/index.js";
+import { remoteEmbeddingModelId } from "../src/retrieval/embedding/remote.js";
 import { GptTokenizer } from "../src/context/tokenizer/index.js";
 
 async function withStorage(run: (s: Storage) => Promise<void>): Promise<void> {
@@ -67,6 +68,45 @@ test("RemoteEmbeddingProvider posts OpenAI-shaped requests and normalizes vector
     assert.equal(vecs.length, 2);
     assert.ok(Math.abs(vecs[0]![0]! - 1) < 1e-6, "normalized to unit length");
     await provider.close();
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+});
+
+test("RemoteEmbeddingProvider applies query/document prefixes and keys the model id on them", async () => {
+  const inputs: string[][] = [];
+  const server = http.createServer((req, res) => {
+    let chunks = "";
+    req.on("data", (c) => (chunks += c));
+    req.on("end", () => {
+      const input: string[] = JSON.parse(chunks).input;
+      inputs.push(input);
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ data: input.map((_t, i) => ({ embedding: [1, i, 0, 0], index: i })) }));
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as AddressInfo).port;
+  const chain = [{ logicalId: "e", config: { id: "org/embed", endpoint: `http://127.0.0.1:${port}/v1`, input_modalities: ["text"], max_tokens: 1, context_window: 1 } as never }];
+  try {
+    const queryPrefix = "Instruct: Given a chat request, retrieve relevant past messages\nQuery: ";
+    const provider = new RemoteEmbeddingProvider({ chain, dim: 4, batchSize: 1, queryPrefix, documentPrefix: "doc: " });
+    await provider.embedDocuments(["alpha", "beta"]);
+    await provider.embedQuery("gamma");
+    assert.deepEqual(inputs, [["doc: alpha"], ["doc: beta"], [`${queryPrefix}gamma`]]);
+
+    // Unprefixed: the plain wire id and raw text (an existing index keeps its id).
+    const plain = new RemoteEmbeddingProvider({ chain, dim: 4, batchSize: 8 });
+    assert.equal(plain.modelId, "org/embed");
+    await plain.embedQuery("gamma");
+    assert.deepEqual(inputs.at(-1), ["gamma"]);
+    // Prefixed: the id carries a hash of both prefixes, so changing either re-embeds.
+    assert.match(provider.modelId, /^org\/embed#[0-9a-f]{12}$/);
+    assert.equal(provider.modelId, remoteEmbeddingModelId("org/embed", queryPrefix, "doc: "));
+    assert.notEqual(provider.modelId, remoteEmbeddingModelId("org/embed", queryPrefix, ""));
+    assert.notEqual(remoteEmbeddingModelId("org/embed", "a", ""), remoteEmbeddingModelId("org/embed", "", "a"));
+    await provider.close();
+    await plain.close();
   } finally {
     await new Promise<void>((r) => server.close(() => r()));
   }

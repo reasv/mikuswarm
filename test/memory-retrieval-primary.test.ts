@@ -110,7 +110,13 @@ test("dual index: primary used once complete and in time; built-in otherwise", a
 test("config: a primary embedder must declare zdr or self_hosted", () => {
   assert.throws(() => resolveRetrievalConfig({ enabled: true, embedding: { primary: { model: "e", dim: 8 } } } as any), /zdr = true or self_hosted = true/);
   const ok = resolveRetrievalConfig({ enabled: true, embedding: { primary: { model: "e", dim: 8, self_hosted: true } } } as any);
-  assert.deepEqual(ok.embedding.primary, { model: "e", dim: 8, timeoutMs: 1000, charsPerToken: undefined });
+  assert.deepEqual(ok.embedding.primary, { model: "e", dim: 8, timeoutMs: 1000, charsPerToken: undefined, queryPrefix: "", documentPrefix: "" });
+  const prefixed = resolveRetrievalConfig({
+    enabled: true,
+    embedding: { primary: { model: "e", dim: 8, self_hosted: true, query_prefix: "task: search result | query: ", document_prefix: "title: none | text: " } },
+  } as any);
+  assert.equal(prefixed.embedding.primary?.queryPrefix, "task: search result | query: ");
+  assert.equal(prefixed.embedding.primary?.documentPrefix, "title: none | text: ");
   assert.equal(resolveRetrievalConfig({ enabled: true, embedding: { primary: { model: "e", dim: 8, zdr: true, enabled: false } } } as any).embedding.primary, null);
 });
 

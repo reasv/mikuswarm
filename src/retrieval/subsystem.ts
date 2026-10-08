@@ -325,6 +325,8 @@ export async function createRetrievalSubsystem(
         scheduler: opts.scheduler,
         isModelAvailable: opts.isModelAvailable,
         charsPerToken: config.embedding.primary.charsPerToken,
+        queryPrefix: config.embedding.primary.queryPrefix,
+        documentPrefix: config.embedding.primary.documentPrefix,
         onUsage: (info) =>
           opts.budget?.record?.({
             class: "embedding",

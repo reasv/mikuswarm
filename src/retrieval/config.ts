@@ -103,6 +103,10 @@ export interface ResolvedRetrievalConfig {
       dim: number;
       timeoutMs: number;
       charsPerToken?: number;
+      /** Prepended to the query text before embedding ("" = none). */
+      queryPrefix: string;
+      /** Prepended to each document text before embedding ("" = none). */
+      documentPrefix: string;
     } | null;
   };
   /** Cross-encoder re-rank stage (§9d "Re-rank stages"). */
@@ -384,6 +388,8 @@ function resolvePrimary(
     dim: raw.dim,
     timeoutMs: raw.timeout_ms ?? 1000,
     charsPerToken: raw.chars_per_token,
+    queryPrefix: raw.query_prefix ?? "",
+    documentPrefix: raw.document_prefix ?? "",
   };
 }
 

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { fetch, ProxyAgent, type Dispatcher } from "undici";
 import type { Logger } from "../../observability/logger.js";
 import { parseRetryAfterMs, type LlmScheduler } from "../../agent/scheduler.js";
@@ -50,6 +51,13 @@ export interface RemoteProviderOptions {
    * be emitted with exact model attribution (spec MODEL-FALLBACK §2.2).
    */
   onUsage?: (info: { promptTokens: number; costUsd: number; logicalModelId: string; modelId: string }) => void;
+  /**
+   * Text prepended to a query / to each document before embedding (default
+   * none), for instruction-trained models. A non-empty prefix is part of
+   * {@link RemoteEmbeddingProvider.modelId}, so changing it re-embeds.
+   */
+  queryPrefix?: string;
+  documentPrefix?: string;
 }
 
 interface EmbeddingsResponse {
@@ -66,11 +74,24 @@ interface EmbeddingsResponse {
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 
 /**
+ * The index model id of a remote embedder: the head's wire id, plus a hash of
+ * the query/document prefixes when either is set (as the built-in model id
+ * covers its prefixes, embedding/local-models.ts), so a prefix change re-embeds
+ * while an unprefixed embedder keeps its plain id.
+ */
+export function remoteEmbeddingModelId(wireId: string, queryPrefix = "", documentPrefix = ""): string {
+  if (!queryPrefix && !documentPrefix) return wireId;
+  const hash = createHash("sha256").update(JSON.stringify({ queryPrefix, documentPrefix })).digest("hex").slice(0, 12);
+  return `${wireId}#${hash}`;
+}
+
+/**
  * Remote embedding provider (ARCHITECTURE.md §9d / design §5d): an OpenRouter/OpenAI
  * -compatible `POST {endpoint}/embeddings` (`{ model, input, encoding_format:"float" }`
  * → `{ data: [{ embedding, index }] }`). `input` accepts an array, so documents embed
  * in batches; queries embed singly. Vectors are L2-normalized to match the local
- * provider and the cosine index. Remote models are symmetric, so query == document.
+ * provider and the cosine index. Query and document text are sent as given unless
+ * `queryPrefix`/`documentPrefix` are set (instruction-trained models).
  */
 export class RemoteEmbeddingProvider implements EmbeddingProvider {
   readonly modelId: string;
@@ -82,7 +103,7 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
     this.options = options;
     // The head's wire id is the stable cache/index key; fallback members must be
     // vector-compatible (see RemoteProviderOptions.chain).
-    this.modelId = options.chain[0]!.config.id;
+    this.modelId = remoteEmbeddingModelId(options.chain[0]!.config.id, options.queryPrefix, options.documentPrefix);
     this.dim = options.dim;
     this.dispatcher = options.httpProxyUrl ? new ProxyAgent(options.httpProxyUrl) : undefined;
   }
@@ -91,7 +112,8 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
     if (texts.length === 0) return [];
     const out: Float32Array[] = [];
     for (let i = 0; i < texts.length; i += this.options.batchSize) {
-      const batch = texts.slice(i, i + this.options.batchSize);
+      const prefix = this.options.documentPrefix ?? "";
+      const batch = texts.slice(i, i + this.options.batchSize).map((t) => prefix + t);
       const vectors = await this.embedBatch(batch, signal);
       out.push(...vectors);
     }
@@ -104,7 +126,7 @@ export class RemoteEmbeddingProvider implements EmbeddingProvider {
     // alike, so an embed-model outage degrades the inline auto-retrieval query
     // to lexical-only instead of blocking the build. A stop-signal abort is
     // NEUTRAL — it never feeds the model-health streak (see embedBatch).
-    const [vec] = await this.embedBatch([text], signal);
+    const [vec] = await this.embedBatch([(this.options.queryPrefix ?? "") + text], signal);
     if (!vec) throw new Error("remote embeddings returned no vector for query");
     return vec;
   }

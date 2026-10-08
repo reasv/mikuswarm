@@ -1058,11 +1058,20 @@ dim = 384
 # built-in one. `model` is a [models.*] block (an OpenAI-compatible /embeddings
 # endpoint) whose fallback members serve the SAME model. Diary text derives from
 # user messages: set zdr = true or self_hosted = true.
+# query_prefix / document_prefix (default "") are prepended to the query / each
+# document before embedding, for instruction-trained models; they are part of
+# the primary index's model id, so changing either re-embeds. Examples:
+#   Qwen3-Embedding: query_prefix = "Instruct: Given a chat request, retrieve relevant past messages\nQuery: "
+#                    (no document prefix)
+#   EmbeddingGemma:  query_prefix = "task: search result | query: "
+#                    document_prefix = "title: none | text: "
 # [retrieval.embedding.primary]
 # model = "embed-gpu"
 # dim = 1024
 # timeout_ms = 1000
 # self_hosted = true
+# query_prefix = ""
+# document_prefix = ""
 
 # Cross-encoder re-rank stage (§9d "Re-rank stages"). Providers are tried in
 # order with health and fallover; a slow member (timeout_ms) falls over to the
