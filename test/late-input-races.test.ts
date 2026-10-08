@@ -541,3 +541,36 @@ test("late input races: a correction while a redo compensates joins the rebuild,
     await h.stop();
   }
 });
+
+test("late input races: a follow-up to a newer request judged not to belong does not join the older session", async () => {
+  let first = true;
+  let judged = 0;
+  const h = await startHarness({
+    toml: LATE({ hold_ms: 0, extend_ms: 0, max_hold_ms: 0 }) + DECIDER(),
+    // The first candidate (the new request) does not belong; the second would.
+    decideNoul: () => (++judged === 1 ? 0.05 : 0.95),
+    script: (req) => {
+      if (isRecordTurnRequest(req)) return { text: "NO_REPLY" };
+      const t = userText(req);
+      if (first) {
+        first = false;
+        return { ...send("sunny"), delayMs: 1500 };
+      }
+      if (t.includes("translate")) return send(t.includes("into German") ? "Hallo" : "hello");
+      return send(t.includes("into German") ? "weather+German?!" : "sunny");
+    },
+  });
+  try {
+    h.say("weather in Rome?", { mention: true });
+    await h.until(() => h.llm.requests.length >= 1, "first request");
+    h.say("translate 'hello'", { mention: true });
+    await h.until(() => hasLog(h, "follow_up_native_redispatch"), "the new request is rejected and redispatched");
+    h.say("into German");
+    await h.until(() => h.sends.length >= 2 && settledAll(h)(), "both answered", 15_000);
+    const weather = h.llm.requests.filter((r) => !isRecordTurnRequest(r) && userText(r).includes("weather in Rome") && !userText(r).includes("translate"));
+    assert.ok(weather.every((r) => !userText(r).includes("into German")), "the follow-up never joined the weather request");
+    assert.ok(!bodies(h).includes("weather+German?!"));
+  } finally {
+    await h.stop();
+  }
+});

@@ -4066,11 +4066,29 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   const STEERED_EVENT_ID_CAP = 1024;
   function markSteered(eventId: string): void {
     steeredEventIds.add(eventId);
+    releasedEventIds.delete(eventId);
     if (steeredEventIds.size > STEERED_EVENT_ID_CAP) {
       // `Set` preserves insertion order — evict the oldest id.
       const oldest = steeredEventIds.values().next().value;
       if (oldest !== undefined) steeredEventIds.delete(oldest);
     }
+  }
+  // Steered ids released to their native fate (a late addition judged not to
+  // belong, a fold whose owner settled): still marked, so their twins stay
+  // suppressed, but not consumed by any session (a released request is a
+  // request of its own for causality routing). Bounded like `steeredEventIds`.
+  const releasedEventIds = new Set<string>();
+  function markReleased(eventId: string): void {
+    if (!steeredEventIds.has(eventId)) return;
+    releasedEventIds.add(eventId);
+    if (releasedEventIds.size > STEERED_EVENT_ID_CAP) {
+      const oldest = releasedEventIds.values().next().value;
+      if (oldest !== undefined) releasedEventIds.delete(oldest);
+    }
+  }
+  /** Consumed by a session: steered and not released to its native fate. */
+  function consumedBySession(eventId: string): boolean {
+    return steeredEventIds.has(eventId) && !releasedEventIds.has(eventId);
   }
 
   function steerReplyToActiveSession(inbound: InboundChatEvent): boolean {
@@ -4933,6 +4951,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
    * as a normal timeline event, so there is nothing to do (= today, no loss).
    */
   function revertFollowUpToNativeFate(inbound: InboundChatEvent, reason: string): void {
+    for (const id of triggerGroupOf(inbound)) markReleased(id);
     if (inbound.trigger) {
       logger.info("follow_up_native_redispatch", {
         reason,
@@ -5280,7 +5299,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         e.timestamp > after &&
         e.sender.id === senderId &&
         !group.has(e.id) &&
-        !steeredEventIds.has(e.id) &&
+        !consumedBySession(e.id) &&
         (dm ||
           e.mentions?.mentionedSelf === true ||
           (e.externalId !== undefined && sessionClaims.claimantOf(entry.timelineKey, e.externalId) !== undefined)),
