@@ -261,6 +261,10 @@ const RetrievalEmbeddingSchema = StrictObject({
     StrictObject({
       model: Type.Optional(Type.String({ minLength: 1 })),
       dim: Type.Optional(Type.Integer({ minimum: 1 })),
+      // Override the model's built-in query/passage prefixes ("" = none). Changing
+      // either changes the vectors, so the index re-embeds (§9d).
+      query_prefix: Type.Optional(Type.String()),
+      passage_prefix: Type.Optional(Type.String()),
     }),
   ),
   remote: Type.Optional(RetrievalEmbeddingRemoteSchema),

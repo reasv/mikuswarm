@@ -7,6 +7,7 @@ import { RemoteEmbeddingProvider } from "./remote.js";
 
 export { type EmbeddingProvider, LocalEmbeddingProvider, l2normalize } from "./provider.js";
 export { RemoteEmbeddingProvider } from "./remote.js";
+export { ensureHfModel, resolveLocalModel } from "./local-models.js";
 
 export interface CreateProviderOptions {
   /** Directory for the local model's ONNX weight cache (first-run download). */
@@ -64,6 +65,8 @@ export function createEmbeddingProvider(
   return new LocalEmbeddingProvider({
     model: config.embedding.local.model,
     dim: config.embedding.local.dim,
+    queryPrefix: config.embedding.local.queryPrefix,
+    passagePrefix: config.embedding.local.passagePrefix,
     cacheDir: opts.cacheDir,
     logger: opts.logger,
   });

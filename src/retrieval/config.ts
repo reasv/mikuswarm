@@ -1,4 +1,5 @@
 import type { RetrievalConfig } from "../config/index.js";
+import { resolveLocalModel } from "./embedding/local-models.js";
 
 /**
  * Resolved memory-retrieval settings (ARCHITECTURE.md §9d). The TypeBox schema
@@ -47,7 +48,13 @@ export interface ResolvedRetrievalConfig {
   embedding: {
     /** Resolved active provider: remote iff a remote block is configured (§5a). */
     provider: "local" | "remote";
-    local: { model: string; dim: number };
+    local: {
+      model: string;
+      dim: number;
+      /** Overrides of the model's built-in prefixes (embedding/local-models.ts); unset = built-in. */
+      queryPrefix?: string;
+      passagePrefix?: string;
+    };
     remote: {
       /** `[models.*]` block name (spec MODEL-FALLBACK §2.3); the chain is resolved at app wiring. */
       model: string;
@@ -106,6 +113,8 @@ export function resolveRetrievalConfig(config: RetrievalConfig | undefined): Res
       local: {
         model: embedding.local?.model ?? DEFAULT_LOCAL_MODEL,
         dim: embedding.local?.dim ?? DEFAULT_LOCAL_DIM,
+        queryPrefix: embedding.local?.query_prefix,
+        passagePrefix: embedding.local?.passage_prefix,
       },
       remote: remoteBlock
         ? {
@@ -197,5 +206,5 @@ export function activeEmbeddingDim(resolved: ResolvedRetrievalConfig): number {
 export function activeEmbeddingModelId(resolved: ResolvedRetrievalConfig): string {
   return resolved.embedding.provider === "remote" && resolved.embedding.remote
     ? resolved.embedding.remote.model
-    : `local:${resolved.embedding.local.model}`;
+    : resolveLocalModel(resolved.embedding.local.model, resolved.embedding.local).modelId;
 }

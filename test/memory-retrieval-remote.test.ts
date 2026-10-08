@@ -333,10 +333,10 @@ test("RemoteEmbeddingProvider: a stop-signal abort during fetch stays NEUTRAL (#
   }
 });
 
-test("LocalEmbeddingProvider throws when passageEmbed returns the wrong vector count (#6)", async () => {
+test("LocalEmbeddingProvider throws when fastembed returns the wrong vector count (#6)", async () => {
   // The local provider binds out[i] to texts[i]'s content-hash positionally; a
   // fastembed under-count/reorder would silently misalign vectors with hashes. Inject
-  // a fake `flag` whose passageEmbed yields one vector for two inputs and assert the
+  // a fake `flag` whose embed yields one vector for two inputs and assert the
   // descriptive count guard throws (the native fastembed module is not exercised).
   const provider = new LocalEmbeddingProvider({
     model: "bge-small-en-v1.5",
@@ -346,7 +346,7 @@ test("LocalEmbeddingProvider throws when passageEmbed returns the wrong vector c
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (provider as any).flag = Promise.resolve({
     // Two inputs in, but only one vector out.
-    async *passageEmbed(_texts: string[], _batchSize: number) {
+    async *embed(_texts: string[], _batchSize: number) {
       yield [[1, 0, 0, 0]];
     },
   });

@@ -1,4 +1,5 @@
 import type { Logger } from "../../observability/logger.js";
+import { ensureHfModel, type ResolvedLocalModel, resolveLocalModel } from "./local-models.js";
 
 /**
  * Internal cap on fastembed's onnxruntime batch size, decoupled from the remote
@@ -45,28 +46,17 @@ export function l2normalize(values: number[] | Float32Array): Float32Array {
   return out;
 }
 
-/** Map a config model name to a fastembed model id string (§5c). */
-function fastembedModelId(name: string): string {
-  switch (name) {
-    case "bge-small-en-v1.5":
-      return "fast-bge-small-en-v1.5";
-    case "bge-small-en":
-      return "fast-bge-small-en";
-    case "all-MiniLM-L6-v2":
-      return "fast-all-MiniLM-L6-v2";
-    case "bge-base-en-v1.5":
-      return "fast-bge-base-en-v1.5";
-    default:
-      // Unknown → assume it is already a fastembed id; let init fail loudly if not.
-      return name;
-  }
-}
-
 export interface LocalProviderOptions {
   model: string;
   dim: number;
   /** Where fastembed downloads/caches ONNX weights (first run only). */
   cacheDir: string;
+  /** Override the model's built-in query prefix (see local-models.ts). */
+  queryPrefix?: string;
+  /** Override the model's built-in passage prefix. */
+  passagePrefix?: string;
+  /** Hugging Face base URL for pinned model downloads; defaults to `$HF_ENDPOINT` or huggingface.co. */
+  hfEndpoint?: string;
   logger?: Logger;
 }
 
@@ -74,13 +64,16 @@ export interface LocalProviderOptions {
  * Local in-process embedder backed by fastembed (onnxruntime-node). The native
  * module and model weights load lazily on the first embed call — first-run download
  * happens in the background indexer, never on a user trigger (§5c). Asymmetric
- * retrieval: documents via `passageEmbed`, queries via `queryEmbed` (the model's
- * trained prefixes), both within the SAME model so the spaces stay comparable (§5a).
+ * retrieval: documents and queries each get the model's own trained prefix (the
+ * table in local-models.ts, overridable per config), both within the SAME model so
+ * the spaces stay comparable (§5a). fastembed's `passageEmbed`/`queryEmbed` are not
+ * used: they prepend the e5 prefixes whatever the model.
  */
 export class LocalEmbeddingProvider implements EmbeddingProvider {
   readonly modelId: string;
   readonly dim: number;
   private readonly options: LocalProviderOptions;
+  private readonly model: ResolvedLocalModel;
   // fastembed's FlagEmbedding instance, lazily created. Untyped to keep the native
   // dependency out of the type graph (it is dynamically imported).
   private flag: Promise<any> | null = null;
@@ -90,7 +83,11 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
 
   constructor(options: LocalProviderOptions) {
     this.options = options;
-    this.modelId = `local:${options.model}`;
+    this.model = resolveLocalModel(options.model, {
+      queryPrefix: options.queryPrefix,
+      passagePrefix: options.passagePrefix,
+    });
+    this.modelId = this.model.modelId;
     this.dim = options.dim;
   }
 
@@ -98,12 +95,23 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     if (!this.flag) {
       this.flag = (async () => {
         const fastembed: any = await import("fastembed");
-        this.options.logger?.info("embedding_model_init", { model: this.options.model });
-        const flag = await fastembed.FlagEmbedding.init({
-          model: fastembedModelId(this.options.model),
-          cacheDir: this.options.cacheDir,
-          showDownloadProgress: false,
-        });
+        this.options.logger?.info("embedding_model_init", { model: this.options.model, modelId: this.modelId });
+        const hf = this.model.spec.hf;
+        const flag = hf
+          ? await fastembed.FlagEmbedding.init({
+              model: fastembed.EmbeddingModel.CUSTOM,
+              modelAbsoluteDirPath: await ensureHfModel(this.options.cacheDir, hf, {
+                endpoint: this.options.hfEndpoint,
+                logger: this.options.logger,
+              }),
+              modelName: hf.onnxFile,
+              pooling: hf.pooling,
+            })
+          : await fastembed.FlagEmbedding.init({
+              model: this.model.spec.fastembedId,
+              cacheDir: this.options.cacheDir,
+              showDownloadProgress: false,
+            });
         // fastembed pads every input to the model's full max length (512 tokens),
         // so a six-word query costs a full-length forward pass: hundreds of ms of
         // synchronous native work on the event loop. Padded positions are masked
@@ -131,11 +139,12 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     if (signal?.aborted) throw new Error("embedDocuments aborted before start");
     const flag = await this.embedding();
     const out: Float32Array[] = [];
-    // passageEmbed yields batches of number[][]; flatten and normalize. The second
-    // arg is fastembed's onnxruntime batch size — cap it independently of the
+    // embed yields batches of number[][]; flatten and normalize. The second arg is
+    // fastembed's onnxruntime batch size — cap it independently of the
     // remote-oriented `embed_batch_size` knob so local memory stays bounded (#13).
     const batchSize = this.unpadded ? 1 : Math.min(texts.length, LOCAL_EMBED_BATCH_CAP);
-    for await (const batch of flag.passageEmbed(texts, batchSize) as AsyncGenerator<number[][]>) {
+    const prefixed = texts.map((t) => this.model.passagePrefix + t);
+    for await (const batch of flag.embed(prefixed, batchSize) as AsyncGenerator<number[][]>) {
       for (const vec of batch) out.push(l2normalize(vec));
     }
     // Guard one-vector-per-input (mirrors the remote provider's count check). The
@@ -158,8 +167,10 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     // during the lexical half). Mirrors the early-abort guard in embedDocuments.
     if (signal?.aborted) throw new Error("embedQuery aborted before start");
     const flag = await this.embedding();
-    const vec: number[] = await flag.queryEmbed(text);
-    return l2normalize(vec);
+    for await (const batch of flag.embed([this.model.queryPrefix + text], 1) as AsyncGenerator<number[][]>) {
+      if (batch[0]) return l2normalize(batch[0]);
+    }
+    throw new Error(`local embedder returned no vector for the query (${this.modelId})`);
   }
 
   async close(): Promise<void> {

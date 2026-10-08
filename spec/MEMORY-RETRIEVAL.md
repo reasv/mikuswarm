@@ -221,6 +221,7 @@ A late-interaction model encodes text into one small vector per token (e.g. 128 
      - a one-off rebuild of hours on CPU, or about half an hour on a GPU that is released afterwards.
      A small model in the same space then queries that index on CPU.
    - **Published gain of this asymmetric pair** (pplx-embed-v2-late: 0.6B queries on a 9B index, against 0.6B on both sides): ViDoRe v3 image 62.3 → 63.5, and +1.6 points on Perplexity's domain-specific set. 9B on both sides is better still, but needs the GPU at query time.
+   - **The bar is a meaningful, useful benefit, not a marginal one** (owner, 2026-10-08). A large model can have 10–20 GB of memory on a server that has it, but that is not free. The choice is reversible: the index can be rebuilt with the small model at any time.
    - **Whether it is worthwhile is a measurement on the §9 set.** Compare small/small, small-query/large-index, and the best small CPU alternative (e.g. an ONNX late model).
      - **Weigh the gain against the costs:** the large model's index-time compute, and the serving path. Today the pplx late models have no ONNX export and use linear-attention layers with no known fast CPU kernel, so even the small query encoder may need a PyTorch sidecar (see the survey).
 2. **MaxSim,** in proportion to query tokens × document tokens scored × dimensions.

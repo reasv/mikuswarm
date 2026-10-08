@@ -994,6 +994,11 @@ provider = "local"                # 'local' | 'remote'
 [retrieval.embedding.local]
 model = "bge-small-en-v1.5"       # fastembed, 384-dim, English (§5c)
 dim = 384
+# Each model embeds with its own trained prefixes (bge: the retrieval instruction on
+# queries, nothing on passages; e5: "query: "/"passage: "). Set these to override;
+# "" means no prefix. Changing either re-embeds the whole memory index.
+# query_prefix = "Represent this sentence for searching relevant passages: "
+# passage_prefix = ""
 
 # Optional remote endpoint. Unified registry (spec MODEL-FALLBACK §2.3): `model`
 # REFERENCES a [models.*] block (endpoint/id/api_key + cost.input = USD/1M input
