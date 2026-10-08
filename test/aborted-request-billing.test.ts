@@ -25,7 +25,7 @@ import { AgentSessionFactory } from "../src/agent/factory.js";
 import { getRequestAttemptState, withRequestRetry, type AbortedRequestInfo } from "../src/agent/request-retry.js";
 import { LlmRequestRing } from "../src/agent/request-ring.js";
 import { LlmScheduler, withSchedulerAdmission } from "../src/agent/scheduler.js";
-import { estimateAbortedRequestUsage } from "../src/agent/usage.js";
+import { ABORTED_OUTPUT_TOKENS_PER_SECOND, estimateAbortedRequestUsage } from "../src/agent/usage.js";
 import type { AgentSessionRecord } from "../src/agent/session-manager.js";
 import type { AppConfig } from "../src/config/index.js";
 import type { BuiltContext, ContextBuilder } from "../src/context/builder.js";
@@ -511,4 +511,14 @@ test("usage_events.estimated: 1 when flagged, null otherwise; the tool-calls API
   } finally {
     storage.close();
   }
+});
+
+test("estimate: hidden reasoning (no deltas) is billed at a per-second floor of the time it streamed", () => {
+  const info = { message: aborted({ input: 100 }), streamedText: "", firstEventSeen: true, streamingMs: 5_000 };
+  const est = estimateAbortedRequestUsage(info, { costRates: RATES, healthKey: "h", promptEstimate: 0, now: 0 });
+  assert.equal(est.usage.output, 5 * ABORTED_OUTPUT_TOKENS_PER_SECOND);
+  // Streamed deltas larger than the floor win; no first event, no floor.
+  const long = "word ".repeat(400);
+  assert.equal(estimateAbortedRequestUsage({ ...info, streamedText: long }, { healthKey: "h", promptEstimate: 0, now: 0 }).usage.output, estimateTokens(long));
+  assert.equal(estimateAbortedRequestUsage({ ...info, firstEventSeen: false }, { healthKey: "h", promptEstimate: 0, now: 0 }).usage.output, 0);
 });

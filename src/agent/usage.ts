@@ -338,15 +338,25 @@ export interface AbortedRequestEstimate {
 const DEFAULT_PROMPT_CACHE_TTL_MS = 300_000;
 
 /**
+ * Floor of an aborted request's output, per second it streamed: a model whose
+ * reasoning is hidden (encrypted, or not streamed) bills thinking tokens the
+ * deltas never show. Deliberately low, so the floor stays under what any model
+ * generates in that time and only matters when the deltas undercount.
+ */
+export const ABORTED_OUTPUT_TOKENS_PER_SECOND = 20;
+
+/**
  * Estimate the billed usage of an aborted request. Reported input counts
  * (input, cache read, cache write) are kept as reported; without them the prompt
  * estimate is split into a cache read of the last billed prompt (same cache
  * domain, within the TTL) and uncached input for the rest. The output is the
- * larger of the reported output and the token count of the streamed text,
- * thinking and tool-call argument deltas.
+ * largest of the reported output, the token count of the streamed text,
+ * thinking and tool-call argument deltas, and a floor of
+ * {@link ABORTED_OUTPUT_TOKENS_PER_SECOND} per second the stream ran (hidden
+ * reasoning streams no deltas but is billed).
  */
 export function estimateAbortedRequestUsage(
-  info: Pick<AbortedRequestInfo, "message" | "streamedText" | "firstEventSeen">,
+  info: Pick<AbortedRequestInfo, "message" | "streamedText" | "firstEventSeen" | "streamingMs">,
   opts: AbortedRequestEstimateOptions,
 ): AbortedRequestEstimate {
   const reported = info.message?.usage as Partial<Usage> | undefined;
@@ -379,7 +389,10 @@ export function estimateAbortedRequestUsage(
   } catch {
     /* tokenization is best-effort */
   }
-  const output = Math.max(finiteOrZero(reported?.output), streamed);
+  const timed = info.firstEventSeen
+    ? Math.round((Math.max(0, finiteOrZero(info.streamingMs)) / 1000) * ABORTED_OUTPUT_TOKENS_PER_SECOND)
+    : 0;
+  const output = Math.max(finiteOrZero(reported?.output), streamed, timed);
   const usage: Usage = {
     input,
     output,
