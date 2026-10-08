@@ -18,7 +18,8 @@
 import { nanoid } from "nanoid";
 import type { Logger } from "../../observability/logger.js";
 import type { DecisionEngine } from "../../decisions/registry.js";
-import { DEFAULT_MEMORY_CONVERSATION_MESSAGES, memoryPointKnobs } from "../../decisions/config.js";
+import { DEFAULT_MEMORY_CONVERSATION_MESSAGES, DEFAULT_TIMEOUT_MS, memoryPointKnobs, pointSettings } from "../../decisions/config.js";
+import type { PriorityClass } from "../../agent/scheduler.js";
 import { memoryPoint, type MemoryPassageVerdict } from "../../decisions/points/memory.js";
 import type { LexicalHit } from "../../storage/database.js";
 import type { MemoryRetrievalStore } from "../../storage/memory-retrieval-store.js";
@@ -54,6 +55,61 @@ export const UNJUDGED_NOTE =
 
 /** Conversation tail joined to the request for the cross-encoder query. */
 const RERANK_TAIL_MESSAGES = 3;
+
+/**
+ * Memory-point requests (and the judged filters riding with an unjudged
+ * selection) queue below routing, records and the send/ending checks, which
+ * run at `interactive` in the same `decision:<model>` group: the build needs
+ * the memory block last, so it never delays them.
+ */
+export const MEMORY_PRIORITY: PriorityClass = "proactive";
+
+/** Added to the memory point's timeout for the build's wait (recall and the re-rank stages run first). */
+export const PLAN_WAIT_GRACE_MS = 1500;
+
+/** Tagged rows read per person (and for the presence lane) while paging past the recency layer. */
+const MAX_PARTICIPANT_ROWS = 200;
+
+/** Excerpt embeds in flight at once. */
+const EXCERPT_CONCURRENCY = 4;
+
+function abortError(): Error {
+  return Object.assign(new Error("aborted"), { name: "AbortError" });
+}
+
+/** `p`, or an AbortError as soon as `signal` aborts (a hung dependency cannot hold the plan). */
+export function untilAborted<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return p;
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(abortError());
+    signal.addEventListener("abort", onAbort, { once: true });
+    p.then(
+      (v) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(v);
+      },
+      (e) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(e);
+      },
+    );
+  });
+}
+
+/** Map with at most `limit` calls in flight, results in input order. */
+async function mapBounded<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i]!);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
 
 export interface MemoryRetrievalPipelineDeps {
   search: MemorySearch;
@@ -108,6 +164,36 @@ export class MemoryRetrievalPipeline {
     return this.deps.config.auto.judge && (this.deps.engine?.()?.isEnabled("memory", agent) ?? false);
   }
 
+  /**
+   * How long a context build waits for a launch-time plan (spec §8): the
+   * memory point's timeout (default the global `[decisions].timeout_ms`) plus
+   * a small grace for recall and the re-rank stages.
+   */
+  waitBudgetMs(agent: string | null): number {
+    const raw = this.deps.engine?.()?.raw(agent);
+    const timeout = (raw && pointSettings(raw, "memory")?.timeoutMs) ?? raw?.timeout_ms ?? DEFAULT_TIMEOUT_MS;
+    return timeout + PLAN_WAIT_GRACE_MS;
+  }
+
+  /**
+   * Tagged rows of `senders`, newest first, paging past the rows `visit`
+   * rejects (blocks in the recency layer) until it says stop or
+   * {@link MAX_PARTICIPANT_ROWS} rows were read.
+   */
+  private pageParticipantRows(
+    agent: string | null,
+    senders: Array<{ provider: string; senderId: string }>,
+    pageSize: number,
+    visit: (row: ReturnType<MemoryRetrievalStore["chunksWithParticipants"]>[number]) => "stop" | "next",
+  ): void {
+    if (senders.length === 0 || pageSize <= 0) return;
+    for (let offset = 0; offset < MAX_PARTICIPANT_ROWS; offset += pageSize) {
+      const rows = this.deps.store.chunksWithParticipants(agent, senders, pageSize, offset);
+      for (const row of rows) if (visit(row) === "stop") return;
+      if (rows.length < pageSize) return;
+    }
+  }
+
   /** Participant names for the lanes: current plus up to 4 earlier, newest first. */
   private namesOf(p: PlanParticipant): string[] {
     const names = [p.name];
@@ -141,6 +227,7 @@ export class MemoryRetrievalPipeline {
     /** Items the fallback rule selected (never a model verdict). */
     const fallbackSelected = new Set<string>();
     const verdicts = new Map<string, MemoryPassageVerdict>();
+    const aborted = () => input.signal?.aborted === true;
 
     // ── 1. Wide recall ────────────────────────────────────────────────────
     const requestText = input.request?.text.trim() ?? "";
@@ -163,7 +250,7 @@ export class MemoryRetrievalPipeline {
     const participants = input.participants;
     const laneNames = [...new Set(participants.flatMap((p) => this.namesOf(p)))];
     const searchOpts = { limit: auto.candidates, minScore: auto.candidateMinScore, now: input.now, agentName: agent };
-    const [laneResults, nameHits, presenceRows] = await Promise.all([
+    const [laneResults, nameHits] = await Promise.all([
       Promise.all(
         queries.map((q) =>
           this.deps.search
@@ -184,17 +271,36 @@ export class MemoryRetrievalPipeline {
             })
             .catch(() => [] as ScoredChunk[])
         : Promise.resolve([] as ScoredChunk[]),
-      Promise.resolve(
-        auto.userLane.enabled && participants.length > 0 && auto.userLaneCandidates > 0
-          ? this.deps.store.chunksWithParticipants(
-              agent,
-              participants.map((p) => ({ provider: p.provider, senderId: p.senderId })),
-              auto.userLaneCandidates * 3,
-            )
-          : [],
-      ),
     ]);
     report.stages.vectorIndex = laneResults.find((r) => r.vectorIndex)?.vectorIndex;
+
+    // The recency layer (its blocks are already in context).
+    const recency = await recencyPromise;
+    const recencyNorm = recency ? norm(recency) : null;
+    const inRecency = (text: string) => {
+      if (!recencyNorm) return false;
+      const probe = norm(cleanBlockText(text).lines.join(" ")).slice(0, 60);
+      return probe.length >= 12 && recencyNorm.includes(probe);
+    };
+
+    // The presence lane: the newest blocks tagged with a participant, paging
+    // past the recency layer so an active person's older entries are reached.
+    const presenceRows: LexicalHit[] = [];
+    if (auto.userLane.enabled && participants.length > 0 && auto.userLaneCandidates > 0) {
+      const want = auto.userLaneCandidates * 3;
+      const seen = new Set<number>();
+      this.pageParticipantRows(
+        agent,
+        participants.map((p) => ({ provider: p.provider, senderId: p.senderId })),
+        want + 10,
+        (row) => {
+          if (seen.has(row.rowid) || inRecency(row.text)) return "next";
+          seen.add(row.rowid);
+          presenceRows.push(row);
+          return presenceRows.length >= want ? "stop" : "next";
+        },
+      );
+    }
 
     const byRow = new Map<number, Candidate>();
     const add = (hit: LexicalHit, lane: CandidateLane, relevance: number, score: number) => {
@@ -260,18 +366,11 @@ export class MemoryRetrievalPipeline {
     };
 
     // ── 2. Exclusions: the recency layer and operator filters ─────────────
-    const recency = await recencyPromise;
-    const recencyNorm = recency ? norm(recency) : null;
-    const inRecency = (c: Candidate) => {
-      if (!recencyNorm) return false;
-      const probe = norm(cleanBlockText(c.chunk.text).lines.join(" ")).slice(0, 60);
-      return probe.length >= 12 && recencyNorm.includes(probe);
-    };
     const exclude = (list: Candidate[]): Candidate[] => {
       const out: Candidate[] = [];
       const states = this.deps.filters?.classify(agent, list.map((c) => filterBlockOf(c.chunk)));
       for (const c of list) {
-        if (inRecency(c)) {
+        if (inRecency(c.chunk.text)) {
           itemStage.set(c.chunk.contentHash, "recency");
           continue;
         }
@@ -297,35 +396,39 @@ export class MemoryRetrievalPipeline {
       const taken = new Set<string>();
       for (const person of input.activePeople ?? []) {
         if (personCued.length >= auto.personRecentMax) break;
-        const rows = this.deps.store.chunksWithParticipants(
-          agent,
-          [{ provider: person.provider, senderId: person.senderId }],
-          auto.personRecent + 10,
-        );
         let n = 0;
-        for (const row of rows) {
-          if (n >= auto.personRecent || personCued.length >= auto.personRecentMax) break;
-          if (taken.has(row.contentHash)) continue;
+        this.pageParticipantRows(agent, [{ provider: person.provider, senderId: person.senderId }], auto.personRecent + 10, (row) => {
+          if (n >= auto.personRecent || personCued.length >= auto.personRecentMax) return "stop";
+          if (taken.has(row.contentHash)) return "next";
           taken.add(row.contentHash);
           const existing = all.get(row.contentHash);
+          // Presence (the near-tie bonus) is a participant's tag only: set by
+          // markPresence below, never for being active in the window.
           const c: Candidate = existing ?? {
             chunk: row,
             hybrid: 0,
             score: 0,
             laneRelevance: {},
-            presence: true,
+            presence: false,
             pendingFilters: [],
           };
           c.laneRelevance.person = c.laneRelevance.person ?? 0;
-          c.presence = true;
           if (!existing) all.set(row.contentHash, c);
-          if (itemStage.get(row.contentHash) === "recency" || itemStage.get(row.contentHash) === "hidden") continue;
+          if (itemStage.get(row.contentHash) === "recency" || itemStage.get(row.contentHash) === "hidden") return "next";
           const kept = existing && pool.includes(existing) ? [existing] : exclude([c]);
-          if (kept.length === 0) continue;
+          if (kept.length === 0) {
+            // A recency-layer block is not a candidate at all: no report item.
+            if (!existing && itemStage.get(row.contentHash) === "recency") {
+              all.delete(row.contentHash);
+              itemStage.delete(row.contentHash);
+            }
+            return "next";
+          }
           kept[0]!.personCued = true;
           personCued.push(kept[0]!);
           n += 1;
-        }
+          return n >= auto.personRecent || personCued.length >= auto.personRecentMax ? "stop" : "next";
+        });
       }
       pool = pool.filter((c) => !c.personCued);
     }
@@ -374,7 +477,7 @@ export class MemoryRetrievalPipeline {
     // ── 4. Cross-encoder ──────────────────────────────────────────────────
     let rerankRan = false;
     let rerankCutoff: number | undefined;
-    if (this.deps.rerank && cfg.rerank.enabled && pool.length > 0) {
+    if (this.deps.rerank && cfg.rerank.enabled && pool.length > 0 && !aborted()) {
       const tail = input.conversation.slice(-RERANK_TAIL_MESSAGES).map((m) => `${m.from}: ${m.text}`).join("\n");
       const q = [requestText ? `${input.request!.from}: ${requestText}` : "", replyText ? `(replying to ${input.request!.replyTo!.from}: ${replyText})` : "", tail]
         .filter(Boolean)
@@ -408,22 +511,32 @@ export class MemoryRetrievalPipeline {
       }
     }
     // Person-cued candidates join after the cuts.
-    pool = [...pool, ...personCued.filter((c) => !pool.includes(c))];
+    const ranked = pool;
+    const cued = personCued.filter((c) => !ranked.includes(c));
+    pool = [...ranked, ...cued];
     markPresence(pool);
+    // At most `max_judged` passages go to the judge, person-cued included (a
+    // third of the cap is theirs when the ranked passages would fill it); the
+    // rest go through the fallback rule, never dropped.
+    const maxJudged = Math.max(0, auto.maxJudged);
+    const cuedSlots = Math.min(cued.length, Math.max(Math.ceil(maxJudged / 3), maxJudged - ranked.length));
+    const toJudge = [...ranked.slice(0, maxJudged - cuedSlots), ...cued.slice(0, cuedSlots)];
 
     // ── 5. The decision model as the final filter ─────────────────────────
     let selected: Candidate[] = [];
     let source: RetrievalSource;
     const judge = input.judge !== false && this.judgeOn(agent);
     const engine = this.deps.engine?.();
-    if (judge && engine && pool.length > 0) {
+    if (aborted()) {
+      source = "none";
+    } else if (judge && engine && pool.length > 0) {
       const t0 = this.now();
       const decisionGroup = nanoid();
       report.decisionGroup = decisionGroup;
       const knobs = memoryPointKnobs(engine.raw(agent));
       const conversation = input.conversation.slice(-(knobs.conversationMessages ?? DEFAULT_MEMORY_CONVERSATION_MESSAGES));
-      const outcomes = await Promise.all(
-        pool.map((c) =>
+      const judgedOutcomes = await Promise.all(
+        toJudge.map((c) =>
           engine
             .evaluate(
               memoryPoint,
@@ -454,7 +567,7 @@ export class MemoryRetrievalPipeline {
               {
                 agentName: agent,
                 attribution: input.attribution,
-                priority: "interactive",
+                priority: MEMORY_PRIORITY,
                 signal: input.signal,
                 decisionGroup,
                 triggerEventId: input.triggerEventId ?? null,
@@ -464,6 +577,8 @@ export class MemoryRetrievalPipeline {
         ),
       );
       report.stages.judgeMs = this.now() - t0;
+      const byCandidate = new Map(toJudge.map((c, i) => [c, judgedOutcomes[i]]));
+      const outcomes = pool.map((c) => byCandidate.get(c));
       let modelVerdicts = 0;
       outcomes.forEach((o, i) => {
         const c = pool[i]!;
@@ -507,8 +622,8 @@ export class MemoryRetrievalPipeline {
         selected = [...orderJudged(keptList, verdicts), ...rescued];
       } else {
         source = "fallback";
-        const reasons = outcomes.map((o) => o?.reason).filter(Boolean);
-        report.reason = reasons[0] ?? "error";
+        const reasons = judgedOutcomes.map((o) => o?.reason).filter(Boolean);
+        report.reason = reasons[0] ?? (toJudge.length === 0 ? "max_judged" : "error");
         for (const c of pool) if (c.hiddenBy) itemStage.set(c.chunk.contentHash, "hidden");
         selected = this.selectWithoutJudge(pool.filter((c) => !c.hiddenBy), {
           cap: auto.fallbackMaxResults,
@@ -540,7 +655,7 @@ export class MemoryRetrievalPipeline {
         const states = await this.deps.filters.enforce(agent, pending.map((c) => filterBlockOf(c.chunk)), {
           surface: "auto_retrieval",
           attribution: input.attribution,
-          priority: "interactive",
+          priority: MEMORY_PRIORITY,
           signal: input.signal,
         });
         for (const c of pending) {
@@ -563,26 +678,45 @@ export class MemoryRetrievalPipeline {
     const lines: string[] = [];
     const excerptQueries = [requestText, replyText].filter(Boolean);
     if (excerptQueries.length === 0 && windowText) excerptQueries.push(windowText);
-    for (const c of selected) {
+    // Excerpt embeds run concurrently (bounded) and stop with the plan.
+    const scorer = this.deps.search.unitScorer;
+    const excerptQuery = excerptQueries.join("\n");
+    const excerpts = aborted()
+      ? []
+      : await mapBounded(selected, EXCERPT_CONCURRENCY, (c) =>
+          makeExcerpt(c.chunk.text, {
+            queries: excerptQueries,
+            budget: { tokens: auto.excerptMaxTokens },
+            ...(scorer && excerptQueries.length > 0
+              ? { scoreUnits: (units: string[]) => untilAborted(scorer(excerptQuery, units, input.signal), input.signal) }
+              : {}),
+          }),
+        );
+    selected.forEach((c, i) => {
+      if (aborted()) return;
       if (lines.length >= auto.maxResults) {
         itemStage.set(c.chunk.contentHash, "budget");
-        continue;
+        return;
       }
-      const scorer = this.deps.search.unitScorer;
-      const excerpt = await makeExcerpt(c.chunk.text, {
-        queries: excerptQueries,
-        budget: { tokens: auto.excerptMaxTokens },
-        ...(scorer && excerptQueries.length > 0 ? { scoreUnits: (units: string[]) => scorer(excerptQueries.join("\n"), units) } : {}),
-      });
-      const line = `- [${formatCitation(c.chunk)}] ${indentContinuation(escapeAngleBrackets(excerpt))}`;
+      const line = `- [${citationLabel(c.chunk)}] ${indentContinuation(escapeAngleBrackets(excerpts[i] ?? ""))}`;
       const cost = estimateTokens(line) + 1;
       if (cost > budget) {
         itemStage.set(c.chunk.contentHash, "budget");
-        continue;
+        return;
       }
       budget -= cost;
       lines.push(line);
       itemStage.set(c.chunk.contentHash, "kept");
+    });
+    // An aborted plan (the session ended, a redo replaced it, or the build
+    // stopped waiting) shows nothing: what it would have kept is recorded as
+    // `aborted`, never as shown.
+    if (aborted()) {
+      lines.length = 0;
+      for (const [hash, stage] of itemStage) if (stage === "kept") itemStage.set(hash, "aborted");
+      for (const c of selected) if (!itemStage.has(c.chunk.contentHash)) itemStage.set(c.chunk.contentHash, "aborted");
+      report.aborted = true;
+      report.reason = "aborted";
     }
     const block = lines.length > 0 ? `<retrieved_memory note="${note}">\n${lines.join("\n")}\n</retrieved_memory>` : null;
 
@@ -703,6 +837,14 @@ export class MemoryRetrievalPipeline {
       .slice(0, opts.cap);
     return [...user, ...topical];
   }
+}
+
+/**
+ * The citation as shown inside `<retrieved_memory>`: a room label is diary
+ * text, so angle brackets are neutralized and line breaks flattened.
+ */
+export function citationLabel(chunk: LexicalHit): string {
+  return escapeAngleBrackets(formatCitation(chunk)).replace(/[\r\n]+/g, " ");
 }
 
 function dedupeByHash(list: Candidate[]): Candidate[] {

@@ -341,11 +341,14 @@ export class MemoryRetrievalStore {
   /**
    * The presence lane: chunks whose source conversation included one of these
    * senders, newest entry first. `agent` null = legacy mode (all chunks).
+   * `offset` pages through the same order (a block tagged with several of the
+   * senders appears once per sender).
    */
   chunksWithParticipants(
     agent: string | null,
     senders: Array<{ provider: string; senderId: string }>,
     limit: number,
+    offset = 0,
   ): Array<ChunkRow & { senderId: string; messageCount: number }> {
     if (senders.length === 0 || limit <= 0) return [];
     const a = agentKey(agent);
@@ -354,15 +357,15 @@ export class MemoryRetrievalStore {
       const params: unknown[] = [a];
       for (const s of senders) params.push(s.provider, s.senderId);
       const agentClause = a === "" ? "" : " and c.agent = p.agent";
-      params.push(limit);
+      params.push(limit, Math.max(0, offset));
       return db
         .prepare(
           `select ${CHUNK_COLUMNS}, p.sender_id as senderId, p.message_count as messageCount
            from memory_block_participants p
            join memory_chunks c on c.content_hash = p.content_hash${agentClause}
            where p.agent = ? and (${pairs})
-           order by c.entry_ts desc, c.rowid desc
-           limit ?`,
+           order by c.entry_ts desc, c.rowid desc, p.provider, p.sender_id
+           limit ? offset ?`,
         )
         .all(...params) as Array<ChunkRow & { senderId: string; messageCount: number }>;
     });

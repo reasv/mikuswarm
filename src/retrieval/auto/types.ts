@@ -80,7 +80,9 @@ export type ItemStage =
   | "not_judged"
   | "dropped"
   | "not_selected"
-  | "budget";
+  | "budget"
+  /** Would have been shown, but the plan was aborted (session ended, redo, the build stopped waiting). */
+  | "aborted";
 
 export interface ReportItem {
   contentHash: string;
@@ -111,7 +113,10 @@ export interface RetrievalReport {
   reason?: string;
   candidates: number;
   judged: number;
-  /** Passages sent to the judge that got no model verdict (they went through the fallback rule). */
+  /**
+   * Passages that got no model verdict (the chain did not answer, or they were
+   * over `auto.max_judged`); they went through the fallback rule.
+   */
   unjudged?: number;
   /** Shown items the fallback rule chose (the decision chain did not answer for them). */
   fellBack?: number;
@@ -120,6 +125,8 @@ export interface RetrievalReport {
   tokens: number;
   ms: number;
   decisionGroup?: string;
+  /** True when the plan was aborted before the build used it: nothing was shown. */
+  aborted?: boolean;
   stages: {
     recallMs: number;
     vectorIndex?: string;
@@ -134,4 +141,13 @@ export interface RetrievalPlan {
   /** The `<retrieved_memory>` block, or null when nothing is kept. */
   block: string | null;
   report: RetrievalReport;
+}
+
+/** A launch-time plan handed to the session's context build (§9d). */
+export interface MemoryPlanTicket {
+  plan: Promise<RetrievalPlan | null>;
+  /** The longest the build waits for it: the memory point's timeout plus a grace (spec §8). */
+  waitMs: number;
+  /** The build stopped waiting: the plan is aborted and its block never recorded as shown. */
+  abandon(): void;
 }

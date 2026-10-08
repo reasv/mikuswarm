@@ -207,9 +207,9 @@ export class MemorySearch {
   }
 
   /** Semantic unit scores for excerpt windows (undefined without an embedder). */
-  get unitScorer(): ((query: string, texts: string[]) => Promise<number[]>) | undefined {
+  get unitScorer(): ((query: string, texts: string[], signal?: AbortSignal) => Promise<number[]>) | undefined {
     const index = this.vectorIndex;
-    return index?.similarity ? (query, texts) => index.similarity!(query, texts) : undefined;
+    return index?.similarity ? (query, texts, signal) => index.similarity!(query, texts, signal) : undefined;
   }
 
   /** True when a semantic half is wired (the index may still be empty). */
