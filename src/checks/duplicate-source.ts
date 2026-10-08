@@ -11,6 +11,7 @@ import { senderName } from "../decisions/transcript.js";
 import type { DecisionEvaluationRow, SessionMessageRow } from "../storage/database.js";
 import { parseTimelineKey } from "../storage/timeline-key.js";
 import { sessionReadDenial, type SessionReadGate } from "../tools/read-session-record.js";
+import { deletedPlaceholder, isDeleted } from "../timeline/deletions.js";
 import type { CanonicalChatEvent } from "../types.js";
 import { duplicateTarget, messageText, type Answering, type DuplicateRow } from "./duplicate.js";
 import type { GateDuplicateSource } from "./gate.js";
@@ -64,14 +65,25 @@ function isProactive(sessionType: string | null | undefined, triggerEventId: str
   return sessionType === proactiveType || (triggerEventId ?? "").startsWith(PROACTIVE_TRIGGER_PREFIX);
 }
 
-/** What a stored session was answering: its trigger, or nothing (proactive). */
-export function answeringOfSession(session: SessionMessageRow["session"], proactiveType: string): Answering {
+/**
+ * What a stored session was answering: its trigger, or nothing (proactive). A
+ * trigger deleted since (any stored marker; with `asOf`, only one at or before
+ * that time, for the calibration replay) is the deletion placeholder, never its
+ * stored text (ARCHITECTURE.md §8j "Duplicate sends").
+ */
+export function answeringOfSession(
+  session: SessionMessageRow["session"],
+  proactiveType: string,
+  asOf?: number,
+): Answering {
   if (!session) return { from: "unknown", text: "" };
   if (isProactive(session.sessionType, session.triggerEventId, proactiveType)) return "unprompted";
-  return {
-    from: session.triggerSenderDisplayName ?? session.triggerSenderId ?? "unknown",
-    text: session.triggerBody ?? "",
-  };
+  const from = session.triggerSenderDisplayName ?? session.triggerSenderId ?? "unknown";
+  const marker = session.triggerDeleted;
+  if (marker && isDeleted({ deleted: marker }, asOf)) {
+    return { from, text: deletedPlaceholder(marker, session.triggerSenderId ?? undefined), deleted: true };
+  }
+  return { from, text: session.triggerBody ?? "" };
 }
 
 /** The draft's request: the session's (hydrated) trigger, or nothing for a proactive session. */

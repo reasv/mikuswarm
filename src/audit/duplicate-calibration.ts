@@ -31,7 +31,7 @@ import {
 } from "../checks/duplicate.js";
 import { postedText } from "../checks/state.js";
 import { buildTimelineKey, parseTimelineKey } from "../storage/timeline-key.js";
-import { dmTimelineKeysForPeerIn } from "../storage/database.js";
+import { dmTimelineKeysForPeerIn, parseDeletionMarker } from "../storage/database.js";
 import { isPostingTool } from "../tools/side-effects.js";
 import type { AttachmentMeta, CanonicalChatEvent } from "../types.js";
 import type { CalibrationItem, SampleResult } from "./calibration.js";
@@ -80,6 +80,7 @@ interface MessageRow {
   trigger_sender_id: string | null;
   trigger_sender_display_name: string | null;
   session_timeline_key: string | null;
+  trigger_deleted: string | null;
 }
 
 interface SessionRow {
@@ -161,8 +162,10 @@ export function sampleDuplicateItems(db: Database.Database, opts: DuplicateSampl
     .prepare(
       `select te.id, te.timeline_key, te.agent_session_id, te.received_at, te.event_json,
               s.session_type, s.trigger_event_id, s.trigger_body, s.trigger_sender_id,
-              s.trigger_sender_display_name, s.timeline_key as session_timeline_key
+              s.trigger_sender_display_name, s.timeline_key as session_timeline_key,
+              json_extract(t.event_json, '$.deleted') as trigger_deleted
          from timeline_events te join agent_sessions s on s.id = te.agent_session_id
+         left join timeline_events t on t.id = s.trigger_event_id
         where te.role = 'assistant' and te.received_at >= ?
         order by te.received_at, te.id`,
     )
@@ -241,8 +244,10 @@ export function sampleDuplicateItems(db: Database.Database, opts: DuplicateSampl
                   triggerBody: r.trigger_body,
                   triggerSenderId: r.trigger_sender_id,
                   triggerSenderDisplayName: r.trigger_sender_display_name,
+                  triggerDeleted: parseDeletionMarker(r.trigger_deleted),
                 },
             proactiveType,
+            call.ts,
           ),
           ...(r.session_timeline_key !== null ? { sessionTimelineKey: r.session_timeline_key } : {}),
         };
@@ -272,6 +277,8 @@ export function sampleDuplicateItems(db: Database.Database, opts: DuplicateSampl
             triggerBody: own.trigger_body,
             triggerSenderId: own.trigger_sender_id,
             triggerSenderDisplayName: own.trigger_sender_display_name,
+            // The draft's own request shows as the live check shows it (its content).
+            triggerDeleted: null,
           },
           proactiveType,
         ),

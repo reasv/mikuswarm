@@ -18,7 +18,7 @@ import {
   type DuplicateRow,
   type UnseenMessage,
 } from "../src/checks/duplicate.js";
-import { priorDuplicateRejections } from "../src/checks/duplicate-source.js";
+import { answeringOfSession, priorDuplicateRejections } from "../src/checks/duplicate-source.js";
 import { estimateTokens } from "../src/context/tokens.js";
 import { assignItemIds, checksPoint, planDuplicateCalls, type ChecksCallInput } from "../src/decisions/points/checks.js";
 import type { PointSettings } from "../src/decisions/config.js";
@@ -375,4 +375,25 @@ test("send_dm target: the account's DM with the user with the newest activity, t
   } finally {
     storage.close();
   }
+});
+
+test("answeringOfSession: a deleted request is the placeholder; the calibration replay counts it only as of the call", () => {
+  const session = {
+    timelineKey: "matrix:a:room:!r:example.org",
+    sessionType: "default",
+    triggerEventId: "t-1",
+    triggerBody: "secret question",
+    triggerSenderId: "@alice:example.org",
+    triggerSenderDisplayName: "alice",
+    triggerDeleted: { at: 5_000, by: "@alice:example.org" },
+  };
+  assert.deepEqual(answeringOfSession(session, "proactive"), { from: "alice", text: "[message deleted]", deleted: true });
+  assert.deepEqual(answeringOfSession({ ...session, triggerDeleted: { at: 5_000, by: "@mod:example.org" } }, "proactive"), {
+    from: "alice",
+    text: "[message deleted by @mod:example.org]",
+    deleted: true,
+  });
+  // Replayed as of a call before the deletion: the request as it stood then.
+  assert.deepEqual(answeringOfSession(session, "proactive", 4_000), { from: "alice", text: "secret question" });
+  assert.deepEqual(answeringOfSession({ ...session, triggerDeleted: null }, "proactive"), { from: "alice", text: "secret question" });
 });

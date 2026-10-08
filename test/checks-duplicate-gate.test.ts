@@ -491,6 +491,34 @@ test("deleted messages: one another session deleted does not count; deleting a q
   storage.close();
 });
 
+test("deleted messages: what an earlier session was answering, deleted since, shows as the placeholder in the state and the error", async () => {
+  for (const by of ["@alice:example.org", "@mod:example.org"]) {
+    const storage = await newStorage();
+    const secret = "what is 6 times 7?";
+    // The other session's request (its stored trigger), deleted after it was answered.
+    await storage.appendTimelineEvent(
+      event("t-s-other001", secret, {
+        role: "user",
+        sender: { id: "@alice:example.org", displayName: "alice" },
+        receivedAt: CUTOFF - 5000,
+        timestamp: CUTOFF - 5000,
+        deleted: { at: Date.now() - 2000, by },
+      }),
+      "complete",
+    );
+    await botMessage(storage, "e1", "It's 42.", CUTOFF + 1000);
+    const t = await setup({ storage, answer: (q) => (q === "repeats" ? 0.95 : 0.1) });
+    const out = await t.call({ message: "The answer is 42." });
+    const placeholder = by === "@mod:example.org" ? "[message deleted by @mod:example.org]" : "[message deleted]";
+    const state = JSON.stringify(t.decisions[0]!.state);
+    assert.ok(!state.includes(secret), `state quotes the deleted request: ${state}`);
+    assert.deepEqual(t.decisions[0]!.state.earlier[0].answering, { from: "alice", text: placeholder });
+    assert.ok(!out.includes(secret), out);
+    assert.ok(out.includes(`(it was answering alice: ${placeholder})`), out);
+    storage.close();
+  }
+});
+
 test("a message posted while the call waits for its verdict: one more evaluation, never more", async () => {
   const storage = await newStorage();
   await botMessage(storage, "e1", "Let me check.", CUTOFF + 1000);

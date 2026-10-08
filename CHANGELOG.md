@@ -338,7 +338,8 @@ Unreleased section; it is not part of any release's notes.
   error that quotes the earlier message and what it was answering and asks for a
   rewrite; `override_checks: ["duplicate"]` sends the draft as written, and the
   gate's revise bounds apply. Messages a rejection quoted count as seen, so the
-  next draft is compared only with newer ones; deleted messages never count.
+  next draft is compared only with newer ones; deleted messages never count, and a
+  request deleted since is shown as `[message deleted]`, never quoted.
   Channel visibility applies: messages in an isolated channel the session is not
   in are never compared, and what another session was answering in an isolated
   channel is never shown. If

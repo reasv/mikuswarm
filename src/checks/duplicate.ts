@@ -49,9 +49,10 @@ export interface SeenState {
 /**
  * What a message was answering: the request of its session, nothing (a
  * proactive post), or `private`: a request in a timeline the drafting session
- * may not read (channel visibility, §9h), never shown.
+ * may not read (channel visibility, §9h), never shown. A request deleted since
+ * (`deleted`) carries the deletion placeholder as its text, never its content.
  */
-export type Answering = { from: string; text: string } | "unprompted" | "private";
+export type Answering = { from: string; text: string; deleted?: true } | "unprompted" | "private";
 
 /** One unseen message of another session, as the check judges it. */
 export interface UnseenMessage {
@@ -416,7 +417,9 @@ function answeredClause(ctx: DuplicateContext, m: UnseenMessage): string {
   if (answering === "unprompted") return "it was not answering anyone: you posted it on your own";
   if (answering === "private") return "what it was answering is in another conversation you cannot see from here";
   const elsewhere = elsewhereOf(ctx, m);
-  return `it was answering ${answering.from}${elsewhere ? ` in ${elsewhere}` : ""}: ${quote(answering.text, ANSWERING_QUOTE_MAX_CHARS)}`;
+  // A deleted request shows as the placeholder, as the recent history shows it.
+  const what = answering.deleted ? answering.text : quote(answering.text, ANSWERING_QUOTE_MAX_CHARS);
+  return `it was answering ${answering.from}${elsewhere ? ` in ${elsewhere}` : ""}: ${what}`;
 }
 
 /** Who posted it, for the single-message error. */

@@ -48,6 +48,17 @@ interface ExaResearchRow {
   remote_id: string | null; state: ExaResearchJobState; remote_json: string | null;
   last_error: string | null; created_at: number; updated_at: number; accounted: number;
 }
+/** A deletion marker read with `json_extract(event_json, '$.deleted')` (null when absent or unreadable). */
+export function parseDeletionMarker(json: string | null | undefined): DeletionMarker | null {
+  if (!json) return null;
+  try {
+    const marker = JSON.parse(json) as DeletionMarker;
+    return typeof marker?.at === "number" ? marker : null;
+  } catch {
+    return null;
+  }
+}
+
 function researchJob(row: ExaResearchRow): ExaResearchJob {
   return { id: row.id, origin: JSON.parse(row.origin_json), request: JSON.parse(row.request_json),
     ...(row.previous_job_id ? { previousJobId: row.previous_job_id } : {}), remoteId: row.remote_id,
@@ -1324,6 +1335,8 @@ export interface SessionMessageRow {
     triggerBody: string | null;
     triggerSenderId: string | null;
     triggerSenderDisplayName: string | null;
+    /** The stored trigger's deletion marker (null when it is not deleted or not stored). */
+    triggerDeleted: DeletionMarker | null;
   } | null;
 }
 
@@ -10031,9 +10044,11 @@ export class Storage {
         .prepare(
           `select te.id, te.agent_session_id, te.received_at, te.event_json,
                   s.timeline_key as session_timeline_key, s.session_type, s.trigger_event_id,
-                  s.trigger_body, s.trigger_sender_id, s.trigger_sender_display_name
+                  s.trigger_body, s.trigger_sender_id, s.trigger_sender_display_name,
+                  json_extract(t.event_json, '$.deleted') as trigger_deleted
              from timeline_events te
              left join agent_sessions s on s.id = te.agent_session_id
+             left join timeline_events t on t.id = s.trigger_event_id
             where te.timeline_key = @timelineKey and te.timestamp >= @floor and te.received_at > @after
               and te.role = 'assistant' and te.agent_session_id is not null and te.agent_session_id != @exclude
             order by te.received_at desc, te.id desc
@@ -10056,6 +10071,7 @@ export class Storage {
           trigger_body: string | null;
           trigger_sender_id: string | null;
           trigger_sender_display_name: string | null;
+          trigger_deleted: string | null;
         }>;
       return rows.map((row) => ({
         event: JSON.parse(row.event_json) as CanonicalChatEvent,
@@ -10070,6 +10086,7 @@ export class Storage {
               triggerBody: row.trigger_body,
               triggerSenderId: row.trigger_sender_id,
               triggerSenderDisplayName: row.trigger_sender_display_name,
+              triggerDeleted: parseDeletionMarker(row.trigger_deleted),
             },
       }));
     });
