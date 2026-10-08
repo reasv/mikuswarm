@@ -72,7 +72,8 @@ export function createReactTool(context: ReactToolContext): AgentTool {
           const count = (removeResult as { removed?: number } | void)?.removed;
           return {
             content: [{ type: "text", text: count != null ? `removed ${count} reaction(s)` : `removed reaction` }],
-            details: null,
+            // Nothing was removed: late input must not "undo" it by adding one (§8 "Late input").
+            details: count === 0 ? { changed: false } : null,
           };
         }
         const result = await context.channelClient.react(messageId, emoji);

@@ -360,6 +360,38 @@ export type ChronItem =
   | { kind: "fork"; reason: string; branchNo: number; excluded?: boolean };
 
 /**
+ * The branches whose span is excluded from statistics: a
+ * {@link STATISTICS_EXCLUDED_BRANCH_REASONS} branch, and any earlier branch cut
+ * from inside such a span (its fork point sits after one of its messages, or at
+ * 0 before one). Needs only the branches' shapes, so every consumer (the
+ * contract derivation, the behaviour rollups) agrees. `transcriptLength`
+ * unknown: the live transcript is taken to be long enough for every fork.
+ */
+export function excludedBranchNumbers(
+  branches: readonly { branchNo: number; forkIndex: number; reason: string; messageCount: number }[],
+  transcriptLength = Number.POSITIVE_INFINITY,
+): Set<number> {
+  const sorted = [...branches].sort((a, b) => a.branchNo - b.branchNo);
+  // The excluded flags of the list as it was before each fork (newest first);
+  // positions past the array are live transcript messages (not excluded).
+  let cur: boolean[] = [];
+  let length = transcriptLength;
+  const out = new Set<number>();
+  for (let i = sorted.length - 1; i >= 0; i -= 1) {
+    const b = sorted[i]!;
+    const f = Math.max(0, Math.min(b.forkIndex, length));
+    const inside = f > 0 ? cur[f - 1] === true : cur[0] === true;
+    const ex = STATISTICS_EXCLUDED_BRANCH_REASONS.has(b.reason) || inside;
+    if (ex) out.add(b.branchNo);
+    const kept = cur.slice(0, f);
+    while (kept.length < f) kept.push(false);
+    cur = kept.concat(new Array<boolean>(Math.max(0, b.messageCount)).fill(ex));
+    length = f + Math.max(0, b.messageCount);
+  }
+  return out;
+}
+
+/**
  * Rebuild the order in which messages were produced from the live transcript
  * and its discarded branches. Fork k truncated the live list at `forkIndex` and
  * stored the discarded tail as branch k, so the list before fork k is the list
@@ -374,13 +406,16 @@ export type ChronItem =
  */
 export function chronology(transcript: readonly unknown[], branches: readonly ContractBranchInput[]): ChronItem[] {
   const sorted = [...branches].sort((a, b) => a.branchNo - b.branchNo);
+  const excluded = excludedBranchNumbers(
+    sorted.map((b) => ({ branchNo: b.branchNo, forkIndex: b.forkIndex, reason: b.reason, messageCount: b.messages.length })),
+    transcript.length,
+  );
   let cur: Located[] = transcript.map((m) => ({ m, loc: 0 }));
   const steps: { branch: ContractBranchInput; ex: boolean; after: Located[] }[] = [];
   for (let i = sorted.length - 1; i >= 0; i -= 1) {
     const b = sorted[i]!;
     const f = Math.max(0, Math.min(b.forkIndex, cur.length));
-    const inside = f > 0 ? cur[f - 1]!.ex === true : cur[0]?.ex === true;
-    const ex = STATISTICS_EXCLUDED_BRANCH_REASONS.has(b.reason) || inside;
+    const ex = excluded.has(b.branchNo);
     steps.unshift({ branch: b, ex, after: cur.slice(f) });
     cur = cur.slice(0, f).concat(b.messages.map((m) => ({ m, loc: b.branchNo, ...(ex ? { ex } : {}) })));
   }

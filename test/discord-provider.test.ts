@@ -741,6 +741,8 @@ describe("NIT 2: MESSAGE_UPDATE routing", () => {
     const editMarker = (capturedInbound as { edit?: { targetExternalId?: string } }).edit;
     assert.ok(editMarker, "edit marker must be present");
     assert.equal(editMarker.targetExternalId, "111111111111111111");
+    // The edit's own time (late input: an edit made after the reply is not sent before it).
+    assert.equal((capturedInbound as { event: { timestamp: number } }).event.timestamp, 1_700_000_001_000);
   });
 });
 

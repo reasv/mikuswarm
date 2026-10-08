@@ -1,4 +1,4 @@
-import type { AttachmentMeta, CanonicalChatEvent, TimelineState } from "../types.js";
+import type { AttachmentMeta, CanonicalChatEvent, MentionInfo, TimelineState } from "../types.js";
 import { needsEnrichment } from "./store.js";
 
 /**
@@ -8,15 +8,22 @@ import { needsEnrichment } from "./store.js";
  * re-decryption sweeper, so the merge and status logic live here once.
  */
 
-/** The replacement content an edit carries: the post-edit body and attachments. */
+/**
+ * The replacement content an edit carries: the post-edit body and attachments,
+ * and the post-edit mentions as the provider normalized them (Matrix
+ * `m.new_content["m.mentions"]`, Discord's resolved mentions). `mentions` is
+ * optional: absent, the target keeps its own (a parked edit replayed from
+ * `pending_edits`, which stores body and attachments only).
+ */
 export interface EditReplacement {
   body: string;
   attachments: AttachmentMeta[];
+  mentions?: MentionInfo;
 }
 
 /**
  * Merge an edit's replacement content onto its target canonical event. Only the
- * `body` and `attachments` change; identity (id, externalId, timelineKey,
+ * `body`, `attachments` and (when the edit carries them) `mentions` change; identity (id, externalId, timelineKey,
  * provider, role, sender, timestamps, threadId, replyTo) is preserved so the
  * edited message keeps its place in the timeline. The `undecryptable` flag is
  * left untouched — an edit only ever applies to an already-decrypted target (a
@@ -31,6 +38,7 @@ export function applyEditToCanonical(
     ...target,
     body: replacement.body,
     attachments: replacement.attachments,
+    ...(replacement.mentions !== undefined ? { mentions: replacement.mentions } : {}),
   };
 }
 

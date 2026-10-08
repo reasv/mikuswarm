@@ -10,7 +10,7 @@
  */
 
 import type Database from "better-sqlite3";
-import { STATISTICS_EXCLUDED_BRANCH_REASONS } from "../agent/contract.js";
+import { excludedBranchNumbers } from "../agent/contract.js";
 import { estimateTokens } from "../context/tokens.js";
 import type { Logger } from "../observability/index.js";
 import type { Storage } from "../storage/index.js";
@@ -58,7 +58,10 @@ interface RefusalRow {
   sid: string | null; ts: number; branch_no: number; site: string; agent: string | null; timeline_key: string | null;
   tasks_json: string | null; served_model: string | null; kind: string; reason: string; method: string; outcome: string;
 }
-interface BranchRow { sid: string; branch_no: number; reason: string; from_model: string | null; cost_usd: number | null }
+interface BranchRow {
+  sid: string; branch_no: number; reason: string; from_model: string | null; cost_usd: number | null;
+  fork_index: number; message_count: number | null;
+}
 interface DecisionRow {
   id: number; sid: string; ts: number; checkpoint: string | null; branch_no: number | null;
   tool_call_id: string | null; attempt_no: number | null; consequence: string | null; verdict_json: string | null;
@@ -257,7 +260,8 @@ export function computeHourRollups(
     const branches = groupBySession(
       db
         .prepare(
-          `select session_id as sid, branch_no, reason, from_model, cost_usd
+          `select session_id as sid, branch_no, reason, from_model, cost_usd, fork_index,
+                  case when json_valid(messages_json) then json_array_length(messages_json) end as message_count
              from agent_session_branches where session_id in ${inHour} order by branch_no`,
         )
         .all(p) as BranchRow[],
@@ -375,9 +379,10 @@ function accumulateSession(
 
   // Spans discarded by a late-input redo, a revival or an aborted turn are their
   // own outcome, never a behaviour sample (STATISTICS_EXCLUDED_BRANCH_REASONS):
-  // refusals and check verdicts re-anchored to such a branch are skipped.
-  const excludedBranches = new Set(
-    rows.branches.filter((b) => STATISTICS_EXCLUDED_BRANCH_REASONS.has(b.reason)).map((b) => b.branch_no),
+  // refusals and check verdicts re-anchored to such a branch, or to an earlier
+  // branch cut from inside its span, are skipped (the contract derivation's rule).
+  const excludedBranches = excludedBranchNumbers(
+    rows.branches.map((b) => ({ branchNo: b.branch_no, forkIndex: b.fork_index, reason: b.reason, messageCount: b.message_count ?? 0 })),
   );
 
   // Requests and sessions. An aborted request (an `estimated` row, §8b "Aborted
@@ -421,6 +426,7 @@ function accumulateSession(
 
   // Redo branches.
   for (const b of rows.branches) {
+    if (excludedBranches.has(b.branch_no)) continue;
     if (b.reason === "contract_redo") {
       const model = b.from_model ?? nudgedModel;
       add(model, "contract_redos");

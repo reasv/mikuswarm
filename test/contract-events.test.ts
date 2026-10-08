@@ -11,7 +11,9 @@ import test from "node:test";
 import {
   CONTRACT_FAILURE_TYPES,
   FORCED_COMPLETION_PROMPTS,
+  chronology,
   deriveContractEvents,
+  excludedBranchNumbers,
   isRunStart,
   looksLikeContextMimicry,
   looksLikeTextualToolCall,
@@ -448,4 +450,19 @@ test("revival: the discarded record turn and its fork do not end or reset the re
   assert.equal(d.outcome, "recovered");
   assert.equal(d.nudges, 1);
   assert.deepEqual(d.attempts.map((a) => [a.branchNo, a.attemptNo]), [[0, 0], [0, 1]]);
+});
+
+test("excludedBranchNumbers: the shapes alone give chronology's exclusion", () => {
+  const msgs = (n: number) => Array.from({ length: n }, () => ({ role: "assistant", content: [] }));
+  const branches = [
+    { branchNo: 1, forkIndex: 3, reason: "refusal_redo", messages: msgs(2) },
+    { branchNo: 2, forkIndex: 0, reason: "edit_redo", messages: msgs(5) },
+    { branchNo: 3, forkIndex: 2, reason: "contract_redo", messages: msgs(1) },
+  ];
+  const shapes = branches.map((b) => ({ branchNo: b.branchNo, forkIndex: b.forkIndex, reason: b.reason, messageCount: b.messages.length }));
+  const fromChronology = new Set(
+    chronology(msgs(4), branches).flatMap((i) => (i.kind === "fork" && i.excluded ? [i.branchNo] : [])),
+  );
+  assert.deepEqual([...excludedBranchNumbers(shapes, 4)].sort(), [1, 2]);
+  assert.deepEqual([...excludedBranchNumbers(shapes)].sort(), [...fromChronology].sort());
 });

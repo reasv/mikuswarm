@@ -277,6 +277,8 @@ export interface AbortedRequestInfo {
   firstEventSeen: boolean;
   /** The text, thinking and tool-call argument deltas streamed before the abort, concatenated. */
   streamedText: string;
+  /** Milliseconds from the first stream event to the abort (0 when none arrived). */
+  streamingMs?: number;
   /** 1-based attempt number within the request. */
   attempt: number;
 }
@@ -770,6 +772,7 @@ export function withRequestRetry(
           // basis of the output estimate (collected only when the hook is wired).
           const abortedAtStart = callerSignal?.aborted === true;
           let firstEventSeen = false;
+          let firstEventAt: number | undefined;
           const streamedDeltas: string[] | undefined = ctx.onRequestAborted ? [] : undefined;
 
           // Per-attempt abort: the caller's abort (drain/Stop) always reaches
@@ -822,6 +825,7 @@ export function withRequestRetry(
                 break;
               }
               buffered.push(event);
+              if (!firstEventSeen) firstEventAt = Date.now();
               firstEventSeen = true;
               if (
                 streamedDeltas &&
@@ -981,6 +985,7 @@ export function withRequestRetry(
                 message: failure,
                 firstEventSeen,
                 streamedText: streamedDeltas?.join("") ?? "",
+                streamingMs: firstEventAt !== undefined ? Date.now() - firstEventAt : 0,
                 attempt: attempt + 1,
               });
             } catch {

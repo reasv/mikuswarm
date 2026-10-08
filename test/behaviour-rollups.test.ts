@@ -300,3 +300,28 @@ test("late-input branches and aborted requests are no behaviour samples", async 
     assert.equal(v("revisions"), 0);
   });
 });
+
+test("a refusal branch cut inside a later late-input redo's span is excluded too (as in the contract derivation)", async () => {
+  await withStorage(async (storage) => {
+    // s10: a refusal redo (branch 1, forked at 3 of the first rollout), then an
+    // edit redo from scratch (branch 2, forked at 0) that discarded that rollout.
+    await storage.insertAgentSession({ id: "s10", timelineKey: KEY_A, sessionType: "default", status: "completed", createdAt: H + 1_000, updatedAt: H + 1_000 });
+    await addRequest(storage, "s10", H + 2_000, "model_a", { key: KEY_A, type: "default" });
+    const msgs = (n: number) => JSON.stringify(Array.from({ length: n }, (_, i) => ({ role: "assistant", content: [], i })));
+    await storage.insertSessionBranch({
+      sessionId: "s10", forkIndex: 3, reason: "refusal_redo", fromModel: "model_a", toModel: "model_b",
+      messagesJson: msgs(2), costUsd: 0.05, createdAt: H + 2_100,
+    });
+    await storage.insertSessionBranch({ sessionId: "s10", forkIndex: 0, reason: "edit_redo", messagesJson: msgs(5), createdAt: H + 2_200 });
+    await storage.insertRefusalEvent({
+      ts: H + 2_050, agentSessionId: "s10", branchNo: 1, site: "default", agent: "agent_a", timelineKey: KEY_A,
+      servedModel: "model_a", kind: "hard", checkCode: "refusal_safety", reason: "safety", method: "stop_reason",
+      checkpoint: "request", outcome: "observed",
+    });
+    await rollups(storage).flush();
+    const rows = table(storage);
+    const v = (metric: string) => value(rows, { hour: H, model: "model_a", metric });
+    assert.equal(v("refusals_hard"), 0, "the nested refusal is part of the discarded rollout");
+    assert.equal(v("refusal_branch_cost_usd"), 0);
+  });
+});

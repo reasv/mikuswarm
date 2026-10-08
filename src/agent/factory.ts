@@ -9,6 +9,7 @@ import { dumpBuiltContext, CACHE_BOUNDARIES, estimateTokens, renderToolBlock, ty
 import { makeBreakpointInjector } from "./cache-breakpoints.js";
 import { makePrefillInjector, makeDropReasoningInjector, wrapToolWithAnalysisStripping } from "./openai-prefill.js";
 import type { ContextMessage } from "../context/builder.js";
+import type { SummaryCoveragePin } from "../context/builder.js";
 import type { AgentSessionRecord } from "./session-manager.js";
 import { convertToLlm } from "./convert.js";
 import { withStaleThinkingDropped } from "./stale-thinking.js";
@@ -482,6 +483,8 @@ export interface CreateAgentOptions {
    * rebuilt prefix matches it (ARCHITECTURE.md §8 "Late input").
    */
   timelineCutoff?: number;
+  /** Redo rebuild: the first build's {@link CreatedAgent.summaryCoverage} (same reason). */
+  summaryCoverage?: SummaryCoveragePin;
 }
 
 export interface CreatedAgent {
@@ -519,6 +522,8 @@ export interface CreatedAgent {
   tokenEstimate?: number;
   /** The build's timeline cutoff (latest `receivedAt` it read); a redo rebuild reuses it. */
   timelineCutoff?: number;
+  /** The summary coverage the build rendered; a redo rebuild reuses it. */
+  summaryCoverage?: SummaryCoveragePin;
   /** Where the in-flight LLM request is (the late-input abort rule). */
   requestProgress: RequestProgress;
   compactTokens?: number;
@@ -1961,8 +1966,8 @@ export class AgentSessionFactory {
       (m) => m.config.prefill?.enabled && m.config.prefill.text,
     )?.config.prefill?.text;
     // Late input (§8 "Late input"): redo-safe results are replayed from the
-    // session's store innermost, so the stored result is the raw one and the
-    // key is the call's own arguments.
+    // session's store innermost, so the stored result is the raw one; the key
+    // is the call's arguments as the transcript holds them.
     const replayCatalog = opts?.lateInput
       ? opts.lateInput.wrapReplayTools(sessionCatalog, () => agentRef.agent?.state.messages ?? [])
       : sessionCatalog;
@@ -2191,6 +2196,7 @@ export class AgentSessionFactory {
     // declared-vs-rendered assertion. Undefined in resume mode (no fresh build).
     let renderedInputIds: string[] | undefined;
     let builtTimelineCutoff: number | undefined;
+    let builtSummaryCoverage: SummaryCoveragePin | undefined;
     if (opts?.resume) {
       // Defensive copy: the resume snapshot is a persisted array owned by the caller
       // (parsed `context_snapshot_json`). Copying it keeps the live runtime prefix
@@ -2264,8 +2270,10 @@ export class AgentSessionFactory {
         replyModelCanSeeImages,
         routedSatellite,
         timelineCutoff: opts?.timelineCutoff,
+        summaryCoverage: opts?.summaryCoverage,
       });
       builtTimelineCutoff = built.timelineCutoff;
+      builtSummaryCoverage = built.summaryCoverage;
       await dumpBuiltContext(
         this.options.config.app.context_dump_dir,
         session.timelineKey,
@@ -2527,6 +2535,7 @@ export class AgentSessionFactory {
       snapshot,
       tokenEstimate: snapshotTokenEstimate,
       timelineCutoff: builtTimelineCutoff,
+      summaryCoverage: builtSummaryCoverage,
       requestProgress,
       compactTokens: snapshotCompactTokens,
       richTokens: snapshotRichTokens,
@@ -2659,6 +2668,7 @@ export class AgentSessionFactory {
     /** Decision-model routing additions to the satellite (§8h). */
     routedSatellite?: RoutedSatellite;
     timelineCutoff?: number;
+    summaryCoverage?: SummaryCoveragePin;
   }): Promise<BuiltContext> {
     const generation = Boolean(args.summarizationCutoff || args.condenseInputs || args.diaryRange);
     return this.options.contextBuilder.build({
@@ -2680,6 +2690,7 @@ export class AgentSessionFactory {
       replyModelCanSeeImages: args.replyModelCanSeeImages,
       routedSatellite: args.routedSatellite,
       timelineCutoff: args.timelineCutoff,
+      summaryCoverage: args.summaryCoverage,
     });
   }
 
