@@ -66,7 +66,8 @@ Unreleased section; it is not part of any release's notes.
   older candidates; `scripts/bench-late.ts` sizes the window). The window is updated
   incrementally in the background and vectors are decoded off the event loop; the
   index is keyed by the model and its document-side settings, so changing one
-  re-indexes. Local models can be pinned (`revision`, `sha256`). Remote providers must be
+  re-indexes. Local models can be pinned (`revision`, `sha256`) and load any current
+  `tokenizer.json` (Hugging Face's `tokenizers` binding). Remote providers must be
   marked zero-data-retention or self-hosted.
 - **Primary embedder** (`[retrieval.embedding.primary]`, optional): a second vector
   index served by a GPU or API embedder, used while it covers every block and answers

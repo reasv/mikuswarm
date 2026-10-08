@@ -14,7 +14,6 @@
     "dev": "tsx watch src/index.ts"
   },
   "dependencies": {
-    "@anush008/tokenizers": "0.0.0",
     "@earendil-works/pi-agent-core": "0.84.2",
     "@earendil-works/pi-ai": "0.84.2",
     "@modelcontextprotocol/sdk": "^1.29.0",
@@ -36,6 +35,7 @@
     "sharp": "0.34.5",
     "smol-toml": "1.6.1",
     "sqlite-vec": "0.1.9",
+    "tokenizers": "0.23.2",
     "tsx": "4.22.3",
     "undici": "^7.25.0",
     "unpdf": "^1.8.1"

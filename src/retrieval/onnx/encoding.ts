@@ -3,7 +3,7 @@
  * provider worker (src/retrieval/onnx/onnx-worker.ts): trimming to the token
  * budget on id arrays, padding a batch, and building the int64 feeds.
  */
-import type { Tokenizer } from "@anush008/tokenizers";
+import type { Tokenizer } from "tokenizers";
 import type * as Ort from "onnxruntime-node";
 
 /** One tokenized input: ids, type ids, and per-token sequence index (null = special). */

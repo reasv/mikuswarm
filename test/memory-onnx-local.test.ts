@@ -5,12 +5,12 @@ import type { AddressInfo } from "node:net";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Tokenizer } from "@anush008/tokenizers";
 import { encodeModel, rawBytes, TensorType, type OnnxModel } from "../src/retrieval/onnx/proto.js";
 import { resolveModelFiles, repoSlug } from "../src/retrieval/onnx/model-files.js";
 import { LocalCrossEncoder } from "../src/retrieval/onnx/cross-encoder.js";
 import { LocalLateEncoder } from "../src/retrieval/onnx/late-encoder.js";
-import { truncateInput } from "../src/retrieval/onnx/encoding.js";
+import { Tokenizer } from "tokenizers";
+import { encodeInput, truncateInput } from "../src/retrieval/onnx/encoding.js";
 import { ProviderNotReadyError } from "../src/retrieval/models/types.js";
 import type { ResolvedModelProvider } from "../src/retrieval/config.js";
 
@@ -54,6 +54,56 @@ function tokenizerJson(): string {
     },
     decoder: null,
     model: { type: "WordLevel", vocab: VOCAB, unk_token: "[UNK]" },
+  });
+}
+
+/**
+ * A SentencePiece-style tokenizer.json: Replace + Metaspace (`prepend_scheme`,
+ * `split`), BOS/EOS template, and normalized `[Q] `/`[D] ` marker tokens, as
+ * modern ColBERT exports ship them. Ids stay inside the fake models' vocab.
+ */
+const META_VOCAB: Record<string, number> = { "<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3 };
+WORDS.slice(0, 8).forEach((w, i) => (META_VOCAB[`\u2581${w}`] = 4 + i));
+const META_Q = 12;
+const META_D = 13;
+
+function metaspaceTokenizerJson(prependScheme: "always" | "first" = "always"): string {
+  const added = (content: string, id: number, special: boolean) => ({
+    id,
+    content,
+    single_word: false,
+    lstrip: false,
+    rstrip: false,
+    normalized: !special,
+    special,
+  });
+  const tok = (id: string) => ({ SpecialToken: { id, type_id: 0 } });
+  const seq = (id: "A" | "B") => ({ Sequence: { id, type_id: 0 } });
+  return JSON.stringify({
+    version: "1.0",
+    truncation: { direction: "Right", max_length: 3, strategy: "LongestFirst", stride: 0 },
+    padding: { strategy: "BatchLongest", direction: "Right", pad_id: 0, pad_type_id: 0, pad_token: "<pad>" },
+    added_tokens: [
+      added("<pad>", 0, true),
+      added("<unk>", 1, true),
+      added("<bos>", 2, true),
+      added("<eos>", 3, true),
+      added("[Q] ", META_Q, false),
+      added("[D] ", META_D, false),
+    ],
+    normalizer: { type: "Replace", pattern: { String: " " }, content: "\u2581" },
+    pre_tokenizer: { type: "Metaspace", replacement: "\u2581", prepend_scheme: prependScheme, split: true },
+    post_processor: {
+      type: "TemplateProcessing",
+      single: [tok("<bos>"), seq("A"), tok("<eos>")],
+      pair: [tok("<bos>"), seq("A"), tok("<eos>"), seq("B"), tok("<eos>")],
+      special_tokens: {
+        "<bos>": { id: "<bos>", ids: [2], tokens: ["<bos>"] },
+        "<eos>": { id: "<eos>", ids: [3], tokens: ["<eos>"] },
+      },
+    },
+    decoder: { type: "Metaspace", replacement: "\u2581", prepend_scheme: prependScheme, split: true },
+    model: { type: "WordLevel", vocab: META_VOCAB, unk_token: "<unk>" },
   });
 }
 
@@ -150,11 +200,11 @@ function lateEncoderModel(opts: { projected?: string } = {}): Uint8Array {
   });
 }
 
-async function modelDir(root: string, name: string, onnx: Uint8Array, config?: object): Promise<string> {
+async function modelDir(root: string, name: string, onnx: Uint8Array, config?: object, tokenizer = tokenizerJson()): Promise<string> {
   const dir = join(root, name);
   await mkdir(join(dir, "onnx"), { recursive: true });
   await writeFile(join(dir, "onnx", "model.onnx"), onnx);
-  await writeFile(join(dir, "tokenizer.json"), tokenizerJson());
+  await writeFile(join(dir, "tokenizer.json"), tokenizer);
   if (config) await writeFile(join(dir, "config.json"), JSON.stringify(config));
   return dir;
 }
@@ -208,6 +258,28 @@ test("the WordLevel fixture tokenizer yields pair type ids", async () => {
   const enc = await tok.encode("alpha beta", "gamma");
   assert.deepEqual(enc.getIds(), [2, 4, 5, 3, 6, 3]);
   assert.deepEqual(enc.getTypeIds(), [0, 0, 0, 0, 1, 1]);
+});
+
+test("a Metaspace tokenizer.json (prepend_scheme, split) loads; marker tokens follow <bos>", async () => {
+  for (const scheme of ["always", "first"] as const) {
+    const tok = Tokenizer.fromString(metaspaceTokenizerJson(scheme));
+    tok.disableTruncation();
+    tok.disablePadding();
+    const plain = await encodeInput(tok, "alpha beta");
+    assert.deepEqual(plain.ids, [2, META_VOCAB["\u2581alpha"], META_VOCAB["\u2581beta"], 3], scheme);
+    assert.deepEqual(plain.sequenceIds, [null, 0, 0, null]);
+    // Pair template, then truncation trims content and keeps the specials.
+    const pair = await encodeInput(tok, "alpha", "beta gamma delta");
+    assert.deepEqual(pair.ids, [2, 4, 3, 5, 6, 7, 3]);
+    assert.deepEqual(truncateInput(pair, 5).ids, [2, 4, 3, 5, 3]);
+    if (scheme === "first") continue;
+    // A text-prefixed marker becomes its own token right after <bos>, and the
+    // text after it tokenizes exactly as it does alone (the marker-id insertion
+    // PyLate-style models are trained with).
+    const query = await encodeInput(tok, "[Q] alpha beta");
+    assert.deepEqual(query.ids, [2, META_Q, ...plain.ids.slice(1)], scheme);
+    assert.deepEqual((await encodeInput(tok, "[D] gamma")).ids, [2, META_D, META_VOCAB["\u2581gamma"], 3], scheme);
+  }
 });
 
 test("truncateInput trims the second sequence first, then the first, keeping specials", () => {
@@ -460,6 +532,28 @@ test("resolveModelFiles: a pinned revision has its own cache dir, sha256 is enfo
     } finally {
       await new Promise<void>((r) => server.close(() => r()));
     }
+  });
+});
+
+test("LocalLateEncoder: a Metaspace tokenizer with [Q]/[D] marker tokens loads and encodes", async () => {
+  await withTemp(async (root) => {
+    const dir = await modelDir(root, "late-meta", lateEncoderModel(), { pad_token_id: 0 }, metaspaceTokenizerJson());
+    const enc = new LocalLateEncoder(provider({ modelDir: dir, queryPrefix: "[Q] ", documentPrefix: "[D] " }), {
+      cacheRoot: root,
+    });
+    await enc.warm();
+    const rows = (m: { tokens: number; dim: number; data: Float32Array }, expect: number[]) => {
+      assert.equal(m.tokens, expect.length);
+      expect.forEach((id, row) => {
+        const raw = EMBED[id]!;
+        const norm = Math.hypot(...raw);
+        for (let k = 0; k < DIM; k++) assert.ok(Math.abs(m.data[row * DIM + k]! - raw[k]! / norm) < 1e-6);
+      });
+    };
+    rows(await enc.encodeQuery("alpha beta", 32, never), [2, META_Q, 4, 5, 3]);
+    const [doc] = await enc.encodeDocuments(["gamma delta"], never);
+    rows(doc!, [2, META_D, 6, 7, 3]);
+    await enc.close();
   });
 });
 

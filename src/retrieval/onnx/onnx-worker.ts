@@ -9,7 +9,7 @@
  * - `lateEncode` {texts, maxTokens} → TokenMatrix[] (unit rows, real tokens only)
  */
 import { readFile } from "node:fs/promises";
-import { Tokenizer } from "@anush008/tokenizers";
+import { Tokenizer } from "tokenizers";
 import * as ort from "onnxruntime-node";
 import type { TokenMatrix } from "../models/types.js";
 import { buildFeeds, clipText, encodeInput, padTokenId, truncateInput, type EncodedInput } from "./encoding.js";
