@@ -166,7 +166,12 @@ import {
 import { createYotsubaTool } from "./tools/yotsuba.js";
 import { createNoReplyTool } from "./tools/no-reply.js";
 import { createSessionRecordTool, SummaryDraft } from "./tools/session-record-tool.js";
-import { createReadSessionRecordTool, createReadSessionTranscriptTool } from "./tools/read-session-record.js";
+import {
+  canReadSession,
+  createReadSessionRecordTool,
+  createReadSessionTranscriptTool,
+  type SessionReadGate,
+} from "./tools/read-session-record.js";
 import type { SessionRecordHandles } from "./agent/record-turn.js";
 import { SessionRecordService, recordTurnStartIndex } from "./agent/session-records.js";
 import {
@@ -4583,8 +4588,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // A quick same-sender follow-up — a forced-split image, a trailing bare-text
   // thought, or an amending re-`@` — is folded into the session its immediately-prior
   // triggering message produced: STEERED in if it is running, PARKED if it is still
-  // building, or, if it already completed, handed to a FRESH session that starts with
-  // the owner's session record (fold-after-settle, spec SESSION-RECORDS §7). The synchronous `foldFollowUp` fork
+  // building, or, if it already completed, it revives the owner when it was sent before
+  // the owner's run ended (§8 "Late input"), else takes its native fate. The synchronous `foldFollowUp` fork
   // (in `handleInbound`, after reply-steer and before the `!trigger` return / accept)
   // makes the decision; the deliveries run async, never blocking the dispatch path.
 
@@ -4630,7 +4635,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
 
   /**
    * The synchronous fold fork (spec §6). Returns true when the follow-up was consumed
-   * (steered / parked / fold-after-settle dispatched, or its trigger-hold twin suppressed) — the
+   * (steered / parked / revival dispatched, or its trigger-hold twin suppressed) — the
    * caller returns without spawning. Returns false to fall through to the normal path
    * (native fate): a reply, a non-matching event, the RAW delivery of a trigger-bearing
    * follow-up (folded later on its post-hold delivery), or an owner that settled into
@@ -6528,26 +6533,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             }),
             createReadSessionRecordTool({
               storage,
-              currentTimelineKey: inbound.timelineKey,
-              visibilityResolver,
-              resolveAgentForTimeline: (tlKey) => {
-                const e = resolveWorkspaceForTimeline(tlKey);
-                if (!e || e.agentName === "__legacy__") return null;
-                return e.agentName;
-              },
-              currentAgentName: sessionAgentName,
+              ...sessionReadGateFor(inbound.timelineKey, sessionAgentName),
               isRecordInFlight: (sid) => sessionRecordService.isInFlight(sid),
             }),
             createReadSessionTranscriptTool({
               storage,
-              currentTimelineKey: inbound.timelineKey,
-              visibilityResolver,
-              resolveAgentForTimeline: (tlKey) => {
-                const e = resolveWorkspaceForTimeline(tlKey);
-                if (!e || e.agentName === "__legacy__") return null;
-                return e.agentName;
-              },
-              currentAgentName: sessionAgentName,
+              ...sessionReadGateFor(inbound.timelineKey, sessionAgentName),
               isRecordInFlight: (sid) => sessionRecordService.isInFlight(sid),
             }),
           ]
@@ -7250,6 +7241,25 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   }
 
   /**
+   * The session-record read gate of a session in `timelineKey` (channel
+   * visibility + own agent, `sessionReadDenial`): shared by the read tools and
+   * record injection, so a record the session could not read is never injected
+   * nor sent to the records decision model.
+   */
+  function sessionReadGateFor(timelineKey: string, agentName: string | null): SessionReadGate {
+    return {
+      currentTimelineKey: timelineKey,
+      visibilityResolver,
+      resolveAgentForTimeline: (tlKey) => {
+        const e = resolveWorkspaceForTimeline(tlKey);
+        if (!e || e.agentName === "__legacy__") return null;
+        return e.agentName;
+      },
+      currentAgentName: agentName,
+    };
+  }
+
+  /**
    * Whether a tool is in a session's catalog: built for it (disabled_tools and
    * feature gates already applied by buildSessionTools) and kept by the session
    * type's tools allowlist (the factory's filterTools).
@@ -7276,27 +7286,31 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
    * create and awaited inside it (after routing and the build), so the waits and
    * the decision requests run in parallel with both. Never rejects.
    *
-   *   - Fold-after-settle owner (`ownerSessionId`): its record is injected
-   *     unconditionally when it exists, after waiting for an in-flight one (§7).
+   *   - Only records this session could read itself (`sessionReadGateFor`: its
+   *     own agent's, none of an isolated channel it is not in) are candidates,
+   *     so no other record reaches the decision state or the injection.
    *   - Reply target: the replied-to bot message's session, after waiting for an
    *     in-flight record (CONTRACT 7). Without the records point it is injected when
    *     `inject_on_reply` (6.1); with it, it is a candidate like the others.
    *   - Records point on: the reply target plus recorded sessions represented
    *     in the continuous recent-chat window (age and message-count bounded,
    *     in-flight ones skipped) are judged one request each; a whole-selection failure
-   *     falls back to the 6.1 rule.
+   *     falls back to the 6.1 rule, and so does a failed reply-target evaluation.
    */
   async function planRecordInjections(
     inbound: InboundChatEvent,
     session: { id: string; sessionType: string; timelineKey: string },
-    ownerSessionId: string | undefined,
   ): Promise<SyntheticCallSpec[]> {
     if (config.session_records?.enabled === false) return [];
     const agentName = agentNameForTimeline(session.timelineKey);
     const injectOnReply = config.session_records?.inject_on_reply !== false;
     const pointOn = decisionEngine?.isEnabled("records", agentName) ?? false;
-    // Only this agent's own records (read_session_record would refuse others).
+    // Only records read_session_record would return to this session: the same
+    // gate (channel visibility, own agent), then the row's own agent.
+    const readGate = sessionReadGateFor(session.timelineKey, agentName);
+    const readable = (sessionId: string) => canReadSession(sessionId, storage, readGate);
     const ownRecord = (sessionId: string) => {
+      if (!readable(sessionId)) return undefined;
       const row = storage.getSessionRecord(sessionId);
       if (!row) return undefined;
       return row.agent !== null && agentName !== null && row.agent !== agentName ? undefined : row;
@@ -7306,12 +7320,6 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       params: { session_id: sessionId },
       harness: { kind: "injection", ...(decisionGroup ? { decisionGroup } : {}) },
     });
-
-    let owner: string | undefined;
-    if (ownerSessionId) {
-      await sessionRecordService.waitFor(ownerSessionId);
-      if (ownRecord(ownerSessionId)) owner = ownerSessionId;
-    }
 
     const replyExternalId = inbound.event.replyTo?.externalId;
     const replyEvent = replyExternalId
@@ -7323,20 +7331,17 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     const repliedSessionId =
       replyEvent?.agentSessionId ??
       (replyEvent && !replyEvent.sender.isSelf ? storage.getSessionIdForRequestEvent(replyEvent.id) : undefined);
-    if (repliedSessionId && repliedSessionId !== owner && repliedSessionId !== session.id && (injectOnReply || pointOn)) {
+    if (repliedSessionId && repliedSessionId !== session.id && (injectOnReply || pointOn) && readable(repliedSessionId)) {
       await sessionRecordService.waitFor(repliedSessionId);
       if (ownRecord(repliedSessionId)) replyTarget = repliedSessionId;
     }
-    const ruleSpecs = (): SyntheticCallSpec[] => [
-      ...(owner ? [spec(owner)] : []),
-      ...(replyTarget && injectOnReply ? [spec(replyTarget)] : []),
-    ];
+    const ruleSpecs = (): SyntheticCallSpec[] => (replyTarget && injectOnReply ? [spec(replyTarget)] : []);
     if (!pointOn || !decisionEngine) return ruleSpecs();
 
     try {
       const rawDecisions = decisionsFor(config, agentName);
       const candidatesLimit = rawDecisions.records?.candidates ?? DEFAULT_RECORDS_CANDIDATES;
-      const exclude = new Set([owner, replyTarget].filter((id): id is string => id !== undefined));
+      const exclude = new Set(replyTarget ? [replyTarget] : []);
       const triggerIds = new Set([inbound.event.id, ...(inbound.trigger?.groupedEventIds ?? [])]);
       // Bound the conversation first; never walk farther back merely to fill the shortlist.
       const maxAgeMs = rawDecisions.records?.candidate_max_age_ms ?? 60 * 60_000;
@@ -7396,7 +7401,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       }
       const { inject, decisionGroup } = await selectRecordsToInject(
         decisionEngine,
-        { candidates, rawDecisions },
+        { candidates, rawDecisions, injectOnReply },
         {
           agentName,
           attribution: {
@@ -7409,8 +7414,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           triggerEventId: inbound.event.id,
         },
       );
-      // The fold owner's record is outside the judgement (§7): first, uncapped.
-      return [...(owner ? [spec(owner)] : []), ...inject.map((id) => spec(id, decisionGroup))];
+      return inject.map((id) => spec(id, decisionGroup));
     } catch (error) {
       logger.warn("records_injection_select_failed", {
         sessionId: session.id,
@@ -7468,6 +7472,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // — steerReplyToActiveSession already ran for running sessions; either way this
     // is not a completed-session fork.
     if (sessions.get(sessionId)) return false;
+    // A completed session that is still revivable (§8 "Late input") keeps its
+    // in-memory agent: a late message may revive it at any moment, and a resume
+    // from the DB beside it would run two agents on one session. Fresh instead.
+    if (lateInputEntries.has(sessionId)) {
+      logger.info("reply_resume_revivable", { sessionId, timelineKey: inbound.timelineKey });
+      return false;
+    }
     // Synchronous single-flight (§15): only the first reply resumes a given state.
     // A concurrent second reply degrades to FRESH; once the first markRunning's,
     // later replies steer via the running-session path instead.
@@ -7483,6 +7494,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         logger.warn("reply_resume_record_unsettled", { sessionId, timelineKey: inbound.timelineKey });
         return false;
       }
+      // Revived while we waited: the steer path's business now.
+      if (sessions.get(sessionId) || lateInputEntries.has(sessionId)) return false;
       // ── Pre-CAS gate (§7 steps 2–8) ────────────────────────────────────────
       // Delegated to the throw-safe `evaluateResumeGate` (review issue #2): every
       // ineligible reply — and any UNEXPECTED throw inside the gate (DB read,
@@ -7926,12 +7939,6 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     duplicate: boolean,
     opts?: {
       proactive?: boolean;
-      /**
-       * Session id whose record must be injected at launch (fold-after-settle
-       * path, spec SESSION-RECORDS §6): the calling session's record is
-       * injected regardless of inject_on_reply / replyTo checks.
-       */
-      ownerSessionId?: string;
     },
   ): Promise<void> {
     // Proactive sessions (ARCHITECTURE.md §9g) reuse this launcher verbatim; the
@@ -7939,7 +7946,6 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // context-build mode, and typing suppression. Everything else — tool assembly,
     // capture, slot release, queued-trigger drainage — is shared.
     const proactive = opts?.proactive === true;
-    const ownerSessionId = opts?.ownerSessionId;
     // Resume fork (spec RESUMABLE-SESSIONS §7): a reply that continues a completed,
     // eligible session takes over this trigger's slot and returns true. Any gate
     // failing (or a non-reply/proactive trigger) falls through to the FRESH launch below.
@@ -8187,7 +8193,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             : undefined,
         injections: proactive || !inSessionCatalog(tools, session.sessionType, "read_session_record")
           ? undefined
-          : planRecordInjections(inbound, session, ownerSessionId).catch((error) => {
+          : planRecordInjections(inbound, session).catch((error) => {
               logger.warn("records_injection_plan_failed", {
                 sessionId: session.id,
                 error: error instanceof Error ? error.message : String(error),
@@ -8566,7 +8572,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         });
       }
       reviving = (async () => {
-        if (finalized || draining || lateCtl?.phase !== "ended") {
+        // A reply-resume that claimed this session continues it from the DB:
+        // never a second agent on the same session.
+        if (finalized || draining || lateCtl?.phase !== "ended" || resumeClaims.has(session.id)) {
           revivalRequested = false;
           return false;
         }

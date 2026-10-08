@@ -21,6 +21,7 @@ import {
   servedModelOf,
   type ContractBranchInput,
 } from "../agent/contract.js";
+import { isHarnessMade, modelToolCalls } from "../agent/harness.js";
 import { assistantText, postedText, reasoningSources, type CheckSources } from "../checks/state.js";
 import type { Checkpoint } from "../checks/types.js";
 import { isPostingTool } from "../tools/side-effects.js";
@@ -37,19 +38,16 @@ function asObj(m: unknown): Loose | undefined {
 }
 
 function isHarness(m: Loose): boolean {
-  return m["harness"] !== undefined;
+  return isHarnessMade(m);
 }
 
+/** The model's own tool calls (none for a harness-made message, src/agent/harness.ts). */
 function toolCallsOf(m: unknown): ToolCall[] {
-  const content = asObj(m)?.["content"];
-  if (!Array.isArray(content)) return [];
-  const out: ToolCall[] = [];
-  for (const b of content as Loose[]) {
-    if (!b || b["type"] !== "toolCall" || typeof b["name"] !== "string") continue;
-    const args = asObj(b["arguments"]);
-    out.push({ id: typeof b["id"] === "string" ? (b["id"] as string) : "", name: b["name"] as string, args });
-  }
-  return out;
+  return modelToolCalls(m).map((b) => ({
+    id: typeof b.id === "string" ? b.id : "",
+    name: b.name,
+    args: asObj(b.arguments),
+  }));
 }
 
 /** Raw text blocks of an assistant message (the `NO_REPLY` marker included). */

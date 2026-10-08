@@ -1,4 +1,5 @@
 import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
+import { modelToolCalls } from "./harness.js";
 
 // =============================================================================
 // Resume work gate (spec RESUMABLE-SESSIONS §7a).
@@ -64,7 +65,10 @@ export function collectExemptToolNames(
 /**
  * Does this transcript contain ≥1 NON-exempt tool call within the configured
  * scope (spec §7a base rule)? Thinking / text / content blocks never count — only
- * `toolCall` blocks in assistant turns, classified by name against `exemptToolNames`.
+ * `toolCall` blocks in assistant turns the MODEL wrote, classified by name against
+ * `exemptToolNames`. Harness-made calls (any message with a `harness` marker:
+ * injected `read_session_record` pairs, routing's `load_skill` preloads, the
+ * synthetic `tool_search` loads) never count, whatever their tool name.
  *
  * - `any_in_history` (loose): a non-exempt call ANYWHERE in the transcript. Keeps a
  *   thread resumable as long as it ever did work (research carried through a chain
@@ -108,14 +112,10 @@ export function hasResumableWork(
     }
   }
   for (let i = startIndex; i < transcript.length; i++) {
-    const msg = transcript[i] as { role?: string; content?: unknown };
-    if (!msg || typeof msg !== "object") continue;
-    if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
-    for (const block of msg.content) {
-      const call = block as { type?: string; name?: unknown };
-      if (call?.type === "toolCall" && typeof call.name === "string") {
-        if (!opts.exemptToolNames.has(call.name)) return true;
-      }
+    // Only the model's own calls: harness-made pairs (record injections, routing's
+    // skill preloads, synthetic loads) never count as work (src/agent/harness.ts).
+    for (const call of modelToolCalls(transcript[i])) {
+      if (!opts.exemptToolNames.has(call.name)) return true;
     }
   }
   return false;

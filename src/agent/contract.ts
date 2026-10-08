@@ -11,6 +11,7 @@
 
 import type { ContractOutcome } from "../storage/database.js";
 import { RENDERED_MESSAGE_TAGS } from "../context/renderer.js";
+import { harnessKindOf, isHarnessMade, modelToolCalls } from "./harness.js";
 import {
   IRREVERSIBLE_TOOLS,
   POSTING_TOOL_NAMES,
@@ -226,11 +227,6 @@ function asObj(m: unknown): Loose | undefined {
   return m !== null && typeof m === "object" ? (m as Loose) : undefined;
 }
 
-function harnessKind(m: Loose): string | undefined {
-  const h = asObj(m["harness"]);
-  return typeof h?.["kind"] === "string" ? (h["kind"] as string) : undefined;
-}
-
 function blocksOf(m: Loose): Block[] {
   return Array.isArray(m["content"]) ? (m["content"] as Block[]).filter((b) => b && typeof b === "object") : [];
 }
@@ -248,6 +244,14 @@ function toolCallsOf(m: Loose): { id: string; name: string; args: unknown }[] {
   return blocksOf(m)
     .filter((b) => b.type === "toolCall" && typeof b.name === "string")
     .map((b) => ({ id: typeof b.id === "string" ? b.id : "", name: b.name as string, args: b.arguments }));
+}
+
+/**
+ * The model's own tool calls of a message: none for a harness-made one
+ * (src/agent/harness.ts), so nothing injected is an attempt or a delivery.
+ */
+function modelToolCallsOf(m: unknown): { id: string; name: string; args: unknown }[] {
+  return modelToolCalls(m).map((b) => ({ id: typeof b.id === "string" ? b.id : "", name: b.name, args: b.arguments }));
 }
 
 /** A corrective prompt: tagged, or (history) matching a known wording. */
@@ -275,7 +279,7 @@ export function isRunStart(message: unknown): boolean {
   if (!m) return false;
   if (m["type"] === "triggerGroup" || m["type"] === "satellite") return true;
   if (m["role"] !== "user") return false;
-  if (m["harness"] !== undefined) return false;
+  if (isHarnessMade(m)) return false;
   return nudgeOf(m) === undefined;
 }
 
@@ -454,7 +458,7 @@ function closeSpan(
   let ending: Located | undefined;
   for (let i = span.length - 1; i >= 0; i -= 1) {
     const m = asObj(span[i]!.m);
-    if (m?.["role"] === "assistant" && harnessKind(m) === undefined) {
+    if (m?.["role"] === "assistant" && !isHarnessMade(m)) {
       ending = span[i];
       break;
     }
@@ -473,9 +477,7 @@ function closeSpan(
   }
   const sends: boolean[] = [];
   for (const x of span) {
-    const m = asObj(x.m);
-    if (m?.["role"] !== "assistant" || harnessKind(m) !== undefined) continue;
-    for (const call of toolCallsOf(m)) {
+    for (const call of modelToolCallsOf(x.m)) {
       if (!isPostingTool(call.name) && call.name !== "no_reply") continue;
       const isError = resultError.get(call.id);
       if (isError !== undefined) sends.push(isError);
@@ -616,7 +618,7 @@ export function deriveContractEvents(
     }
     const m = asObj(item.m);
     if (!m) continue;
-    if (m["role"] === "user" && harnessKind(m) === "record_turn") {
+    if (m["role"] === "user" && harnessKindOf(m) === "record_turn") {
       finishRun();
       continue;
     }
@@ -636,8 +638,8 @@ export function deriveContractEvents(
       run.variant = nudge.variant;
       continue;
     }
-    if (m["role"] === "assistant" && harnessKind(m) === undefined) {
-      for (const call of toolCallsOf(m)) if (isPostingTool(call.name)) run.postingCalls.add(call.id);
+    if (m["role"] === "assistant" && !isHarnessMade(m)) {
+      for (const call of modelToolCallsOf(m)) if (isPostingTool(call.name)) run.postingCalls.add(call.id);
     } else if (m["role"] === "toolResult" && m["isError"] !== true && run.postingCalls.has(m["toolCallId"] as string)) {
       run.delivered = true;
     }

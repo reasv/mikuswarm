@@ -2,6 +2,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import { collectExemptToolNames, hasResumableWork } from "../src/agent/work-gate.ts";
+import { isHarnessMade, modelToolCalls } from "../src/agent/harness.ts";
+import { executeSyntheticCalls } from "../src/agent/synthetic-calls.ts";
+import { externalizeImages } from "../src/agent/session-capture.ts";
+import { rehydrateImages } from "../src/agent/recovery.ts";
 
 // Tool factories that MUST be flagged exempt (spec RESUMABLE-SESSIONS §7a list).
 import { createSendMessageTool } from "../src/tools/send-message.ts";
@@ -103,6 +107,58 @@ test("work gate: extra_exempt_tools demote a would-be work tool (incl. mcp__ nam
   const t = [triggerGroup(), assistantCalls("mcp__weather__get")];
   const exempt = collectExemptToolNames([], ["mcp__weather__get"]);
   assert.equal(hasResumableWork(t, { scope: "any_in_history", exemptToolNames: exempt }), false);
+});
+
+// ── Owner rule: nothing injected counts as work (src/agent/harness.ts) ───────
+
+/** Harness-made pairs exactly as the injection mechanism builds them. */
+async function injectedPairs(): Promise<AgentMessage[]> {
+  const tool = (name: string): AgentTool =>
+    ({ name, label: name, description: name, parameters: {}, execute: async () => ({ content: [{ type: "text", text: "ok" }], details: { session_id: "s-earlier" } }) }) as unknown as AgentTool;
+  return executeSyntheticCalls(
+    [
+      // withDeferredLoads' synthetic select, routing's skill preload, the records point's injection.
+      { name: "tool_search", params: { query: "select:read_session_record" }, harness: { kind: "injection", decisionGroup: "g1" } },
+      { name: "load_skill", params: { name: "research" }, harness: { kind: "injection", decisionGroup: "g0" } },
+      { name: "read_session_record", params: { session_id: "s-earlier" }, harness: { kind: "injection", decisionGroup: "g1" } },
+    ],
+    [tool("tool_search"), tool("load_skill"), tool("read_session_record")],
+    { api: "openai-completions", provider: "p", model: "m" },
+  );
+}
+
+test("work gate: harness-injected calls never count as work, whatever the tool", async () => {
+  const pairs = await injectedPairs();
+  // The injected tool is NOT exempt by name: only the harness marker keeps it out.
+  const t = [triggerGroup(), ...pairs, assistantCalls("send_message")];
+  for (const scope of ["any_in_history", "since_last_turn"] as const) {
+    assert.equal(hasResumableWork(t, { scope, exemptToolNames: EXEMPT }), false, scope);
+  }
+});
+
+test("work gate: the model's own read_session_record call still counts as work", async () => {
+  const t = [triggerGroup(), ...(await injectedPairs()), assistantCalls("read_session_record"), assistantCalls("send_message")];
+  assert.equal(hasResumableWork(t, { scope: "any_in_history", exemptToolNames: EXEMPT }), true);
+});
+
+test("work gate: the harness marker survives transcript persistence and resume loading", async () => {
+  const t = [triggerGroup(), ...(await injectedPairs()), assistantCalls("send_message")];
+  // The capture's serialization, then the resume path's rehydration.
+  const stored = JSON.stringify(externalizeImages(t));
+  const loaded = (await rehydrateImages(JSON.parse(stored), async () => null)) as AgentMessage[];
+  assert.equal(loaded.filter(isHarnessMade).length, 6);
+  assert.equal(hasResumableWork(loaded, { scope: "any_in_history", exemptToolNames: EXEMPT }), false);
+  assert.equal(
+    hasResumableWork([...loaded, assistantCalls("web_fetch")], { scope: "since_last_turn", exemptToolNames: EXEMPT }),
+    true,
+  );
+});
+
+test("modelToolCalls: only the model's own calls, never a harness-made message's", async () => {
+  const [assistant] = await injectedPairs();
+  assert.deepEqual(modelToolCalls(assistant), []);
+  assert.deepEqual(modelToolCalls(assistantCalls("web_fetch")).map((c) => c.name), ["web_fetch"]);
+  assert.deepEqual(modelToolCalls({ role: "toolResult", content: [] }), []);
 });
 
 test("collectExemptToolNames reads the per-tool flag and merges extras", () => {

@@ -16,6 +16,7 @@ import type { DynamicToolRegistry } from "./dynamic-tools.js";
 import type { PriorityClass } from "./scheduler.js";
 import { buildSyntheticCallFromResult, type HarnessMarker } from "./synthetic-calls.js";
 import { hasResumableWork } from "./work-gate.js";
+import { harnessKindOf, isHarnessMade } from "./harness.js";
 import { SYNTHETIC_SESSION_TYPES } from "./recovery.js";
 import { extractLlmRequestClass, isRefusalSignal } from "./request-retry.js";
 import { formatLoadedTools } from "../tools/tool-search.js";
@@ -56,7 +57,8 @@ const RECORD_TOOL = "session_record_tool";
  *   - Synthetic session type (summarize, condense, diary) → no.
  *   - Only the chat lane (`default`) and the proactive session type write one.
  *   - Work gate (a tool call in the rollout outside `exemptToolNames`) → no
- *     record for pure conversation.
+ *     record for pure conversation. Only the model's own calls count: a record
+ *     the harness injected is not work (src/agent/harness.ts).
  */
 export function isEligibleForRecord(
   sessionType: string,
@@ -97,7 +99,7 @@ export function buildsOnFromTranscript(messages: readonly AgentMessage[]): strin
       isError?: boolean;
       details?: unknown;
     };
-    if (m.harness?.kind !== "injection") continue;
+    if (harnessKindOf(m) !== "injection") continue;
     if (m.role === "assistant" && Array.isArray(m.content)) {
       for (const block of m.content as Array<{ type?: string; id?: string; name?: string }>) {
         if (block.type === "toolCall" && block.name === "read_session_record" && block.id) injectedCalls.add(block.id);
@@ -128,7 +130,7 @@ export type RecordTurnFailure =
  */
 export function recordTurnStartIndex(messages: readonly AgentMessage[]): number {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
-    if ((messages[i] as { harness?: { kind?: string } }).harness?.kind === "record_turn") return i;
+    if (harnessKindOf(messages[i]) === "record_turn") return i;
   }
   return -1;
 }
@@ -394,6 +396,10 @@ export class SessionRecordService {
       agent.clearAllQueues();
       logger.warn("session_record_queue_cleared", { sessionId });
     }
+    // Every record turn starts on an empty draft. A revived run reuses its
+    // launch's handles: the draft of the turn the revival forked away is not
+    // this run's record (and `create` would refuse to start a new one).
+    handles.draft.reset();
 
     // The kickoff: the record prompt, plus the record tool's load when it is
     // not loaded yet. Rebuilt for a rerun (a fork unloads what only the
@@ -448,7 +454,10 @@ export class SessionRecordService {
       }
       if (event.type !== "turn_end") return;
       turns += 1;
-      if (turns >= maxTurns && !finalized) entry.abort?.("max_turns");
+      // Not finalized after max_turns: give up. Finalized but still looping (a
+      // finalize batched with another call does not end pi's loop): one turn of
+      // slack, then stop; the finalized draft is still written.
+      if ((turns >= maxTurns && !finalized) || turns > maxTurns) entry.abort?.("max_turns");
     });
     handles.gate.active = true;
     // The record's soft-refusal verdict (spec REFUSAL-HANDLING §5.2.3), when judged.
@@ -461,6 +470,9 @@ export class SessionRecordService {
         const draftText = handles.draft.isCreated() ? handles.draft.getContent() : "";
         if (draftText.trim().length === 0) break;
         const verdict = await params.judgeRecord(draftText);
+        // A revival or shutdown that landed while the judge ran ends the turn:
+        // no rerun, no write.
+        if (abortReason || this.stopping) break;
         if (verdict === undefined) break;
         if (verdict !== "rerun") {
           judged = verdict;
@@ -486,7 +498,9 @@ export class SessionRecordService {
       params.setRefusalSite?.(undefined);
     }
 
-    if (abortReason && !finalized) {
+    // A revival forks this turn away: it never writes, even when it finalized
+    // (the revived run writes the record at its new end).
+    if (abortReason === "revival" || (abortReason && !finalized)) {
       fail(abortReason, { turns });
       return;
     }
@@ -524,7 +538,7 @@ export class SessionRecordService {
     // assistant message carries the wire model id, like agent_sessions.model_id.
     const served = [...turnMessages]
       .reverse()
-      .find((m) => (m as { role?: string }).role === "assistant" && !(m as { harness?: unknown }).harness) as { model?: string } | undefined;
+      .find((m) => (m as { role?: string }).role === "assistant" && !isHarnessMade(m)) as { model?: string } | undefined;
     await params.storage.upsertSessionRecord({
       session_id: sessionId,
       timeline_key: params.timelineKey,

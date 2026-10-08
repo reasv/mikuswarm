@@ -36,7 +36,7 @@ export interface AppHarness {
   llm: FakeLlm;
   sends: HarnessSend[];
   /** Deliver a user message; `mention` makes it a trigger. Returns its external id. */
-  say(body: string, opts?: { mention?: boolean; replyTo?: string; id?: string; attachments?: AttachmentMeta[]; sender?: { id: string; displayName: string; username?: string }; timestamp?: number }): string;
+  say(body: string, opts?: { mention?: boolean; replyTo?: string; id?: string; attachments?: AttachmentMeta[]; sender?: { id: string; displayName: string; username?: string }; timestamp?: number; timelineKey?: string; roomId?: string }): string;
   /** Edit a stored message (`m.replace`); `mention` = the new content mentions the bot. */
   edit(targetExternalId: string, body: string, opts?: { mention?: boolean; sender?: { id: string; displayName: string; username?: string } }): void;
   /** Delete a stored message (a tombstone through the edit path). */
@@ -208,14 +208,17 @@ export async function startHarness(opts: {
       const sentAt = sayOpts.timestamp ?? now;
       const externalId = sayOpts.id ?? `$user${seq}`;
       const sender = sayOpts.sender ?? { id: "@alice:fake", displayName: "Alice", username: "alice" };
+      // Another group room of the same account: `timelineKey` + its `roomId`.
+      const timelineKey = sayOpts.timelineKey ?? HARNESS_TK;
+      const roomId = sayOpts.roomId ?? "!room";
       const inbound: InboundChatEvent = {
         provider: "matrix",
-        timelineKey: HARNESS_TK,
+        timelineKey,
         channelType: "group",
         event: {
           id: `evt-${externalId}`,
           externalId,
-          timelineKey: HARNESS_TK,
+          timelineKey,
           provider: "matrix",
           role: "user",
           sender,
@@ -229,7 +232,7 @@ export async function startHarness(opts: {
         ...(sayOpts.mention
           ? { trigger: { type: "mention" as const, reason: "mention", triggeredBy: sender } }
           : {}),
-        outboundTarget: { provider: "matrix", timelineKey: HARNESS_TK, accountId: "test", roomId: "!room" },
+        outboundTarget: { provider: "matrix", timelineKey, accountId: "test", roomId },
       } as InboundChatEvent;
       host!.onEvent(inbound);
       return externalId;

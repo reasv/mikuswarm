@@ -62,6 +62,11 @@ export interface RecordsInput {
   candidateSessionId: string;
   /** True when this candidate is the session targeted by the reply (spec §6.2). */
   isReplyTarget: boolean;
+  /**
+   * `[session_records].inject_on_reply` (absent = true): the fallback is the
+   * 6.1 rule, so a reply target is injected without a verdict only when on.
+   */
+  injectOnReply?: boolean;
 }
 
 /** Verdict: whether to inject this record. */
@@ -169,10 +174,12 @@ export const recordsPoint: DecisionPoint<RecordsInput, RecordsVerdict> = {
   },
 
   fallback(input: RecordsInput): RecordsVerdict {
-    // CONTRACT decision 8: reply target → inject; others → don't.
+    // CONTRACT decision 8 (the 6.1 rule): reply target → inject when
+    // inject_on_reply is on; others → don't.
+    const inject = input.isReplyTarget && input.injectOnReply !== false;
     return {
-      inject: input.isReplyTarget,
-      relevance: input.isReplyTarget ? 1 : 0,
+      inject,
+      relevance: inject ? 1 : 0,
       candidateSessionId: input.candidateSessionId,
     };
   },

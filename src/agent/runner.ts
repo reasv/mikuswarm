@@ -5,6 +5,7 @@ import type { AgentSessionRecord, SessionRunLifecycle } from "./session-manager.
 import type { Logger } from "../observability/logger.js";
 import type { RedoRequest, SessionRedoControl } from "./redo-signal.js";
 import { isPostingTool } from "../tools/side-effects.js";
+import { isHarnessMade } from "./harness.js";
 import { FORCED_COMPLETION_PROMPTS, currentContractAttempt, type ForcedCompletionMarker } from "./contract.js";
 import {
   classifyLlmError,
@@ -419,8 +420,7 @@ async function reportEnding(
   if (!hook || lifecycle?.isInterrupted() || wasAborted(agent.state.messages)) return;
   const messages = agent.state.messages;
   // Harness-made endings are policy outcomes, not model output to judge again.
-  const terminal = findLastAssistantMessage(messages) as { harness?: unknown } | undefined;
-  if (terminal?.harness) return;
+  if (isHarnessMade(findLastAssistantMessage(messages))) return;
   let kind: SessionEnding["kind"];
   if (!isTerminallyValid(messages)) {
     kind = "exhausted";

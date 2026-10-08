@@ -190,6 +190,11 @@ test("records fallback: reply target → inject=true; others → inject=false", 
   assert.equal(other.relevance, 0);
 });
 
+test("records fallback: inject_on_reply = false → the reply target is not injected either", () => {
+  assert.equal(recordsPoint.fallback(input({ isReplyTarget: true, injectOnReply: false })).inject, false);
+  assert.equal(recordsPoint.fallback(input({ isReplyTarget: true, injectOnReply: true })).inject, true);
+});
+
 // --- describe ----------------------------------------------------------------
 
 test("records describe: serializable with rounded relevance", () => {
@@ -626,6 +631,29 @@ test("selectRecordsToInject: point disabled → 6.1 rule (reply target only)", a
   );
   // Both candidates get fallback verdict: reply target → inject, other → don't
   assert.deepEqual(result.inject, ["s-reply"]);
+});
+
+test("selectRecordsToInject: a failed reply-target evaluation follows inject_on_reply", async () => {
+  const malformed = {
+    model: "vendor/decider-1-20261001",
+    answers: { relevant: { choice: "yes", probabilities: {}, confidence: 0.9 } },
+    usage: { input_tokens: 200, output_tokens: 5, cost: 0.000009 },
+  };
+  for (const injectOnReply of [undefined, true, false]) {
+    const { fn } = fakeFetch([() => j(200, malformed)]);
+    const { engine } = makeEngine(recordsConfig(), fn);
+    const result = await selectRecordsToInject(
+      engine,
+      {
+        candidates: [{ sessionId: "s-reply", record: "r", isReplyTarget: true, request: { from: "Alice", text: "x" } }],
+        rawDecisions: decisionsRaw,
+        ...(injectOnReply === undefined ? {} : { injectOnReply }),
+      },
+      { agentName: null, attribution: {} },
+    );
+    assert.equal(result.outcomes.get("s-reply")?.reason, "error");
+    assert.deepEqual(result.inject, injectOnReply === false ? [] : ["s-reply"], `injectOnReply=${injectOnReply}`);
+  }
 });
 
 test("selectRecordsToInject: empty candidates returns empty inject", async () => {
