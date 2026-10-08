@@ -117,7 +117,8 @@ export function seenStampOf(message: unknown): SeenStamp | undefined {
   if (!seen) return undefined;
   const stamp: SeenStamp = {};
   if (typeof seen["timelineKey"] === "string") stamp.timelineKey = seen["timelineKey"];
-  if (typeof seen["upTo"] === "number" && Number.isFinite(seen["upTo"])) stamp.upTo = seen["upTo"];
+  // A non-positive point was never a real one (an older build that read no raw event stamped 0).
+  if (typeof seen["upTo"] === "number" && Number.isFinite(seen["upTo"]) && seen["upTo"] > 0) stamp.upTo = seen["upTo"];
   if (Array.isArray(seen["eventIds"])) stamp.eventIds = seen["eventIds"].filter((id): id is string => typeof id === "string");
   return stamp;
 }
@@ -178,6 +179,13 @@ export function seenFromMessages(
   if (state.since === undefined) delete state.since;
   return state;
 }
+
+/**
+ * How far back the unseen messages are read at most (ms before the draft): the
+ * check is about sessions posting in parallel, and the bound keeps the read of
+ * a session with an old last-seen point (a long or resumed one) cheap.
+ */
+export const UNSEEN_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 
 /** The last-seen point of `timelineKey`: its own watermark, else the build cutoff. */
 export function lastSeen(seen: SeenState, timelineKey: string): number | undefined {

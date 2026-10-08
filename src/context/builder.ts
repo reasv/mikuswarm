@@ -409,6 +409,9 @@ export class ContextBuilder {
     //    are no raw events.
     let selection: SummarySelection;
     let events: CanonicalChatEvent[];
+    // When the timeline was read (the `receivedAt` clock): the visibility point
+    // of a build that read no raw event (everything summarized, or nothing yet).
+    const readAt = Date.now();
     if (condenseInputs) {
       selection = { summaries: condenseInputs.summaries, coverageEndEventId: null };
       events = [];
@@ -475,9 +478,11 @@ export class ContextBuilder {
       ? (e: CanonicalChatEvent) => e.receivedAt <= options.timelineCutoff! || triggerGroupIds.has(e.id)
       : undefined;
     if (cutoffKeep) events = events.filter(cutoffKeep);
+    // The newest message read; a build that read none saw the timeline up to
+    // the moment it read it (its summaries cover everything before). Never 0.
     const timelineCutoff = generation
       ? undefined
-      : options.timelineCutoff ?? events.reduce((max, e) => Math.max(max, e.receivedAt ?? 0), 0);
+      : options.timelineCutoff ?? (events.reduce((max, e) => Math.max(max, e.receivedAt ?? e.timestamp ?? 0), 0) || readAt);
 
     this.logger?.debug("summary_coverage_resolved", {
       timelineKey: options.timelineKey,

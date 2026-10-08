@@ -58,6 +58,7 @@ import {
   lastSeen,
   seenFromMessages,
   selectUnseen,
+  UNSEEN_MAX_AGE_MS,
   type Answering,
   type DuplicateContext,
   type DuplicateRow,
@@ -487,7 +488,8 @@ export class OutputGate implements SessionEndingHook {
       if (after === undefined) return skip("no_last_seen", { target });
       const knobs = this.evaluator.duplicateKnobs(scope.agent);
       const now = this.now();
-      const rows = source.messages(target, after, knobs.maxEarlier * 4 + 8);
+      // Never older than the bound: a parallel session's messages are recent.
+      const rows = source.messages(target, Math.max(after, now - UNSEEN_MAX_AGE_MS), knobs.maxEarlier * 4 + 8);
       // Deleted messages count as of now (the evaluation time).
       const earlier = selectUnseen(rows, seen, { selfSessionId: scope.sessionId ?? "", max: knobs.maxEarlier, asOf: now });
       if (earlier.length === 0) return skip("no_unseen", { target });
