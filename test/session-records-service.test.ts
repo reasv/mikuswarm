@@ -620,3 +620,45 @@ test("record turn: max_turns still stops a loop that goes on after finalize", as
   assert.deepEqual(rows.map((r) => r.text), ["the record"], "the finalized draft is still written");
   assert.ok(lines.some((l) => l.message === "session_record_written"));
 });
+
+test("record turn: a finalized record stopped by max_turns is still judged before it is written", async () => {
+  for (const verdict of ["exhausted", "accept"] as const) {
+    const svc = new SessionRecordService();
+    const { logger } = quietLogger();
+    const rows: Array<{ text: string }> = [];
+    const handles: Handles = { gate: { active: false }, draft: new SummaryDraft() };
+    const script = [{ command: "create", file_text: "the record", finalize: true, blocked: true }];
+    for (let i = 0; i < 20; i++) script.push({ command: "view", blocked: true } as never);
+    const agent = scriptedAgent(handles, script);
+    let judgedTexts: string[] = [];
+    await svc.start({
+      ...recordParams(handles, rows, logger),
+      agent,
+      config: { enabled: true, max_turns: 3 },
+      judgeRecord: async (text: string) => { judgedTexts.push(text); return verdict; },
+    });
+    assert.deepEqual(judgedTexts, ["the record"], `${verdict}: judged once`);
+    assert.deepEqual(rows.map((r) => r.text), verdict === "accept" ? ["the record"] : [], `${verdict}: written only when accepted`);
+    judgedTexts = [];
+  }
+});
+
+test("record turn: a revival during the judge of a capped turn still stops the write", async () => {
+  const svc = new SessionRecordService();
+  const { logger, lines } = quietLogger();
+  const rows: Array<{ text: string }> = [];
+  const handles: Handles = { gate: { active: false }, draft: new SummaryDraft() };
+  const script = [{ command: "create", file_text: "the record", finalize: true, blocked: true }];
+  for (let i = 0; i < 20; i++) script.push({ command: "view", blocked: true } as never);
+  const agent = scriptedAgent(handles, script);
+  let revival: Promise<void> | undefined;
+  await svc.start({
+    ...recordParams(handles, rows, logger),
+    agent,
+    config: { enabled: true, max_turns: 3 },
+    judgeRecord: async () => { revival = svc.abortForRevival("s1"); return "accept"; },
+  });
+  await revival;
+  assert.equal(rows.length, 0);
+  assert.ok(lines.some((l) => l.message === "session_record_failed" && l.fields?.reason === "revival"));
+});
