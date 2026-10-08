@@ -1,6 +1,6 @@
 # Memory retrieval: judged candidates, readable excerpts, operator filters
 
-**Status**: PROPOSAL, draft rev 3 (2026-10-08: owner answers folded in, §12; keyword/pattern filters and time-scoped filters, §7). Not implemented.
+**Status**: PROPOSAL, draft rev 4 (2026-10-08: owner answers, §12; keyword/pattern/time-scoped filters, §7; the cross-encoder stage, §5.0a; batched vs split judging, §5). Not implemented.
 **Supersedes**: spec/DECISION-MODEL.md §5.5, first half (re-ranking and richer excerpts). Summary pre-expansion (the second half of §5.5) stays out of scope.
 **Builds on**: ARCHITECTURE.md §9c (diary memory, recency layer), §9d (hybrid search, `recall_memory`, auto-retrieval), §8h (decision engine, chains, calibration), spec/DECISION-MODEL.md §3 (client, fits, billing).
 **Target ARCHITECTURE.md home once implemented**: §9d (auto-retrieval, `recall_memory`), §9c (recency layer filtering), §8h (the `memory` decision point).
@@ -99,15 +99,32 @@ The decision model is one option among several. They differ in what they answer 
 | Query rewriting / hypothetical-entry generation (an LLM writes the search query or a fake diary entry to embed) | better recall on terse follow-ups | an LLM call per session | remote, needs a ZDR model | Addresses problem 3 differently from §4's conversation-window query. |
 | Provenance participant tags (§4a) | exact "was in the conversation" tags | free | local | Fixes the user lane at the source, not per query. |
 
-**Recommended combination.**
-- Wider recall (§4) with fusion, plus provenance participant tags (§4a).
-- The decision model as the relevance judge (§5).
-  - On a per-request-billed member, one call already judges all ~24 candidates, so nothing needs trimming before it.
-  - A cross-encoder's remaining value is better ordering for the fallback path and for per-question members. Its cost is CPU or GPU time and latency on every build.
-  - Start without it. Measure it offline (below) and on the deployment's hardware before adding it to the hot path.
-- **Compare the options offline** with the §9 harness before tuning:
-  - hybrid alone, the cross-encoder alone, the decision model alone, and combinations, scored against ZDR-labelled relevance;
-  - an embedding-model swap as a separate axis.
+**Recommended combination** (rev 4: the cross-encoder is part of the design, not deferred):
+
+```
+wide recall (§4, ~60 blocks) ─► cross-encoder scores every candidate (§5.0a) ─► top ~12
+   ─► decision model keep/drop with the conversation in view (§5) ─► excerpts (§6)
+```
+
+- **The cross-encoder is the ranker.** It reads each query–passage pair together, so it is far better at "does this passage answer this" than vector or BM25 similarity. Because it is cheap per pair, recall can be widened to ~60 candidates without sending 60 passages to the decision model.
+- **The decision model is the judge.** It sees what the cross-encoder cannot: the conversation, the reply target and the participants. It makes the keep/drop call, including "none".
+- **The fallback improves too.** When the decision chain is down, the cross-encoder's calibrated score with a cutoff selects the items in place of hybrid similarity.
+- **Every stage is optional and degrades in order:** no cross-encoder → the decision model judges the hybrid top ~24; no decision model → the cross-encoder cutoff; neither → the hybrid ranking with the higher floor.
+- **Compare offline first** with the §9 harness: hybrid alone, cross-encoder alone, decision model alone, and the combination, scored against ZDR-labelled relevance; plus an embedding-model swap as a separate axis. The measurements choose the cut-offs and `top_n`, not the shape.
+
+### 5.0a The cross-encoder stage
+
+- **Config** `[retrieval.rerank]`: `enabled`, `provider = "local" | "remote"`, `model`, `top_n` (default 12), `min_score` (the fallback cutoff, calibrated), `timeout_ms`, `max_passage_tokens`.
+  - **`local`:** an ONNX cross-encoder in the agent process, the same way the local embedder runs today (fastembed / onnxruntime-node). CPU only.
+  - **`remote`:** an HTTP re-rank endpoint (`POST {endpoint}/rerank` with a query and a list of texts, as served by common open inference servers), so the model can run on a GPU host. Passages are diary text derived from user messages, so a remote endpoint must be self-hosted or ZDR. Startup refuses a remote endpoint without an explicit `zdr = true` acknowledgement.
+- **Query.** The request plus a short conversation tail, clipped to the model's input budget alongside the passage.
+- **Cost and latency** (to be measured on the deployment's hardware):
+  - a large multilingual cross-encoder over ~60 passages of ~400 tokens is likely ~1 s or more of CPU per build;
+  - on a GPU, tens of milliseconds;
+  - a small English model is much cheaper on CPU but weaker.
+
+  The stage runs at launch, in parallel with routing, and its time adds to the decision model's only because the judge needs its `top_n`.
+- **Unavailable or slow** (timeout, error, not configured): the stage is skipped and the next stage takes the hybrid top ~24.
 
 ## 5. Relevance judgement: the `memory` decision point
 
@@ -140,9 +157,12 @@ Phrasing follows the documented weaknesses (§2 of DECISION-MODEL): literal, no 
 - **Zero kept means no block.**
 - `about_participant` never admits a passage on its own. Participant-tied and other relevant memories are wanted alike.
 
-**Billing layouts** (the client picks by the serving member's `billing`):
-- **Per-request members (Jev).** One call: 24 passages × 2 questions over ~10–12k tokens of state, about $0.0005 at $0.042/M.
-- **Per-question members (Perplexity, D1).** Re-billing 12k tokens for each of 48 questions is wasteful. The client splits instead: one call per passage, with state `{conversation, request, participants, passage}` and that passage's two questions, at bounded concurrency. This needs a generic "split by item" mode in the decision client (a point declares its item list; the client chooses whole or split per member). §5.5 of DECISION-MODEL anticipated it.
+**How it is asked: two layouts.** A decision request is one `state` plus a map of independent questions. Each question is answered in isolation over the same state and refers to a field by path (`passages[3].text`).
+- **Batched:** one request whose state holds all candidates in `passages[]`, with `relevant_<i>` and `about_participant_<i>` per candidate (2 × 12 = 24 questions). On a per-request-billed member (Jev) the state is billed once, about 6k tokens, roughly $0.0003.
+  - The documented weakness: accuracy degrades with irrelevant material in the state. Each question sees the other 11 passages as noise.
+- **Split:** one request per candidate, each with state `{conversation, request, participants, passage}` and that passage's two questions, at bounded concurrency. This costs ~12 × 2k tokens, about $0.001 on Jev, with roughly the same wall time as one call. It is the natural layout for per-question-billed members (Perplexity, D1) and avoids the noise problem.
+- Both need the client's "split by item" mode: the point declares its item list, and the client chooses whole or split per member, or by a per-point `layout = "batched" | "split"` setting.
+- **The default is decided by the §9 offline comparison:** batched vs split accuracy on the same labelled items. Until measured, `split` is the safer default given the documented weakness. The cross-encoder's `top_n` is what keeps the split layout's call count small.
 
 **Fallback** (the whole chain failed, timed out or is budget-blocked; owner, 2026-10-08): today's hybrid ranking with a higher floor (`auto.fallback_min_score`, default 0.6), at most `auto.fallback_max_results` (default 2) items, with the §6 excerpts. The candidates are always available, so a fallback never costs latency.
 
@@ -303,4 +323,5 @@ Decided:
 7. **Snippets** were noise because they were too short to understand and wasted space on repeated citation parts, more than because they were the wrong part of the block (§1, §6).
 
 Remaining:
-- **Cross-encoder.** Whether a local cross-encoder earns its place depends on its resource use and the latency it adds on the deployment's hardware (CPU, or a GPU if one is available to the agent). The proposal is to measure that, together with its offline quality against the decision model, before putting it on the hot path (§5.0).
+- **Cross-encoder placement and model.** It is now part of the design (§5.0a). Still to measure on the deployment's hardware: local CPU cost vs a remote GPU endpoint, the model choice, and `top_n`.
+- **Judging layout.** Batched vs split (§5), decided by the offline comparison.
