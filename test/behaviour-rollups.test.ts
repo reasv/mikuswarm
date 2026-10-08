@@ -325,3 +325,31 @@ test("a refusal branch cut inside a later late-input redo's span is excluded too
     assert.equal(v("refusal_branch_cost_usd"), 0);
   });
 });
+
+test("a duplicate block is no style revision: it counts apart", async () => {
+  await withStorage(async (storage) => {
+    await storage.insertAgentSession({ id: "s9", timelineKey: KEY_A, sessionType: "default", status: "completed", createdAt: H, updatedAt: H });
+    await addRequest(storage, "s9", H + 1, "model_a", { key: KEY_A });
+    const row = (tool_call_id: string, fired: string[], consequence: string, ts = H + 2) =>
+      storage.insertDecisionEvaluation({
+        ts, decision_group: "g", point: "checks", agent_session_id: "s9", source: "model",
+        verdict_json: JSON.stringify({ fired }), checkpoint: "send", tool_call_id, branch_no: 0, consequence,
+      });
+    await row("dup", ["duplicate"], "revise"); // the duplicate stage alone
+    await row("dup", [], "revise"); // the checks call of the same send: nothing fired
+    await row("style", ["style_x"], "revise");
+    await row("both", ["style_x"], "revise");
+    await row("both", ["duplicate"], "revise");
+    await row("over", ["duplicate"], "overridden");
+    // No catalogue: the duplicate check is still recognized by its code.
+    await rollups(storage).flush();
+    const rows = table(storage);
+    const v = (metric: string) => value(rows, { hour: H, model: "model_a", metric });
+    assert.equal(v("revisions"), 2, "the style send and the send both fired on");
+    assert.equal(v("duplicate_revisions"), 2);
+    assert.equal(v("overrides"), 0);
+    assert.equal(v("duplicate_overrides"), 1);
+    assert.equal(v("check_revisions:duplicate"), 2);
+    assert.equal(v("check_revisions:style_x"), 2);
+  });
+});

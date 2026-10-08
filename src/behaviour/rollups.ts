@@ -11,6 +11,7 @@
 
 import type Database from "better-sqlite3";
 import { excludedBranchNumbers } from "../agent/contract.js";
+import { DUPLICATE_CHECK_CODE } from "../checks/builtin/duplicate.js";
 import { estimateTokens } from "../context/tokens.js";
 import type { Logger } from "../observability/index.js";
 import type { Storage } from "../storage/index.js";
@@ -446,8 +447,10 @@ function accumulateSession(
   // evaluation share the anchor) and per (call, code).
   const seenCodes = new Set<string>();
   const styledAnchors = new Set<string>();
-  const revisedAnchors = new Set<string>();
-  const overriddenAnchors = new Set<string>();
+  // Per judged call: its outcome and the kinds of every check fired on it. A
+  // duplicate block is no model style issue (another session posted first), so it
+  // counts apart (`duplicate_revisions` / `duplicate_overrides`).
+  const outcomes = new Map<string, { model: string | null; revise: boolean; overridden: boolean; kinds: Set<string> }>();
   const intentAnchors = new Set<string>();
   for (const d of rows.decisions) {
     if (d.branch_no !== null && excludedBranches.has(d.branch_no)) continue;
@@ -463,12 +466,15 @@ function accumulateSession(
       add(model, "no_reply_intent_judged");
     }
     const fired = firedChecks(d.verdict_json);
+    const outcome = outcomes.get(anchor) ?? { model, revise: false, overridden: false, kinds: new Set<string>() };
+    outcomes.set(anchor, outcome);
     for (const f of fired) {
+      const kind = f.kind ?? ctx.checkKind?.(f.code, agent) ?? (f.code === DUPLICATE_CHECK_CODE ? "duplicate" : undefined);
+      outcome.kinds.add(kind ?? "");
       const key = `${anchor}\u0000${f.code}`;
       if (seenCodes.has(key)) continue;
       seenCodes.add(key);
       add(model, familyMetric("check_hits", f.code));
-      const kind = f.kind ?? ctx.checkKind?.(f.code, agent);
       if (kind === "style") {
         add(model, "style_hits");
         if (!styledAnchors.has(anchor)) {
@@ -479,18 +485,29 @@ function accumulateSession(
     }
     const consequence = d.consequence;
     if (consequence === "revise" || consequence === "overridden") {
-      const set = consequence === "revise" ? revisedAnchors : overriddenAnchors;
       const family = consequence === "revise" ? "check_revisions" : "check_overrides";
-      if (!set.has(anchor)) {
-        set.add(anchor);
-        add(model, consequence === "revise" ? "revisions" : "overrides");
-      }
+      if (consequence === "revise") outcome.revise = true;
+      else outcome.overridden = true;
       for (const f of fired) {
         const key = `${family}\u0000${anchor}\u0000${f.code}`;
         if (seenCodes.has(key)) continue;
         seenCodes.add(key);
         add(model, familyMetric(family, f.code));
       }
+    }
+  }
+
+  for (const o of outcomes.values()) {
+    const duplicate = o.kinds.has("duplicate");
+    // Anything else fired (or nothing recorded): the model's own output was revised.
+    const other = o.kinds.size === 0 || [...o.kinds].some((k) => k !== "duplicate");
+    if (o.revise) {
+      if (other) add(o.model, "revisions");
+      if (duplicate) add(o.model, "duplicate_revisions");
+    }
+    if (o.overridden) {
+      if (other) add(o.model, "overrides");
+      if (duplicate) add(o.model, "duplicate_overrides");
     }
   }
 
@@ -515,7 +532,7 @@ function accumulateSession(
  * dirty once (stored as `model_behaviour_rollup_version` in `metadata`), so the
  * background drain recomputes history with the new definitions.
  */
-export const MODEL_BEHAVIOUR_ROLLUP_VERSION = 2;
+export const MODEL_BEHAVIOUR_ROLLUP_VERSION = 3;
 const ROLLUP_VERSION_KEY = "model_behaviour_rollup_version";
 
 /**

@@ -83,11 +83,19 @@ export const MODEL_BEHAVIOUR_METRICS = {
     model: "as style_hits",
   },
   revisions: {
-    source: "distinct judged calls with a decision row whose consequence is revise",
+    source: "distinct judged calls with a decision row whose consequence is revise, where a check other than the duplicate check fired",
     model: "as style_hits",
   },
   overrides: {
-    source: "distinct judged calls with a decision row whose consequence is overridden",
+    source: "distinct judged calls with a decision row whose consequence is overridden, where a check other than the duplicate check fired",
+    model: "as style_hits",
+  },
+  duplicate_revisions: {
+    source: "distinct judged calls with a decision row whose consequence is revise, where the duplicate check fired (another session posted first: no model style issue)",
+    model: "as style_hits",
+  },
+  duplicate_overrides: {
+    source: "distinct judged calls with a decision row whose consequence is overridden, where the duplicate check fired",
     model: "as style_hits",
   },
   no_reply_intent_judged: {

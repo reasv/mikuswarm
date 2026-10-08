@@ -344,7 +344,9 @@ Unreleased section; it is not part of any release's notes.
   thresholds (default 0.8) go in `[checks.duplicate].thresholds`, and
   `scripts/calibrate-checks.ts --check duplicate --question <name>` calibrates
   them on pairs of sessions that sent close together. Check questions may now
-  carry a `name`, and any check accepts `thresholds` by question name.
+  carry a `name`, and any check accepts `thresholds` by question name. The
+  model behaviour statistics count its rejections and overrides apart from the
+  model's style revisions.
 
 ### Changed
 
