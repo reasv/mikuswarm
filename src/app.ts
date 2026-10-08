@@ -95,6 +95,8 @@ import { forkSession } from "./agent/fork.js";
 import { createActingPolicy } from "./checks/acting-policy.js";
 import { createRevisePolicyPart, priorRejections } from "./checks/revise.js";
 import { createDuplicateSource } from "./checks/duplicate-source.js";
+import type { SeenStamp } from "./checks/duplicate.js";
+import { roomKeyOf } from "./timeline/pending-deletions.js";
 import { ContractReconciler, persistSessionContract } from "./agent/contract-store.js";
 import type { CreatedAgent } from "./agent/factory.js";
 import type { SummaryCoveragePin } from "./context/builder.js";
@@ -4907,7 +4909,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       }
     }
     const content = buildFollowUpInterjection(inbound, form, gapMs, hydrated);
-    const message: SteerMessage = { type: "interjection", content, ...(imageBlocks ? { imageBlocks } : {}) };
+    // A quote in the follow-up counts as seen by the duplicate check (§8j).
+    const message: SteerMessage = { type: "interjection", content, ...(imageBlocks ? { imageBlocks } : {}), ...quoteSeen(hydrated) };
     const steered = sessions.steer(
       sessionId,
       message,
@@ -5650,13 +5653,30 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
 
   const LATE_NOTE = (sender: SenderInfo): string => `${senderLabel(sender)} sent this before your reply reached them.`;
 
-  /** One interjection message (the content is wrapped in `<interjection>` again by convert.ts). */
-  function lateInterjection(reason: string, body: string, imageBlocks?: ImageBlock[]): SteerMessage {
+  /**
+   * One interjection message (the content is wrapped in `<interjection>` again by
+   * convert.ts). `seen`: the messages it quotes, seen by the duplicate check (§8j).
+   */
+  function lateInterjection(reason: string, body: string, imageBlocks?: ImageBlock[], seen?: SeenStamp): SteerMessage {
     return {
       type: "interjection",
       content: `<interjection reason="${reason}">\n${body}\n</interjection>`,
       ...(imageBlocks ? { imageBlocks } : {}),
+      ...(seen ? { seen } : {}),
     } as SteerMessage;
+  }
+
+  /**
+   * The duplicate check's stamp for a rendered message's quote (§8j "Last seen"):
+   * the stored id of the message it replies to (in its room or one of its
+   * threads). Empty when it quotes nothing stored.
+   */
+  function quoteSeen(event: CanonicalChatEvent): { seen?: SeenStamp } {
+    const quoted = event.replyTo?.externalId;
+    if (!quoted) return {};
+    const key = timeline.resolveEditTargetTimelineKey(event.provider, quoted, roomKeyOf(event.timelineKey));
+    const stored = key ? timeline.getByExternalId(event.provider, quoted, key) : undefined;
+    return stored ? { seen: { eventIds: [stored.id] } } : {};
   }
 
   function sameRequestContent(a: CanonicalChatEvent, b: CanonicalChatEvent): boolean {
@@ -5948,7 +5968,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       interjection: async ({ late }) => {
         const built = await buildAdditionInterjection(entry.sessionId, inbound, form, gapMs);
         if (!late) return built;
-        return lateInterjection("revival", `${LATE_NOTE(inbound.event.sender)}\n${(built as { content: string }).content}`, (built as { imageBlocks?: ImageBlock[] }).imageBlocks);
+        return lateInterjection(
+          "revival",
+          `${LATE_NOTE(inbound.event.sender)}\n${(built as { content: string }).content}`,
+          (built as { imageBlocks?: ImageBlock[] }).imageBlocks,
+          (built as { seen?: SeenStamp }).seen,
+        );
       },
       source: {
         eventId: inbound.event.id,
@@ -5989,8 +6014,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       const target = inbound.event.replyTo?.externalId
         ? timeline.getByExternalId(inbound.provider, inbound.event.replyTo.externalId, inbound.timelineKey)
         : undefined;
-      const rendered = renderRichMessage(target ? buildReplyHydratedEvent(inbound, target) : followUpHydratedEvent(inbound));
-      return lateInterjection("reply-to-request", `${senderLabel(inbound.event.sender)} replied to the request you are answering:\n\n${rendered}`);
+      const shown = target ? buildReplyHydratedEvent(inbound, target) : followUpHydratedEvent(inbound);
+      const rendered = renderRichMessage(shown);
+      return lateInterjection(
+        "reply-to-request",
+        `${senderLabel(inbound.event.sender)} replied to the request you are answering:\n\n${rendered}`,
+        undefined,
+        target ? { eventIds: [target.id] } : quoteSeen(shown).seen,
+      );
     }
     if (form === "media") {
       await awaitEnrichmentComplete(inbound.event.id, config.enrichment?.trigger_wait_timeout_ms ?? 30_000);
@@ -6012,7 +6043,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       }
     }
     const content = buildFollowUpInterjection(inbound, form, gapMs, hydrated);
-    return { type: "interjection", content, ...(imageBlocks ? { imageBlocks } : {}) } as SteerMessage;
+    return { type: "interjection", content, ...(imageBlocks ? { imageBlocks } : {}), ...quoteSeen(hydrated) } as SteerMessage;
   }
 
   /**
@@ -6179,7 +6210,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     const entry = lateInputEntries.get(sessionId);
     if (!entry || !sentBeforeRunEnd(entry.ctl, inbound.event.timestamp)) return false;
     const content = (message as { content?: string }).content ?? "";
-    const late = lateInterjection("revival", `${LATE_NOTE(inbound.event.sender)}\n${content}`, (message as { imageBlocks?: ImageBlock[] }).imageBlocks);
+    const late = lateInterjection(
+      "revival",
+      `${LATE_NOTE(inbound.event.sender)}\n${content}`,
+      (message as { imageBlocks?: ImageBlock[] }).imageBlocks,
+      (message as { seen?: SeenStamp }).seen,
+    );
     return entry.revive([late], { eventId: inbound.event.id });
   }
 

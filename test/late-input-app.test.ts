@@ -222,7 +222,7 @@ test("late input: a moderator's redaction of the trigger only marks the message"
   }
 });
 
-test("late input: a Matrix redaction of something that is not a stored message is dropped, never parked", async () => {
+test("late input: a Matrix redaction of something that is not a stored message is never a pending edit", async () => {
   const h = await startHarness({ toml: LATE(), script: () => ({ text: "NO_REPLY" }) });
   try {
     h.redact("$some-reaction");
@@ -445,6 +445,35 @@ test("late input: an addition sent before the reply but arriving after the run e
     const revivedRequest = h.llm.requests.filter((r) => !isRecordTurnRequest(r)).at(-1)!;
     assert.ok(userText(revivedRequest).includes("before your reply reached them"));
     assert.ok(userText(revivedRequest).includes("and in Osaka"));
+  } finally {
+    await h.stop();
+  }
+});
+
+test("late input: an interjected reply to the request stamps the quoted message as seen", async () => {
+  let n = 0;
+  const h = await startHarness({
+    toml: LATE({ hold_ms: 0 }),
+    script: (req) => {
+      if (isRecordTurnRequest(req)) return { text: "NO_REPLY" };
+      n += 1;
+      if (n === 1) return send("first part", false);
+      if (userText(req).includes("replied to the request you are answering")) return send("noted");
+      return { ...send("second part"), delayMs: 1500 };
+    },
+  });
+  try {
+    const id = h.say("tell me two things", { mention: true });
+    await h.until(() => h.sends.length >= 1, "the first message");
+    await h.until(() => h.llm.requests.length >= 2, "the second request");
+    h.say("make it short", { replyTo: id, mention: true });
+    await h.until(() => settledAll(h)() && hasLog(h, "late_input_interjected"), "interjected");
+    const [trigger] = h.query<{ id: string }>("select id from timeline_events where external_id = ?", id);
+    const interjection = transcript(h, sessionRows(h)[0]!.id).find(
+      (m) => m.type === "interjection" && String(m.content).includes("replied to the request you are answering"),
+    );
+    assert.ok(interjection, "the reply was interjected");
+    assert.deepEqual(interjection.seen, { eventIds: [trigger!.id] }, "the quoted request message is stamped as seen");
   } finally {
     await h.stop();
   }
