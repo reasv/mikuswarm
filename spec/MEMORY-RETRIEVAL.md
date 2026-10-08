@@ -479,6 +479,13 @@ There is **no corpus pass and no backfill**.
   - Label relevance with a ZDR-eligible labeller through the existing calibration tool (scripts/calibrate-checks.ts generalised to the `memory` point).
   - Calibrate `relevance_threshold` per member.
   - The harness prints only ids, labels and aggregates.
+- **Does late interaction earn its place on this corpus?**
+  - Blocks are short (~336 tokens), so one vector may be enough. But many blocks are lists of loosely related events, and a single vector averages them, so a query about one item matches the block only weakly.
+  - Compare recall at the cut (top 20 and top 60), each alone and fused with BM25:
+    1. one vector per block;
+    2. one vector per sentence or list item, scoring a block by its best item (a coarse multi-vector using the existing embedder);
+    3. late interaction.
+  - Report separately for blocks with many list items or many participants (the multi-topic cases).
 - **The recall ceiling, measured first:** the share of sessions with at least one labelled-relevant entry anywhere in the recall set. A ranker cannot beat that, so it decides how much the re-rank work (the TurboQuant kernel, a large index model) is worth.
 - **Experiment, offline only: write-time cues.**
   - A ZDR model writes, for each entry, a few lines naming what it would come up for. These are indexed beside the entry; the diary file is unchanged.
