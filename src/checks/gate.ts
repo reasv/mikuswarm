@@ -477,6 +477,8 @@ export class OutputGate implements SessionEndingHook {
         }
         return false;
       };
+      // An edit corrects a message already posted: it is no new post after the others.
+      if (toolName === "edit_message") return skip("edit");
       const target = source.target(toolName, args);
       if (!target) return skip("no_target");
       this.seedDuplicateRejections(source);

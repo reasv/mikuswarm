@@ -326,10 +326,11 @@ export function duplicateJudgeText(text: string): string {
 }
 
 /**
- * The timeline a posting call targets: the session's own for `send_message`,
- * `edit_message` and `create_poll`, the `channel` of `send_to_channel`, and
- * the existing DM with `user` for `send_dm` (`resolveDm`; none yet = no
- * earlier messages). Undefined when it cannot be known.
+ * The timeline a posting call targets: the session's own for `send_message`
+ * and `create_poll`, the `channel` of `send_to_channel`, and the existing DM
+ * with `user` for `send_dm` (`resolveDm`; none yet = no earlier messages).
+ * Undefined when it cannot be known, and for `edit_message`: an edit corrects
+ * a message already posted, it is no new post after the others.
  */
 export function duplicateTarget(
   toolName: string,
@@ -339,7 +340,6 @@ export function duplicateTarget(
 ): string | undefined {
   switch (toolName) {
     case "send_message":
-    case "edit_message":
     case "create_poll":
       return ownTimelineKey;
     case "send_to_channel": {

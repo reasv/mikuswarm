@@ -408,8 +408,10 @@ test("every posting tool is judged against its own target timeline", async () =>
   assert.deepEqual(earlierOf(), ["Over there: 42."]);
   assert.equal(await t.call({ user: "@carol:example.org", message: "42", context_note: "n" }, "send_dm"), "sent");
   assert.deepEqual(earlierOf(), ["In the DM: 42."]);
+  const judged = t.decisions.length;
   assert.equal(await t.call({ message_id: "$m", text: "edited: 42" }, "edit_message"), "sent");
-  assert.deepEqual(earlierOf(), ["Here: 42."]);
+  assert.equal(t.decisions.length, judged, "an edit is not judged");
+  assert.equal(skipped(t.lines).at(-1), "edit");
   assert.equal(await t.call({ question: "42?", options: ["yes", "no"] }, "create_poll"), "sent");
   assert.deepEqual(earlierOf(), ["Here: 42."]);
   assert.equal(t.decisions.at(-1)!.state.draft.text, "42? - yes - no", "the poll's question and options");
@@ -640,5 +642,17 @@ test("visibility: a send into an isolated channel the session is not in reads no
   assert.equal(await t.call({ message: "42", channel: OTHER, context_note: "n" }, "send_to_channel"), "sent");
   assert.equal(t.decisions.length, 0);
   assert.equal(skipped(t.lines).at(-1), "no_unseen");
+  storage.close();
+});
+
+test("an edit of an older own message is not judged as a new post against a later message", async () => {
+  const storage = await newStorage();
+  await botMessage(storage, "e-mine", "Its 42.", CUTOFF - 10, SELF);
+  await botMessage(storage, "e-later", "It's 42, yes.", CUTOFF + 1000);
+  const t = await setup({ storage, answer: (q) => (q === "repeats" ? 0.95 : 0.1) });
+  assert.equal(await t.call({ message_id: "$mine", text: "It's 42." }, "edit_message"), "sent");
+  assert.equal(t.decisions.length, 0);
+  // A new post with the same text is still judged.
+  assert.match(await t.call({ message: "It's 42." }), /^Not sent/);
   storage.close();
 });

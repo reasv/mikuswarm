@@ -197,7 +197,7 @@ test("judge state: each earlier message as request + reply, the draft's request 
 test("targets: every posting tool against its own target timeline", () => {
   const dm = (user: string) => (user === "@carol:example.org" ? "matrix:acct:dm:!dm:example.org" : undefined);
   assert.equal(duplicateTarget("send_message", { message: "x" }, OWN, dm), OWN);
-  assert.equal(duplicateTarget("edit_message", { message_id: "$e", text: "x" }, OWN, dm), OWN);
+  assert.equal(duplicateTarget("edit_message", { message_id: "$e", text: "x" }, OWN, dm), undefined, "an edit is no new post");
   assert.equal(duplicateTarget("create_poll", { question: "q" }, OWN, dm), OWN);
   assert.equal(duplicateTarget("send_to_channel", { channel: ` ${OTHER} `, message: "x" }, OWN, dm), OTHER);
   assert.equal(duplicateTarget("send_dm", { user: "@carol:example.org", message: "x" }, OWN, dm), "matrix:acct:dm:!dm:example.org");
