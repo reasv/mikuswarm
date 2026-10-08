@@ -4,7 +4,7 @@ import type { TimelineStore } from "../timeline/index.js";
 import type { SummarizationConfig, AppConfig } from "../config/index.js";
 import type { Logger } from "../observability/logger.js";
 import { estimateTokens } from "../context/tokens.js";
-import { renderCompactMessage, renderRichMessage } from "../context/renderer.js";
+import { renderRecentCompactMessage, renderRecentRichMessage } from "../context/renderer.js";
 import { selectSummaryCoverage, renderSummaryLayer } from "../context/summary-layer.js";
 import { hydrateEvents } from "../context/hydrate.js";
 
@@ -209,14 +209,14 @@ export class SummarizationIndexer {
       let richTailStart = events.length;
       for (let i = events.length - 1; i >= 0; i--) {
         if (richTailTokens >= richTarget) break;
-        richTailTokens += estimateTokens(renderRichMessage(events[i]!));
+        richTailTokens += estimateTokens(renderRecentRichMessage(events[i]!));
         richTailStart = i;
       }
 
       const compactEvents = events.slice(0, richTailStart).map((event) => ({
         id: event.id,
         timestamp: event.timestamp,
-        compactTokens: estimateTokens(renderCompactMessage(event)),
+        compactTokens: estimateTokens(renderRecentCompactMessage(event)),
       }));
       const compactTotal = compactEvents.reduce((sum, e) => sum + e.compactTokens, 0);
 
