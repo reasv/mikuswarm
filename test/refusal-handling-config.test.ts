@@ -15,6 +15,7 @@ import {
   anyDecisionPointEnabled,
   checksPointKnobs,
   decisionsFor,
+  duplicateKnobs,
   pointSettings,
   validateDecisionsConfig,
 } from "../src/decisions/config.js";
@@ -228,5 +229,61 @@ test("decisions: checks point validation", () => {
   assert.throws(
     () => validateDecisionsConfig(cfg({ decisions: { checks: { min_confidence: 0.5 } } })),
     /checks\.min_confidence is not used by the checks point/,
+  );
+});
+
+test("TOML: the duplicate check's table, named questions, thresholds and [decisions.checks.duplicate] load", async () => {
+  const config = await load(`
+[models.decider]
+id = "decider-1"
+provider = "test"
+api = "system-one"
+endpoint = "http://localhost/decisions"
+api_key = "k"
+input_modalities = ["text"]
+max_tokens = 1
+
+[checks.duplicate]
+enabled = true
+thresholds = { repeats = 0.9 }
+
+[checks.same_link]
+kind = "duplicate"
+  [[checks.same_link.questions]]
+  name = "same_link"
+  source = "message"
+  instructions = "\`draft.text\` posts a link one of \`earlier[*].text\` already posted."
+  criteria = { true = "the same link", false = "no link in common" }
+  threshold = 0.7
+
+[decisions]
+enabled = true
+
+[decisions.checks]
+enabled = true
+model = "decider"
+
+[decisions.checks.duplicate]
+max_earlier = 3
+earlier_max_tokens = 800
+`);
+  const catalogue = buildCheckCatalogue(config);
+  assert.deepEqual(catalogue.get("duplicate")!.questions.map((q) => q.threshold), [0.8, 0.9, 0.8]);
+  assert.equal(catalogue.get("same_link")!.questions[0]!.name, "same_link");
+  assert.deepEqual(duplicateKnobs(decisionsFor(config, null)), { model: "decider", maxEarlier: 3, earlierMaxTokens: 800 });
+  validateDecisionsConfig(config);
+});
+
+test("decisions: the duplicate chain defaults to [decisions].model and is validated", () => {
+  assert.deepEqual(duplicateKnobs(cfg({ decisions: { model: "decider", checks: { model: "judge" } } }).decisions), {
+    model: "decider",
+    maxEarlier: 5,
+    earlierMaxTokens: 1500,
+  });
+  assert.equal(duplicateKnobs({ checks: { model: "judge" } } as never).model, "judge", "without [decisions].model: the point's");
+  assert.equal(duplicateKnobs({ model: "decider", checks: { duplicate: { model: "other" } } } as never).model, "other");
+  assert.throws(
+    () => validateDecisionsConfig(cfg({ decisions: { checks: { duplicate: { model: "default" } } } })),
+    /decisions\.checks\.duplicate\.model = "default" must name a model with api = "system-one"/,
   );
 });
