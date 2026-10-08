@@ -117,13 +117,18 @@ const EMBED = Array.from({ length: VOCAB_SIZE }, (_, r) => [r + 1, (r % 3) - 1, 
  * pooled output comes first, so the encoder must pick `last_hidden_state`.
  * No token_type_ids input: the encoder must not feed one.
  */
-function lateEncoderModel(): Uint8Array {
+function lateEncoderModel(opts: { projected?: string } = {}): Uint8Array {
+  // `projected`: also a ColBERT-style projection output (here the negated states), listed after the raw states.
+  const projection = opts.projected
+    ? { nodes: [{ opType: "Neg", inputs: ["last_hidden_state"], outputs: [opts.projected] }], outputs: [{ name: opts.projected, elemType: F32, dims: ["batch", "seq", DIM] }] }
+    : { nodes: [], outputs: [] };
   return encodeModel({
     opset: 13,
     graph: {
       name: "fake_late",
       nodes: [
         { opType: "Gather", inputs: ["E", "input_ids"], outputs: ["last_hidden_state"], attributes: { axis: { int: 0 } } },
+        ...projection.nodes,
         {
           opType: "ReduceMean",
           inputs: ["last_hidden_state"],
@@ -138,6 +143,7 @@ function lateEncoderModel(): Uint8Array {
       outputs: [
         { name: "pooler_output", elemType: F32, dims: ["batch", DIM] },
         { name: "last_hidden_state", elemType: F32, dims: ["batch", "seq", DIM] },
+        ...projection.outputs,
       ],
       initializers: [floatInit("E", [VOCAB_SIZE, DIM], EMBED.flat())],
     },
@@ -453,6 +459,21 @@ test("resolveModelFiles: a pinned revision has its own cache dir, sha256 is enfo
       await resolveModelFiles({ modelDir: a.dir, onnxFile: "onnx/model.onnx", cacheRoot, sha256: { "tokenizer.json": sha(tok) } });
     } finally {
       await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+});
+
+test("LocalLateEncoder: a projected ColBERT output is preferred over last_hidden_state", async () => {
+  await withTemp(async (root) => {
+    for (const name of ["token_embeddings", "linear_out"]) {
+      const dir = await modelDir(root, `late-${name}`, lateEncoderModel({ projected: name }), { pad_token_id: 5 });
+      const enc = new LocalLateEncoder(provider({ modelDir: dir, maxTokens: 6 }), { cacheRoot: root });
+      await enc.warm();
+      const [m] = await enc.encodeDocuments(["alpha"], never);
+      const raw = EMBED[VOCAB.alpha!]!;
+      const norm = Math.hypot(...raw);
+      for (let k = 0; k < DIM; k++) assert.ok(Math.abs(m!.data[1 * DIM + k]! + raw[k]! / norm) < 1e-6, `${name}: the projected (negated) vectors`);
+      await enc.close();
     }
   });
 });
