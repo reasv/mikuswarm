@@ -21,6 +21,8 @@ export interface DuplicateSourceDeps {
     listSessionMessagesSince(opts: { timelineKey: string; after: number; excludeSessionId: string; limit: number }): SessionMessageRow[];
     dmTimelineKeysForPeer(provider: string, accountId: string, userId: string): string[];
     getDecisionEvaluationsForSession(sessionId: string): DecisionEvaluationRow[];
+    /** The cached human room label (`room_metadata`), for the error text. */
+    getRoomMetadata?(timelineKey: string): { displayName: string } | undefined;
   };
   /** The agent owning a timeline (null = legacy single-agent mode). */
   agentFor: (timelineKey: string) => string | null;
@@ -155,6 +157,7 @@ export function createDuplicateSource(
       },
       priorRejections: () =>
         priorDuplicateRejections(deps.storage.getDecisionEvaluationsForSession(session.id), duplicateCodes(agentName)),
+      placeLabel: (timelineKey) => deps.storage.getRoomMetadata?.(timelineKey)?.displayName,
     };
   };
 }

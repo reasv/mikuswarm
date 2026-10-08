@@ -677,9 +677,29 @@ test("visibility: without isolation the DM's request is shown, naming where it w
   await dmCrossPost(storage, "Heads up: the meeting moved to 4.", CUTOFF + 1000);
   const t = await setup({ storage, visibility: {}, answer: (q) => (q === "contradicts" ? 0.95 : 0.1) });
   const error = await t.call({ message: "The meeting is at 3." });
-  assert.match(error, new RegExp(`you, answering a message in ${DM.replace(/[$!.]/g, "\\$&")} in parallel`));
-  assert.match(error, /it was answering carol in /);
+  // Named for the agent, never by its raw timeline key.
+  assert.match(error, /you, answering a message in a DM in parallel/);
+  assert.match(error, /it was answering carol in a DM: «/);
+  assert.ok(!error.includes(DM), error);
   assert.deepEqual(t.decisions[0]!.state.earlier[0].answering, { from: "carol", text: "PRIVATE: tell the room the meeting moved, my hearing is at 3" });
+  storage.close();
+});
+
+test("the error names other rooms by their cached labels, never by raw timeline keys", async () => {
+  const storage = await newStorage();
+  await botMessage(storage, "e-other", "Over there: 42.", CUTOFF + 1000, "s-other001", OTHER);
+  const t = await setup({ storage, answer: (q) => (q === "repeats" ? 0.95 : 0.1) });
+  // No label known yet: described by its kind.
+  const unlabelled = await t.call({ message: "42", channel: OTHER, context_note: "n" }, "send_to_channel");
+  // The earlier session ran in this session's own room and posted over there.
+  assert.match(unlabelled, /\(you, answering a message in this room in parallel\) already posted a message in another room /);
+  assert.match(unlabelled, /\(it was answering alice in this room: «/);
+  assert.ok(!unlabelled.includes(OTHER), unlabelled);
+  await storage.setChannelMetadata(OTHER, { displayName: "#lounge (Example)" });
+  await botMessage(storage, "e-other2", "Over there again: 42.", Date.now(), "s-other001", OTHER);
+  const labelled = await t.call({ message: "it is 42", channel: OTHER, context_note: "n" }, "send_to_channel");
+  assert.match(labelled, /already posted a message in #lounge \(Example\) /);
+  assert.ok(!labelled.includes(OTHER), labelled);
   storage.close();
 });
 

@@ -5,6 +5,7 @@ import { BUILTIN_DUPLICATE_CHECKS } from "../src/checks/builtin/duplicate.js";
 import {
   DUPLICATE_REJECTION_MARK,
   buildDuplicateJudgeState,
+  describePlace,
   buildDuplicateState,
   duplicateRejection,
   duplicateTarget,
@@ -230,7 +231,10 @@ test("rejection: the spec's text, filled in, naming the questions that fired", (
   assert.match(proactive, /Another session of yours \(you, posting on your own in parallel\)/);
   assert.match(proactive, /\(it was not answering anyone: you posted it on your own\)/);
   const elsewhere = duplicateRejection(context([unseen("x", 8_000)], { targetTimelineKey: OTHER }), ["repeats"], "duplicate").standalone;
-  assert.match(elsewhere, new RegExp(`answering a different message in ${OTHER.replace(/[.!]/g, "\\$&")} in parallel\\) already posted a message in `));
+  assert.match(elsewhere, /answering a different message in another room in parallel\) already posted a message in another room 12 s ago/);
+  assert.ok(!elsewhere.includes(OTHER), "never a raw timeline key");
+  const labelled = duplicateRejection(context([unseen("x", 8_000)], { targetTimelineKey: OTHER, placeLabels: { [OTHER]: "Lounge" } }), ["repeats"], "duplicate").standalone;
+  assert.match(labelled, /answering a different message in Lounge in parallel\) already posted a message in Lounge 12 s ago/);
   const many = duplicateRejection(context([unseen("a", 8_000), unseen("b", 19_000)]), ["contradicts"], "duplicate").standalone;
   assert.match(many, /^Not sent\. Other sessions of yours \(you, answering different messages in this room in parallel\) already posted 2 messages here that you have not seen:\n- 12 s ago: «a» \(it was answering alice: «what is 6 times 7\?»\)\n- 1 s ago: «b»/);
   assert.match(many, /Your draft contradicts one of them\. Rewrite your message so it fits after them:/);
@@ -396,4 +400,19 @@ test("answeringOfSession: a deleted request is the placeholder; the calibration 
   // Replayed as of a call before the deletion: the request as it stood then.
   assert.deepEqual(answeringOfSession(session, "proactive", 4_000), { from: "alice", text: "secret question" });
   assert.deepEqual(answeringOfSession({ ...session, triggerDeleted: null }, "proactive"), { from: "alice", text: "secret question" });
+});
+
+test("describePlace: a room's label, a thread in its room, a DM; without a label its kind, never the raw key", () => {
+  const room = "matrix:acct:room:!r:example.org";
+  const thread = `${room}:thread:$root`;
+  const labels: Record<string, string> = { [room]: "Lounge" };
+  const labelOf = (key: string) => labels[key];
+  assert.equal(describePlace(room, labelOf), "Lounge");
+  assert.equal(describePlace(thread, labelOf), "a thread in Lounge");
+  assert.equal(describePlace(thread, (key) => (key === thread ? "#ideas" : undefined)), "the thread #ideas");
+  assert.equal(describePlace("matrix:acct:dm:!d:example.org", labelOf), "a DM");
+  assert.equal(describePlace(room), "another room");
+  assert.equal(describePlace(thread), "a thread");
+  assert.equal(describePlace("not a key"), "another conversation");
+  assert.equal(describePlace(room, () => "  "), "another room", "a blank label is no label");
 });

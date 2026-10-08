@@ -55,6 +55,7 @@ import {
 } from "./state.js";
 import type { CheckDefinition, Checkpoint } from "./types.js";
 import {
+  describePlace,
   lastSeen,
   seenFromMessages,
   selectUnseen,
@@ -180,6 +181,8 @@ export interface GateDuplicateSource {
   answering(): Answering;
   /** Duplicate rejections recorded earlier in the session (tool call id → quoted event ids), for a resume. */
   priorRejections?(): ReadonlyMap<string, readonly string[]>;
+  /** A timeline's cached human label (a room name), for the error text; undefined = none known. */
+  placeLabel?(timelineKey: string): string | undefined;
 }
 
 interface Entry {
@@ -537,6 +540,11 @@ export class OutputGate implements SessionEndingHook {
         earlier,
         draftAnswering: source.answering(),
         earlierMaxTokens: knobs.earlierMaxTokens,
+        placeLabels: Object.fromEntries(
+          [target, ...earlier.map((m) => m.sessionTimelineKey)]
+            .filter((key): key is string => key !== undefined)
+            .map((key) => [key, describePlace(key, source.placeLabel)]),
+        ),
       };
       if (!this.evaluator.extendDuplicate(entry.evaluation, ctx, { rerun: recheck })) return false;
       this.duplicateQuoted.set(toolCallId, earlier.flatMap((m) => m.eventIds));

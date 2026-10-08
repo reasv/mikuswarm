@@ -22,7 +22,7 @@
  */
 import type { CanonicalChatEvent } from "../types.js";
 import { clipText, packNewest } from "../decisions/state.js";
-import { parseTimelineKey } from "../storage/timeline-key.js";
+import { buildTimelineKey, parseTimelineKey } from "../storage/timeline-key.js";
 import { isDeleted } from "../timeline/deletions.js";
 import { DUPLICATE_QUESTION_TEXT, type DuplicateQuestionName } from "./builtin/duplicate.js";
 import { headTokens, STATE_CLIPS } from "./state.js";
@@ -81,6 +81,34 @@ export interface DuplicateContext {
   draftAnswering: Answering;
   /** Clip of each earlier text (tokens). */
   earlierMaxTokens: number;
+  /**
+   * Human-readable names of the timelines the error names (the target, where
+   * the earlier sessions ran), by timeline key ({@link describePlace}); a key
+   * missing here is described from its kind alone, never shown raw.
+   */
+  placeLabels?: Record<string, string>;
+}
+
+/**
+ * How the agent-facing error names a timeline (never its raw key): its cached
+ * room label (`labelOf`, e.g. `room_metadata`) for a room, "a thread in <room>"
+ * for a thread, "a DM" for a DM; without a label, "another room" or "a thread".
+ */
+export function describePlace(timelineKey: string, labelOf?: (timelineKey: string) => string | undefined): string {
+  const parsed = parseTimelineKey(timelineKey);
+  if (!parsed) return "another conversation";
+  if (parsed.kind === "dm") return "a DM";
+  const label = (key: string) => {
+    const text = labelOf?.(key)?.trim();
+    return text ? text : undefined;
+  };
+  if (parsed.threadId) {
+    const own = label(timelineKey);
+    if (own) return `the thread ${own}`;
+    const room = label(buildTimelineKey({ ...parsed, threadId: undefined }));
+    return room ? `a thread in ${room}` : "a thread";
+  }
+  return label(timelineKey) ?? "another room";
 }
 
 /** One stored bot message of another session, with that session's request. */
@@ -399,7 +427,8 @@ function quote(text: string, max: number): string {
 
 function placeOf(ctx: DuplicateContext): { here: string; room: string } {
   if (ctx.targetTimelineKey !== ctx.ownTimelineKey) {
-    return { here: `in ${ctx.targetTimelineKey}`, room: `in ${ctx.targetTimelineKey}` };
+    const place = `in ${placeName(ctx, ctx.targetTimelineKey)}`;
+    return { here: place, room: place };
   }
   const kind = parseTimelineKey(ctx.ownTimelineKey)?.kind;
   return { here: "here", room: kind === "dm" ? "in this DM" : "in this room" };
@@ -409,7 +438,20 @@ function placeOf(ctx: DuplicateContext): { here: string; room: string } {
 function elsewhereOf(ctx: DuplicateContext, m: UnseenMessage): string | undefined {
   if (m.answering === "private") return "another conversation you cannot see from here";
   if (m.sessionTimelineKey === undefined || m.sessionTimelineKey === ctx.targetTimelineKey) return undefined;
-  return m.sessionTimelineKey;
+  return placeName(ctx, m.sessionTimelineKey);
+}
+
+/**
+ * A timeline's human-readable name in the error: "this room" (DM, thread) for
+ * the drafting session's own, else {@link DuplicateContext.placeLabels}, else
+ * its kind.
+ */
+function placeName(ctx: DuplicateContext, timelineKey: string): string {
+  if (timelineKey === ctx.ownTimelineKey) {
+    const parsed = parseTimelineKey(timelineKey);
+    return parsed?.kind === "dm" ? "this DM" : parsed?.threadId ? "this thread" : "this room";
+  }
+  return ctx.placeLabels?.[timelineKey] ?? describePlace(timelineKey);
 }
 
 function answeredClause(ctx: DuplicateContext, m: UnseenMessage): string {

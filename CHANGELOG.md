@@ -345,8 +345,8 @@ Unreleased section; it is not part of any release's notes.
   collects those unseen messages, and when there are any it asks the
   decision model three questions: does the draft answer what one of them already
   answered, repeat most of it, or contradict it. A yes blocks the send with an
-  error that quotes the earlier message and what it was answering and asks for a
-  rewrite; `override_checks: ["duplicate"]` sends the draft as written, and the
+  error that quotes the earlier message and what it was answering (naming other
+  rooms by their names, never by internal keys) and asks for a rewrite; `override_checks: ["duplicate"]` sends the draft as written, and the
   gate's revise bounds apply. Messages a rejection quoted count as seen, so the
   next draft is compared only with newer ones; deleted messages never count, and a
   request deleted since is shown as `[message deleted]`, never quoted.
