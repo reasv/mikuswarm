@@ -6,6 +6,7 @@
 	import { sessionQuery } from '$lib/query/sessions';
 	import { sessionDecisionsQuery, sessionRecordQuery } from '$lib/query/session-record';
 	import { keys } from '$lib/query/keys';
+	import { sessionMemoryRetrievalsQuery } from '$lib/query/memory';
 	import { selection } from '$lib/stores/selection.svelte';
 	import { contextSummary } from '$lib/stores/context-summary.svelte';
 	import { coerceContextMessage, type RolloutMsg } from '$lib/rollout';
@@ -48,6 +49,9 @@
 	recordRef = record;
 	const decisions = sessionDecisionsQuery(() => activeId, () => session.data);
 	const decisionEvaluations = $derived(decisions.data ? [...decisions.data.evaluations] : []);
+	// Memory retrieval builds (spec MEMORY-RETRIEVAL §9); [] on an older backend.
+	const memory = sessionMemoryRetrievalsQuery(() => activeId, () => session.data);
+	const memoryRetrievals = $derived(memory.data ? [...memory.data.retrievals] : []);
 	// Refusal handling (spec REFUSAL-HANDLING §12.1–§12.2): discarded branches,
 	// refusal events, the send contract and check descriptions, from the session
 	// detail; empty on a pre-feature backend.
@@ -369,6 +373,7 @@
 					{contract}
 					{checks}
 					{interjections}
+					{memoryRetrievals}
 				/>
 			{/key}
 		{:else}
@@ -383,6 +388,7 @@
 				{checks}
 				{audits}
 				{interjections}
+				{memoryRetrievals}
 				{focus}
 			/>
 		{/if}

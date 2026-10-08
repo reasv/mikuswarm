@@ -8,6 +8,9 @@ import type { DecisionEvaluation } from '$lib/schemas';
  *   `{ task, tasks?, difficulty?, models?, thinkingLevel?, skills?, tailFiles? }`
  *   (`tasks` = every selected task, multi-label; `task` = the first of them).
  *   Records: `{ inject, relevance, candidateSessionId }`.
+ *   Memory (one row per passage): `{ citation, contentHash, keep, relevant,
+ *   aboutParticipant, hiddenBy?, scores }`, or for a filter-only call (the
+ *   recency layer, the search tools) `{ citation, contentHash, surface, filters }`.
  * - `answersJson`: the parsed answer map keyed by question name, e.g.
  *   routing's `{ task__<key>: { type: 'noul', noul }, skill__<name>: …,
  *   difficulty: { type: 'score', … } }` (older rows: one `task` choice) or
@@ -38,6 +41,32 @@ export interface RecordsVerdict {
 	relevance: number;
 	candidateSessionId: string | null;
 }
+
+/** A `memory` row judging one passage for auto-retrieval. */
+export interface MemoryRelevanceVerdict {
+	kind: 'relevance';
+	citation: string;
+	contentHash: string;
+	keep: boolean;
+	/** Null on the fallback (not judged). */
+	relevant: number | null;
+	aboutParticipant: number | null;
+	/** Keys of the judged filters that hid the passage. */
+	hiddenBy: string[];
+	scores: Record<string, number | null>;
+}
+
+/** A `memory` row judging one block against judged filters only. */
+export interface MemoryFilterVerdict {
+	kind: 'filter';
+	citation: string;
+	contentHash: string;
+	surface: string;
+	/** Per filter key; null when not judged (fallback). */
+	filters: Record<string, { probability: number; hidden: boolean }> | null;
+}
+
+export type MemoryVerdict = MemoryRelevanceVerdict | MemoryFilterVerdict;
 
 function parse(json: string | null | undefined): unknown {
 	if (!json) return null;
@@ -161,6 +190,69 @@ export function parseRecordsVerdict(json: string | null | undefined): RecordsVer
 	};
 }
 
+function memoryScores(v: unknown): Record<string, number | null> {
+	const out: Record<string, number | null> = {};
+	if (!isObject(v)) return out;
+	for (const [k, s] of Object.entries(v)) {
+		if (s === null) out[k] = null;
+		else if (num(s) !== null) out[k] = s as number;
+	}
+	return out;
+}
+
+/** A `memory` row's verdict (relevance or filter-only), or null when malformed. */
+export function parseMemoryVerdict(json: string | null | undefined): MemoryVerdict | null {
+	const v = parse(json);
+	if (!isObject(v)) return null;
+	const citation = typeof v.citation === 'string' ? v.citation : null;
+	const contentHash = typeof v.contentHash === 'string' ? v.contentHash : '';
+	if (typeof v.keep === 'boolean') {
+		return {
+			kind: 'relevance',
+			citation: citation ?? contentHash.slice(0, 12),
+			contentHash,
+			keep: v.keep,
+			relevant: num(v.relevant),
+			aboutParticipant: num(v.aboutParticipant),
+			hiddenBy: strings(v.hiddenBy),
+			scores: memoryScores(v.scores)
+		};
+	}
+	if ('filters' in v) {
+		let filters: MemoryFilterVerdict['filters'] = null;
+		if (isObject(v.filters)) {
+			filters = {};
+			for (const [k, f] of Object.entries(v.filters)) {
+				if (isObject(f) && num(f.probability) !== null) {
+					filters[k] = { probability: f.probability as number, hidden: f.hidden === true };
+				}
+			}
+		}
+		return {
+			kind: 'filter',
+			citation: citation ?? contentHash.slice(0, 12),
+			contentHash,
+			surface: typeof v.surface === 'string' ? v.surface : '?',
+			filters
+		};
+	}
+	return null;
+}
+
+/** "keep p=0.82", "drop p=0.10", "hidden by k", "not judged"; filter rows: "hidden by k", "shown", "unjudged". */
+export function memoryVerdictLabel(v: MemoryVerdict): string {
+	if (v.kind === 'relevance') {
+		if (v.hiddenBy.length > 0) return `hidden by ${v.hiddenBy.join(', ')}`;
+		if (v.relevant === null) return 'not judged';
+		return `${v.keep ? 'keep' : 'drop'} p=${v.relevant.toFixed(2)}`;
+	}
+	if (v.filters === null) return 'unjudged';
+	const hidden = Object.entries(v.filters)
+		.filter(([, f]) => f.hidden)
+		.map(([k]) => k);
+	return hidden.length > 0 ? `hidden by ${hidden.join(', ')}` : 'shown';
+}
+
 /** One routing verdict as a short label: tasks, difficulty, models, skills. */
 export function routingLabel(v: RoutingVerdict): string {
 	const parts = [v.tasks.join(' + ')];
@@ -181,6 +273,10 @@ export function rowVerdictLabel(row: DecisionEvaluation): string | null {
 	if (row.point === 'records') {
 		const v = parseRecordsVerdict(row.verdictJson);
 		return v ? (v.inject ? 'inject' : 'skip') : null;
+	}
+	if (row.point === 'memory') {
+		const v = parseMemoryVerdict(row.verdictJson);
+		return v ? memoryVerdictLabel(v) : null;
 	}
 	if (row.point === 'checks') {
 		// Output gate rows (spec REFUSAL-HANDLING §9): the fired codes, else clean.
@@ -215,7 +311,7 @@ export interface DecisionGroupSummary {
 	fallbackReasons: Array<{ reason: string; count: number }>;
 	/** Records only: the injected candidate session ids, in injection order. */
 	injected?: string[];
-	/** Records only: how many candidates were judged. */
+	/** Records and memory: how many candidates were judged. */
 	candidates?: number;
 }
 
@@ -262,11 +358,44 @@ export function summarizeDecisionGroup(
 		};
 	}
 
+	if (point === 'memory') {
+		return { point, verdict: memoryGroupVerdict(evaluations), topConfidence, sources, fallbackReasons, candidates: evaluations.length };
+	}
+
 	const verdict =
 		evaluations.length === 1
 			? (rowVerdictLabel(evaluations[0]!) ?? '—')
 			: evaluations.map((row) => rowVerdictLabel(row) ?? '—').join(' | ');
 	return { point, verdict, topConfidence, sources, fallbackReasons };
+}
+
+/**
+ * A memory group in one phrase: "kept 2 of 9, 1 hidden" for a retrieval's
+ * passages; "hid 1 of 3" / "nothing hidden" for filter-only rows.
+ */
+function memoryGroupVerdict(evaluations: readonly DecisionEvaluation[]): string {
+	let relevance = 0;
+	let kept = 0;
+	let hidden = 0;
+	let filterRows = 0;
+	for (const row of evaluations) {
+		const v = parseMemoryVerdict(row.verdictJson);
+		if (!v) continue;
+		if (v.kind === 'relevance') {
+			relevance += 1;
+			if (v.hiddenBy.length > 0) hidden += 1;
+			else if (v.keep) kept += 1;
+		} else {
+			filterRows += 1;
+			if (v.filters && Object.values(v.filters).some((f) => f.hidden)) hidden += 1;
+		}
+	}
+	if (relevance > 0) {
+		const base = `kept ${kept} of ${relevance}`;
+		return hidden > 0 ? `${base}, ${hidden} hidden` : base;
+	}
+	if (filterRows > 0) return hidden > 0 ? `hid ${hidden} of ${filterRows}` : 'nothing hidden';
+	return '—';
 }
 
 /** "timeout", "error ×2, timeout": the fallback reasons, for one line. */

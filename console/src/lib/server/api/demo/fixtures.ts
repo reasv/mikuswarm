@@ -20,6 +20,13 @@ import demoRefusalSession from './refusal-session.json';
 import demoAuditedSession from './audited-session.json';
 import demoLateInputSession from './late-input-session.json';
 import demoModelBehaviour from './model-behaviour.json';
+import {
+	fallbackRetrievalFixture,
+	memoryDecisionRows,
+	memoryFilterHitsFixture,
+	memoryRetrievalsFixture,
+	memoryStatsFixture
+} from './memory';
 
 const MIN = 60_000;
 const HOUR = 3_600_000;
@@ -1333,15 +1340,33 @@ function sessionDecisionsFixture(id: string, now: number): unknown {
 	if (id !== FEATURED_ID) return { evaluations: [] };
 	const ts = now - 6 * MIN;
 	return {
-		evaluations: demoDecisionRows.map((row, i) => ({
-			...row,
-			id: i + 1,
-			ts: ts + i * 5,
-			timelineKey: ROOMS[0].key,
-			agentSessionId: id,
-			latencyMs: DEMO_DECISION_LATENCY_MS[i] ?? 200
-		}))
+		evaluations: [
+			...demoDecisionRows.map((row, i) => ({
+				...row,
+				id: i + 1,
+				ts: ts + i * 5,
+				timelineKey: ROOMS[0].key,
+				agentSessionId: id,
+				latencyMs: DEMO_DECISION_LATENCY_MS[i] ?? 200
+			})),
+			// Judged memory retrieval (spec MEMORY-RETRIEVAL §5): one row per passage.
+			...memoryDecisionRows({
+				sessionId: id,
+				timelineKey: ROOMS[0].key,
+				ts: ts + 100,
+				firstId: demoDecisionRows.length + 1
+			})
+		]
 	};
+}
+
+/** Demo fixture for GET /api/sessions/:id/memory-retrievals */
+function sessionMemoryRetrievalsFixture(id: string, now: number): unknown {
+	const opts = { sessionId: id, timelineKey: ROOMS[0].key, ts: now - 6 * MIN };
+	if (id === FEATURED_ID) return memoryRetrievalsFixture(opts);
+	// A build whose decision chain timed out: no decision rows, the fallback selection.
+	if (id === DEMO_LATE_INPUT_SESSION) return fallbackRetrievalFixture({ ...opts, ts: now - 5 * MIN });
+	return { retrievals: [] };
 }
 
 // ── Refusal handling + model behaviour (spec REFUSAL-HANDLING §12) ─────────────
@@ -1470,6 +1495,10 @@ export function resolveFixture(pathname: string, params: URLSearchParams): unkno
 			return modelBehaviourFixture(now, params.get('metric'));
 		case '/api/models/behaviour/incidents':
 			return modelBehaviourFixture(now).incidents;
+		case '/api/memory/filter-hits':
+			return memoryFilterHitsFixture(now);
+		case '/api/memory/stats':
+			return memoryStatsFixture(now);
 	}
 
 	const status = params.get('status');
@@ -1486,6 +1515,8 @@ export function resolveFixture(pathname: string, params: URLSearchParams): unkno
 		if (id === DEMO_LATE_INPUT_SESSION) return lateInputSessionDetail(now);
 		return id === DEMO_REFUSAL_SESSION ? refusalSessionDetail(now) : sessionDetailFixture(id, now);
 	}
+	if ((m = pathname.match(/^\/api\/sessions\/([^/]+)\/memory-retrievals$/)))
+		return sessionMemoryRetrievalsFixture(decodeURIComponent(m[1]), now);
 	if ((m = pathname.match(/^\/api\/sessions\/([^/]+)\/record$/)))
 		return sessionRecordFixture(decodeURIComponent(m[1]), now);
 	if ((m = pathname.match(/^\/api\/sessions\/([^/]+)\/decisions$/))) {

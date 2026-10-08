@@ -28,6 +28,7 @@
 	import ToolCallCard from './ToolCallCard.svelte';
 	import HarnessCallRow from './HarnessCallRow.svelte';
 	import DecisionCard from './DecisionCard.svelte';
+	import MemoryRetrievalCard from './MemoryRetrievalCard.svelte';
 	import RecordTurnSection from './RecordTurnSection.svelte';
 	import InterjectionCard from './InterjectionCard.svelte';
 	import GateCard from './GateCard.svelte';
@@ -38,6 +39,7 @@
 	import type {
 		CheckInfo,
 		DecisionEvaluation,
+		MemoryRetrieval,
 		RefusalEvent,
 		SessionBranch,
 		SessionAudit,
@@ -68,6 +70,7 @@
 		checks = [],
 		audits = [],
 		interjections = [],
+		memoryRetrievals = [],
 		focus
 	}: {
 		messages: readonly unknown[];
@@ -82,6 +85,8 @@
 		audits?: readonly SessionAudit[];
 		/** The session's interjection rows: the kind each interjection card is labelled with. */
 		interjections?: readonly SessionInterjection[];
+		/** The session's memory retrieval builds (spec MEMORY-RETRIEVAL §9): one card each. */
+		memoryRetrievals?: readonly MemoryRetrieval[];
 		focus?: { branchNo?: number | null; toolCallId?: string | null; attemptNo?: number | null } | null;
 	} = $props();
 
@@ -128,6 +133,19 @@
 			contract,
 			audits
 		})
+	);
+	// Memory retrieval cards (spec MEMORY-RETRIEVAL §9): a build whose `memory`
+	// decision group is in the plan replaces that group's decision card (its rows
+	// are nested in the card); a build with no rows (fallback, unjudged, none)
+	// goes before turn 1, where the decision cards without injections go.
+	const retrievalByGroup = $derived(
+		new Map(memoryRetrievals.flatMap((r) => (r.decisionGroup ? [[r.decisionGroup, r] as const] : [])))
+	);
+	const plannedGroups = $derived(
+		new Set(plan.flatMap((item) => (item.type === 'decision' ? [item.decisionGroup] : [])))
+	);
+	const leadingRetrievals = $derived(
+		memoryRetrievals.filter((r) => !r.decisionGroup || !plannedGroups.has(r.decisionGroup))
 	);
 	const shown = $derived(plan.flatMap((item) => (item.type === 'message' ? [item.msg] : [])));
 	const toolResults = $derived(collectToolResults(shown));
@@ -179,8 +197,17 @@
 </script>
 
 <div class="space-y-2 p-3">
+	{#each leadingRetrievals as retrieval (retrieval.id)}
+		<MemoryRetrievalCard {retrieval} />
+	{/each}
 	{#each plan as item (item.key)}
-		{#if item.type === 'decision'}
+		{#if item.type === 'decision' && item.evaluations[0]?.point === 'memory' && retrievalByGroup.has(item.decisionGroup)}
+			<MemoryRetrievalCard
+				retrieval={retrievalByGroup.get(item.decisionGroup)!}
+				evaluations={item.evaluations}
+				elementId={decisionElementId(item.decisionGroup)}
+			/>
+		{:else if item.type === 'decision'}
 			<DecisionCard
 				evaluations={item.evaluations}
 				injected={item.injected}

@@ -30,7 +30,10 @@ import {
 	SessionRecordResponse,
 	SessionDecisionsResponse,
 	ModelBehaviourResponse,
-	BehaviourIncidentPage
+	BehaviourIncidentPage,
+	SessionMemoryRetrievalsResponse,
+	MemoryFilterHitsResponse,
+	MemoryStatsResponse
 } from '$lib/schemas';
 
 /**
@@ -63,6 +66,11 @@ const cases: Case[] = [
 	{ path: `/api/sessions/${DEMO_AUDITED_SESSION}/decisions`, schema: SessionDecisionsResponse as never },
 	{ path: `/api/sessions/${DEMO_LATE_INPUT_SESSION}`, schema: SessionDetailResponse as never },
 	{ path: `/api/sessions/${DEMO_LATE_INPUT_SESSION}/decisions`, schema: SessionDecisionsResponse as never },
+	{ path: `/api/sessions/${encodeURIComponent(DEMO_FEATURED_SESSION)}/memory-retrievals`, schema: SessionMemoryRetrievalsResponse as never },
+	{ path: `/api/sessions/${DEMO_LATE_INPUT_SESSION}/memory-retrievals`, schema: SessionMemoryRetrievalsResponse as never },
+	{ path: `/api/sessions/${DEMO_REFUSAL_SESSION}/memory-retrievals`, schema: SessionMemoryRetrievalsResponse as never },
+	{ path: '/api/memory/filter-hits', query: { limit: '500' }, schema: MemoryFilterHitsResponse as never },
+	{ path: '/api/memory/stats', schema: MemoryStatsResponse as never },
 	{ path: '/api/models/behaviour', query: { window: '24h' }, schema: ModelBehaviourResponse as never },
 	{ path: '/api/models/behaviour/incidents', schema: BehaviourIncidentPage as never },
 	{ path: '/api/pipelines', schema: PipelinesResponse as never },

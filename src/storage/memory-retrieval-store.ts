@@ -682,6 +682,16 @@ export class MemoryRetrievalStore {
     );
   }
 
+  /** Builds since `sinceTs` counted by source (model / fallback / unjudged / none). */
+  sourceCounts(sinceTs: number): Record<string, number> {
+    return this.storage.read((db) => {
+      const rows = db
+        .prepare(`select source, count(*) as n from memory_retrievals where ts >= ? group by source`)
+        .all(sinceTs) as Array<{ source: string; n: number }>;
+      return Object.fromEntries(rows.map((r) => [r.source, r.n]));
+    });
+  }
+
   /** The follow-up rate over builds since `sinceTs` (the before/after metric of spec §9). */
   followUpStats(sinceTs: number, agent?: string | null): FollowUpStats {
     return this.storage.read((db) => {
