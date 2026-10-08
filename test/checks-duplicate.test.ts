@@ -309,3 +309,16 @@ test("prior rejections: live-branch check rows where a duplicate check fired, wi
   ];
   assert.deepEqual([...priorDuplicateRejections(rows, new Set(["duplicate"]))], [["c1", ["e1"]]]);
 });
+
+test("unseen: a message deleted by the evaluation time does not count; a later deletion does not yet", () => {
+  const deleted = (r: DuplicateRow, at: number): DuplicateRow => ({ ...r, event: { ...r.event, deleted: { at } } });
+  const rows = [
+    deleted(row("e1", "gone", 2100), 5000),
+    deleted(row("e2", "deleted later", 2200), 9000),
+    row("assistant:s-other:x:0", "part one", 2300),
+    deleted(row("assistant:s-other:y:1", "part two", 2301), 5000),
+    row("assistant:s-other:z:2", "part three", 2302),
+  ];
+  const unseen = selectUnseen(rows, seenFromMessages([]), { selfSessionId: "s-self", max: 5, asOf: 6000 });
+  assert.deepEqual(unseen.map((m) => m.text), ["deleted later", "part one", "part three"], "a deleted chunk breaks the message");
+});

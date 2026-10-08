@@ -57,6 +57,8 @@ interface SetupOpts {
   /** The live messages (default: a head stamped with CUTOFF). */
   messages?: any[];
   storage?: Storage;
+  /** Awaited before a duplicate call is answered (n = 1 for the first). */
+  onDuplicateCall?: (n: number, state: any) => Promise<void> | void;
 }
 
 function event(id: string, body: string, over: Partial<CanonicalChatEvent> = {}): CanonicalChatEvent {
@@ -152,7 +154,10 @@ async function setup(opts: SetupOpts = {}) {
     const body = JSON.parse(String(init.body));
     // The built-in refusal checks are judged too (their own call): answered "no", not counted.
     const duplicateCall = Object.keys(body.questions).some((id) => id.startsWith("duplicate__"));
-    if (duplicateCall) decisions.push({ state: body.state, questions: body.questions });
+    if (duplicateCall) {
+      decisions.push({ state: body.state, questions: body.questions });
+      await opts.onDuplicateCall?.(decisions.length, body.state);
+    }
     if (opts.failing) return new Response("upstream down", { status: 500 });
     const answers: Record<string, unknown> = {};
     for (const id of Object.keys(body.questions)) {
@@ -440,5 +445,72 @@ test("last seen: a redo rebuild sees the room up to its (first) cutoff; a reviva
   const resumed = await setup({ storage, messages: [...redone.messages], answer: () => 0.9 });
   assert.equal(await resumed.call({ message: "As I said elsewhere, 42." }), "sent");
   assert.equal(resumed.decisions.length, 0, "e1 was quoted by the earlier rejection");
+  storage.close();
+});
+
+/** Mark a stored message deleted at `at`. */
+async function deleteMessage(storage: Storage, id: string, at: number) {
+  const event = storage.getTimelineEventById(id)!;
+  await storage.appendTimelineEvent({ ...event, deleted: { at } }, "complete");
+}
+
+test("deleted messages: one another session deleted does not count; deleting a quoted one changes nothing", async () => {
+  const storage = await newStorage();
+  await botMessage(storage, "e1", "It's 42.", CUTOFF + 1000);
+  await botMessage(storage, "e2", "It's 41.", CUTOFF + 1200);
+  await deleteMessage(storage, "e2", Date.now() - 1000);
+  // A deletion marked later than the evaluation does not count yet.
+  await botMessage(storage, "e3", "Or 43.", CUTOFF + 1300);
+  await deleteMessage(storage, "e3", Date.now() + 60_000);
+  const t = await setup({ storage, answer: (q) => (q === "repeats" ? 0.95 : 0.1) });
+  assert.match(await t.call({ message: "The answer is 42." }), /^Not sent\. Other sessions of yours/);
+  assert.deepEqual(t.decisions[0]!.state.earlier.map((m: any) => m.text), ["It's 42.", "Or 43."]);
+  // The quoted message is deleted afterwards: it stays seen, nothing new to compare.
+  await deleteMessage(storage, "e1", Date.now());
+  assert.equal(await t.call({ message: "As I said: 42." }), "sent");
+  assert.equal(t.decisions.length, 1);
+  storage.close();
+});
+
+test("a message posted while the call waits for its verdict: one more evaluation, never more", async () => {
+  const storage = await newStorage();
+  await botMessage(storage, "e1", "Let me check.", CUTOFF + 1000);
+  const t = await setup({
+    storage,
+    // The draft repeats only what arrives during the wait.
+    answer: (q, state) => (q === "repeats" && state.earlier.some((m: any) => m.text === "It's 42.") ? 0.95 : 0.1),
+    onDuplicateCall: async (n) => {
+      // Another session posts while this call waits (during both judgements).
+      if (n === 1) await botMessage(storage, "e2", "It's 42.", Date.now());
+      if (n === 2) await botMessage(storage, "e3", "Definitely 42.", Date.now());
+    },
+  });
+  const error = await t.call({ message: "The answer is 42." });
+  assert.match(error, /^Not sent\. Other sessions of yours .* already posted 2 messages here that you have not seen:/s);
+  assert.equal(t.decisions.length, 2, "one recheck, no loop");
+  assert.deepEqual(t.decisions[1]!.state.earlier.map((m: any) => m.text), ["Let me check.", "It's 42."]);
+  assert.ok(t.lines.some(([e, f]) => e === "check_duplicate_rechecked" && f.newMessages === 1));
+  const rows = await t.consequences();
+  assert.deepEqual(rows.map(([, c]) => c), ["revise"], "one evaluation, recorded once");
+  storage.close();
+});
+
+test("a recheck past the checkpoint deadline takes the normal late path: the send goes out unjudged", async () => {
+  const storage = await newStorage();
+  await botMessage(storage, "e1", "Let me check.", CUTOFF + 1000);
+  const t = await setup({
+    storage,
+    knobs: { send_deadline_ms: 400 },
+    // The first judgement (e1 only) says no in time; the recheck (e1 + e2) would say yes, too late.
+    answer: (_q, state) => (state.earlier.length > 1 ? 0.95 : 0.1),
+    onDuplicateCall: async (n) => {
+      if (n === 1) await botMessage(storage, "e2", "It's 42.", Date.now());
+      if (n === 2) await new Promise((r) => setTimeout(r, 600));
+    },
+  });
+  assert.equal(await t.call({ message: "The answer is 42." }), "sent");
+  assert.equal(t.decisions.length, 2);
+  await new Promise((r) => setTimeout(r, 700));
+  assert.deepEqual((await t.consequences()).map(([, c]) => c), ["sent_unjudged"]);
   storage.close();
 });

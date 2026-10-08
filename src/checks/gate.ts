@@ -285,22 +285,29 @@ export class OutputGate implements SessionEndingHook {
    * Past the deadline the verdict is unjudged (pattern hits only) and the
    * evaluation is recorded `sent_unjudged` when it completes.
    */
-  async settle(key: string, opts: { held?: boolean } = {}): Promise<GateVerdict> {
+  async settle(key: string, opts: { held?: boolean; recheck?: () => boolean } = {}): Promise<GateVerdict> {
     const entry = this.entries.get(key);
     if (!entry) return emptyVerdict();
     entry.claimed = true;
     const held = opts.held ?? true;
     const heldFrom = this.now();
     const { evaluation } = entry;
-    const remaining = evaluation.deadlineAt - heldFrom;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const inTime = await Promise.race([
-      evaluation.done.then(() => true),
-      new Promise<false>((resolve) => {
-        timer = setTimeout(() => resolve(false), Math.max(0, remaining));
-      }),
-    ]);
-    if (timer) clearTimeout(timer);
+    const waitDone = async (): Promise<boolean> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const remaining = evaluation.deadlineAt - this.now();
+      const done = await Promise.race([
+        evaluation.done.then(() => true),
+        new Promise<false>((resolve) => {
+          timer = setTimeout(() => resolve(false), Math.max(0, remaining));
+        }),
+      ]);
+      if (timer) clearTimeout(timer);
+      return done;
+    };
+    let inTime = await waitDone();
+    // One more look before the verdict acts (the duplicate check, at most once):
+    // an extension runs within the same deadline; past it, the normal late path.
+    if (inTime && opts.recheck?.()) inTime = await waitDone();
     if (inTime) return this.recordEntry(key, entry, { held, heldMs: held ? this.now() - heldFrom : 0 });
     const heldMs = held ? this.now() - heldFrom : 0;
     // The output proceeds unjudged; the evaluation still completes and is recorded.
@@ -376,7 +383,10 @@ export class OutputGate implements SessionEndingHook {
       this.observe(toolCallId);
       return { kind: "proceed" };
     }
-    const verdict = await this.settle(toolCallId, { held: true });
+    const verdict = await this.settle(toolCallId, {
+      held: true,
+      ...(checkpoint === "send" ? { recheck: () => this.recheckDuplicate(toolName, toolCallId, args, entry) } : {}),
+    });
     try {
       return await this.policy.act(entry.info, verdict);
     } catch (error) {
@@ -401,15 +411,47 @@ export class OutputGate implements SessionEndingHook {
     args: Record<string, unknown> | undefined,
     entry: Entry,
   ): void {
+    this.duplicateStage(toolName, toolCallId, args, entry, false);
+  }
+
+  /**
+   * After the verdict of a held send (called once, from {@link settle}): when
+   * other sessions of the same agent posted to the target timeline while the
+   * call waited and the duplicate check has not fired, judge the draft once more
+   * against every unseen message, new ones included, in the same evaluation
+   * (its deadline unchanged). True = the evaluation was extended.
+   */
+  private recheckDuplicate(
+    toolName: string,
+    toolCallId: string,
+    args: Record<string, unknown> | undefined,
+    entry: Entry,
+  ): boolean {
+    const fired = entry.evaluation.result?.fired ?? [];
+    if (fired.some((f) => f.kind === "duplicate")) return false;
+    return this.duplicateStage(toolName, toolCallId, args, entry, true);
+  }
+
+  private duplicateStage(
+    toolName: string,
+    toolCallId: string,
+    args: Record<string, unknown> | undefined,
+    entry: Entry,
+    recheck: boolean,
+  ): boolean {
     const source = this.options.duplicate;
-    if (!source) return;
+    if (!source) return false;
     const scope = this.scope;
     try {
-      if (this.evaluator.duplicateChecks(scope.agent).length === 0) return;
+      if (this.evaluator.duplicateChecks(scope.agent).length === 0) return false;
       const draft = entry.evaluation.subject.sources.message;
-      if (!draft?.trim()) return;
-      const skip = (reason: string, extra: Record<string, unknown> = {}) =>
-        this.options.logger?.debug("check_duplicate_skipped", { sessionId: scope.sessionId, toolCallId, action: toolName, reason, ...extra });
+      if (!draft?.trim()) return false;
+      const skip = (reason: string, extra: Record<string, unknown> = {}) => {
+        if (!recheck) {
+          this.options.logger?.debug("check_duplicate_skipped", { sessionId: scope.sessionId, toolCallId, action: toolName, reason, ...extra });
+        }
+        return false;
+      };
       const target = source.target(toolName, args);
       if (!target) return skip("no_target");
       this.seedDuplicateRejections(source);
@@ -417,26 +459,42 @@ export class OutputGate implements SessionEndingHook {
       const after = lastSeen(seen, target);
       if (after === undefined) return skip("no_last_seen", { target });
       const knobs = this.evaluator.duplicateKnobs(scope.agent);
+      const now = this.now();
       const rows = source.messages(target, after, knobs.maxEarlier * 4 + 8);
-      const earlier = selectUnseen(rows, seen, { selfSessionId: scope.sessionId ?? "", max: knobs.maxEarlier });
+      // Deleted messages count as of now (the evaluation time).
+      const earlier = selectUnseen(rows, seen, { selfSessionId: scope.sessionId ?? "", max: knobs.maxEarlier, asOf: now });
       if (earlier.length === 0) return skip("no_unseen", { target });
+      if (recheck) {
+        // Only messages that arrived while the call waited start another evaluation.
+        const judged = new Set(entry.evaluation.duplicate?.earlier.flatMap((m) => m.eventIds) ?? []);
+        const fresh = earlier.filter((m) => m.eventIds.some((id) => !judged.has(id)));
+        if (fresh.length === 0) return false;
+        this.options.logger?.info("check_duplicate_rechecked", {
+          sessionId: scope.sessionId,
+          toolCallId,
+          action: toolName,
+          target,
+          newMessages: fresh.length,
+        });
+      }
       const ctx: DuplicateContext = {
         targetTimelineKey: target,
         ownTimelineKey: scope.timelineKey ?? target,
-        draftAt: this.now(),
+        draftAt: now,
         earlier,
         draftAnswering: source.answering(),
         earlierMaxTokens: knobs.earlierMaxTokens,
       };
-      if (this.evaluator.extendDuplicate(entry.evaluation, ctx)) {
-        this.duplicateQuoted.set(toolCallId, earlier.flatMap((m) => m.eventIds));
-      }
+      if (!this.evaluator.extendDuplicate(entry.evaluation, ctx, { rerun: recheck })) return false;
+      this.duplicateQuoted.set(toolCallId, earlier.flatMap((m) => m.eventIds));
+      return true;
     } catch (error) {
       this.options.logger?.warn("check_duplicate_failed", {
         sessionId: scope.sessionId,
         toolCallId,
         error: error instanceof Error ? error.message : String(error),
       });
+      return false;
     }
   }
 

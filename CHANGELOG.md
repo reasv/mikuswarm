@@ -319,7 +319,9 @@ Unreleased section; it is not part of any release's notes.
   error that quotes the earlier message and what it was answering and asks for a
   rewrite; `override_checks: ["duplicate"]` sends the draft as written, and the
   gate's revise bounds apply. Messages a rejection quoted count as seen, so the
-  next draft is compared only with newer ones. Its chain is
+  next draft is compared only with newer ones; deleted messages never count. If
+  another session posts while the send waits for its verdict, the draft is
+  judged once more, new messages included, within the same deadline. Its chain is
   `[decisions.checks.duplicate].model` (default `[decisions].model`); per-question
   thresholds (default 0.8) go in `[checks.duplicate].thresholds`, and
   `scripts/calibrate-checks.ts --check duplicate --question <name>` calibrates

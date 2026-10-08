@@ -249,7 +249,7 @@ export function sampleDuplicateItems(db: Database.Database, opts: DuplicateSampl
           ),
         };
       });
-      const earlier = selectUnseen(duplicateRows, seen, { selfSessionId: session.id, max: maxEarlier });
+      const earlier = selectUnseen(duplicateRows, seen, { selfSessionId: session.id, max: maxEarlier, asOf: call.ts });
       const newest = earlier[earlier.length - 1];
       if (!newest || call.ts - newest.receivedAt > windowMs) continue;
       const own = ownSession.get(session.id) as {

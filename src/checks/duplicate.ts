@@ -23,6 +23,7 @@
 import type { CanonicalChatEvent } from "../types.js";
 import { clipText, packNewest } from "../decisions/state.js";
 import { parseTimelineKey } from "../storage/timeline-key.js";
+import { isDeleted } from "../timeline/deletions.js";
 import { DUPLICATE_QUESTION_TEXT, type DuplicateQuestionName } from "./builtin/duplicate.js";
 import { headTokens, STATE_CLIPS } from "./state.js";
 
@@ -196,29 +197,39 @@ export function messageText(event: CanonicalChatEvent): string {
 /**
  * The unseen messages among `rows` (another session's bot messages in the
  * target timeline, received after the last-seen point, any order): drops the
- * ones already seen and the session's own, joins the chunks of one long
- * message, and keeps the newest `max`, oldest first.
+ * ones already seen, the session's own and the ones deleted by `asOf` (the
+ * evaluation time; a deletion marker after it does not count), joins the
+ * chunks of one long message, and keeps the newest `max`, oldest first.
  */
 export function selectUnseen(
   rows: readonly DuplicateRow[],
   seen: SeenState,
-  opts: { selfSessionId: string; max: number },
+  opts: { selfSessionId: string; max: number; asOf?: number },
 ): UnseenMessage[] {
   const sorted = rows
     .filter((r) => r.sessionId !== opts.selfSessionId && !seen.eventIds.has(r.event.id))
     .sort((a, b) => a.receivedAt - b.receivedAt || a.event.id.localeCompare(b.event.id));
   const out: UnseenMessage[] = [];
+  // A deleted chunk breaks a long message: a later chunk never joins an earlier message.
+  let previous: UnseenMessage | undefined;
   for (const row of sorted) {
+    if (isDeleted(row.event, opts.asOf)) {
+      previous = undefined;
+      continue;
+    }
     const text = messageText(row.event);
     const chunk = CHUNK_ID.exec(row.event.id);
-    const previous = out[out.length - 1];
     if (chunk && Number(chunk[1]) > 0 && previous && previous.sessionId === row.sessionId) {
       previous.eventIds.push(row.event.id);
       if (text) previous.text = previous.text ? `${previous.text}\n${text}` : text;
       continue;
     }
-    if (!text) continue;
-    out.push({ eventIds: [row.event.id], sessionId: row.sessionId, receivedAt: row.receivedAt, text, answering: row.answering });
+    if (!text) {
+      previous = undefined;
+      continue;
+    }
+    previous = { eventIds: [row.event.id], sessionId: row.sessionId, receivedAt: row.receivedAt, text, answering: row.answering };
+    out.push(previous);
   }
   return out.slice(-Math.max(0, opts.max));
 }

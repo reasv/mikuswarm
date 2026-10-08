@@ -218,8 +218,10 @@ export class CheckEvaluation {
    * (the duplicate stage, {@link CheckEvaluator.extendDuplicate}).
    */
   deadlineAt: number;
-  /** The duplicate stage's context, when one was started. */
+  /** The duplicate stage's context, when one was started (the rerun's, after a rerun). */
   duplicate?: DuplicateContext;
+  /** A rerun of the duplicate stage was started (new unseen messages during the wait). */
+  duplicateRerun = false;
   completedAt?: number;
   recorded = false;
   canceled = false;
@@ -416,8 +418,11 @@ export class CheckEvaluator {
    * duplicate question applies or the evaluation already completed or was
    * canceled.
    */
-  extendDuplicate(evaluation: CheckEvaluation, ctx: DuplicateContext): boolean {
-    if (evaluation.canceled || evaluation.recorded || evaluation.duplicate) return false;
+  extendDuplicate(evaluation: CheckEvaluation, ctx: DuplicateContext, opts: { rerun?: boolean } = {}): boolean {
+    if (evaluation.canceled || evaluation.recorded) return false;
+    // At most one stage, plus at most one rerun (new unseen messages arrived
+    // while the call waited for its verdict); a rerun keeps the deadline.
+    if (opts.rerun ? evaluation.duplicateRerun : evaluation.duplicate) return false;
     const { scope, subject } = evaluation;
     const message = subject.sources.message ?? "";
     if (!message.trim() || ctx.earlier.length === 0) return false;
@@ -431,10 +436,10 @@ export class CheckEvaluator {
       checks.push(check);
     }
     if (raw.length === 0) return false;
+    if (opts.rerun) evaluation.duplicateRerun = true;
+    else evaluation.deadlineAt = Math.max(evaluation.deadlineAt, this.now() + evaluation.deadlineMs);
     evaluation.duplicate = ctx;
-    evaluation.checks.push(...checks);
-    const now = this.now();
-    evaluation.deadlineAt = Math.max(evaluation.deadlineAt, now + evaluation.deadlineMs);
+    for (const check of checks) if (!evaluation.checks.includes(check)) evaluation.checks.push(check);
     const items = assignItemIds(raw);
     const knobs = this.duplicateKnobs(scope.agent);
     const stage = this.judgeSafely(evaluation, items, {
