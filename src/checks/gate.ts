@@ -54,6 +54,14 @@ import {
   type StateMessage,
 } from "./state.js";
 import type { CheckDefinition, Checkpoint } from "./types.js";
+import {
+  lastSeen,
+  seenFromMessages,
+  selectUnseen,
+  type Answering,
+  type DuplicateContext,
+  type DuplicateRow,
+} from "./duplicate.js";
 
 /** The gate's verdict on one evaluation. */
 export interface GateVerdict {
@@ -139,8 +147,25 @@ export interface OutputGateOptions {
   /** Logical id of the member serving the session's latest request. */
   servingModel?: () => string | undefined;
   policy?: GatePolicy;
+  /** The duplicate check's reads (ARCHITECTURE.md §8j "Duplicate sends"); absent = no duplicate stage. */
+  duplicate?: GateDuplicateSource;
   logger?: Logger;
   now?: () => number;
+}
+
+/** What the gate reads for the duplicate check of one session. */
+export interface GateDuplicateSource {
+  /** The timeline a posting call targets (`duplicateTarget`); undefined = unknown. */
+  target(toolName: string, args: Record<string, unknown> | undefined): string | undefined;
+  /**
+   * Bot messages other sessions of the same agent stored in `timelineKey`
+   * after `after` (`receivedAt`), hydrated, newest first, at most `limit`.
+   */
+  messages(timelineKey: string, after: number, limit: number): DuplicateRow[];
+  /** What this session's draft is answering (its request; `unprompted` for a proactive session). */
+  answering(): Answering;
+  /** Duplicate rejections recorded earlier in the session (tool call id → quoted event ids), for a resume. */
+  priorRejections?(): ReadonlyMap<string, readonly string[]>;
 }
 
 interface Entry {
@@ -163,6 +188,13 @@ export class OutputGate implements SessionEndingHook {
   private artifactSeq = 0;
   /** Per checkpoint: the revisable codes that put `override_checks` on its tools. */
   private readonly overrideCodes = new Map<Checkpoint, string[]>();
+  /**
+   * Tool call id → the unseen messages its duplicate stage judged against.
+   * They count as seen once that call's tool result carries the rejection
+   * (`seenFromMessages`). Seeded from the session's rows on a resume.
+   */
+  private readonly duplicateQuoted = new Map<string, readonly string[]>();
+  private duplicateSeeded = false;
 
   constructor(private readonly options: OutputGateOptions) {
     this.policy = options.policy ?? OBSERVE_POLICY;
@@ -260,7 +292,7 @@ export class OutputGate implements SessionEndingHook {
     const held = opts.held ?? true;
     const heldFrom = this.now();
     const { evaluation } = entry;
-    const remaining = evaluation.deadlineMs - (heldFrom - evaluation.startedAt);
+    const remaining = evaluation.deadlineAt - heldFrom;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const inTime = await Promise.race([
       evaluation.done.then(() => true),
@@ -294,7 +326,7 @@ export class OutputGate implements SessionEndingHook {
     entry.recording ??= (async () => {
       const result = await entry.evaluation.done;
       const evaluation = entry.evaluation;
-      const late = (evaluation.completedAt ?? this.now()) - evaluation.startedAt > evaluation.deadlineMs;
+      const late = (evaluation.completedAt ?? this.now()) > evaluation.deadlineAt;
       const base: GateVerdict = {
         evaluationIds: [],
         fired: result.fired,
@@ -337,6 +369,9 @@ export class OutputGate implements SessionEndingHook {
     }
     const entry = this.entries.get(toolCallId);
     if (!entry) return { kind: "proceed" };
+    // The duplicate stage reads the target timeline now, after the precheck and
+    // any hold before execute, so it sees what other sessions posted meanwhile.
+    if (checkpoint === "send") this.startDuplicateStage(toolName, toolCallId, args, entry);
     if (!this.shouldHold(toolCallId)) {
       this.observe(toolCallId);
       return { kind: "proceed" };
@@ -351,6 +386,66 @@ export class OutputGate implements SessionEndingHook {
         error: error instanceof Error ? error.message : String(error),
       });
       return { kind: "proceed" };
+    }
+  }
+
+  /**
+   * The duplicate stage of a send (ARCHITECTURE.md §8j "Duplicate sends"):
+   * the unseen messages of the same agent's other sessions in the call's target
+   * timeline, since this session last saw it. None = no decision call (a
+   * debug line). Never throws.
+   */
+  private startDuplicateStage(
+    toolName: string,
+    toolCallId: string,
+    args: Record<string, unknown> | undefined,
+    entry: Entry,
+  ): void {
+    const source = this.options.duplicate;
+    if (!source) return;
+    const scope = this.scope;
+    try {
+      if (this.evaluator.duplicateChecks(scope.agent).length === 0) return;
+      const draft = entry.evaluation.subject.sources.message;
+      if (!draft?.trim()) return;
+      const skip = (reason: string, extra: Record<string, unknown> = {}) =>
+        this.options.logger?.debug("check_duplicate_skipped", { sessionId: scope.sessionId, toolCallId, action: toolName, reason, ...extra });
+      const target = source.target(toolName, args);
+      if (!target) return skip("no_target");
+      this.seedDuplicateRejections(source);
+      const seen = seenFromMessages(this.options.getMessages(), this.duplicateQuoted);
+      const after = lastSeen(seen, target);
+      if (after === undefined) return skip("no_last_seen", { target });
+      const knobs = this.evaluator.duplicateKnobs(scope.agent);
+      const rows = source.messages(target, after, knobs.maxEarlier * 4 + 8);
+      const earlier = selectUnseen(rows, seen, { selfSessionId: scope.sessionId ?? "", max: knobs.maxEarlier });
+      if (earlier.length === 0) return skip("no_unseen", { target });
+      const ctx: DuplicateContext = {
+        targetTimelineKey: target,
+        ownTimelineKey: scope.timelineKey ?? target,
+        draftAt: this.now(),
+        earlier,
+        draftAnswering: source.answering(),
+        earlierMaxTokens: knobs.earlierMaxTokens,
+      };
+      if (this.evaluator.extendDuplicate(entry.evaluation, ctx)) {
+        this.duplicateQuoted.set(toolCallId, earlier.flatMap((m) => m.eventIds));
+      }
+    } catch (error) {
+      this.options.logger?.warn("check_duplicate_failed", {
+        sessionId: scope.sessionId,
+        toolCallId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /** A resumed session's earlier duplicate rejections (once per gate). */
+  private seedDuplicateRejections(source: GateDuplicateSource): void {
+    if (this.duplicateSeeded) return;
+    this.duplicateSeeded = true;
+    for (const [id, quoted] of source.priorRejections?.() ?? []) {
+      if (!this.duplicateQuoted.has(id)) this.duplicateQuoted.set(id, quoted);
     }
   }
 

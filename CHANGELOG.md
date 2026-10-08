@@ -298,6 +298,24 @@ Unreleased section; it is not part of any release's notes.
   failed before it runs refusal checks, and `/models` shows its progress.
   Database schema v27 adds `session_audits`.
 
+- **Duplicate-send check** (`[checks.duplicate]`, off by default; needs judged
+  checks): when one agent runs several sessions in parallel, a session can be
+  about to post what another session of the same agent already posted to the
+  same channel after this session last saw it. At every send (every posting
+  tool, every session type, judged against the tool's target channel) the output
+  gate collects those unseen messages, and when there are any it asks the
+  decision model three questions: does the draft answer what one of them already
+  answered, repeat most of it, or contradict it. A yes blocks the send with an
+  error that quotes the earlier message and what it was answering and asks for a
+  rewrite; `override_checks: ["duplicate"]` sends the draft as written, and the
+  gate's revise bounds apply. Messages a rejection quoted count as seen, so the
+  next draft is compared only with newer ones. Its chain is
+  `[decisions.checks.duplicate].model` (default `[decisions].model`); per-question
+  thresholds (default 0.8) go in `[checks.duplicate].thresholds`, and
+  `scripts/calibrate-checks.ts --check duplicate --question <name>` calibrates
+  them on pairs of sessions that sent close together. Check questions may now
+  carry a `name`, and any check accepts `thresholds` by question name.
+
 ### Changed
 
 - **A reply to the bot always triggers.** A reply to a bot message starts a session like a

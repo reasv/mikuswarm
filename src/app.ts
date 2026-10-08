@@ -91,6 +91,7 @@ import { JobSoftRefusalRedo, decideSessionArtifactRefusal } from "./refusals/job
 import { forkSession } from "./agent/fork.js";
 import { createActingPolicy } from "./checks/acting-policy.js";
 import { createRevisePolicyPart, priorRejections } from "./checks/revise.js";
+import { createDuplicateSource } from "./checks/duplicate-source.js";
 import { ContractReconciler, persistSessionContract } from "./agent/contract-store.js";
 import type { CreatedAgent } from "./agent/factory.js";
 import type { SummaryCoveragePin } from "./context/builder.js";
@@ -2161,6 +2162,16 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           }),
           logger: logger.child("checks"),
         }),
+      // The duplicate-send check (§8j "Duplicate sends"): the same agent's other
+      // sessions' messages in a send's target timeline, read when the call executes.
+      duplicate: createDuplicateSource(
+        {
+          storage,
+          agentFor: agentNameForTimeline,
+          proactiveSessionType: config.proactive?.session_type ?? "proactive",
+        },
+        (agent) => new Set(checkCatalogue.all(agent).filter((c) => c.kind === "duplicate").map((c) => c.code)),
+      ),
       logger: logger.child("checks"),
     },
   });
@@ -4144,7 +4155,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // quotes the original message just like the normal trigger path would.
     const eventForRender = buildReplyHydratedEvent(inbound, target);
 
-    const message: SteerMessage = { type: "interjection", content: renderRichMessage(eventForRender) };
+    // The quoted message counts as seen by the duplicate check (§8j).
+    const message: SteerMessage = { type: "interjection", content: renderRichMessage(eventForRender), seen: { eventIds: [target.id] } };
     const ok = sessions.steer(
       target.agentSessionId,
       message,
@@ -4363,8 +4375,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
 
     const content = buildCoReplyInterjection(inbound, target);
     // Pass the interjection source so it is indexed for the timeline→session debug
-    // path (master ef173b1).
-    const message: SteerMessage = { type: "interjection", content };
+    // path (master ef173b1). The quoted target counts as seen (§8j).
+    const message: SteerMessage = { type: "interjection", content, seen: { eventIds: [target.id] } };
     const steered = sessions.steer(
       coReplySessionId,
       message,
@@ -4464,7 +4476,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       });
     }
     const content = buildCoReplyInterjection(inbound, target, eventForRender);
-    const message: SteerMessage = { type: "interjection", content, ...(imageBlocks ? { imageBlocks } : {}) };
+    const message: SteerMessage = {
+      type: "interjection",
+      content,
+      ...(imageBlocks ? { imageBlocks } : {}),
+      seen: { eventIds: [target.id] },
+    };
     const steered = sessions.steer(
       coReplySessionId,
       message,

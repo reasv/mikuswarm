@@ -16,6 +16,7 @@ import { withStaleThinkingDropped } from "./stale-thinking.js";
 import { makeDeferLoadingInjector, withDeclaredDeferredTools, type DeclaredToolSet } from "./declared-tools.js";
 import { executeSyntheticCalls, type SyntheticCallSpec } from "./synthetic-calls.js";
 import { wrapToolsWithRecordTurnGate, type RecordTurnGate } from "./record-turn.js";
+import { withSeenStamp } from "../checks/duplicate.js";
 import { wrapToolsWithOutputGate, type OutputGate } from "../checks/gate.js";
 import { createSessionOutputGate, withGateTap, type OutputGateServices } from "../checks/session.js";
 import { estimateLiveSliceTokens } from "./live-token-estimate.js";
@@ -2293,7 +2294,12 @@ export class AgentSessionFactory {
       // so the two cannot drift if the terminal-type detection ever changes (§3 / §10a).
       const split = splitBuiltContext(built);
       frozenBaseSeed = split.frozenBase;
-      finalTurn = split.finalTurn;
+      // The build's cutoff rides on the transcript head: the duplicate check's
+      // last-seen point, read back after a resume, revival or redo (§8j).
+      finalTurn =
+        split.finalTurn && built.timelineCutoff !== undefined
+          ? withSeenStamp(split.finalTurn, { timelineKey: session.timelineKey, upTo: built.timelineCutoff })
+          : split.finalTurn;
       snapshot = split.snapshot;
       snapshotTokenEstimate = built.tokenEstimate;
       snapshotCompactTokens = built.compactTokens;

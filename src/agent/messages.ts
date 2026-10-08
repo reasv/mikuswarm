@@ -1,6 +1,7 @@
 import type {} from "@earendil-works/pi-agent-core";
 import type { ChatRole, CanonicalChatEvent } from "../types.js";
 import type { ImageBlock, ContextMessage } from "../context/index.js";
+import type { SeenStamp } from "../checks/duplicate.js";
 
 export interface ChatEventMessage {
   type: "chatEvent";
@@ -25,6 +26,12 @@ export interface TriggerGroupMessage {
    */
   tier?: ContextMessage["tier"];
   tokenEstimate?: number;
+  /**
+   * What this turn showed the session of its timelines (the build's cutoff, a
+   * resume gap's messages): the duplicate check's last-seen point (ARCHITECTURE.md
+   * §8j "Duplicate sends"). Metadata; `convertToLlm` ignores it.
+   */
+  seen?: SeenStamp;
 }
 
 export interface SatelliteMessage {
@@ -36,6 +43,8 @@ export interface SatelliteMessage {
    *  summarization-cutoff head turn. */
   tier?: ContextMessage["tier"];
   tokenEstimate?: number;
+  /** See {@link TriggerGroupMessage.seen}. */
+  seen?: SeenStamp;
 }
 
 export interface InterjectionMessage {
@@ -50,6 +59,8 @@ export interface InterjectionMessage {
    * `contentWithImages`. A co-reply that itself carries an image rides the same field.
    */
   imageBlocks?: ImageBlock[];
+  /** Messages the interjection quotes (its reply target): seen by the session, see {@link TriggerGroupMessage.seen}. */
+  seen?: SeenStamp;
 }
 
 declare module "@earendil-works/pi-agent-core" {

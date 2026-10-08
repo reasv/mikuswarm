@@ -72,7 +72,7 @@ src/
   yotsuba/          4chan support: URL recognition (url.ts), API types + config resolver (types.ts), comment HTML→text (markup.ts), thread graph + helpers (graph.ts), post-view engine (view.ts), rendering vocabulary (format.ts), HTTP client with caching/pacing (client.ts) (see ARCHITECTURE.md §7f)
   net/              Shared HTTP utilities: PacedLimiter (paced-limiter.ts) — generic paced request limiter with interactive/background priority classes, extracted from and re-used by DanbooruRateLimiter
   decisions/        Decision models: System-One client over the fallback chain, per-member fits, decision points + evaluate(), [decisions] config (see ARCHITECTURE.md §8h)
-  checks/           Output checks: check catalogue + built-in refusal/style/contract checks, the output gate, judged-check evaluator, judge-shaped state, acting policy, revise remedy (see ARCHITECTURE.md §8j)
+  checks/           Output checks: check catalogue + built-in refusal/style/contract/duplicate checks, the output gate, judged-check evaluator, judge-shaped state, acting policy, revise remedy, the duplicate-send check's unseen-message tracking (see ARCHITECTURE.md §8j)
   refusals/         Refusal handling: API-signal classifier, [[refusal_fallback]] rules and walks, session refusal handle, soft-refusal redo, mechanical-job reruns, caption refusal routing (see ARCHITECTURE.md §8j)
   behaviour/        Model behaviour statistics: behaviour snapshots + change events, prompt-change tracker, hourly rollups, the /models read API (see ARCHITECTURE.md §8k)
   audit/            Offline audit worker: send-contract diagnosis, judged history backfill, calibration core for scripts/calibrate-checks.ts (see ARCHITECTURE.md §9i)
