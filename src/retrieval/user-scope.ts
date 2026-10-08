@@ -19,6 +19,8 @@ export interface UserScope {
 }
 
 const MAX_SCOPE = 5000;
+/** Senders a display name can resolve to. */
+const MAX_NAME_SENDERS = 20;
 
 export function resolveUserScope(
   storage: Storage,
@@ -34,12 +36,10 @@ export function resolveUserScope(
   const byId = senders.filter((s) => s.senderId.toLowerCase() === lower || s.senderId.toLowerCase().replace(/^@/, "") === lower);
   if (byId.length > 0) matched.push(...byId);
   else {
-    for (const s of senders) {
-      const history = store.senderDisplayNameHistory(s.provider, s.senderId, 5);
-      if (history.some((n) => n.toLowerCase() === lower)) {
-        matched.push(s);
-        for (const n of history) names.add(n);
-      }
+    // By display name: one indexed lookup, kept to senders with tagged blocks.
+    const tagged = new Set(senders.map((s) => `${s.provider}\0${s.senderId}`));
+    for (const s of store.sendersByDisplayName(needle, MAX_NAME_SENDERS)) {
+      if (tagged.has(`${s.provider}\0${s.senderId}`)) matched.push(s);
     }
   }
   for (const s of matched) for (const n of store.senderDisplayNameHistory(s.provider, s.senderId, 5)) names.add(n);

@@ -143,3 +143,22 @@ test("user scope: by sender id or a (former) display name, plus entries naming t
     assert.equal(nobody.rowids.length, 0);
   });
 });
+
+test("user scope by display name is one indexed lookup; name history is a bounded, cached query", async () => {
+  await withFixture(async ({ storage, store }) => {
+    const plan = (sql: string, ...args: unknown[]) =>
+      storage.read((db) => (db.prepare(`explain query plan ${sql}`).all(...args) as Array<{ detail: string }>).map((r) => r.detail).join(" | "));
+    const byName = plan(
+      "select distinct provider, sender_id from timeline_events where sender_display_name = ? collate nocase limit ?",
+      "alice old",
+      20,
+    );
+    assert.match(byName, /idx_timeline_events_sender_name/);
+    assert.doesNotMatch(byName, /SCAN timeline_events/);
+    assert.deepEqual(store.sendersByDisplayName("ALICE OLD", 20), [{ provider: "matrix", senderId: "@alice:x" }]);
+    // Cached: a rename seen within the cache window does not re-query per build.
+    const before = store.senderDisplayNameHistory("matrix", "@alice:x", 4);
+    await storage.write((db) => db.exec("update timeline_events set sender_display_name = 'Renamed' where sender_id = '@alice:x'"));
+    assert.deepEqual(store.senderDisplayNameHistory("matrix", "@alice:x", 4), before);
+  });
+});

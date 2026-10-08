@@ -134,6 +134,8 @@ create index if not exists idx_memory_retrievals_ts
 export const MEMORY_RETRIEVAL_TIMELINE_INDEX = `
 create index if not exists idx_timeline_events_sender
   on timeline_events(provider, sender_id, timestamp);
+create index if not exists idx_timeline_events_sender_name
+  on timeline_events(sender_display_name collate nocase, provider, sender_id);
 `;
 
 export const MEMORY_RETRIEVAL_SCHEMA = `${MEMORY_RETRIEVAL_TABLES_SCHEMA}${MEMORY_RETRIEVAL_TIMELINE_INDEX}`;

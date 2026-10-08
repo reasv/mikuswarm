@@ -129,7 +129,15 @@ const CHUNK_COLUMNS = `c.rowid as rowid, c.id as id, c.path as path, c.start_lin
   c.end_line as endLine, c.room as room, c.entry_ts as entryTs, c.text as text,
   c.content_hash as contentHash, c.token_count as tokenCount, c.agent as agent, 0 as bm25`;
 
+/** Newest messages of a sender scanned for its display-name history (bounds the query). */
+const NAME_HISTORY_SCAN = 5000;
+const NAME_HISTORY_CACHE_MS = 10 * 60_000;
+const NAME_HISTORY_CACHE_MAX = 1000;
+
 export class MemoryRetrievalStore {
+  /** Display-name history per sender (read on every build): a bounded, short-lived cache. */
+  private readonly nameHistory = new Map<string, { at: number; names: string[] }>();
+
   constructor(readonly storage: Storage) {}
 
   // ── Chunks ────────────────────────────────────────────────────────────────
@@ -401,30 +409,70 @@ export class MemoryRetrievalStore {
    */
   senderDisplayNameHistory(provider: string, senderId: string, limit: number, exclude?: string): string[] {
     if (limit <= 0) return [];
-    return this.storage.read((db) => {
+    const skip = exclude?.trim().toLowerCase();
+    return this.displayNames(provider, senderId)
+      .filter((n) => n.toLowerCase() !== skip)
+      .slice(0, limit);
+  }
+
+  /**
+   * A sender's distinct display names, newest first (up to 6), from its newest
+   * {@link NAME_HISTORY_SCAN} messages; cached for a few minutes.
+   */
+  private displayNames(provider: string, senderId: string): string[] {
+    const key = `${provider}\0${senderId}`;
+    const now = Date.now();
+    const hit = this.nameHistory.get(key);
+    if (hit && now - hit.at < NAME_HISTORY_CACHE_MS) return hit.names;
+    const names = this.storage.read((db) => {
       const rows = db
         .prepare(
-          `select sender_display_name as name, max(timestamp) as last
-           from timeline_events
-           where provider = ? and sender_id = ? and sender_display_name is not null
-             and sender_display_name != ''
-           group by sender_display_name
+          `select name, max(ts) as last from (
+             select sender_display_name as name, timestamp as ts
+             from timeline_events
+             where provider = ? and sender_id = ? and sender_display_name is not null
+               and sender_display_name != ''
+             order by timestamp desc
+             limit ?
+           )
+           group by name
            order by last desc
-           limit ?`,
+           limit 12`,
         )
-        .all(provider, senderId, limit + 1) as Array<{ name: string; last: number }>;
-      const skip = exclude?.trim().toLowerCase();
+        .all(provider, senderId, NAME_HISTORY_SCAN) as Array<{ name: string; last: number }>;
       const seen = new Set<string>();
       const out: string[] = [];
       for (const r of rows) {
-        const key = r.name.trim().toLowerCase();
-        if (!key || key === skip || seen.has(key)) continue;
-        seen.add(key);
+        const k = r.name.trim().toLowerCase();
+        if (!k || seen.has(k)) continue;
+        seen.add(k);
         out.push(r.name.trim());
-        if (out.length >= limit) break;
+        if (out.length >= 6) break;
       }
       return out;
     });
+    if (this.nameHistory.size >= NAME_HISTORY_CACHE_MAX) this.nameHistory.delete(this.nameHistory.keys().next().value!);
+    this.nameHistory.set(key, { at: now, names });
+    return names;
+  }
+
+  /**
+   * Senders that have used this display name (case-insensitive), via the
+   * `sender_display_name` index; at most `limit`.
+   */
+  sendersByDisplayName(name: string, limit: number): Array<{ provider: string; senderId: string }> {
+    const needle = name.trim();
+    if (!needle || limit <= 0) return [];
+    return this.storage.read((db) =>
+      db
+        .prepare(
+          `select distinct provider, sender_id as senderId
+           from timeline_events
+           where sender_display_name = ? collate nocase
+           limit ?`,
+        )
+        .all(needle, limit) as Array<{ provider: string; senderId: string }>,
+    );
   }
 
   // ── Filter verdicts and hits (§9c "Memory filters") ───────────────────────
