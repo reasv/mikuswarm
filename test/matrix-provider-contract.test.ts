@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { MatrixProvider } from "../src/matrix/provider.js";
-import type { IChatProvider } from "../src/types.js";
+import type { IChatProvider, InboundChatEvent } from "../src/types.js";
 import type { AppConfig } from "../src/config/index.js";
 
 // ── Type-level check ─────────────────────────────────────────────────────────
@@ -148,4 +148,52 @@ test("onEvent is called for delivered events when provider is started with host"
   emitFn(fakeEvent);
   // The non-triggered message is emitted immediately (trigger stripped, trigger hold not buffered).
   assert.equal(received.length, 1);
+});
+
+test("a redaction on the native stream is surfaced as a reaction removal and as a deletion edit", async () => {
+  const p = makeProvider({ enabled: false, trigger_hold_ms: 0 });
+  const events: InboundChatEvent[] = [];
+  const reactions: unknown[] = [];
+  await p.start({ onEvent: (e) => events.push(e), onError: () => {}, onReaction: (e) => reactions.push(e) });
+  const account = {
+    accountId: "bot",
+    selfUserId: "@bot:h",
+    attachmentDir: "/tmp",
+    client: {
+      pollEvents: () => [
+        {
+          type: "reaction",
+          event: { action: "remove", reactionEventId: "$msg", roomId: "!r:h", senderId: "@alice:h", reactedAtMs: 1_700_000_000_123 },
+        },
+      ],
+    },
+  };
+  await (p as unknown as { poll(a: object): Promise<void> }).poll(account);
+  assert.equal(reactions.length, 1, "the reaction store still sees it");
+  assert.equal(events.length, 1);
+  const deletion = events[0]!;
+  assert.deepEqual(deletion.edit, {
+    targetExternalId: "$msg",
+    deleted: true,
+    deletedBy: "@alice:h",
+    lookupTimelineKeys: ["matrix:bot:room:!r:h", "matrix:bot:dm:!r:h"],
+  });
+  assert.equal(deletion.event.timestamp, 1_700_000_000_123, "the redaction's server time");
+  assert.equal(deletion.event.sender.id, "@alice:h", "the redacting user");
+  assert.equal(deletion.event.body, "");
+  assert.equal(deletion.trigger, undefined);
+});
+
+test("a reaction add on the native stream is never a deletion", async () => {
+  const p = makeProvider({ enabled: false, trigger_hold_ms: 0 });
+  const events: unknown[] = [];
+  await p.start({ onEvent: (e) => events.push(e), onError: () => {}, onReaction: () => {} });
+  const account = {
+    accountId: "bot",
+    selfUserId: "@bot:h",
+    attachmentDir: "/tmp",
+    client: { pollEvents: () => [{ type: "reaction", event: { action: "add", reactionEventId: "$r", roomId: "!r:h", targetEventId: "$m", senderId: "@alice:h", reactedAtMs: 1 } }] },
+  };
+  await (p as unknown as { poll(a: object): Promise<void> }).poll(account);
+  assert.equal(events.length, 0);
 });

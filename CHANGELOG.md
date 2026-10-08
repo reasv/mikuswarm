@@ -45,8 +45,9 @@ Unreleased section; it is not part of any release's notes.
   continues it, with the record turn written again at the new end. This replaces the
   fresh session that such a follow-up used to start. A reply to the request belongs to
   it without any judgement; after the run ended it triggers like a reply to the bot's
-  message. Matrix redactions are not routed (Discord deletions are), and a session
-  evicted by a restart cannot be revived.
+  message. A Matrix redaction of a message is a deletion like a Discord one (only the
+  sender's own redaction withdraws a request; a moderator's only updates the stored
+  message), and a session evicted by a restart cannot be revived.
   A discarded rollout is kept as a branch with the message that caused it. The console
   session view labels redo, revival and aborted-turn branches with that message, shows
   how long a call was held, labels each interjection's kind, and marks redone sessions

@@ -173,6 +173,56 @@ test("late input: deleting the trigger before anything was sent cancels the sess
   }
 });
 
+test("late input: a Matrix redaction of the trigger by its sender cancels the session", async () => {
+  const h = await startHarness({
+    toml: LATE(),
+    script: (req) => (isRecordTurnRequest(req) ? { text: "NO_REPLY" } : { ...send("never"), delayMs: 500 }),
+  });
+  try {
+    const id = h.say("oops wrong room", { mention: true });
+    await h.until(() => h.llm.requests.length >= 1, "first request");
+    h.redact(id);
+    await h.until(settledAll(h), "settled");
+    assert.equal(h.sends.length, 0, "nothing sent");
+    assert.equal(sessionRows(h)[0]!.status, "discarded");
+    assert.ok(hasLog(h, "late_input_cancelled"));
+    const [row] = h.query<{ body: string }>("select body from timeline_events where external_id = ?", id);
+    assert.equal(row?.body, "", "stored as a tombstone");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("late input: a moderator's redaction of the trigger only updates the stored message", async () => {
+  const h = await startHarness({
+    toml: LATE(),
+    script: (req) => (isRecordTurnRequest(req) ? { text: "NO_REPLY" } : { ...send("answer"), delayMs: 500 }),
+  });
+  try {
+    const id = h.say("a question", { mention: true });
+    await h.until(() => h.llm.requests.length >= 1, "first request");
+    h.redact(id, { by: "@mod:fake" });
+    await h.until(() => settledAll(h)() && h.sends.length >= 1, "answered");
+    assert.ok(!hasLog(h, "late_input_cancelled"));
+    assert.ok(hasLog(h, "late_input_ignored", { reason: "deleted_by_other" }));
+    const [row] = h.query<{ body: string }>("select body from timeline_events where external_id = ?", id);
+    assert.equal(row?.body, "", "the stored message is a tombstone");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("late input: a Matrix redaction of something that is not a stored message is dropped, never parked", async () => {
+  const h = await startHarness({ toml: LATE(), script: () => ({ text: "NO_REPLY" }) });
+  try {
+    h.redact("$some-reaction");
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(h.query("select * from pending_edits").length, 0);
+  } finally {
+    await h.stop();
+  }
+});
+
 test("late input: a quick same-sender addition joins the request and redoes it", async () => {
   let first = true;
   const h = await startHarness({

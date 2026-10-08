@@ -3521,8 +3521,23 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
    * re-armed only when the recomputed status warrants it and the target's timeline
    * isn't inactive — mirroring the live append and re-decryption gating.
    */
-  async function applyEdit(inbound: InboundChatEvent): Promise<void> {
+  async function applyEdit(edit: InboundChatEvent): Promise<void> {
+    let inbound = edit;
     const targetExternalId = inbound.edit!.targetExternalId;
+    // A deletion whose provider cannot place its target (a Matrix redaction):
+    // applied to the stored message in one of the candidate timelines (with
+    // their threads), else dropped (a reaction, a state event, a message this
+    // store never had); never parked.
+    const lookup = inbound.edit!.lookupTimelineKeys;
+    if (lookup) {
+      let storedKey: string | undefined;
+      for (const key of lookup) {
+        storedKey = timeline.resolveEditTargetTimelineKey(inbound.provider, targetExternalId, key);
+        if (storedKey) break;
+      }
+      if (!storedKey) return;
+      inbound = { ...inbound, timelineKey: storedKey, event: { ...inbound.event, timelineKey: storedKey } };
+    }
     // Late input (§8 "Late input"): the message before the edit, for the request
     // correction (before/after text, the no-op filter, mention changes).
     const prior = lateInputSettings.enabled
@@ -5563,6 +5578,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     const entry = lateEntryForRequestEvent(prior.timelineKey, prior.id);
     if (!entry) {
       if (!deleted) maybeTriggerOnAddedMention(inbound, prior, after);
+      return;
+    }
+    // A deletion by someone else (a moderator's redaction) only updates the
+    // stored message; one by an unknown deleter (a Discord deletion) is the sender's.
+    if (deleted && inbound.edit?.deletedBy !== undefined && inbound.edit.deletedBy !== prior.sender.id) {
+      logger.info("late_input_ignored", { sessionId: entry.sessionId, kind: "delete", reason: "deleted_by_other" });
       return;
     }
     if (!deleted) {
