@@ -77,6 +77,10 @@ Unreleased section; it is not part of any release's notes.
   or the bot's own; another bot's or a webhook's edited embed-only message is
   not deleted), and schema v32 removes the markers the first v31 step wrongly
   put on such bot and webhook messages and marks the bot's own wiped messages.
+  Schema v33 marks an agent's copy of another agent's wiped message (two agents
+  sharing one database), told apart by that agent's own marked copy; a webhook's
+  wiped message stays unmarked, since nothing stored tells it from an edited
+  embed-only one.
   A deletion that arrives before its message is stored (still held by the startup
   gap backfetch, even while it commits, or the Discord trigger hold, or simply overtaking it) is applied
   when the message lands, the bot's own sent messages included, and a deleted Discord trigger still in its hold starts

@@ -200,3 +200,53 @@ test("v31→v32 removes the false markers the first v31 step put on bot and webh
     }
   });
 });
+
+test("v32→v33 marks this agent's copy of a sibling agent's wiped message, where the sibling's own copy is marked", async () => {
+  await withStorage(async (storage, dbPath) => {
+    const chen = { id: "777", displayName: "Chen", isBot: true };
+    const rows: Array<[CanonicalChatEvent, number | null]> = [
+      // A sibling agent's message wiped in both agents' timelines: its own copy is marked (v32), ours is not.
+      [event("discord:chen:555", "555", "discord:chen:room:c", "", { provider: "discord", role: "assistant", sender: { ...chen, isSelf: true }, deleted: { at: 6_000 } }), 6_000],
+      [event("discord:miku:555", "555", "discord:miku:room:c", "", { provider: "discord", sender: chen }), 6_050],
+      // Its own copy not marked (a sibling message that was never deleted): ours stays as it is.
+      [event("discord:chen:556", "556", "discord:chen:room:c", "hello", { provider: "discord", role: "assistant", sender: { ...chen, isSelf: true } }), null],
+      [event("discord:miku:556", "556", "discord:miku:room:c", "", { provider: "discord", sender: chen }), 6_100],
+      // Another bot's edited embed-only message with no agent copy: never marked.
+      [event("discord:miku:557", "557", "discord:miku:room:c", "", { provider: "discord", sender: { id: "4242", displayName: "MusicBot", isBot: true } }), 6_200],
+      // A webhook row whose external id matches a marked agent copy: webhooks stay out.
+      [event("discord:chen:558", "558", "discord:chen:room:c", "", { provider: "discord", role: "assistant", sender: { ...chen, isSelf: true }, deleted: { at: 6_300 } }), 6_300],
+      [event("discord:miku:558", "558", "discord:miku:room:c", "", { provider: "discord", sender: { id: "999", displayName: "Hook", isBot: true, isWebhook: true } }), 6_300],
+      // The same external id on another provider: not the same message.
+      [event("matrix:miku:555", "555", ROOM_TK, "", { sender: { id: "@bot:example.org", displayName: "Bot", isBot: true } }), 6_400],
+      // Our copy with content (not wiped): untouched.
+      [event("discord:chen:559", "559", "discord:chen:room:c", "", { provider: "discord", role: "assistant", sender: { ...chen, isSelf: true }, deleted: { at: 6_500 } }), 6_500],
+      [event("discord:miku:559", "559", "discord:miku:room:c", "still here", { provider: "discord", sender: chen }), null],
+    ];
+    for (const [r] of rows) await storage.appendTimelineEvent(r, "skipped");
+    await storage.write((db) => {
+      const setEdited = db.prepare(`update timeline_events set last_edit_timestamp = ? where id = ?`);
+      for (const [r, ts] of rows) if (ts !== null) setEdited.run(ts, r.id);
+      db.pragma("user_version = 32");
+    });
+    const bodies = new Map(rows.map(([r]) => [r.id, row(storage, r.id).body]));
+    storage.close();
+    for (let pass = 0; pass < 2; pass++) {
+      const reopened = await Storage.open({ databasePath: dbPath });
+      try {
+        assert.equal(reopened.read((db) => Number(db.pragma("user_version", { simple: true }))), LATEST_SCHEMA_VERSION);
+        const deletedOf = (id: string) => (JSON.parse(row(reopened, id).event_json) as CanonicalChatEvent).deleted;
+        assert.deepEqual(deletedOf("discord:chen:555"), { at: 6_000 });
+        assert.deepEqual(deletedOf("discord:miku:555"), { at: 6_050 }, "our copy marked at its own wipe time");
+        assert.equal(deletedOf("discord:miku:556"), undefined, "the sibling's copy is not marked");
+        assert.equal(deletedOf("discord:miku:557"), undefined, "another bot's embed-only edit");
+        assert.equal(deletedOf("discord:miku:558"), undefined, "a webhook row");
+        assert.equal(deletedOf("matrix:miku:555"), undefined, "another provider");
+        assert.equal(deletedOf("discord:miku:559"), undefined, "not wiped");
+        for (const [id, body] of bodies) assert.equal(row(reopened, id).body, body, "no body changes");
+        if (pass === 0) await reopened.write((db) => db.pragma("user_version = 32"));
+      } finally {
+        reopened.close();
+      }
+    }
+  });
+});

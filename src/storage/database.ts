@@ -12833,7 +12833,7 @@ ${EXA_RESEARCH_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 32;
+export const LATEST_SCHEMA_VERSION = 33;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -13888,6 +13888,36 @@ function repairWipedDeletionMarkers(db: Database.Database): void {
   markWipedRows(db);
 }
 
+/**
+ * v32→v33 (data-only): another agent of this deployment is another bot to this
+ * agent, so v31/v32 left this agent's copy of a sibling agent's wiped message
+ * unmarked (a bot's empty edited message can be an edited embed-only one). The
+ * sibling's own copy of the same message (`role = 'assistant'`, the same
+ * `(provider, external_id)`) carries a deletion marker when it was wiped (v32
+ * marks it), and an agent's sends always have a body: that marker tells a
+ * deletion apart. Such a wiped bot row (not a webhook's) gets the marker
+ * (`deleted.at` = its own `last_edit_timestamp`, deleter unknown). Idempotent.
+ */
+function markSiblingWipedDeletions(db: Database.Database): void {
+  if (!hasTimelineEvents(db)) return;
+  db.prepare(
+    `update timeline_events
+     set event_json = json_set(event_json, '$.deleted', json_object('at', last_edit_timestamp))
+     where role = 'user'
+       and coalesce(sender_is_bot, 0) = 1 and coalesce(sender_is_webhook, 0) = 0
+       and external_id is not null
+       and ${WIPED_ROW_CONDITION}
+       and json_extract(event_json, '$.deleted') is null
+       and exists (
+         select 1 from timeline_events own
+          where own.provider = timeline_events.provider
+            and own.external_id = timeline_events.external_id
+            and own.role = 'assistant'
+            and json_type(own.event_json, '$.deleted') = 'object'
+       )`,
+  ).run();
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -13928,6 +13958,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   addLateInputColumns,                  // v29→v30 late input
   markWipedDeletions,                   // v30→v31 deletion markers on wiped rows
   repairWipedDeletionMarkers,           // v31→v32 bot/webhook false markers out, own rows in
+  markSiblingWipedDeletions,            // v32→v33 sibling agents' wiped messages marked
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write
