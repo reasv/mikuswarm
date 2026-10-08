@@ -168,6 +168,8 @@ test("late input: deleting the trigger before anything was sent cancels the sess
     assert.equal(h.sends.length, 0, "nothing sent");
     assert.equal(sessionRows(h)[0]!.status, "discarded");
     assert.ok(hasLog(h, "late_input_cancelled"));
+    const [row] = h.query<{ body: string }>("select body from timeline_events where external_id = ?", id);
+    assert.equal(row?.body, "oops wrong room", "a deletion never changes stored history");
   } finally {
     await h.stop();
   }
@@ -187,13 +189,13 @@ test("late input: a Matrix redaction of the trigger by its sender cancels the se
     assert.equal(sessionRows(h)[0]!.status, "discarded");
     assert.ok(hasLog(h, "late_input_cancelled"));
     const [row] = h.query<{ body: string }>("select body from timeline_events where external_id = ?", id);
-    assert.equal(row?.body, "", "stored as a tombstone");
+    assert.equal(row?.body, "oops wrong room", "a deletion never changes stored history");
   } finally {
     await h.stop();
   }
 });
 
-test("late input: a moderator's redaction of the trigger only updates the stored message", async () => {
+test("late input: a moderator's redaction of the trigger changes nothing", async () => {
   const h = await startHarness({
     toml: LATE(),
     script: (req) => (isRecordTurnRequest(req) ? { text: "NO_REPLY" } : { ...send("answer"), delayMs: 500 }),
@@ -206,7 +208,7 @@ test("late input: a moderator's redaction of the trigger only updates the stored
     assert.ok(!hasLog(h, "late_input_cancelled"));
     assert.ok(hasLog(h, "late_input_ignored", { reason: "deleted_by_other" }));
     const [row] = h.query<{ body: string }>("select body from timeline_events where external_id = ?", id);
-    assert.equal(row?.body, "", "the stored message is a tombstone");
+    assert.equal(row?.body, "a question", "a deletion never changes stored history");
   } finally {
     await h.stop();
   }

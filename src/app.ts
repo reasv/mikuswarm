@@ -3538,6 +3538,21 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       if (!storedKey) return;
       inbound = { ...inbound, timelineKey: storedKey, event: { ...inbound.event, timelineKey: storedKey } };
     }
+    // A deletion never changes stored history: the message stays in the timeline,
+    // summaries and search as it was. It only corrects a request still being
+    // answered (late input); `after` is the deleted view, built in memory.
+    if (inbound.edit!.deleted === true) {
+      const stored = lateInputSettings.enabled
+        ? timeline.getByExternalId(inbound.provider, targetExternalId, inbound.timelineKey)
+        : undefined;
+      logger.info("message_deletion_observed", {
+        timelineKey: inbound.timelineKey,
+        targetExternalId,
+        stored: stored !== undefined,
+      });
+      if (stored) onRequestEdited(inbound, stored, { ...stored, body: "", attachments: [] });
+      return;
+    }
     // Late input (§8 "Late input"): the message before the edit, for the request
     // correction (before/after text, the no-op filter, mention changes).
     const prior = lateInputSettings.enabled
@@ -5569,7 +5584,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
 
   /**
    * A trigger-group message was edited or deleted (§8 "Late input"). Called by
-   * `applyEdit` once the stored row changed. Edits by anyone but the message's
+   * `applyEdit` once the stored row changed (a deletion: without changing it). Edits by anyone but the message's
    * own human sender are content updates only; a formatting-only edit is a no-op.
    */
   function onRequestEdited(inbound: InboundChatEvent, prior: CanonicalChatEvent, after: CanonicalChatEvent): void {
