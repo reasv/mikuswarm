@@ -2171,6 +2171,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           storage,
           agentFor: agentNameForTimeline,
           proactiveSessionType: config.proactive?.session_type ?? "proactive",
+          // Channel visibility (§9h): what the session may read, as read_session_record.
+          readGate: (timelineKey, agentName) => sessionReadGateFor(timelineKey, agentName),
         },
         (agent) => new Set(checkCatalogue.all(agent).filter((c) => c.kind === "duplicate").map((c) => c.code)),
       ),

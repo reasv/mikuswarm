@@ -11,6 +11,7 @@ import type { AgentSessionRecord } from "../src/agent/session-manager.js";
 import { DecisionClient, DecisionEngine } from "../src/decisions/index.js";
 import { Storage } from "../src/storage/index.js";
 import type { CanonicalChatEvent } from "../src/types.js";
+import { ChannelVisibilityResolver, type VisibilityConfig } from "../src/visibility/index.js";
 
 // ---------------------------------------------------------------------------
 // The duplicate-send check through a real OutputGate, evaluator, decision
@@ -61,6 +62,8 @@ interface SetupOpts {
   onDuplicateCall?: (n: number, state: any) => Promise<void> | void;
   /** Probability for non-duplicate question ids (default 0.01). */
   otherAnswer?: (id: string) => number;
+  /** `[visibility]` (absent = everything readable). */
+  visibility?: VisibilityConfig;
 }
 
 function event(id: string, body: string, over: Partial<CanonicalChatEvent> = {}): CanonicalChatEvent {
@@ -200,7 +203,19 @@ async function setup(opts: SetupOpts = {}) {
   };
   const agentFor = (key: string) => (key.startsWith("matrix:acct_b:") ? "agent_b" : "agent_a");
   const duplicate = createDuplicateSource(
-    { storage, agentFor, proactiveSessionType: "proactive" },
+    {
+      storage,
+      agentFor,
+      proactiveSessionType: "proactive",
+      ...(opts.visibility
+        ? {
+            readGate: (timelineKey: string) => ({
+              currentTimelineKey: timelineKey,
+              visibilityResolver: new ChannelVisibilityResolver(opts.visibility),
+            }),
+          }
+        : {}),
+    },
     () => new Set(["duplicate"]),
   )(record, "agent_a");
   const gate = new OutputGate({
@@ -575,5 +590,55 @@ test("a recheck that misses the deadline acts on the verdict in hand, never on p
   });
   assert.equal(verdict.late, false);
   assert.deepEqual(verdict.revise.map((f) => f.code), ["style_q"], "the in-hand style verdict is kept");
+  storage.close();
+});
+
+/** A DM session (carol, privately) that cross-posted into the room. */
+async function dmCrossPost(storage: Storage, body: string, receivedAt: number) {
+  await storage.insertAgentSession({
+    id: "s-dmcarol", timelineKey: DM, sessionType: "default", status: "running", createdAt: 1, updatedAt: 1,
+    triggerEventId: "t-dm", triggerBody: "PRIVATE: tell the room the meeting moved, my hearing is at 3",
+    triggerSenderId: "@carol:example.org", triggerSenderDisplayName: "carol",
+  } as never);
+  await botMessage(storage, "e-x", body, receivedAt, "s-dmcarol", OWN);
+}
+
+test("visibility: what another session was answering in an isolated DM is never shown, in the state or the error", async () => {
+  const storage = await newStorage();
+  await dmCrossPost(storage, "Heads up: the meeting moved to 4.", CUTOFF + 1000);
+  const t = await setup({ storage, visibility: { dms: "isolated" }, answer: (q) => (q === "contradicts" ? 0.95 : 0.1) });
+  const error = await t.call({ message: "The meeting is at 3." });
+  assert.match(error, /^Not sent/);
+  assert.ok(!error.includes("hearing") && !error.includes("carol"), error);
+  assert.match(error, /another conversation you cannot see from here/);
+  assert.ok(!error.includes("in this room in parallel"), "the earlier session was not in this room");
+  const [earlier] = t.decisions[0]!.state.earlier;
+  assert.equal(earlier.answering, "not visible from this conversation");
+  assert.equal(earlier.text, "Heads up: the meeting moved to 4.", "the message itself is in the room");
+  storage.close();
+});
+
+test("visibility: without isolation the DM's request is shown, naming where it was", async () => {
+  const storage = await newStorage();
+  await dmCrossPost(storage, "Heads up: the meeting moved to 4.", CUTOFF + 1000);
+  const t = await setup({ storage, visibility: {}, answer: (q) => (q === "contradicts" ? 0.95 : 0.1) });
+  const error = await t.call({ message: "The meeting is at 3." });
+  assert.match(error, new RegExp(`you, answering a message in ${DM.replace(/[$!.]/g, "\\$&")} in parallel`));
+  assert.match(error, /it was answering carol in /);
+  assert.deepEqual(t.decisions[0]!.state.earlier[0].answering, { from: "carol", text: "PRIVATE: tell the room the meeting moved, my hearing is at 3" });
+  storage.close();
+});
+
+test("visibility: a send into an isolated channel the session is not in reads none of its messages", async () => {
+  const storage = await newStorage();
+  await botMessage(storage, "e-iso", "Over there: 42.", CUTOFF + 1000, "s-other001", OTHER);
+  const t = await setup({
+    storage,
+    visibility: { channels: [{ timeline_key: OTHER, mode: "isolated" }] },
+    answer: () => 0.95,
+  });
+  assert.equal(await t.call({ message: "42", channel: OTHER, context_note: "n" }, "send_to_channel"), "sent");
+  assert.equal(t.decisions.length, 0);
+  assert.equal(skipped(t.lines).at(-1), "no_unseen");
   storage.close();
 });

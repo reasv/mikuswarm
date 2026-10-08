@@ -18,7 +18,8 @@ import type Database from "better-sqlite3";
 import { isHarnessMade } from "../agent/harness.js";
 import { SYNTHETIC_SESSION_TYPES } from "../agent/recovery.js";
 import { DEFAULT_DUPLICATE_EARLIER_MAX_TOKENS, DEFAULT_DUPLICATE_MAX_EARLIER } from "../decisions/config.js";
-import { answeringOfSession, priorDuplicateRejections } from "../checks/duplicate-source.js";
+import { answeringOfSession, priorDuplicateRejections, visibleDuplicateRows } from "../checks/duplicate-source.js";
+import type { SessionReadGate } from "../tools/read-session-record.js";
 import {
   DUPLICATE_REJECTION_MARK,
   duplicateTarget,
@@ -51,6 +52,11 @@ export interface DuplicateSampleOptions {
   firedOnly?: boolean;
   /** The duplicate check codes (for `firedOnly` and earlier rejections). Default `duplicate`. */
   codes?: ReadonlySet<string>;
+  /**
+   * The read gate of a session in a timeline (channel visibility), applied as
+   * the live check does (`visibleDuplicateRows`). Absent = everything readable.
+   */
+  readGate?: (timelineKey: string) => SessionReadGate;
 }
 
 export const DEFAULT_DUPLICATE_WINDOW_MS = 60_000;
@@ -227,7 +233,7 @@ export function sampleDuplicateItems(db: Database.Database, opts: DuplicateSampl
       );
       if (candidates.length === 0) continue;
       const captions = attachmentsOf(db, candidates.map((r) => r.id));
-      const duplicateRows: DuplicateRow[] = candidates.map((r) => {
+      const allRows: DuplicateRow[] = candidates.map((r) => {
         const event = JSON.parse(r.event_json) as CanonicalChatEvent;
         const attachments = captions.get(r.id);
         return {
@@ -247,8 +253,10 @@ export function sampleDuplicateItems(db: Database.Database, opts: DuplicateSampl
                 },
             proactiveType,
           ),
+          ...(r.session_timeline_key !== null ? { sessionTimelineKey: r.session_timeline_key } : {}),
         };
       });
+      const duplicateRows = visibleDuplicateRows(allRows, target, opts.readGate?.(session.timeline_key));
       const earlier = selectUnseen(duplicateRows, seen, { selfSessionId: session.id, max: maxEarlier, asOf: call.ts });
       const newest = earlier[earlier.length - 1];
       if (!newest || call.ts - newest.receivedAt > windowMs) continue;

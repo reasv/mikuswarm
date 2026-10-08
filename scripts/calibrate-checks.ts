@@ -66,6 +66,7 @@ import { completeSimple } from "@earendil-works/pi-ai/compat";
 import { buildCheckCatalogue } from "../src/checks/catalogue.js";
 import { CHECK_SOURCES, type CheckSource } from "../src/checks/types.js";
 import { loadConfig } from "../src/config/index.js";
+import { ChannelVisibilityResolver, type VisibilityConfig } from "../src/visibility/index.js";
 import { createModelFromConfig } from "../src/agent/factory.js";
 import { DecisionClient } from "../src/decisions/client.js";
 import { decisionsFor, duplicateKnobs, isDecisionModel } from "../src/decisions/config.js";
@@ -230,7 +231,8 @@ if (anyRefusal) {
     persona: decisions.persona ?? "",
     stateMaxTokens,
   });
-  const db = openReadOnly(dbPath);
+  const visibilityResolver = new ChannelVisibilityResolver(config.visibility as VisibilityConfig | undefined);
+const db = openReadOnly(dbPath);
   try {
     const report = await runAnyRefusalCalibration({
       db,
@@ -300,6 +302,8 @@ try {
         proactiveSessionType: config.proactive?.session_type ?? "proactive",
         codes: new Set(catalogue.all(agent).filter((c) => c.kind === "duplicate").map((c) => c.code)),
         ...(switches.has("fired-only") ? { firedOnly: true } : {}),
+        // Channel visibility, as the live check applies it.
+        readGate: (timelineKey) => ({ currentTimelineKey: timelineKey, visibilityResolver }),
       })
     : undefined;
   const report = await runCalibration({

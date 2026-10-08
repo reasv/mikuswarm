@@ -46,8 +46,12 @@ export interface SeenState {
   eventIds: Set<string>;
 }
 
-/** What a message was answering: the request of its session, or nothing (a proactive post). */
-export type Answering = { from: string; text: string } | "unprompted";
+/**
+ * What a message was answering: the request of its session, nothing (a
+ * proactive post), or `private`: a request in a timeline the drafting session
+ * may not read (channel visibility, §9h), never shown.
+ */
+export type Answering = { from: string; text: string } | "unprompted" | "private";
 
 /** One unseen message of another session, as the check judges it. */
 export interface UnseenMessage {
@@ -59,6 +63,8 @@ export interface UnseenMessage {
   /** Its text, with `[image: <caption>]` for posted media. */
   text: string;
   answering: Answering;
+  /** The timeline of the session that posted it, when known and readable. */
+  sessionTimelineKey?: string;
 }
 
 /** Everything the duplicate questions of one send are judged on. */
@@ -83,6 +89,8 @@ export interface DuplicateRow {
   sessionId: string;
   receivedAt: number;
   answering: Answering;
+  /** The timeline of the session that posted it, when known and readable. */
+  sessionTimelineKey?: string;
 }
 
 /** A tool result that quoted unseen messages carries this phrase. */
@@ -228,7 +236,14 @@ export function selectUnseen(
       previous = undefined;
       continue;
     }
-    previous = { eventIds: [row.event.id], sessionId: row.sessionId, receivedAt: row.receivedAt, text, answering: row.answering };
+    previous = {
+      eventIds: [row.event.id],
+      sessionId: row.sessionId,
+      receivedAt: row.receivedAt,
+      text,
+      answering: row.answering,
+      ...(row.sessionTimelineKey !== undefined ? { sessionTimelineKey: row.sessionTimelineKey } : {}),
+    };
     out.push(previous);
   }
   return out.slice(-Math.max(0, opts.max));
@@ -239,8 +254,12 @@ export function secondsBefore(draftAt: number, receivedAt: number): number {
   return Math.max(0, Math.round((draftAt - receivedAt) / 1000));
 }
 
-function answeringState(answering: Answering): { from: string; text: string } | "unprompted" {
+/** The state's marker for a request in a timeline the drafting session may not read. */
+export const PRIVATE_ANSWERING = "not visible from this conversation";
+
+function answeringState(answering: Answering): { from: string; text: string } | string {
   if (answering === "unprompted") return "unprompted";
+  if (answering === "private") return PRIVATE_ANSWERING;
   return { from: answering.from, text: clipText(answering.text, STATE_CLIPS.request) };
 }
 
@@ -270,7 +289,9 @@ export function buildDuplicateState(ctx: DuplicateContext, draftText: string, bu
 }
 
 function answeringLine(answering: Answering): string {
-  return answering === "unprompted" ? "(no request: the assistant posted on its own)" : `${answering.from}: ${answering.text}`;
+  if (answering === "unprompted") return "(no request: the assistant posted on its own)";
+  if (answering === "private") return "(a request in a conversation not visible here)";
+  return `${answering.from}: ${answering.text}`;
 }
 
 /**
@@ -375,10 +396,28 @@ function placeOf(ctx: DuplicateContext): { here: string; room: string } {
   return { here: "here", room: kind === "dm" ? "in this DM" : "in this room" };
 }
 
-function answeredClause(answering: Answering): string {
-  return answering === "unprompted"
-    ? "it was not answering anyone: you posted it on your own"
-    : `it was answering ${answering.from}: ${quote(answering.text, ANSWERING_QUOTE_MAX_CHARS)}`;
+/** Where the earlier message's session ran, when not in the timeline the draft posts into. */
+function elsewhereOf(ctx: DuplicateContext, m: UnseenMessage): string | undefined {
+  if (m.answering === "private") return "another conversation you cannot see from here";
+  if (m.sessionTimelineKey === undefined || m.sessionTimelineKey === ctx.targetTimelineKey) return undefined;
+  return m.sessionTimelineKey;
+}
+
+function answeredClause(ctx: DuplicateContext, m: UnseenMessage): string {
+  const { answering } = m;
+  if (answering === "unprompted") return "it was not answering anyone: you posted it on your own";
+  if (answering === "private") return "what it was answering is in another conversation you cannot see from here";
+  const elsewhere = elsewhereOf(ctx, m);
+  return `it was answering ${answering.from}${elsewhere ? ` in ${elsewhere}` : ""}: ${quote(answering.text, ANSWERING_QUOTE_MAX_CHARS)}`;
+}
+
+/** Who posted it, for the single-message error. */
+function actorOf(ctx: DuplicateContext, m: UnseenMessage, room: string): string {
+  if (m.answering === "unprompted") return "you, posting on your own in parallel";
+  const elsewhere = elsewhereOf(ctx, m);
+  return elsewhere
+    ? `you, answering a message in ${elsewhere} in parallel`
+    : `you, answering a different message ${room} in parallel`;
 }
 
 /**
@@ -406,21 +445,20 @@ export function duplicateRejection(
   let body: string;
   if (single) {
     const m = ctx.earlier[0]!;
-    const who = m.answering === "unprompted"
-      ? "you, posting on your own in parallel"
-      : `you, answering a different message ${room} in parallel`;
     body =
-      `Another session of yours (${who}) already posted a message ${here} ` +
+      `Another session of yours (${actorOf(ctx, m, room)}) already posted a message ${here} ` +
       `${agoLabel(secondsBefore(ctx.draftAt, m.receivedAt))} ago ${DUPLICATE_REJECTION_MARK}: ` +
-      `${quote(m.text, QUOTE_MAX_CHARS)} (${answeredClause(m.answering)}). Your draft ${clauses}.`;
+      `${quote(m.text, QUOTE_MAX_CHARS)} (${answeredClause(ctx, m)}). Your draft ${clauses}.`;
   } else {
     const lines = ctx.earlier.map(
       (m) =>
         `- ${agoLabel(secondsBefore(ctx.draftAt, m.receivedAt))} ago: ${quote(m.text, QUOTE_MAX_CHARS)} ` +
-        `(${answeredClause(m.answering)})`,
+        `(${answeredClause(ctx, m)})`,
     );
+    const allHere = ctx.earlier.every((m) => m.answering !== "private" && elsewhereOf(ctx, m) === undefined);
+    const who = allHere ? `you, answering different messages ${room} in parallel` : "you, answering other messages in parallel";
     body =
-      `Other sessions of yours (you, answering different messages ${room} in parallel) already posted ` +
+      `Other sessions of yours (${who}) already posted ` +
       `${ctx.earlier.length} messages ${here} ${DUPLICATE_REJECTION_MARK}:\n${lines.join("\n")}\nYour draft ${clauses}.`;
   }
   const rewrite =
