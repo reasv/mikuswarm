@@ -237,6 +237,24 @@ test("compensationFor: the inverse of every undoable call, accepted by the tool 
   for (const name of UNDOABLE_TOOL_NAMES) assert.ok(cases.some((c) => c.name === name), `${name} needs a compensation case`);
 });
 
+test("undoable tools report a no-op as details.changed = false (late input never undoes it)", async () => {
+  const client = {
+    unreact: async () => ({ removed: 0 }),
+    pins: async () => [{ externalId: "$pinned" }],
+    pinMessage: async () => undefined,
+    unpinMessage: async () => undefined,
+  } as unknown as ChannelClient;
+  const react = createReactTool({ channelClient: client });
+  const pins = createPinsTool({ channelClient: client });
+  const details = async (tool: typeof react, args: Record<string, unknown>) =>
+    ((await tool.execute("t", args as never, undefined)) as { details?: { changed?: boolean } | null }).details ?? null;
+  assert.deepEqual(await details(react, { message_id: "$m", emoji: "x", remove: true }), { changed: false });
+  assert.deepEqual(await details(pins, { action: "pin", message_id: "$pinned" }), { changed: false });
+  assert.deepEqual(await details(pins, { action: "unpin", message_id: "$other" }), { changed: false });
+  assert.equal(await details(pins, { action: "pin", message_id: "$other" }), null, "a real pin changed state");
+  assert.equal(await details(pins, { action: "unpin", message_id: "$pinned" }), null, "a real unpin changed state");
+});
+
 test("compensationFor: undefined for anything that is not a well-formed undoable call", () => {
   assert.equal(compensationFor("pins", { action: "list" }), undefined);
   assert.equal(compensationFor("pins", { action: "pin" }), undefined);

@@ -61,13 +61,16 @@ export function createPinsTool(context: PinsToolContext): AgentTool {
           };
         }
 
+        // Already in the requested state: the call is a no-op, which late input
+        // must not "undo" (unpinning a pin that existed before, §8 "Late input").
+        const unchanged = await alreadyInState(context.channelClient, args.message_id!.trim(), args.action);
         if (args.action === "pin") {
           const result = await context.channelClient.pinMessage(args.message_id!.trim());
           const pinCount = (result as { pinCount?: number } | null | void)?.pinCount;
           const suffix = pinCount != null ? ` ${pinCount} total pins.` : "";
           return {
             content: [{ type: "text", text: `pinned message.${suffix}` }],
-            details: null,
+            details: unchanged ? { changed: false } : null,
           };
         }
 
@@ -76,7 +79,7 @@ export function createPinsTool(context: PinsToolContext): AgentTool {
         const suffix = pinCount != null ? ` ${pinCount} total pins.` : "";
         return {
           content: [{ type: "text", text: `unpinned message.${suffix}` }],
-          details: null,
+          details: unchanged ? { changed: false } : null,
         };
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -87,4 +90,14 @@ export function createPinsTool(context: PinsToolContext): AgentTool {
       }
     },
   };
+}
+
+/** True when the message is already pinned (pin) or not pinned (unpin); false when unknown. */
+async function alreadyInState(client: ChannelClient, messageId: string, action: "pin" | "unpin"): Promise<boolean> {
+  try {
+    const pinned = (await client.pins()).some((p) => p.externalId === messageId);
+    return action === "pin" ? pinned : !pinned;
+  } catch {
+    return false;
+  }
 }
