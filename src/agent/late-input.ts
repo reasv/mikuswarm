@@ -80,9 +80,34 @@ function canonicalJson(value: unknown): string {
   return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(",")}}`;
 }
 
-/** The replay key of a tool call: its name and canonical arguments. */
+/**
+ * The replay key of a tool call: its name and canonical arguments. The OpenAI
+ * prefill's `analysis` argument (ARCHITECTURE.md "Model-scoped OpenAI prefill")
+ * is not part of a call's identity: the tool never sees it.
+ */
 export function callKey(name: string, args: unknown): string {
-  return `${name}\u0000${canonicalJson(args ?? {})}`;
+  let identity = args ?? {};
+  if (identity !== null && typeof identity === "object" && !Array.isArray(identity) && "analysis" in identity) {
+    const { analysis: _analysis, ...rest } = identity as Record<string, unknown>;
+    identity = rest;
+  }
+  return `${name}\u0000${canonicalJson(identity)}`;
+}
+
+/**
+ * The arguments of tool call `toolCallId` as the live transcript stores them (the
+ * model's own, before validation, coercion or stripping), or undefined when the
+ * transcript does not hold it (a synthetic call executed before the agent exists).
+ */
+export function transcriptArguments(messages: readonly AgentMessage[], toolCallId: string): { found: boolean; args: unknown } {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i] as { role?: unknown; content?: unknown };
+    if (m?.role !== "assistant" || !Array.isArray(m.content)) continue;
+    for (const block of m.content as Array<{ type?: unknown; id?: unknown; arguments?: unknown }>) {
+      if (block?.type === "toolCall" && block.id === toolCallId) return { found: true, args: block.arguments };
+    }
+  }
+  return { found: false, args: undefined };
 }
 
 /**
@@ -129,6 +154,8 @@ export class ReplayStore {
 /**
  * How many tool calls with `key` the live transcript already holds, ignoring the
  * call `exceptId` (the one being executed, already in its assistant message).
+ * The transcript's arguments are the model's own, so `key` must be computed from
+ * those too ({@link transcriptArguments}), never from the executed parameters.
  */
 export function lineageCallCount(messages: readonly AgentMessage[], key: string, exceptId?: string): number {
   let count = 0;
@@ -490,8 +517,12 @@ export class LateInputSession {
         if (effect !== "redo_safe" && effect !== "repeatable") {
           return original.call(tool, toolCallId, params, signal, onUpdate);
         }
-        const key = callKey(tool.name, params);
-        if (lineageCallCount(liveMessages(), key, toolCallId) === 0) {
+        // Keyed on the transcript's own arguments, like the lineage it is compared
+        // with (the executed parameters went through validation and stripping).
+        const live = liveMessages();
+        const stored = transcriptArguments(live, toolCallId);
+        const key = callKey(tool.name, stored.found ? stored.args : params);
+        if (lineageCallCount(live, key, toolCallId) === 0) {
           const cached = this.replay.get(key);
           if (cached) {
             this.logger?.info("redo_replayed_call", { sessionId: this.sessionId, tool: tool.name });

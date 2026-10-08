@@ -146,3 +146,38 @@ test("request progress: queued, awaiting the first event, streaming, idle", asyn
   await p.waitForFirstEventOrEnd(60);
   assert.ok(Date.now() - t0 >= 50, "bounded by the timeout");
 });
+
+function assistantCall(id: string, name: string, args: Record<string, unknown>): AgentMessage {
+  return { role: "assistant", content: [{ type: "toolCall", id, name, arguments: args }] } as unknown as AgentMessage;
+}
+
+for (const [label, rawArgs, executed] of [
+  ["an explicit null optional (dropped by validation)", { query: "x", limit: null }, { query: "x" }],
+  ["a coerced string number", { query: "x", limit: "5" }, { query: "x", limit: 5 }],
+  ["a prefill analysis argument (stripped before the replay wrapper)", { query: "x", analysis: "We must search" }, { query: "x" }],
+] as const) {
+  test(`replay: a repeated call on the same lineage executes fresh (${label})`, async () => {
+    const ctl = session();
+    let runs = 0;
+    const live: AgentMessage[] = [];
+    const [read] = ctl.wrapReplayTools([tool("read_messages", () => (runs += 1))], () => live);
+    live.push(assistantCall("c1", "read_messages", rawArgs as Record<string, unknown>));
+    await read!.execute("c1", executed as never, undefined, undefined);
+    // The model calls it again within the same line of work: it wants a new value.
+    live.push(assistantCall("c2", "read_messages", rawArgs as Record<string, unknown>));
+    await read!.execute("c2", executed as never, undefined, undefined);
+    assert.equal(runs, 2, "the second call on the same lineage executes, it is not replayed");
+  });
+}
+
+test("replay: a prefill analysis argument does not stop a redo from replaying the call", async () => {
+  const ctl = session();
+  let runs = 0;
+  let live: AgentMessage[] = [];
+  const [search] = ctl.wrapReplayTools([tool("web_search", () => (runs += 1))], () => live);
+  live = [assistantCall("a", "web_search", { query: "x", analysis: "We must look" })];
+  await search!.execute("a", { query: "x" }, undefined, undefined);
+  live = [assistantCall("b", "web_search", { query: "x", analysis: "We must look it up" })];
+  await search!.execute("b", { query: "x" }, undefined, undefined);
+  assert.equal(runs, 1, "replayed on the new lineage");
+});
