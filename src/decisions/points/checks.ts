@@ -27,6 +27,7 @@ import {
   type CheckSources,
   type CheckStateScope,
 } from "../../checks/state.js";
+import { buildDuplicateJudgeState, buildDuplicateState, duplicateJudgeText } from "../../checks/duplicate.js";
 import type { PointSettings } from "../config.js";
 import type { DecisionChainMember, DecisionPoint } from "../registry.js";
 import type { DecisionAnswers, DecisionQuestion } from "../types.js";
@@ -71,6 +72,11 @@ export interface ChecksCallVerdict {
   results: QuestionResult[];
   /** True for the fallback verdict (no answers). */
   unjudged?: true;
+  /**
+   * A duplicate call: the timeline event ids of the unseen messages it judged
+   * against (stored on the row, so a resumed session knows what a rejection quoted).
+   */
+  earlierIds?: string[];
 }
 
 /** The sources a judge-only member reads as its `output`, per checkpoint (§5.5). */
@@ -98,11 +104,14 @@ function withPersona(text: string, persona: string): string {
   return text.replaceAll("{persona}", trimmed ? ` (the persona: ${trimmed.replace(/\s+/g, " ")})` : "");
 }
 
-/** Question ids for items: `<code>__<source>`, with `_2`, `_3`… for repeats. */
+/**
+ * Question ids for items: `<code>__<name>` for a named question, else
+ * `<code>__<source>`, with `_2`, `_3`… for repeats.
+ */
 export function assignItemIds(items: Array<Omit<CheckItem, "id">>): CheckItem[] {
   const seen = new Map<string, number>();
   return items.map((item) => {
-    const base = `${item.code}__${item.source}`;
+    const base = `${item.code}__${item.question.name ?? item.source}`;
     const n = (seen.get(base) ?? 0) + 1;
     seen.set(base, n);
     return { ...item, id: n === 1 ? base : `${base}_${n}` };
@@ -118,7 +127,9 @@ export const checksPoint: DecisionPoint<ChecksCallInput, ChecksCallVerdict> = {
     const outputSources = JUDGE_OUTPUT_SOURCES[checkpointOf(input)];
     const text = (s: string) => {
       const persona = withPersona(s, settings.persona);
-      return judge ? judgeText(persona, outputSources) : persona;
+      if (!judge) return persona;
+      // The duplicate questions name fields of their own state (DECISION-MODEL §5.4).
+      return input.scope === "duplicate" ? duplicateJudgeText(persona) : judgeText(persona, outputSources);
     };
     for (const item of input.items) {
       const q = item.question;
@@ -138,6 +149,14 @@ export const checksPoint: DecisionPoint<ChecksCallInput, ChecksCallVerdict> = {
   },
 
   state(input: ChecksCallInput, budgetTokens: number): unknown {
+    if (input.scope === "duplicate") {
+      const ctx = input.context.duplicate;
+      const draft = input.sources.message ?? "";
+      if (!ctx) return { earlier: [], draft: { text: draft } };
+      return input.shape === "conversation"
+        ? buildDuplicateJudgeState(ctx, draft, budgetTokens)
+        : buildDuplicateState(ctx, draft, budgetTokens);
+    }
     if (input.shape === "conversation") {
       return buildJudgeState(input.context, input.judgeOutput ?? "", budgetTokens);
     }
@@ -152,7 +171,9 @@ export const checksPoint: DecisionPoint<ChecksCallInput, ChecksCallVerdict> = {
     for (const item of input.items) {
       const answer = answers[item.id];
       if (!answer) continue;
-      const t = threshold(item.code, item.question.threshold);
+      // A named question may be calibrated alone (`"checks.<code>.<name>"`), else as its check.
+      const checkLevel = threshold(item.code, item.question.threshold);
+      const t = item.question.name ? threshold(`${item.code}.${item.question.name}`, checkLevel) : checkLevel;
       if (answer.type === "noul") {
         results.push({ id: item.id, code: item.code, source: item.source, probability: answer.noul, threshold: t, fired: answer.noul >= t });
       } else if (answer.type === "choice") {
@@ -171,7 +192,8 @@ export const checksPoint: DecisionPoint<ChecksCallInput, ChecksCallVerdict> = {
         });
       }
     }
-    return { results };
+    const earlierIds = input.scope === "duplicate" ? input.context.duplicate?.earlier.flatMap((m) => m.eventIds) : undefined;
+    return earlierIds && earlierIds.length > 0 ? { results, earlierIds } : { results };
   },
 
   fallback(): ChecksCallVerdict {
@@ -189,6 +211,7 @@ export const checksPoint: DecisionPoint<ChecksCallInput, ChecksCallVerdict> = {
         ...(r.fired ? { fired: true } : {}),
         ...(r.choice !== undefined ? { choice: r.choice } : {}),
       })),
+      ...(verdict.earlierIds ? { earlier_ids: verdict.earlierIds } : {}),
     };
   },
 
@@ -287,4 +310,21 @@ function chunked<T>(items: T[], size: number | undefined): T[][] {
   const out: T[][] = [];
   for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
   return out;
+}
+
+/**
+ * The calls of a send's duplicate questions (DECISION-MODEL §5.4), for the
+ * member their chain would reach first: one object call over the
+ * `{ earlier, draft }` state, or the judge-shaped conversation for a judge-only
+ * member (§3.8); chunked to the member's `max_questions`.
+ */
+export function planDuplicateCalls(items: readonly CheckItem[], member: DecisionChainMember | undefined): PlannedCall[] {
+  if (items.length === 0) return [];
+  const fits = member?.config.decision;
+  const judge = fits?.state_shapes === "text_or_conversation";
+  return chunked([...items], fits?.max_questions).map((chunk) => ({
+    items: chunk,
+    shape: judge ? "conversation" : "object",
+    scope: "duplicate",
+  }));
 }
