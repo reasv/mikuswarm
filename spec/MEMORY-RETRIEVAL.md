@@ -262,6 +262,8 @@ The turbovec figure is a top-k scan, which does the same per-token work as MaxSi
 - The scan therefore only has to keep the true top 20 inside its top 60, which is far more forgiving than ranking them exactly. The noise also biases a max over many tokens upward, which could otherwise favour long blocks.
 - Measured on the §9 set: TurboQuant 4/3/2-bit, with and without rescoring and token pooling, against exact MaxSim (top-20 overlap and labelled relevance).
 
+*Measured with the implemented kernel* (same host, the whole corpus × 32 query tokens): TurboQuant 4-bit 13.5 ms, exact fp32 on the ONNX runtime ~54 ms. Both fit the budget today. **TurboQuant 4-bit is the default** (owner, 2026-10-08): it is faster and keeps "search everything" viable as the corpus grows. It stays the default as long as the real-vector check shows little loss (the exact top 20 surviving in the scan's top `rescore`); otherwise the exact path is used.
+
 *Storage:* fp16 vectors on disk (SQLite blobs) for rescoring, plus the TurboQuant codes resident in memory for the scan. The exact fp32 matrix path stays as the portable fallback when the native module is unavailable.
 
 **Two branches, one score** (owner, 2026-10-08):
