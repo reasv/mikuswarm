@@ -260,3 +260,13 @@ test("redo: queued steers the old agent never read can be moved", () => {
   assert.deepEqual(takeQueuedSteers(agent), [message]);
   assert.equal(agent.hasQueuedMessages(), false);
 });
+
+test("redo: a correction while a redo rebuilds joins the rebuild instead of a second redo", () => {
+  const ctl = session();
+  const req = (id: string) => ({ reason: "edit_redo" as const, causeEventIds: [id], fallbacks: [], addedEventIds: [], removedEventIds: [] });
+  ctl.markRebuilding();
+  ctl.markBuildStarted();
+  ctl.requestRestart(req("e2"));
+  assert.equal(ctl.peekPending(), undefined, "no step for the new agent's first request to trip on");
+  assert.deepEqual(ctl.takeRebuildBeforeStart()?.causeEventIds, ["e2"]);
+});

@@ -339,3 +339,24 @@ test("late input races: a follow-up to a queued newer request does not redo the 
     await h.stop();
   }
 });
+
+test("late input races: the hold waits for a late-addition verdict at most max_hold_ms plus the point's timeout", async () => {
+  const h = await startHarness({
+    toml: LATE({ hold_ms: 300, max_hold_ms: 800 }) + DECIDER({ timeout_ms: 500 }) + "\n[enrichment]\ntrigger_wait_timeout_ms = 8000\n",
+    decideNoul: () => 0.9,
+    script: (req) => (isRecordTurnRequest(req) ? { text: "NO_REPLY" } : { ...send("a cat"), delayMs: 100 }),
+  });
+  try {
+    const started = Date.now();
+    h.say("what is this?", { mention: true });
+    await h.until(() => h.llm.requests.length >= 1, "first request");
+    // An image candidate: judging it waits for its download first.
+    h.say("", { attachments: [{ id: "att-1", mediaType: "image", mimeType: "image/png", filename: "cat.png", sizeBytes: 10, remoteUrl: "mxc://fake/cat" } as never] });
+    await h.until(() => h.sends.length >= 1, "the send", 15_000);
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 4000, `the send was not held for the whole download wait (${elapsed} ms)`);
+    assert.ok(hasLog(h, "late_input_verdict_timeout"));
+  } finally {
+    await h.stop();
+  }
+});
