@@ -1,4 +1,4 @@
-import type { RetrievalPlan } from "../retrieval/auto/types.js";
+import type { MemoryPlanTicket } from "../retrieval/auto/types.js";
 import { eligibleSkillIndex } from "../workspace/skills.js";
 import { Agent } from "@earendil-works/pi-agent-core";
 import type { AgentMessage, AgentTool, PrepareNextTurnContext, StreamFn } from "@earendil-works/pi-agent-core";
@@ -367,9 +367,9 @@ export interface CreateAgentOptions {
   /**
    * The session's auto-retrieval plan, started at launch in parallel with routing
    * (ARCHITECTURE.md §9d "Judged retrieval"); the build awaits it when assembling
-   * the final user turn. Absent = the build runs the pipeline inline, unjudged.
+   * the final user turn. Absent = no retrieval block (a preview runs it inline).
    */
-  memoryRetrieval?: Promise<RetrievalPlan | null>;
+  memoryRetrieval?: MemoryPlanTicket;
   /**
    * The session's record-turn gate (spec SESSION-RECORDS §3.2), applied to the
    * final tool list (the caller's tools plus the loading tools the factory adds),
@@ -2683,7 +2683,7 @@ export class AgentSessionFactory {
     routedSatellite?: RoutedSatellite;
     timelineCutoff?: number;
     summaryCoverage?: SummaryCoveragePin;
-    memoryRetrieval?: Promise<RetrievalPlan | null>;
+    memoryRetrieval?: MemoryPlanTicket;
   }): Promise<BuiltContext> {
     const generation = Boolean(args.summarizationCutoff || args.condenseInputs || args.diaryRange);
     return this.options.contextBuilder.build({

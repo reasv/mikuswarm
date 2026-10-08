@@ -5,10 +5,11 @@ import type { RetrievalPlan } from "../retrieval/auto/types.js";
 /**
  * Auto-retrieval dependencies of the context builder (ARCHITECTURE.md §9d
  * "Judged retrieval"). A live session's plan is started at launch, in
- * parallel with routing, and handed to the build as a promise
- * (`BuildContextOptions.memoryRetrieval`); a build without one (a room
- * preview) runs the pipeline inline, never judged, so a preview never bills a
- * decision call.
+ * parallel with routing, and handed to the build as a ticket
+ * (`BuildContextOptions.memoryRetrieval`). A room preview runs the pipeline
+ * inline without the memory point; judged filters it meets follow `pending`,
+ * though the recency layer it renders may still judge filters (billed and
+ * attributed to the preview).
  */
 export interface AutoRetrievalDeps {
   pipeline: MemoryRetrievalPipeline;
@@ -16,9 +17,10 @@ export interface AutoRetrievalDeps {
 }
 
 /**
- * Await a launch-time plan within `maxWaitMs`; null on timeout or failure.
- * The plan bounds its own stages (embed wait, late timeout, per-member
- * re-rank timeouts, the decision timeout); this is the outer safety net.
+ * Await a plan within `maxWaitMs`; null on timeout or failure. The plan
+ * bounds its own stages (embed wait, late timeout, per-member re-rank
+ * timeouts, the decision timeout); this is the build's own bound (the memory
+ * point's timeout plus a grace).
  */
 export async function awaitPlan(
   plan: Promise<RetrievalPlan | null>,

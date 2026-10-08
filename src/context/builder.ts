@@ -42,7 +42,7 @@ import { renderToolBlock, type ToolDefinitionLike, type ToolBlockSummary } from 
 import { buildRecentDiaryContent } from "./diary-layer.js";
 import { awaitPlan, type AutoRetrievalDeps } from "./auto-retrieval.js";
 import { buildPlanInput } from "../retrieval/auto/input.js";
-import type { RetrievalPlan } from "../retrieval/auto/types.js";
+import type { MemoryPlanTicket } from "../retrieval/auto/types.js";
 import { agentDateStamp, formatAgentTimestamp } from "../time/index.js";
 import type { Logger } from "../observability/index.js";
 
@@ -102,10 +102,11 @@ export interface BuildContextOptions {
   routedSatellite?: RoutedSatellite;
   /**
    * The session's auto-retrieval plan, started at launch in parallel with routing
-   * (ARCHITECTURE.md §9d "Judged retrieval"). Absent = the build runs the pipeline
-   * inline, unjudged. Rebuilds of one session reuse the same promise.
+   * (ARCHITECTURE.md §9d "Judged retrieval"); a redo replans. Absent on a
+   * live build = no retrieval block; a room preview (no `selfSessionId`) runs
+   * the pipeline inline, without the memory point.
    */
-  memoryRetrieval?: Promise<RetrievalPlan | null>;
+  memoryRetrieval?: MemoryPlanTicket;
   /**
    * Redo rebuild (ARCHITECTURE.md §8 "Late input"): render only timeline events
    * received at or before this instant (the first build's
@@ -770,19 +771,24 @@ export class ContextBuilder {
     // A live session's plan was started at launch, in parallel with routing
     // (`options.memoryRetrieval`): recall, the re-rank stages and the decision
     // filter run while routing and this build proceed, and the build waits only
-    // here, bounded by the interactive wall-clock budget
-    // (`recovery.llm_request_max_wait_ms`). A build without a plan (a room preview)
-    // runs the pipeline inline, never judged (no decision call is billed), with the
-    // query-embed wait bounded the same way and aborted on shutdown drain.
+    // here, bounded by the memory point's timeout plus a small grace (spec §8).
+    // A build that stops waiting abandons the plan: it is aborted and its block
+    // is never recorded as shown. A room preview (no session) runs the pipeline
+    // inline without the memory point; judged filters it meets follow
+    // `pending`, though the recency layer it renders may still judge filters
+    // (billed, attributed to the preview).
     const retrievalAgentName = this.resolveAgentName?.(options.timelineKey) ?? null;
     let retrievedMemory: string | null = null;
     if (!generation && this.autoRetrieval) {
-      const maxWaitMs = this.config.recovery?.llm_request_max_wait_ms ?? 120_000;
       const onError = (error: unknown) =>
         this.logger?.warn("auto_retrieval_failed", { error: error instanceof Error ? error.message : String(error) });
-      if (options.memoryRetrieval) {
-        retrievedMemory = (await awaitPlan(options.memoryRetrieval, maxWaitMs, onError))?.block ?? null;
-      } else {
+      const ticket = options.memoryRetrieval;
+      if (ticket) {
+        const plan = await awaitPlan(ticket.plan, ticket.waitMs, onError);
+        if (!plan) ticket.abandon();
+        retrievedMemory = plan?.block ?? null;
+      } else if (!options.selfSessionId) {
+        const maxWaitMs = this.autoRetrieval.pipeline.waitBudgetMs(retrievalAgentName);
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), maxWaitMs);
         const onDrain = () => ctrl.abort();
@@ -792,7 +798,7 @@ export class ContextBuilder {
         const input = buildPlanInput({
           agentName: retrievalAgentName,
           timelineKey: options.timelineKey,
-          attribution: { timelineKey: options.timelineKey, agentSessionId: null },
+          attribution: { timelineKey: options.timelineKey, agentSessionId: null, sessionType: "preview" },
           proactive,
           now,
           triggerEvents,
@@ -807,6 +813,7 @@ export class ContextBuilder {
           .then((plan) => plan?.block ?? null)
           .finally(() => {
             clearTimeout(timer);
+            ctrl.abort();
             options.abortSignal?.removeEventListener("abort", onDrain);
           });
       }

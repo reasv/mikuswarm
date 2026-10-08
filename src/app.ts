@@ -8,6 +8,7 @@ import type { ExaUsageRecord } from "./exa/accounting.js";
 import { createExaRetrievalTools } from "./tools/exa.js";
 import { recentRecordCandidates } from "./decisions/points/records-select.js";
 import { ageLabel } from "./decisions/state.js";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { accessSync, constants as fsConstants } from "node:fs";
 import { mkdir, unlink, writeFile } from "node:fs/promises";
@@ -229,7 +230,7 @@ import { SummarizationIndexer, SummarizationWorkerPool, createEscalateSummary, M
 import { DiaryWorkerPool, recentDayFiles } from "./diary/index.js";
 import { MemoryRetrievalPipeline } from "./retrieval/auto/pipeline.js";
 import { buildPlanInput } from "./retrieval/auto/input.js";
-import type { RetrievalPlan } from "./retrieval/auto/types.js";
+import type { MemoryPlanTicket } from "./retrieval/auto/types.js";
 import {
   MemoryFilterService,
   filterMemoryFileText,
@@ -1229,17 +1230,37 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     logger: logger.child("memory_filters"),
   });
   /** A memory file's text with filter-hidden blocks removed, for a non-retrieval surface. */
+  // One build reads the recency layer twice (the build's diary layer and the
+  // memory plan's recency exclusion): a short-lived memo of the filtered day
+  // file makes the second read reuse the first's verdicts instead of judging
+  // the same blocks again.
+  const recencyFilterMemo = new Map<string, { at: number; text: Promise<string> }>();
+  const RECENCY_FILTER_MEMO_MS = 60_000;
+  const RECENCY_FILTER_MEMO_MAX = 64;
   const filterMemoryFile = (
     agent: string | null,
     surface: "recency_layer" | "diary_writer",
     attribution: { timelineKey?: string | null; agentSessionId?: string | null; sessionType?: string | null },
   ) =>
-    (relPath: string, text: string) =>
-      filterMemoryFileText(memoryFilters, agent, relPath, text, {
-        surface,
-        attribution,
-        priority: surface === "diary_writer" ? "background" : "interactive",
-      });
+    (relPath: string, text: string): Promise<string> => {
+      const run = () =>
+        filterMemoryFileText(memoryFilters, agent, relPath, text, {
+          surface,
+          attribution,
+          priority: surface === "diary_writer" ? "background" : "interactive",
+        });
+      if (surface !== "recency_layer" || !memoryFilters?.hasFilters(agent)) return run();
+      const now = Date.now();
+      const key = `${agent ?? ""}\0${relPath}\0${createHash("sha1").update(text).digest("hex")}`;
+      const hit = recencyFilterMemo.get(key);
+      if (hit && now - hit.at < RECENCY_FILTER_MEMO_MS) return hit.text;
+      for (const [k, v] of recencyFilterMemo) if (now - v.at >= RECENCY_FILTER_MEMO_MS) recencyFilterMemo.delete(k);
+      while (recencyFilterMemo.size >= RECENCY_FILTER_MEMO_MAX) recencyFilterMemo.delete(recencyFilterMemo.keys().next().value!);
+      const out = run();
+      recencyFilterMemo.set(key, { at: now, text: out });
+      out.catch(() => recencyFilterMemo.delete(key));
+      return out;
+    };
   /**
    * The follow-up metric (ARCHITECTURE.md §9d "Observability"): the first time a
    * session that was shown memories searches its memory or opens a cited path,
@@ -1318,8 +1339,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // Per-session agent name resolver (spec MULTI-AGENT-SUPPORT §7.1): scopes
   // auto-retrieval to the calling session's agent corpus. Returns null in legacy mode.
   // Memory filters on the recency layer (§9c): hidden blocks are dropped per day file.
+  // A build without a session is a room preview: its filter judging is attributed to it.
   contextBuilder.filterDiaryFile = (timelineKey, sessionId) =>
-    filterMemoryFile(agentNameForTimeline(timelineKey), "recency_layer", { timelineKey, agentSessionId: sessionId ?? null });
+    filterMemoryFile(agentNameForTimeline(timelineKey), "recency_layer", {
+      timelineKey,
+      agentSessionId: sessionId ?? null,
+      ...(sessionId ? {} : { sessionType: "preview" }),
+    });
   contextBuilder.resolveAgentName = (timelineKey) => {
     const entry = resolveWorkspaceForTimeline(timelineKey);
     if (!entry) return null;
@@ -7671,10 +7697,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // the context fresh and re-run the session like a launch, reusing the
       // same row. The rebuild sees the timeline as of NOW (including messages
       // that arrived after the crash), which a launch would too.
+      // A fresh rebuild is a build like a launch's: it gets its own memory plan.
+      const memoryPlan = planMemoryRetrieval(inbound, record, isProactiveResume);
       try {
         created = await factory.create(record, tools, {
           proactive: isProactiveResume ? true : undefined,
           recordTurnGate: recoveryRecordHandles.gate,
+          ...(memoryPlan ? { memoryRetrieval: memoryPlan } : {}),
           abortSignal: drainAbort.signal,
           usage,
           userLimit: recoveryGate?.userLimit,
@@ -7683,6 +7712,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         ({ agent, kickoff, snapshot, tokenEstimate } = created);
         if (!kickoff) throw new Error("context build produced no final user turn");
       } catch (error) {
+        memoryPlan?.abandon();
         const message = error instanceof Error ? error.message : String(error);
         // A build-wait timeout is environmental (an outage backing up summary
         // coverage) — mechanical, so the manual resume re-parks instead of
@@ -8732,20 +8762,24 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
    * Start a session's auto-retrieval plan at launch (ARCHITECTURE.md §9d "Judged
    * retrieval"): recall, the re-rank stages and the memory decision point run in
    * parallel with routing, records planning and the context build, which awaits
-   * the plan only when it assembles the final user turn. Human-triggered chat-lane
-   * sessions and proactive sessions (the conversation stands in for the request);
-   * other builds run the pipeline inline, unjudged. Never rejects.
+   * the plan only when it assembles the final user turn. Every session build
+   * gets one (any trigger, any session type; a proactive session's conversation
+   * stands in for the request), and each records a `memory_retrievals` row
+   * under the session id. The ticket's `abandon` aborts the plan: called when
+   * the build stops waiting, a redo replaces it, or the session ends. Never
+   * rejects.
    */
   function planMemoryRetrieval(
     inbound: InboundChatEvent,
     session: { id: string; sessionType: string; timelineKey: string },
     proactive: boolean,
-  ): Promise<RetrievalPlan | null> | undefined {
+  ): MemoryPlanTicket | undefined {
     if (!memoryPipeline) return undefined;
     const agentName = agentNameForTimeline(session.timelineKey);
     const maxWaitMs = config.recovery?.llm_request_max_wait_ms ?? 120_000;
-    const signal = AbortSignal.any([drainAbort.signal, AbortSignal.timeout(maxWaitMs)]);
-    return (async () => {
+    const abandoned = new AbortController();
+    const signal = AbortSignal.any([drainAbort.signal, abandoned.signal, AbortSignal.timeout(maxWaitMs)]);
+    const plan = (async () => {
       const queryMessages = retrievalConfig.auto.queryMessages;
       let triggerEvents: CanonicalChatEvent[] = [];
       let replyTarget: CanonicalChatEvent | undefined;
@@ -8796,6 +8830,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       });
       return null;
     });
+    return {
+      plan,
+      waitMs: memoryPipeline.waitBudgetMs(agentName),
+      abandon: () => abandoned.abort(),
+    };
   }
 
   async function launchSession(
@@ -9036,6 +9075,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     let snapshot: ContextMessage[] | undefined;
     let tokenEstimate: number | undefined;
     let unappliedRebuild: RestartRequest | undefined;
+    let memoryPlan: MemoryPlanTicket | undefined;
+    const replanMemory = (): void => {
+      memoryPlan?.abandon();
+      memoryPlan = planMemoryRetrieval(inbound, session, proactive);
+    };
     try {
       // §4.3: buildSessionTools throws when agents mode + unresolvable account.
       // Placed INSIDE the try block so the existing catch handles it identically
@@ -9054,11 +9098,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // drains the next trigger, exactly like a factory failure. For a proactive /
       // synthetic trigger (no persisted event, no media) this is a fast no-op.
       // Auto-retrieval starts now (§9d), in parallel with the readiness wait,
-      // routing and the build; every rebuild of this session reuses the plan.
-      const memoryPlan =
-        proactive || (!isBotTriggered && session.sessionType === "default")
-          ? planMemoryRetrieval(inbound, session, proactive)
-          : undefined;
+      // routing and the build, for every session (bot-triggered and any session
+      // type included). A redo replans on the corrected trigger and aborts the
+      // stale plan; a cancelled or discarded session aborts it.
+      memoryPlan = planMemoryRetrieval(inbound, session, proactive);
       await awaitTriggerReadiness(inbound);
 
       // Session records to start with (spec SESSION-RECORDS §6/§7): planned in
@@ -9112,6 +9155,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         const cancelled = lateCtl.takeCancelBeforeStart();
         if (cancelled) {
           created.gate?.dispose();
+          memoryPlan?.abandon();
           lateCtl.markSettled();
           sessions.markDiscarded(session.id, { error: `cancelled: ${cancelled.reason}` });
           logger.info("late_input_cancelled", { sessionId: session.id, reason: cancelled.reason, phase: "building" });
@@ -9129,6 +9173,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         lateCtl.redoCount += 1;
         void storage.bumpAgentSessionRedoCount(session.id).catch(() => undefined);
         refreshTriggerFromStore(inbound);
+        replanMemory();
         logger.info("late_input_redo", { sessionId: session.id, reason: rebuild.reason, phase: "building", causes: rebuild.causeEventIds });
         await awaitTriggerReadiness(inbound);
       }
@@ -9142,6 +9187,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // no snapshot/transcript yet, so there is genuinely nothing to park; the
       // waited job is untouched and completes when its model recovers.
       const buildTimeout = error instanceof Error && error.name === "BuildWaitTimeoutError";
+      memoryPlan?.abandon();
       // Not correctable any more: a correction still in flight takes its native fate.
       lateCtl?.markSettled();
       sessions.markDiscarded(session.id, {
@@ -9279,6 +9325,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         lateCtl!.redoCount += 1;
         void storage.bumpAgentSessionRedoCount(session.id).catch(() => undefined);
         refreshTriggerFromStore(inbound);
+        replanMemory();
         await awaitTriggerReadiness(inbound);
         lateCtl!.markBuildStarted();
         next = await factory.create(session, sessionTools, createOpts!(firstPin));
