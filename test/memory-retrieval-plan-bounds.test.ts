@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { MemoryRetrievalPipeline, MEMORY_PRIORITY, PLAN_WAIT_GRACE_MS, citationLabel } from "../src/retrieval/auto/pipeline.js";
+import { MemoryRetrievalPipeline, MEMORY_PRIORITY, MEMORY_SLOT_SHARE, PLAN_WAIT_GRACE_MS, citationLabel } from "../src/retrieval/auto/pipeline.js";
 import { judgedPerBuildMax, resolveRetrievalConfig } from "../src/retrieval/config.js";
 import type { PlanInput } from "../src/retrieval/auto/types.js";
 import type { LexicalHit } from "../src/storage/database.js";
@@ -57,12 +57,12 @@ function stubStore(tagged: Map<string, LexicalHit[]>, inserted: any[] = [], part
   } as any;
 }
 
-function stubEngine(calls: Array<{ hash: string; priority?: string }>, opts: { relevant?: (text: string) => number; raw?: any } = {}) {
+function stubEngine(calls: Array<{ hash: string; priority?: string; share?: { name: string; fraction: number } }>, opts: { relevant?: (text: string) => number; raw?: any } = {}) {
   return {
     isEnabled: () => true,
     raw: () => opts.raw ?? {},
     evaluate: async (_p: unknown, inp: any, ctx: any) => {
-      calls.push({ hash: inp.meta.contentHash, priority: ctx.priority });
+      calls.push({ hash: inp.meta.contentHash, priority: ctx.priority, share: ctx.share });
       const relevant = opts.relevant?.(inp.passage.text) ?? 0.9;
       return {
         source: "model",
@@ -128,7 +128,7 @@ test("max_judged caps the judge requests per build (person-cued included); the r
   const hits = Array.from({ length: 30 }, (_, i) => scored(hit(`Topic block ${i} about pancakes and syrup ${i}`, NOW - (40 + i) * DAY), 0.9 - i * 0.01));
   const people = ["@a:x", "@b:x", "@c:x", "@d:x"];
   const tagged = new Map(people.map((p, k) => [p, [hit(`Person ${k} entry one`, NOW - (5 + k) * DAY), hit(`Person ${k} entry two`, NOW - (6 + k) * DAY)]]));
-  const calls: Array<{ hash: string; priority?: string }> = [];
+  const calls: Array<{ hash: string; priority?: string; share?: { name: string; fraction: number } }> = [];
   const config = resolveRetrievalConfig({ enabled: true, auto: { max_results: 20, max_tokens: 20000 } } as any);
   assert.equal(config.auto.maxJudged, 12);
   const pipeline = new MemoryRetrievalPipeline({
@@ -143,6 +143,7 @@ test("max_judged caps the judge requests per build (person-cued included); the r
   );
   assert.equal(calls.length, 12);
   assert.ok(calls.every((c) => c.priority === MEMORY_PRIORITY));
+  assert.ok(calls.every((c) => c.share?.name === MEMORY_SLOT_SHARE && c.share.fraction === 0.5), "judge requests count against the capped memory share");
   assert.notEqual(MEMORY_PRIORITY, "interactive");
   const cuedHashes = new Set([...tagged.values()].flat().map((h) => h.contentHash));
   assert.equal(calls.filter((c) => cuedHashes.has(c.hash)).length, 4, "a third of the cap goes to person-cued candidates");

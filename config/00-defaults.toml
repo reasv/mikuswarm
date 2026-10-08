@@ -993,6 +993,7 @@ person_recent_max = 8             # ... in total; these skip the re-rank cuts
 fallback_min_score = 0.6          # decision chain down: hybrid floor of the fallback selection
 fallback_max_results = 2          # ... and its cap
 max_judged = 12                   # most passages judged per build (person-cued included); the rest fall back
+judge_slot_share = 0.5            # most of a decision group's max_in_flight memory judging holds (at least 1 slot)
 dedup_against_recency = true      # skip blocks already in the §10a recency layer
 # User lane (§9d): a lexical-only sub-search keyed on the trigger user's display
 # name(s), reserving slots for "my recent history with this person" alongside the

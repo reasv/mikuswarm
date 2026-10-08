@@ -15,7 +15,7 @@
 
 import { nanoid } from "nanoid";
 import type { AppConfig } from "../config/index.js";
-import type { LlmScheduler, PriorityClass } from "../agent/scheduler.js";
+import type { LlmScheduler, PriorityClass, SlotShare } from "../agent/scheduler.js";
 import type { Logger } from "../observability/logger.js";
 import type { UsageEventInput } from "../storage/database.js";
 import {
@@ -214,6 +214,8 @@ export interface EvaluateContext {
   agentName: string | null;
   attribution: DecisionAttribution;
   priority?: PriorityClass;
+  /** The capped share of the decision group this evaluation counts against (memory judging). */
+  share?: SlotShare;
   signal?: AbortSignal;
   /** Cheap verdict of today's code, logged alongside for agreement analysis. */
   heuristicVerdict?: unknown;
@@ -447,6 +449,7 @@ export class DecisionEngine {
           {
             consumer: `decision:${point.name}`,
             priority: ctx.priority ?? "interactive",
+            ...(ctx.share ? { share: ctx.share } : {}),
             timeoutMs: ctx.timeoutMs ?? (images ? settings.vision!.timeoutMs : settings.timeoutMs),
             signal: ctx.signal,
             isModelAvailable: (id) => available.get(id) ?? true,

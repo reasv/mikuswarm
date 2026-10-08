@@ -8,6 +8,7 @@ import {
   type LlmScheduler,
   type ModelProber,
   type PriorityClass,
+  type SlotShare,
 } from "./scheduler.js";
 import { extractStatus, getRequestAttemptState } from "./request-retry.js";
 
@@ -705,6 +706,8 @@ export type FetchAttemptOutcome<T> =
 export interface RunFetchFallbackOptions {
   consumer: string;
   priority: PriorityClass;
+  /** The capped share of the member's group these requests count against. */
+  share?: SlotShare;
   scheduler?: LlmScheduler;
   isModelAvailable?: (logicalId: string) => boolean;
   /** Drop incapable members (head retained); e.g. modality support. */
@@ -819,6 +822,7 @@ export async function runFetchWithFallback<T>(
           modelKey: member.healthKey,
           probeBackoffMaxMs: options.probeBackoffMaxMs?.(member.config),
           signal: options.signal,
+          ...(options.share ? { share: options.share } : {}),
         })
       : undefined;
     let outcome: FetchAttemptOutcome<T>;

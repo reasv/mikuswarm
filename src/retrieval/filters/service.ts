@@ -18,7 +18,7 @@
  */
 import type { Logger } from "../../observability/logger.js";
 import type { DecisionEngine, DecisionAttribution } from "../../decisions/registry.js";
-import type { PriorityClass } from "../../agent/scheduler.js";
+import type { PriorityClass, SlotShare } from "../../agent/scheduler.js";
 import type { AppConfig } from "../../config/index.js";
 import { memoryFilterPoint, type MemoryFilterQuestion } from "../../decisions/points/memory.js";
 import type { MemoryRetrievalStore, FilterVerdictRow } from "../../storage/memory-retrieval-store.js";
@@ -61,6 +61,8 @@ export interface EnforceContext {
   surface: FilterSurface;
   attribution: DecisionAttribution;
   priority?: PriorityClass;
+  /** The capped share of the decision group the judging calls count against. */
+  share?: SlotShare;
   signal?: AbortSignal;
   /** Deadline of the judging calls (default the memory point's timeout). */
   timeoutMs?: number;
@@ -286,6 +288,7 @@ export class MemoryFilterService {
                   agentName: agent,
                   attribution: ctx.attribution,
                   priority: ctx.priority ?? "background",
+                  ...(ctx.share ? { share: ctx.share } : {}),
                   signal: ctx.signal,
                   ...(ctx.timeoutMs !== undefined ? { timeoutMs: ctx.timeoutMs } : {}),
                   ...(this.chainHead(agent) ? { chainHead: this.chainHead(agent) } : {}),

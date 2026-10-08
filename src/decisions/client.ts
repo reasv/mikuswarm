@@ -32,7 +32,7 @@ import {
   type FetchChainMember,
   type ModelChainEntry,
 } from "../agent/model-fallback.js";
-import { parseRetryAfterMs, type LlmScheduler, type PriorityClass } from "../agent/scheduler.js";
+import { parseRetryAfterMs, type LlmScheduler, type PriorityClass, type SlotShare } from "../agent/scheduler.js";
 import { computeUsageCost } from "../agent/usage.js";
 import { estimateTokens } from "../context/tokens.js";
 import type { Logger } from "../observability/logger.js";
@@ -108,6 +108,8 @@ export interface DecisionCallOptions {
   /** Label for logs and the fallback resolver (`decision:<point>`). */
   consumer: string;
   priority: PriorityClass;
+  /** The capped share of the decision group these requests count against. */
+  share?: SlotShare;
   /** Hard deadline for the whole call, chain included. */
   timeoutMs: number;
   signal?: AbortSignal;
@@ -314,6 +316,7 @@ export class DecisionClient {
         {
           consumer: options.consumer,
           priority: options.priority,
+          ...(options.share ? { share: options.share } : {}),
           scheduler: this.options.scheduler,
           isModelAvailable: options.isModelAvailable,
           probeBackoffMaxMs: (cfg) => cfg.llm_probe_backoff_max_ms,

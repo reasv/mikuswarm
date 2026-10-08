@@ -511,6 +511,10 @@ const RetrievalSchema = StrictObject({
       // Most passages one build sends to the memory decision point, person-cued
       // included; the rest go through the fallback rule. Default 12.
       max_judged: Type.Optional(Type.Integer({ minimum: 0, maximum: 100 })),
+      // Most of a decision group's max_in_flight slots memory judging holds at
+      // once (a fraction, at least one slot), so routing, records and the
+      // send/ending checks always find a free slot. Default 0.5.
+      judge_slot_share: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 1 })),
     }),
   ),
   embedding: Type.Optional(RetrievalEmbeddingSchema),

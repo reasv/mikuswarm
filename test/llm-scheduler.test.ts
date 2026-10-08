@@ -909,3 +909,48 @@ test("snapshot does not duplicate a group's sticky escalation onto other groups 
   await Promise.all([qDefault, qOther]);
   scheduler.stop();
 });
+
+test("slot share: a capped share holds at most its fraction of max_in_flight, so other requests find a free slot", async () => {
+  const scheduler = new LlmScheduler({ groups: { decision: { max_in_flight: 4 } } });
+  const memory = { name: "memory", fraction: 0.5 };
+  const admitted: string[] = [];
+  const releases = new Map<string, ReleaseFn>();
+  const take = (id: string, opts: Parameters<LlmScheduler["acquire"]>[0]) =>
+    void scheduler.acquire({ group: "decision", ...opts }).then((r) => {
+      admitted.push(id);
+      releases.set(id, r);
+    });
+  // A burst of memory judging fills the queue first.
+  for (let i = 0; i < 6; i++) take(`m${i}`, { priority: "proactive", share: memory });
+  await tick();
+  assert.deepEqual(admitted, ["m0", "m1"], "memory holds half the slots");
+  take("routing", { priority: "interactive" });
+  take("records", { priority: "interactive" });
+  await tick();
+  assert.deepEqual(admitted.slice(2), ["routing", "records"], "routing and records take the free slots");
+  take("check", { priority: "interactive" });
+  await tick();
+  assert.equal(admitted.includes("check"), false, "the group is full");
+  releases.get("m0")!();
+  await tick();
+  assert.equal(admitted.at(-1), "check", "a freed slot goes to the waiting interactive request first");
+  releases.get("routing")!();
+  await tick();
+  assert.equal(admitted.at(-1), "m2", "memory refills its share when a slot frees and its share has room");
+  releases.get("records")!();
+  await tick();
+  assert.equal(admitted.at(-1), "m2", "but never past its share, even with a free slot");
+  releases.get("m1")!();
+  await tick();
+  assert.equal(admitted.at(-1), "m3");
+  for (const id of ["check", "m2", "m3"]) releases.get(id)!();
+  await tick();
+  assert.deepEqual(admitted.slice(-2), ["m4", "m5"]);
+  for (const id of ["m4", "m5"]) releases.get(id)!();
+});
+
+test("slot share: a group of one still admits the share (at least one slot)", async () => {
+  const scheduler = new LlmScheduler({ groups: { decision: { max_in_flight: 1 } } });
+  const release = await scheduler.acquire({ group: "decision", priority: "proactive", share: { name: "memory", fraction: 0.5 } });
+  release();
+});

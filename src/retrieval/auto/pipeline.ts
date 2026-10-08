@@ -64,6 +64,14 @@ const RERANK_TAIL_MESSAGES = 3;
  */
 export const MEMORY_PRIORITY: PriorityClass = "proactive";
 
+/**
+ * Priority only orders the queue: memory judging (a dozen requests per build)
+ * could still hold every slot of the group. Its requests count against a
+ * capped share (`auto.judge_slot_share` of `max_in_flight`), so the other
+ * decision points always find a free slot.
+ */
+export const MEMORY_SLOT_SHARE = "memory";
+
 /** Added to the memory point's timeout for the build's wait (recall and the re-rank stages run first). */
 export const PLAN_WAIT_GRACE_MS = 1500;
 
@@ -571,6 +579,7 @@ export class MemoryRetrievalPipeline {
                 agentName: agent,
                 attribution: input.attribution,
                 priority: MEMORY_PRIORITY,
+                share: { name: MEMORY_SLOT_SHARE, fraction: auto.judgeSlotShare },
                 signal: input.signal,
                 decisionGroup,
                 triggerEventId: input.triggerEventId ?? null,
@@ -659,6 +668,7 @@ export class MemoryRetrievalPipeline {
           surface: "auto_retrieval",
           attribution: input.attribution,
           priority: MEMORY_PRIORITY,
+          share: { name: MEMORY_SLOT_SHARE, fraction: auto.judgeSlotShare },
           signal: input.signal,
         });
         for (const c of pending) {

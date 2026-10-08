@@ -62,6 +62,12 @@ export interface ResolvedRetrievalConfig {
     fallbackMaxResults: number;
     /** Most passages one build sends to the memory point (person-cued included); the rest fall back. */
     maxJudged: number;
+    /**
+     * Most of a decision group's `max_in_flight` slots memory judging holds at
+     * once, as a fraction (at least one slot), so routing, records and the
+     * send/ending checks always find a free slot.
+     */
+    judgeSlotShare: number;
     /** User lane (§9d): lexical "history with this person" sub-search, by display name. */
     userLane: {
       enabled: boolean;
@@ -204,6 +210,7 @@ export function resolveRetrievalConfig(config: RetrievalConfig | undefined): Res
       fallbackMinScore: auto.fallback_min_score ?? 0.6,
       fallbackMaxResults: auto.fallback_max_results ?? 2,
       maxJudged: auto.max_judged ?? 12,
+      judgeSlotShare: auto.judge_slot_share ?? 0.5,
       userLane: {
         enabled: auto.user_lane_enabled ?? true,
         maxResults: auto.user_lane_max_results ?? 2,

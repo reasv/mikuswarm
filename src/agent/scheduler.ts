@@ -171,6 +171,26 @@ export interface AcquireOptions {
   sessionType?: string;
   /** Abort waiting for a slot (shutdown / run abort). */
   signal?: AbortSignal;
+  /** The share of the group this request counts against ({@link SlotShare}). */
+  share?: SlotShare;
+}
+
+/**
+ * A capped share of a group's slots. Requests of one share hold at most
+ * `max(1, floor(fraction × max_in_flight))` slots at once; a waiter whose
+ * share is full is passed over (it keeps its place), so a bulk consumer at a
+ * low class never holds every slot and the group's other requests always find
+ * one free (with `max_in_flight` of 2 or more).
+ */
+export interface SlotShare {
+  name: string;
+  /** 0 < fraction ≤ 1. */
+  fraction: number;
+}
+
+/** Slots a share may hold in a group of `maxInFlight`. */
+export function shareCap(share: SlotShare, maxInFlight: number): number {
+  return Math.max(1, Math.floor(maxInFlight * Math.min(1, Math.max(0, share.fraction))));
 }
 
 /**
@@ -239,11 +259,13 @@ interface QueueEntry {
   reject: (err: Error) => void;
   signal?: AbortSignal;
   onAbort?: () => void;
+  share?: SlotShare;
 }
 
 /** An admitted (in-flight) request, tracked for the console snapshot (§9.1). */
 interface ActiveEntry {
   rank: number;
+  share?: string;
   key?: string;
   modelKey?: string;
   sessionId?: string;
@@ -425,6 +447,7 @@ export class LlmScheduler {
         resolve,
         reject,
         signal: opts.signal,
+        ...(opts.share ? { share: opts.share } : {}),
       };
       if (opts.signal) {
         entry.onAbort = () => {
@@ -1005,10 +1028,24 @@ export class LlmScheduler {
       // never head-of-line-block healthy models sharing the group. Queues are
       // tiny (a handful of pending requests), so a linear scan is the simplest
       // correct structure.
+      // A waiter whose share is full is passed over too (it keeps its place).
+      let shareFull: Map<string, boolean> | undefined;
+      const fullShare = (share: SlotShare): boolean => {
+        shareFull ??= new Map();
+        let full = shareFull.get(share.name);
+        if (full === undefined) {
+          let held = 0;
+          for (const a of group.activeEntries) if (a.share === share.name) held += 1;
+          full = held >= shareCap(share, group.maxInFlight);
+          shareFull.set(share.name, full);
+        }
+        return full;
+      };
       let best = -1;
       for (let i = 0; i < group.queue.length; i++) {
         const candidate = group.queue[i]!;
         if (!this.modelAdmissible(candidate.modelKey, now)) continue;
+        if (candidate.share && fullShare(candidate.share)) continue;
         if (best === -1) {
           best = i;
           continue;
@@ -1020,8 +1057,9 @@ export class LlmScheduler {
       }
       if (best === -1) {
         // Every queued entry is gated behind an unhealthy model's probe
-        // window. Arm a timer for the earliest window so the pump re-runs
-        // exactly when the next probe becomes admissible.
+        // window (arm a timer for the earliest window so the pump re-runs
+        // exactly when the next probe becomes admissible) or a full share
+        // (a release of the share pumps).
         this.armProbeTimer(group, now);
         return;
       }
@@ -1048,6 +1086,7 @@ export class LlmScheduler {
       group.active += 1;
       const activeEntry: ActiveEntry = {
         rank: entry.rank,
+        ...(entry.share ? { share: entry.share.name } : {}),
         key: entry.key,
         modelKey: entry.modelKey,
         sessionId: entry.sessionId,
