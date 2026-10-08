@@ -171,6 +171,20 @@ export function lineageCallCount(messages: readonly AgentMessage[], key: string,
   return count;
 }
 
+/**
+ * Remove and return an agent's queued steering messages it has not read yet. A
+ * redo moves them to the rebuilt agent (pi-agent-core exposes no read access to
+ * its queue; when the shape is not the expected one nothing is moved, and the
+ * session's unread-steer redelivery at settle still covers tracked steers).
+ */
+export function takeQueuedSteers(agent: Agent): AgentMessage[] {
+  const queue = (agent as unknown as { steeringQueue?: { messages?: unknown } }).steeringQueue;
+  if (!Array.isArray(queue?.messages)) return [];
+  const messages = (queue.messages as AgentMessage[]).slice();
+  agent.clearSteeringQueue();
+  return messages;
+}
+
 // ── Corrections and steps ──────────────────────────────────────────────────
 
 /** A correction that redoes the session from scratch. */
@@ -180,22 +194,31 @@ export interface RestartRequest {
   causeEventIds: string[];
   /**
    * What to deliver instead when the redo turns out impossible at apply time
-   * (an undoable effect could not be compensated): the interjections of the
-   * same corrections.
+   * (an irreversible effect exists by then, an undoable one could not be
+   * compensated, or the run ended first): the interjections of the same
+   * corrections.
    */
-  fallbackInterjections: AgentMessage[];
+  fallbacks: CorrectionFallback[];
   /** Late additions that join the trigger group. */
   addedEventIds: string[];
   /** Grouped parts removed from the trigger group (deleted). */
   removedEventIds: string[];
 }
 
+/**
+ * Delivers a correction as an interjection instead of the redo or cancel it
+ * requested, decided synchronously when the correction arrived but impossible
+ * when the step is applied. `live`: steered into the running session; `late`:
+ * the run ended before the step was taken, so the settled session is revived.
+ */
+export type CorrectionFallback = (mode: "live" | "late") => Promise<void>;
+
 /** What the runner does at its next idle point. */
 export type LateInputPending =
   | { kind: "restart"; request: RestartRequest }
   /** A generation was aborted so the steered interjection is read now. */
   | { kind: "interject" }
-  | { kind: "cancel"; reason: string; causeEventId: string };
+  | { kind: "cancel"; reason: string; causeEventId: string; fallback: CorrectionFallback };
 
 /** An effect a tool call left, as the controller recorded it. */
 export interface EffectRecord {
@@ -203,8 +226,16 @@ export interface EffectRecord {
   name: string;
   args: unknown;
   effect: "undoable" | "irreversible";
-  /** The call failed (a posting call that failed delivered nothing). */
+  /**
+   * The call reported a failure cleanly (a posting call that failed delivered
+   * nothing). An effect is recorded before its call executes, so a call still
+   * executing, or one that threw (an abort included), counts as having happened.
+   */
   failed: boolean;
+  /** An undoable effect the tool reported as a no-op (nothing to compensate). */
+  noop?: boolean;
+  /** An undoable effect already compensated (never compensated twice). */
+  compensated?: boolean;
 }
 
 /** Why a held call waited (recorded on its tool result). */
@@ -244,8 +275,13 @@ export class LateInputSession {
   private readonly now: () => number;
 
   phase: SessionPhase = "building";
-  /** When the main run ended (the settled point revival compares against). */
+  /**
+   * When the run ended (the point revival compares against): stamped when the
+   * runner passes its last check, and again when the run has settled.
+   */
   runEndedAt?: number;
+  /** The ended run has settled (the session is completed or discarded). */
+  runSettled = false;
   /** When the session's first message was delivered (late additions end there). */
   firstDeliveryAt?: number;
   /** The context build read the timeline: a correction from now on needs a rebuild. */
@@ -264,8 +300,8 @@ export class LateInputSession {
   private progress?: RequestProgress;
   private readonly changeListeners = new Set<() => void>();
   private aborting = false;
-  /** Called when a step is pending while no run is active (the runner picks it up at its next check). */
-  onPendingWhileIdle?: () => void;
+  /** Repeatable calls executing now: a restart lets them finish (their result is replayed). */
+  private repeatableExecuting = 0;
 
   constructor(options: LateInputSessionOptions) {
     this.sessionId = options.sessionId;
@@ -286,8 +322,10 @@ export class LateInputSession {
     this.progress = progress;
     this.aborting = false;
     // A fresh lineage starts with no effects of its own: a restart only happens
-    // when every effect was compensated (undoable) or none existed.
+    // when every effect was compensated (undoable) or none existed. Its first
+    // visible call is held again (the correction extended the deadline).
     this.effects.length = 0;
+    this.holdReleased = false;
   }
 
   get boundAgent(): Agent | undefined {
@@ -335,9 +373,12 @@ export class LateInputSession {
     return this.effects.some((e) => e.effect === "irreversible" && !(e.failed && isPostingTool(e.name)));
   }
 
-  /** Undoable effects on the live lineage that must be compensated before a redo. */
+  /**
+   * Undoable effects on the live lineage that must be compensated before a redo
+   * (or a cancel): not failed, not a reported no-op, not compensated already.
+   */
   undoableEffects(): EffectRecord[] {
-    return this.effects.filter((e) => e.effect === "undoable" && !e.failed);
+    return this.effects.filter((e) => e.effect === "undoable" && !e.failed && !e.noop && !e.compensated);
   }
 
   /** A redo from scratch is possible now. */
@@ -345,6 +386,16 @@ export class LateInputSession {
     if (!this.settings.enabled) return false;
     if (this.redoCount >= this.settings.maxRedos) return false;
     if (this.phase === "ended") return false;
+    return this.canDiscardRollout();
+  }
+
+  /**
+   * The rollout can still be thrown away (a redo or cancel applied now): no
+   * irreversible effect, and every undoable one has an inverse. Checked again
+   * when a step is applied, since an effect may have happened since the
+   * correction was decided.
+   */
+  canDiscardRollout(): boolean {
     if (this.hasIrreversibleEffect()) return false;
     return this.undoableEffects().every((e) => compensationFor(e.name, e.args) !== undefined);
   }
@@ -377,12 +428,9 @@ export class LateInputSession {
   }
 
   /** The trigger was deleted (or no longer addresses the bot) before any irreversible effect. */
-  requestCancel(reason: string, causeEventId: string): void {
-    if (this.phase === "building") {
-      this.pending = { kind: "cancel", reason, causeEventId };
-      return;
-    }
-    this.pending = { kind: "cancel", reason, causeEventId };
+  requestCancel(reason: string, causeEventId: string, fallback: CorrectionFallback): void {
+    this.pending = { kind: "cancel", reason, causeEventId, fallback };
+    if (this.phase === "building") return;
     this.emitChange();
     void this.abortForStep();
   }
@@ -440,16 +488,54 @@ export class LateInputSession {
     this.phase = "running";
   }
 
-  markEnded(at: number = this.now()): void {
+  /** A redo rebuilds the context: corrections meanwhile join the rebuild (no branch, no request). */
+  markRebuilding(): void {
+    this.phase = "building";
+  }
+
+  /**
+   * The run ended (the runner's last late-input check is behind it). Idempotent:
+   * the first call stamps the run end. A step still pending was never taken; it
+   * is returned (and cleared) so the caller delivers its correction another way
+   * (a redo or cancel by its fallback, which revives the settled session).
+   */
+  markEnded(at: number = this.now()): LateInputPending | undefined {
+    if (this.phase === "ended") return undefined;
     this.phase = "ended";
+    this.runSettled = false;
     this.runEndedAt = at;
+    const dropped = this.pending;
+    this.pending = undefined;
+    this.rebuildBeforeStart = undefined;
+    this.aborting = false;
     this.emitChange();
+    return dropped;
+  }
+
+  /**
+   * The ended run has settled. Until now a message was still delivered to the
+   * session (as a steer it never read), so the run end that revival compares
+   * against is this moment.
+   */
+  markSettled(at: number = this.now()): void {
+    if (this.phase !== "ended") this.markEnded(at);
+    if (this.runSettled) return;
+    this.runSettled = true;
+    this.runEndedAt = at;
   }
 
   /** A revival continues the session: running again, hold released (an effect exists). */
   markRevived(): void {
     this.phase = "running";
+    this.runSettled = false;
     this.holdReleased = true;
+    this.pending = undefined;
+    this.aborting = false;
+  }
+
+  /** An undoable effect was compensated (a later redo or cancel must not undo it again). */
+  markCompensated(effect: EffectRecord): void {
+    effect.compensated = true;
   }
 
   // ── tool wrappers ──
@@ -483,21 +569,29 @@ export class LateInputSession {
             });
           }
         }
-        if (visible) this.holdReleased = true;
-        let failed = false;
-        try {
-          const result = await original.call(tool, toolCallId, params, signal, onUpdate);
-          failed = isErrorResult(result);
-          return result;
-        } catch (error) {
-          failed = true;
-          throw error;
-        } finally {
-          if (visible) {
-            this.effects.push({ toolCallId, name: tool.name, args: params, effect, failed });
-            if (!failed && isPostingTool(tool.name) && this.firstDeliveryAt === undefined) this.firstDeliveryAt = this.now();
+        if (!visible) {
+          if (effect !== "repeatable") return original.call(tool, toolCallId, params, signal, onUpdate);
+          // A restart waits for a repeatable call (its result lands in the replay store).
+          this.repeatableExecuting += 1;
+          try {
+            return await original.call(tool, toolCallId, params, signal, onUpdate);
+          } finally {
+            this.repeatableExecuting -= 1;
+            this.emitChange();
           }
         }
+        this.holdReleased = true;
+        // Recorded before the call executes: a correction arriving while it runs
+        // (a send on its way out) must not redo or cancel the session. Only a
+        // clean failure the tool reports downgrades it; a throw (an abort
+        // included) may have delivered, so it still counts.
+        const record: EffectRecord = { toolCallId, name: tool.name, args: params, effect, failed: false };
+        this.effects.push(record);
+        const result = await original.call(tool, toolCallId, params, signal, onUpdate);
+        if (isErrorResult(result)) record.failed = true;
+        else if ((result as { details?: { changed?: unknown } } | undefined)?.details?.changed === false) record.noop = true;
+        if (!record.failed && isPostingTool(tool.name) && this.firstDeliveryAt === undefined) this.firstDeliveryAt = this.now();
+        return result;
       };
       return { ...tool, execute };
     });
@@ -579,8 +673,11 @@ export class LateInputSession {
    * Abort the agent for the pending step, under the abort rule: a request still
    * queued for admission is aborted at once (nothing was sent); a request sent
    * but without its first stream event is waited for (bounded); a streaming one
-   * is aborted. No request in flight: an executing tool is aborted for a restart
-   * or a cancel (its span is discarded), and an interjection just waits.
+   * is aborted. No request in flight: a repeatable call is let finish (its result
+   * is replayed by the redo), an executing redo-safe tool is aborted for a
+   * restart or a cancel (its span is discarded), and an interjection just
+   * waits. Nothing to abort (the agent idle between steps): the runner takes
+   * the step at its next check.
    */
   private async abortForStep(): Promise<void> {
     if (this.aborting) return;
@@ -588,34 +685,49 @@ export class LateInputSession {
     const agent = this.agent;
     if (!agent) return;
     const progress = this.progress;
-    if (progress?.phase === "awaiting_first_event") {
-      await progress.waitForFirstEventOrEnd(this.settings.firstEventWaitMs);
+    for (;;) {
+      if (progress?.phase === "awaiting_first_event") {
+        await progress.waitForFirstEventOrEnd(this.settings.firstEventWaitMs);
+      }
+      const step = this.pending;
+      if (!step || this.agent !== agent) return;
+      if (step.kind === "interject" && (progress?.phase ?? "idle") === "idle") {
+        // The request ended while we waited: the steer is read before the next one.
+        this.pending = undefined;
+        this.aborting = false;
+        return;
+      }
+      if (step.kind !== "interject" && this.repeatableExecuting > 0 && (progress?.phase ?? "idle") === "idle") {
+        await this.waitChange(1000);
+        continue;
+      }
+      break;
     }
     const step = this.pending;
     if (!step || this.agent !== agent) return;
-    if (step.kind === "interject" && (progress?.phase ?? "idle") === "idle") {
-      // The request ended while we waited: the steer is read before the next one.
-      this.pending = undefined;
-      this.aborting = false;
-      return;
-    }
     if (agent.signal !== undefined) {
       if (step.kind === "interject") {
         this.logger?.info("turn_aborted_for_interjection", { sessionId: this.sessionId, phase: progress?.phase });
       }
       agent.abort();
-    } else {
-      this.onPendingWhileIdle?.();
     }
+  }
+
+  /**
+   * After a rebuild bound a new agent: a step filed meanwhile (one the rebuild
+   * did not absorb) aborts the new agent's first request under the abort rule.
+   */
+  reapplyPending(): void {
+    if (this.pending && this.pending.kind !== "interject") void this.abortForStep();
   }
 }
 
-function mergeRestart(a: RestartRequest | undefined, b: RestartRequest): RestartRequest {
-  if (!a) return { ...b, causeEventIds: [...b.causeEventIds], fallbackInterjections: [...b.fallbackInterjections] };
+export function mergeRestart(a: RestartRequest | undefined, b: RestartRequest): RestartRequest {
+  if (!a) return { ...b, causeEventIds: [...b.causeEventIds], fallbacks: [...b.fallbacks] };
   return {
     reason: a.reason === "edit_redo" || b.reason === "edit_redo" ? "edit_redo" : "addition_redo",
     causeEventIds: [...new Set([...a.causeEventIds, ...b.causeEventIds])],
-    fallbackInterjections: [...a.fallbackInterjections, ...b.fallbackInterjections],
+    fallbacks: [...a.fallbacks, ...b.fallbacks],
     addedEventIds: [...new Set([...a.addedEventIds, ...b.addedEventIds])],
     removedEventIds: [...new Set([...a.removedEventIds, ...b.removedEventIds])],
   };

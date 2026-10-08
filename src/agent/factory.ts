@@ -1961,8 +1961,8 @@ export class AgentSessionFactory {
       (m) => m.config.prefill?.enabled && m.config.prefill.text,
     )?.config.prefill?.text;
     // Late input (§8 "Late input"): redo-safe results are replayed from the
-    // session's store innermost, so the stored result is the raw one and the
-    // key is the call's own arguments.
+    // session's store innermost, so the stored result is the raw one; the key
+    // is the call's arguments as the transcript holds them.
     const replayCatalog = opts?.lateInput
       ? opts.lateInput.wrapReplayTools(sessionCatalog, () => agentRef.agent?.state.messages ?? [])
       : sessionCatalog;

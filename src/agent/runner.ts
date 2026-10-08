@@ -106,6 +106,11 @@ export interface SessionRunnerOptions {
    */
   lateInput?: {
     next(agent: Agent): Promise<LateInputStep | undefined>;
+    /**
+     * The run is past its last `next` check (called first thing when it settles,
+     * however it ends): a correction from now on finds the run ended.
+     */
+    ended?(): void;
   };
 }
 
@@ -355,6 +360,12 @@ export class SessionRunner {
         agent,
       };
     } finally {
+      // Late input: nothing is applied any more, synchronously after the last check.
+      try {
+        this.options.lateInput?.ended?.();
+      } catch {
+        // observe-only
+      }
       // A redo nobody took (an operator Stop won) must not outlive the run: it
       // would stop the record turn's loop after its first turn.
       this.redoBinding?.control.take();

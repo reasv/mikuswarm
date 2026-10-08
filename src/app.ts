@@ -99,6 +99,9 @@ import {
   HELD_CALL_CANCELLED,
   LateInputSession,
   resolveLateInputSettings,
+  takeQueuedSteers,
+  type CorrectionFallback,
+  type LateInputPending,
   type RestartRequest,
 } from "./agent/late-input.js";
 import { compensationFor } from "./tools/side-effects.js";
@@ -5237,6 +5240,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
    * The request a message from `senderId` sent at `sentAt` followed (causality,
    * §8 "Late input"): the newest live-or-revivable session that sender triggered
    * in this timeline before `sentAt`, other than the one `exceptEventId` belongs to.
+   * None when the sender made a newer request in between that has no session of
+   * its own yet (queued, still in its trigger hold, waiting for admission): the
+   * message followed that one, never the older session.
    */
   function lateEntryForSender(timelineKey: string, senderId: string, exceptEventId: string, sentAt: number): LateInputEntry | undefined {
     let best: LateInputEntry | undefined;
@@ -5247,13 +5253,43 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       if (entry.inbound.event.timestamp >= sentAt) continue;
       if (!best || entry.inbound.event.timestamp > best.inbound.event.timestamp) best = entry;
     }
+    if (best && newerRequestBetween(best, senderId, exceptEventId, sentAt)) return undefined;
     return best;
   }
 
-  /** Sent (server time) before the run ended, and the run ended recently enough to revive. */
+  /**
+   * A message from `senderId` after `entry`'s request and up to `sentAt` that is a
+   * request of its own (it addresses the bot or was accepted as a trigger) and
+   * was not consumed as a correction of a running session.
+   */
+  function newerRequestBetween(entry: LateInputEntry, senderId: string, exceptEventId: string, sentAt: number): boolean {
+    const after = entry.inbound.event.timestamp;
+    const group = new Set(triggerGroupOf(entry.inbound));
+    const dm = channelTypeOf(entry.inbound) === "dm";
+    return timeline
+      .query({ timelineKey: entry.timelineKey, fromTimestamp: after, toTimestamp: sentAt, limit: 50 })
+      .some((e) =>
+        e.id !== exceptEventId &&
+        e.timestamp > after &&
+        e.sender.id === senderId &&
+        !group.has(e.id) &&
+        !steeredEventIds.has(e.id) &&
+        (dm ||
+          e.mentions?.mentionedSelf === true ||
+          (e.externalId !== undefined && sessionClaims.claimantOf(entry.timelineKey, e.externalId) !== undefined)),
+      );
+  }
+
+  /**
+   * Sent (server time) before the run ended, and the run ended recently enough to
+   * revive. While an ended run is still settling, anything sent so far counts as
+   * sent before its end (it would still have been steered into the session).
+   */
   function sentBeforeRunEnd(ctl: LateInputSession, sentAt: number): boolean {
+    if (ctl.phase !== "ended") return false;
+    if (!ctl.runSettled) return true;
     const endedAt = ctl.runEndedAt;
-    if (endedAt === undefined || ctl.phase !== "ended") return false;
+    if (endedAt === undefined) return false;
     if (Date.now() - endedAt > lateInputSettings.reviveMaxMs) return false;
     return sentAt <= endedAt + lateInputSettings.skewToleranceMs;
   }
@@ -5290,7 +5326,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     if (slot) slot.agent = agent;
   }
 
-  /** Undo the session's undoable effects (newest first) before a redo; false = one could not be undone. */
+  /**
+   * Undo the session's undoable effects (newest first) before a redo or a cancel;
+   * false = one could not be undone. Each compensated effect is marked so a later
+   * attempt (after a partial failure) never undoes it twice; an effect the tool
+   * reported as a no-op is never compensated (that would create state that did
+   * not exist before the call).
+   */
   async function compensateUndoableEffects(ctl: LateInputSession, tools: readonly AgentTool[], sessionId: string): Promise<boolean> {
     for (const effect of ctl.undoableEffects().reverse()) {
       const call = compensationFor(effect.name, effect.args);
@@ -5303,6 +5345,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       } catch {
         return false;
       }
+      ctl.markCompensated(effect);
       logger.info("late_input_compensated", { sessionId, tool: effect.name, compensation: call.name });
     }
     return true;
@@ -5320,31 +5363,84 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     delivery: FoldDelivery;
     added?: string[];
     removed?: string[];
+    /** The correction reached nobody (a late fallback that could not revive). */
+    onUndelivered?: () => void;
   }
 
   type CorrectionOutcome = "redo" | "cancelled" | "interjected" | "revived" | "ignored";
+
+  /** The entry still indexes a live-or-revivable session (not discarded or expired meanwhile). */
+  function entryLive(entry: LateInputEntry): boolean {
+    return lateInputEntries.get(entry.sessionId) === entry;
+  }
+
+  /** Revive the settled session with the correction (sent before its run ended). */
+  async function reviveWithCorrection(entry: LateInputEntry, plan: CorrectionPlan): Promise<boolean> {
+    const message = await plan.interjection({ late: true });
+    if (!(await entry.revive([message], { eventId: plan.causeEventId }))) return false;
+    void storage.insertSessionInterjection({
+      sessionId: entry.sessionId,
+      eventId: plan.source.eventId ?? null,
+      externalId: plan.source.externalId ?? null,
+      senderId: plan.source.senderId ?? null,
+      senderDisplayName: plan.source.senderDisplayName ?? null,
+      kind: "revival",
+      body: (plan.source.body ?? "").slice(0, 500),
+      createdAt: Date.now(),
+    }).catch(() => undefined);
+    return true;
+  }
+
+  /**
+   * The interjection a redo or cancel falls back to when it cannot be applied
+   * after all (an effect happened before the runner took the step, or the run
+   * ended first): steered into the running session, or reviving it.
+   */
+  function correctionFallback(entry: LateInputEntry, plan: CorrectionPlan): CorrectionFallback {
+    return async (mode) => {
+      if (mode === "live") {
+        const message = await plan.interjection({ late: false });
+        if (sessions.steer(entry.sessionId, message, plan.source)) {
+          trackSteer(entry.sessionId, message, plan.delivery);
+          logger.info("late_input_interjected", { sessionId: entry.sessionId, kind: plan.kind, causeEventId: plan.causeEventId, fallback: true });
+          return;
+        }
+      } else if (await reviveWithCorrection(entry, plan)) {
+        return;
+      }
+      logger.info("late_input_ignored", { sessionId: entry.sessionId, kind: plan.kind, reason: "fallback_undelivered" });
+      plan.onUndelivered?.();
+    };
+  }
 
   /**
    * Apply a correction to its session (§8 "Late input"): redo from scratch while
    * nothing irreversible happened (a withdrawn trigger cancels), otherwise
    * interject; a settled session is revived when the message was sent before
    * its run ended, else the correction is ignored (the stored message changed).
+   * The redo or cancel is filed synchronously, before anything is awaited, so a
+   * held call never proceeds between the decision and the step.
    */
   async function deliverCorrection(entry: LateInputEntry, plan: CorrectionPlan): Promise<CorrectionOutcome> {
+    // Discarded during its build, or expired: the correction reaches no session.
+    if (!entryLive(entry)) {
+      logger.info("late_input_ignored", { sessionId: entry.sessionId, kind: plan.kind, reason: "session_gone" });
+      return "ignored";
+    }
     const ctl = entry.ctl;
     if (ctl.phase !== "ended") {
       if (ctl.canRedo()) {
+        const fallback = correctionFallback(entry, plan);
         if (plan.kind === "delete_trigger" || plan.kind === "unmention") {
-          ctl.requestCancel(plan.kind, plan.causeEventId);
+          ctl.requestCancel(plan.kind, plan.causeEventId, fallback);
           logger.info("late_input_cancel_requested", { sessionId: entry.sessionId, kind: plan.kind, causeEventId: plan.causeEventId });
           return "cancelled";
         }
         applyTriggerGroupChange(entry, plan.added ?? [], plan.removed ?? []);
-        const fallback = await plan.interjection({ late: false });
         ctl.requestRestart({
           reason: plan.kind === "edit" || plan.kind === "delete_part" ? "edit_redo" : "addition_redo",
           causeEventIds: [plan.causeEventId],
-          fallbackInterjections: [fallback],
+          fallbacks: [fallback],
           addedEventIds: plan.added ?? [],
           removedEventIds: plan.removed ?? [],
         });
@@ -5357,6 +5453,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         return "redo";
       }
       const message = await plan.interjection({ late: false });
+      if (!entryLive(entry)) {
+        logger.info("late_input_ignored", { sessionId: entry.sessionId, kind: plan.kind, reason: "session_gone" });
+        return "ignored";
+      }
       if (ctl.phase === "building") {
         entry.parked.push({ message, source: plan.source, delivery: plan.delivery });
         logger.info("late_input_interjected", { sessionId: entry.sessionId, kind: plan.kind, parked: true });
@@ -5369,22 +5469,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         return "interjected";
       }
     }
-    if (sentBeforeRunEnd(ctl, plan.sentAt)) {
-      const message = await plan.interjection({ late: true });
-      if (await entry.revive([message], { eventId: plan.causeEventId })) {
-        void storage.insertSessionInterjection({
-          sessionId: entry.sessionId,
-          eventId: plan.source.eventId ?? null,
-          externalId: plan.source.externalId ?? null,
-          senderId: plan.source.senderId ?? null,
-          senderDisplayName: plan.source.senderDisplayName ?? null,
-          kind: "revival",
-          body: (plan.source.body ?? "").slice(0, 500),
-          createdAt: Date.now(),
-        }).catch(() => undefined);
-        return "revived";
-      }
-    }
+    if (sentBeforeRunEnd(ctl, plan.sentAt) && (await reviveWithCorrection(entry, plan))) return "revived";
     logger.info("late_input_ignored", { sessionId: entry.sessionId, kind: plan.kind, reason: ctl.phase === "ended" ? "after_run_end" : "not_steerable" });
     return "ignored";
   }
@@ -5556,28 +5641,36 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     if (firstDelivery !== undefined && sentAt > firstDelivery + lateInputSettings.skewToleranceMs) return false;
     // A settled session takes a late addition only through revival (sent before its end).
     if (entry.ctl.phase === "ended" && !sentBeforeRunEnd(entry.ctl, sentAt)) return false;
+    // A cheap early exit only: the bound is enforced when an addition joins.
     if (entry.folded >= knobs.maxFolded) return false;
     const form = classifyFollowUpForm(inbound.event);
-    const pointOn = decisionEngine?.isEnabled("late_addition", agentName) ?? false;
-    if (pointOn && entry.judged < knobs.maxJudged) {
+    const pointSettings = decisionEngine?.settings("late_addition", agentName);
+    if (pointSettings && entry.judged < knobs.maxJudged) {
       entry.judged += 1;
       markSteered(inbound.event.id);
-      const verdict = judgeLateAddition(entry, inbound);
-      entry.ctl.trackVerdict(verdict);
-      void verdict.then((v) => {
+      // The held call waits for the verdict AND the join it leads to (the redo is
+      // filed before the hold may let the call go), bounded: a verdict later than
+      // max_hold_ms plus the point's timeout counts as unjudged.
+      const boundAt =
+        entry.ctl.triggerReceivedAt +
+        lateInputSettings.maxHoldMs +
+        Math.max(pointSettings.timeoutMs, pointSettings.vision?.timeoutMs ?? 0);
+      const verdict = boundedVerdict(judgeLateAddition(entry, inbound), boundAt, entry.sessionId);
+      const decided = verdict.then((v) => {
         if (v.judged) {
           if (v.belongs) return joinLateAddition(entry, inbound, form, "judged");
           logger.info("late_input_ignored", { sessionId: entry.sessionId, kind: "addition", reason: "judged_not_belonging", probability: v.probability });
           revertFollowUpToNativeFate(inbound, "late_addition_rejected");
           return;
         }
-        // No verdict (point failed): the quick fold windows decide, as without the point.
+        // No verdict (point failed or too late): the quick fold windows decide, as without the point.
         if (quickFoldPasses(entry, inbound, form)) return joinLateAddition(entry, inbound, form, "quick_window");
         revertFollowUpToNativeFate(inbound, "late_addition_unjudged");
       }).catch((error) => {
         logger.error("late_input_addition_failed", { sessionId: entry.sessionId, error: error instanceof Error ? error.message : String(error) });
         revertFollowUpToNativeFate(inbound, "late_addition_failed");
       });
+      entry.ctl.trackVerdict(raceDeadline(decided, boundAt));
       return true;
     }
     if (!quickFoldPasses(entry, inbound, form)) return false;
@@ -5586,6 +5679,32 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       logger.error("late_input_addition_failed", { sessionId: entry.sessionId, error: error instanceof Error ? error.message : String(error) });
     });
     return true;
+  }
+
+  /** `promise`, or undefined at `deadline` (wall clock) if it has not settled by then. */
+  function raceDeadline<T>(promise: Promise<T>, deadline: number): Promise<T | undefined> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(undefined), Math.max(0, deadline - Date.now()));
+      timer.unref?.();
+      promise.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        () => {
+          clearTimeout(timer);
+          resolve(undefined);
+        },
+      );
+    });
+  }
+
+  /** A late-addition verdict, or "not judged" when it is not in by `deadline`. */
+  async function boundedVerdict(verdict: Promise<LateAdditionVerdict>, deadline: number, sessionId: string): Promise<LateAdditionVerdict> {
+    const settled = await raceDeadline(verdict, deadline);
+    if (settled !== undefined) return settled;
+    logger.info("late_input_verdict_timeout", { sessionId });
+    return LATE_ADDITION_NOT_JUDGED;
   }
 
   function quickFoldPasses(entry: LateInputEntry, inbound: InboundChatEvent, form: FollowUpForm): boolean {
@@ -5648,15 +5767,29 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     return outcome.verdict;
   }
 
-  /** A late addition (or an explicit reply to the request) joins its request. */
+  /**
+   * A late addition (or an explicit reply to the request) joins its request. The
+   * `max_folded` bound is checked and reserved here, synchronously, so candidates
+   * judged in parallel cannot all join; one over the bound takes its native fate.
+   */
   async function joinLateAddition(
     entry: LateInputEntry,
     inbound: InboundChatEvent,
     form: FollowUpForm | "reply",
     admittedBy: "judged" | "quick_window" | "reply",
   ): Promise<void> {
+    const knobs = lateAdditionKnobs(decisionsFor(config, agentNameForTimeline(entry.timelineKey)));
+    if (entry.folded >= knobs.maxFolded) {
+      logger.info("late_input_ignored", { sessionId: entry.sessionId, kind: "addition", reason: "max_folded", eventId: inbound.event.id });
+      revertFollowUpToNativeFate(inbound, "late_addition_max_folded");
+      return;
+    }
     entry.folded += 1;
     const gapMs = Math.abs(inbound.event.timestamp - entry.inbound.event.timestamp);
+    // A trigger-bearing addition brings its trigger hold's group with it.
+    const added = triggerGroupOf(inbound);
+    for (const id of added) markSteered(id);
+    let undelivered = false;
     const outcome = await deliverCorrection(entry, {
       kind: form === "reply" ? "reply" : "addition",
       causeEventId: inbound.event.id,
@@ -5675,10 +5808,22 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         body: inbound.event.body ?? "",
       },
       delivery: { inbound, form: form === "reply" ? "reply" : form },
-      added: [inbound.event.id],
+      added,
+      onUndelivered: () => {
+        if (undelivered) return;
+        undelivered = true;
+        revertFollowUpToNativeFate(inbound, "late_addition_undelivered");
+      },
     });
     logger.info("late_input_addition", { sessionId: entry.sessionId, eventId: inbound.event.id, form, admittedBy, outcome });
-    if (outcome === "ignored") revertFollowUpToNativeFate(inbound, "late_addition_after_run_end");
+    if (outcome === "ignored") {
+      // It did not join: the budget is not used.
+      entry.folded = Math.max(0, entry.folded - 1);
+      if (!undelivered) {
+        undelivered = true;
+        revertFollowUpToNativeFate(inbound, "late_addition_after_run_end");
+      }
+    }
   }
 
   /** The interjection of an addition that cannot redo: the fold texts (a reply quotes its target). */
@@ -8032,6 +8177,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       const gate = await resolveUserLimitGate(inbound, session.id, session.sessionType);
       if (gate.denied) {
         postUserLimitRefusal(target, session.id, session.timelineKey, gate);
+        lateCtl?.markSettled();
         sessions.markDiscarded(session.id);
         drainNextQueuedTrigger(session.timelineKey);
         return;
@@ -8133,6 +8279,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             error: error instanceof Error ? error.message : String(error),
           });
         }
+        lateCtl?.markSettled();
         sessions.markDiscarded(session.id);
         drainNextQueuedTrigger(session.timelineKey);
         return;
@@ -8154,6 +8301,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     let kickoff: Awaited<ReturnType<typeof factory.create>>["kickoff"];
     let snapshot: ContextMessage[] | undefined;
     let tokenEstimate: number | undefined;
+    let unappliedRebuild: RestartRequest | undefined;
     try {
       // §4.3: buildSessionTools throws when agents mode + unresolvable account.
       // Placed INSIDE the try block so the existing catch handles it identically
@@ -8222,14 +8370,19 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         const cancelled = lateCtl.takeCancelBeforeStart();
         if (cancelled) {
           created.gate?.dispose();
-          lateCtl.markEnded();
+          lateCtl.markSettled();
           sessions.markDiscarded(session.id, { error: `cancelled: ${cancelled.reason}` });
           logger.info("late_input_cancelled", { sessionId: session.id, reason: cancelled.reason, phase: "building" });
           drainNextQueuedTrigger(session.timelineKey);
           return;
         }
         const rebuild = lateCtl.takeRebuildBeforeStart();
-        if (!rebuild || lateCtl.redoCount >= lateInputSettings.maxRedos) break;
+        if (!rebuild) break;
+        if (lateCtl.redoCount >= lateInputSettings.maxRedos) {
+          // Past max_redos: interjected once the session runs.
+          unappliedRebuild = rebuild;
+          break;
+        }
         created.gate?.dispose();
         lateCtl.redoCount += 1;
         void storage.bumpAgentSessionRedoCount(session.id).catch(() => undefined);
@@ -8247,6 +8400,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       // no snapshot/transcript yet, so there is genuinely nothing to park; the
       // waited job is untouched and completes when its model recovers.
       const buildTimeout = error instanceof Error && error.name === "BuildWaitTimeoutError";
+      // Not correctable any more: a correction still in flight takes its native fate.
+      lateCtl?.markSettled();
       sessions.markDiscarded(session.id, {
         error: error instanceof Error ? error.message : String(error),
       });
@@ -8274,6 +8429,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     sessions.attachAgent(session.id, agent!);
     lateCtl?.markRunning();
     drainLateInputParked(session.id);
+    if (unappliedRebuild) {
+      for (const fallback of unappliedRebuild.fallbacks) {
+        void fallback("live").catch((error) => {
+          logger.error("late_input_fallback_failed", { sessionId: session.id, error: error instanceof Error ? error.message : String(error) });
+        });
+      }
+    }
     // Success drain (spec DEFERRED-COALESCING): the session is now steerable, so fold
     // every co-reply parked on its trigger in as an interjection. Consumes the parked
     // entries, so the settle-fallback registered above then fires on nothing.
@@ -8335,14 +8497,20 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // Redo from scratch (§8 "Late input"): discard the rollout into a branch,
     // rebuild against the first build's timeline cutoff with the corrected
     // trigger group (routing and record planning re-run), and hand the runner
-    // the new agent and kickoff. Falls back to interjecting when an undoable
-    // effect cannot be compensated.
+    // the new agent and kickoff. The redo was decided when the correction
+    // arrived; it is checked again here, since an effect may have happened
+    // before the runner took the step: then (or when an undoable effect cannot
+    // be compensated) the correction is interjected instead.
     const restartSession = async (request: RestartRequest, current: Agent): Promise<LateInputStep | undefined> => {
       await current.waitForIdle();
-      const compensated = await compensateUndoableEffects(lateCtl!, sessionTools, session.id);
-      if (!compensated) {
-        for (const message of request.fallbackInterjections) current.steer(message);
-        logger.info("late_input_interjected", { sessionId: session.id, reason: "compensation_failed", causes: request.causeEventIds });
+      const discardable = lateCtl!.canDiscardRollout();
+      if (!discardable || !(await compensateUndoableEffects(lateCtl!, sessionTools, session.id))) {
+        logger.info("late_input_redo_impossible", {
+          sessionId: session.id,
+          reason: discardable ? "compensation_failed" : "irreversible_effect",
+          causes: request.causeEventIds,
+        });
+        for (const fallback of request.fallbacks) await fallback("live");
         return continueAfterAbortedTurn(current);
       }
       const generated = current.state.messages.some((m) => (m as { role?: string }).role === "assistant");
@@ -8356,18 +8524,39 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       binding.capture.detach();
       binding.costWarnUnsub();
       binding.created.gate?.dispose();
-      lateCtl!.redoCount += 1;
-      void storage.bumpAgentSessionRedoCount(session.id).catch(() => undefined);
       // A redo from scratch re-runs routing: a refusal pin of the old rollout is dropped.
       void storage.setAgentSessionRefusalPin(session.id, null).catch(() => undefined);
-      refreshTriggerFromStore(inbound);
-      await awaitTriggerReadiness(inbound);
-      const next = await factory.create(session, sessionTools, createOpts!(firstCutoff));
-      if (!next.kickoff) throw new Error("redo build produced no final user turn");
+      // Corrections arriving while the context is rebuilt join the rebuild (no
+      // request is sent for a build they made stale); interjections are parked.
+      lateCtl!.markRebuilding();
+      let next: CreatedAgent;
+      let unapplied: RestartRequest | undefined;
+      for (;;) {
+        lateCtl!.redoCount += 1;
+        void storage.bumpAgentSessionRedoCount(session.id).catch(() => undefined);
+        refreshTriggerFromStore(inbound);
+        await awaitTriggerReadiness(inbound);
+        lateCtl!.markBuildStarted();
+        next = await factory.create(session, sessionTools, createOpts!(firstCutoff));
+        if (!next.kickoff) throw new Error("redo build produced no final user turn");
+        if (lateCtl!.peekPending()?.kind === "cancel") break;
+        const again = lateCtl!.takeRebuildBeforeStart();
+        if (!again) break;
+        if (lateCtl!.redoCount >= lateInputSettings.maxRedos) {
+          unapplied = again;
+          break;
+        }
+        next.gate?.dispose();
+        logger.info("late_input_redo", { sessionId: session.id, reason: again.reason, phase: "building", causes: again.causeEventIds });
+      }
       attachBinding(next, next.snapshot, next.tokenEstimate);
       sessions.attachAgent(session.id, next.agent);
-      for (const message of redeliver) next.agent.steer(message);
+      // Steers the old agent never read (some may have reached it during the
+      // rebuild, while it was still the session's agent) move to the new one.
+      for (const message of [...redeliver, ...takeQueuedSteers(current)]) next.agent.steer(message);
       rebindPendingSteers(session.id, next.agent);
+      lateCtl!.markRunning();
+      drainLateInputParked(session.id);
       logger.info("late_input_redo", {
         sessionId: session.id,
         reason: request.reason,
@@ -8376,6 +8565,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         discarded: generated,
         redelivered: redeliver.length,
       });
+      const cancelled = lateCtl!.takeCancelBeforeStart();
+      if (cancelled) {
+        logger.info("late_input_cancelled", { sessionId: session.id, reason: cancelled.reason, causeEventId: cancelled.causeEventId, phase: "building" });
+        return { kind: "end", noReply: true, cancelled: true };
+      }
+      // Corrections past max_redos are interjected into the rebuilt session.
+      if (unapplied) for (const fallback of unapplied.fallbacks) await fallback("live");
       const redoOpts = sessionRedoOptions(next, binding.capture);
       return { kind: "continue", agent: next.agent, kickoff: next.kickoff, redo: redoOpts.redo, ...(next.gate ? { endings: next.gate } : {}) };
     };
@@ -8399,11 +8595,39 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       if (!step) return undefined;
       if (step.kind === "cancel") {
         await current.waitForIdle();
+        // Checked again at apply time: an effect that happened after the cancel
+        // was decided turns the withdrawal into an interjection. Undoable effects
+        // (a reaction) are undone before the session is discarded.
+        const discardable = lateCtl!.canDiscardRollout();
+        if (!discardable || !(await compensateUndoableEffects(lateCtl!, sessionTools, session.id))) {
+          logger.info("late_input_cancel_impossible", {
+            sessionId: session.id,
+            reason: discardable ? "compensation_failed" : "irreversible_effect",
+            causeEventId: step.causeEventId,
+          });
+          await step.fallback("live");
+          return continueAfterAbortedTurn(current);
+        }
         logger.info("late_input_cancelled", { sessionId: session.id, reason: step.reason, causeEventId: step.causeEventId });
         return { kind: "end", noReply: true, cancelled: true };
       }
       if (step.kind === "interject") return continueAfterAbortedTurn(current);
       return restartSession(step.request, current);
+    };
+    // The runner is past its last late-input check: the run has ended (the
+    // revival test compares against this moment). A redo or cancel filed in the
+    // window since that check was never taken; its correction revives the
+    // settled session instead.
+    const onRunEnded = (): void => {
+      const dropped: LateInputPending | undefined = lateCtl?.markEnded();
+      if (!dropped || dropped.kind === "interject") return;
+      const fallbacks = dropped.kind === "restart" ? dropped.request.fallbacks : [dropped.fallback];
+      logger.info("late_input_step_after_run_end", { sessionId: session.id, kind: dropped.kind });
+      for (const fallback of fallbacks) {
+        void fallback("late").catch((error) => {
+          logger.error("late_input_fallback_failed", { sessionId: session.id, error: error instanceof Error ? error.message : String(error) });
+        });
+      }
     };
 
     // One run of the session: the first, and each revival (§8 "Late input"). A
@@ -8418,7 +8642,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         suppressTyping: proactive,
         endings: binding.created.gate,
         ...sessionRedoOptions(binding.created, binding.capture),
-        ...(lateCtl ? { lateInput: { next: lateInputNext } } : {}),
+        ...(lateCtl ? { lateInput: { next: lateInputNext, ended: onRunEnded } } : {}),
       });
       // drainCalled: the success path releases the timeline slot itself (before the
       // record turn), so the .finally drains only on the error path.
@@ -8430,7 +8654,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           if (result.cancelled) {
             // The trigger was deleted (or stopped addressing the bot) before anything
             // irreversible happened: nothing is sent and no record is written.
-            lateCtl?.markEnded();
+            lateCtl?.markSettled();
             sessions.markDiscarded(session.id, { error: "cancelled: the request was withdrawn" });
             drainCalled = true;
             if (runOpts.holdsSlot) drainNextQueuedTrigger(session.timelineKey);
@@ -8439,7 +8663,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           // An operator interrupt settles through here too (markCompleted keeps the
           // `interrupted` status); such a run writes no record.
           const interrupted = sessions.get(session.id)?.status === "interrupted";
-          lateCtl?.markEnded();
+          lateCtl?.markSettled();
           sessions.markCompleted(session.id, { noReply: result.noReply });
           revivable = !interrupted && lateCtl !== undefined;
           // Send-contract record (spec REFUSAL-HANDLING §7.1), before the record turn appends.
@@ -8470,7 +8694,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           await recordTurn;
         })
         .catch(async (error) => {
-          lateCtl?.markEnded();
+          lateCtl?.markSettled();
           // Best-effort transcript flush BEFORE any recovery decision (issue #1 +
           // spec §6.2 persist-at-failure): if the run rejected before any
           // turn_end, the only durable copy of the kickoff turn (+ any partial
@@ -8576,6 +8800,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         await sessionRecordService.abortForRevival(session.id);
         await currentRun;
         if (finalized || draining) return false;
+        // The ended run armed the revival window's expiry; the revived run re-arms
+        // it when it ends (until then the session must stay bound).
+        const entry = lateInputEntries.get(session.id);
+        if (entry?.expiry) {
+          clearTimeout(entry.expiry);
+          entry.expiry = undefined;
+        }
         const agentNow = binding.created.agent;
         const start = recordTurnStartIndex(agentNow.state.messages);
         if (start >= 0 && start < agentNow.state.messages.length) {
