@@ -6,7 +6,8 @@ import type { DeletionMarker } from "../types.js";
  * "Message edits"): a message can be deleted before it is stored (its live
  * append is still on its way through the pipeline, behind the deletion). The
  * deletion is parked here and its marker is set when the target is appended
- * (`TimelineStore.appendIfMissing`, in the insert's transaction). The parking
+ * (`TimelineStore.appendIfMissing`, and for the agent's own messages
+ * `ingestAssistantSend` / `ingestAssistantEcho`, in the insert's transaction). The parking
  * itself happens inside the write that found no target
  * (`Storage.markTimelineEventDeleted`'s `onMissing`), so no append can slip in
  * between. Messages buffered for longer (the gap-backfetch freeze) are marked in

@@ -237,6 +237,9 @@ export class TimelineStore {
             @agentSessionGeneration, @eventJson, @enrichmentStatus, @createdAt, @updatedAt
           )`,
         ).run({ ...timelineEventParams(event, now), enrichmentStatus: "pending" });
+        // A deletion that arrived before the send was stored (parked): its
+        // marker lands in the insert's transaction, as on every append.
+        this.#applyPendingDeletion(db, event);
         return "appended";
       }
 
@@ -269,6 +272,7 @@ export class TimelineStore {
              updated_at = @updatedAt
          where id = @id`,
       ).run(timelineEventParams(updated, Date.now()));
+      this.#applyPendingDeletion(db, updated);
       return "merged";
     });
   }
@@ -289,6 +293,7 @@ export class TimelineStore {
             @agentSessionGeneration, @eventJson, @enrichmentStatus, @createdAt, @updatedAt
           )`,
         ).run({ ...timelineEventParams(event, now), enrichmentStatus: "skipped" });
+        this.#applyPendingDeletion(db, event);
         return "appended";
       }
 
@@ -321,6 +326,7 @@ export class TimelineStore {
              updated_at = @updatedAt
          where id = @id`,
       ).run(timelineEventParams(updated, Date.now()));
+      this.#applyPendingDeletion(db, updated);
       return "enriched";
     });
   }

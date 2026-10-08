@@ -106,6 +106,36 @@ test("a deletion queued just ahead of its message's append is parked inside the 
   }
 });
 
+for (const path of ["ingestAssistantSend", "ingestAssistantEcho"] as const) {
+  test(`a parked deletion of the agent's own message lands on ${path} (append and merge)`, async () => {
+    const storage = await Storage.open({ databasePath: ":memory:" });
+    try {
+      const timeline = new TimelineStore(storage);
+      const own = (id: string, externalId: string): CanonicalChatEvent => ({
+        ...event(id, externalId),
+        role: "assistant",
+        sender: { id: "@miku:example.org", displayName: "Miku", isSelf: true },
+        body: "my reply",
+        agentSessionId: "s-1",
+      });
+      // Deleted before the send's post-send append (or its self-echo) stored it.
+      assert.deepEqual(await timeline.markDeleted("matrix", "$own", ROOM, { at: 2_000, by: "@mod:example.org" }), { parked: true });
+      if (path === "ingestAssistantSend") await timeline.ingestAssistantSend(own("assistant:s-1:$own:0", "$own"));
+      else await timeline.ingestAssistantEcho(own("matrix:miku:$own", "$own"));
+      const stored = timeline.getByExternalId("matrix", "$own", ROOM)!;
+      assert.deepEqual(stored.deleted, { at: 2_000, by: "@mod:example.org" });
+      assert.equal(stored.body, "my reply", "content kept");
+      assert.equal(timeline.pendingDeletions.size, 0);
+      // The other side of the race merges into the marked row and keeps the marker.
+      if (path === "ingestAssistantSend") await timeline.ingestAssistantEcho(own("matrix:miku:$own", "$own"));
+      else await timeline.ingestAssistantSend(own("assistant:s-1:$own:0", "$own"));
+      assert.deepEqual(timeline.getByExternalId("matrix", "$own", ROOM)!.deleted, { at: 2_000, by: "@mod:example.org" });
+    } finally {
+      storage.close();
+    }
+  });
+}
+
 test("a redaction's candidate timelines are resolved inside the write (a thread message of the room)", async () => {
   const storage = await Storage.open({ databasePath: ":memory:" });
   try {

@@ -79,7 +79,7 @@ Unreleased section; it is not part of any release's notes.
   put on such bot and webhook messages and marks the bot's own wiped messages.
   A deletion that arrives before its message is stored (still held by the startup
   gap backfetch or the Discord trigger hold, or simply overtaking it) is applied
-  when the message lands, and a deleted Discord trigger still in its hold starts
+  when the message lands, the bot's own sent messages included, and a deleted Discord trigger still in its hold starts
   no session. A Discord bulk deletion (a purge) marks every purged message.
   See ARCHITECTURE.md §6 "Message edits" and §9 "Deleted messages".
 - **Tool effect classes.** Every tool is classified as `redo_safe` (no external
