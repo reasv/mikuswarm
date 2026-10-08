@@ -541,6 +541,34 @@ The current scheduler wakes at random times inside a quota-derived cadence, chec
 - **Mechanical pre-gate unchanged:** evaluated only when another session of the same agent in the same timeline delivered a message after this session's context was built (or after its last delivered interjection). Expected to be rare: it needs two parallel sessions, and late input folds more follow-ups into the running session.
 - **Model:** a text-only check on the point's own chain, defaulting to `[decisions].model` (Jev head with failover, e.g. Jev → Perplexity → D1). Judge-shaped state (§3.8) where the member takes it.
 
+**What it judges (owner-approved 2026-10-08).** The failure is not "similar text". Posting the draft right after the agent's own unseen message would make the agent look as if it did not notice what it just said. A decision model cannot judge "looks like", so the check asks literal, independent questions over explicit fields.
+
+- **Unseen messages.** These are messages the same agent delivered into the draft's target timeline from other sessions, after the last point where this session saw that timeline. That point is its context cutoff, a later interjection, or a previous rejection by this check that quoted them.
+  - With no unseen messages, no call is made.
+  - After a rejection, the quoted messages count as seen, so the next draft is compared only against newer ones. This needs no extra override state, and the gate's own `override_checks` still applies.
+  - Every posting tool is checked against its own target timeline (a `send_to_channel` into room X against what the agent just posted in X).
+- **State** (one call, a plain object):
+  ```json
+  { "earlier": [ { "seconds_before_draft": 12,
+                   "answering": { "from": "alice", "text": "<the trigger of that session>" },
+                   "text": "<what the agent already posted>" } ],
+    "draft": { "answering": { "from": "bob", "text": "<this session's trigger>" },
+               "text": "<the draft>" } }
+  ```
+  - `answering` is the request each message served (a proactive message is marked unprompted). This makes "answers the same thing" checkable when two different people asked.
+  - At most the newest 5 unseen messages, each text clipped to about 1.5k tokens.
+  - An image the agent posted is shown as `[image: <caption>]` when a caption exists.
+  - **Left out on purpose:** persona, the room transcript, human messages posted between the earlier message and the draft (owner: leave out for now), tool results, thinking and the prefill analysis.
+- **Questions** (independent `noul`, each with its own threshold, default 0.8 until calibrated):
+  1. `answered_already`: "`draft.text` answers a question or request that one of `earlier[*].text` already answered."
+  2. `repeats`: "Most of the information in `draft.text` already appears in one of `earlier[*].text`."
+  3. `contradicts` (owner: keep): "`draft.text` states something that conflicts with a statement in one of `earlier[*].text`."
+
+  Any one at or above its threshold blocks the send.
+- **The error the agent sees** (the gate's non-terminating block). It names the actor and the problem explicitly:
+  > Not sent. Another session of yours (you, answering a different message in this room in parallel) already posted a message here 12 s ago that you have not seen: «…» (it was answering alice: «…»). Your draft {repeats what that message already says | answers the same question it already answered | contradicts it}. Rewrite your message so it fits after that one: refer to it, correct it, or add only what is new. Call no_reply if nothing is left to add. If your draft is still right as written, send it again with override_checks: ["duplicate"].
+- **Calibration** uses the existing calibration tool (scripts/calibrate-checks.ts) with a ZDR labeller. The historical pairs of same-agent sessions that sent within 60 s of each other (about 157 in the 30 days before 2026-10-08, by a metadata-only count) are the calibration set.
+
 Today `send_message` refuses to *reply to a message another session has claimed* (`isClaimedByOther`) — a check on the target, not on the content. The residual failure is two near-simultaneous sessions saying the same thing, usually because one sent a reply the other had not seen when it drafted its own.
 
 **When.** At `send_message`, only if **another session in the same timeline has sent a message after this session's context was built** (or after this session's last delivered interjection, whichever is later) — a timeline query on `agent_session_id ≠ self ∧ ts > built_at`. Otherwise no call. This is the owner's two-stage shape: a mechanical trigger, then the model.
