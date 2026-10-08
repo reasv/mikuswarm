@@ -2,6 +2,8 @@ export { estimateObjectTokens, estimateTokens, truncateToTokens } from "./tokens
 export {
   renderCompactMessage,
   renderMessage,
+  renderRecentCompactMessage,
+  renderRecentRichMessage,
   renderRichMessage,
   type RenderTier,
 } from "./renderer.js";

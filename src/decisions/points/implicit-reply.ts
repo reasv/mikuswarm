@@ -95,8 +95,9 @@ export const implicitReplyPoint: DecisionPoint<ImplicitReplyInput, ImplicitReply
   }),
 };
 
-function stateMessage(event: CanonicalChatEvent, maxChars: number, now: number, self: boolean) {
-  const message = toTranscriptMessage(event, maxChars);
+function stateMessage(event: CanonicalChatEvent, maxChars: number, now: number, self: boolean, window = false) {
+  // The recent-chat window shows a deleted message as its placeholder.
+  const message = toTranscriptMessage(event, maxChars, window ? { deletedPlaceholder: true } : undefined);
   return {
     from: message.from,
     text: message.text,
@@ -137,7 +138,7 @@ export function implicitReplyInputFrom(args: {
   const window = events.slice(Math.max(0, anchor - limit));
   const isSelf = (event: CanonicalChatEvent) => args.selfIds?.has(event.sender?.id) ?? false;
   const recent: ImplicitReplyChatMessage[] = window.map((event) => ({
-    ...stateMessage(event, CHAT_TEXT_CLIP, now, isSelf(event)),
+    ...stateMessage(event, CHAT_TEXT_CLIP, now, isSelf(event), true),
     ...(event.id === args.botMessage.id ? { bot_message: true as const } : {}),
   }));
   const message = stateMessage(args.candidate, CANDIDATE_TEXT_CLIP, now, false);

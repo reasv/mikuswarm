@@ -20,6 +20,7 @@ import { jsonTokens } from "../client.js";
 import { DEFAULT_LATE_ADDITION_RECENT_MESSAGES, DEFAULT_LATE_ADDITION_THRESHOLD } from "../config.js";
 import { clipText, durationLabel, packNewest } from "../state.js";
 import { senderName } from "../transcript.js";
+import { deletedPlaceholder } from "../../timeline/deletions.js";
 import type { DecisionQuestion } from "../types.js";
 
 /** One chat message before or between, as the state shows it. */
@@ -172,7 +173,8 @@ function chatMessage(
 ): LateAdditionChatMessage {
   return {
     from: senderName(event.sender),
-    text: clipText(eventText(event), CHAT_TEXT_CLIP),
+    // The surrounding chat shows a deleted message as its placeholder.
+    text: event.deleted ? deletedPlaceholder(event.deleted, event.sender?.id) : clipText(eventText(event), CHAT_TEXT_CLIP),
     age,
     ...(isSelfEvent(event, selfIds) ? { self: true as const } : {}),
   };

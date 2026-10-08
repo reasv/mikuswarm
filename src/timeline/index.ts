@@ -10,6 +10,7 @@ export {
 export { TriggerCoordinator, type QueuedTrigger, type TriggerDecision } from "./trigger.js";
 export { AssistantEchoResolver } from "./echo.js";
 export { applyEditToCanonical, editStatus, type EditReplacement } from "./edits.js";
+export { isDeleted, deletedPlaceholder, markDeletedReplyTargets, type DeletedLookup } from "./deletions.js";
 export {
   ActivationCoordinator,
   type ActivationCoordinatorOptions,

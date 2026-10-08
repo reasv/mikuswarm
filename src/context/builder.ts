@@ -19,7 +19,8 @@ import type {
 import { processImageForInference, cleanupProcessedImage, buildInferenceImageOptions } from "../media/index.js";
 import { parseYotsubaPreviewPayload, resolveYotsubaConfig, YOTSUBA_SOURCE_KIND } from "../yotsuba/types.js";
 import { compactTimelineEvents } from "./compaction.js";
-import { renderCompactMessage, renderRichMessage } from "./renderer.js";
+import { renderRecentCompactMessage, renderRecentRichMessage, renderRichMessage } from "./renderer.js";
+import { markDeletedReplyTargets } from "../timeline/deletions.js";
 import { hydrateEvents as hydrateEventsShared, mediaAssetToAttachmentMeta } from "./hydrate.js";
 import { synthesizeReactionLines, type ReactionLine, type ReactionTarget } from "./reactions.js";
 import { estimateTokens, truncateToTokens } from "./tokens.js";
@@ -544,6 +545,13 @@ export class ContextBuilder {
       }
     }
 
+    // Deleted messages (§6 "Message edits"): a quote of one shows the deletion
+    // placeholder, like the message itself in the tiers (the recent renderers
+    // below). Render-time only; the trigger group renders its own content, as
+    // late input decides what belongs to the request.
+    compactionInput = this.markDeletedReplies(compactionInput);
+    triggerEvents = this.markDeletedReplies(triggerEvents);
+
     // Render-time current-identity resolution (§6.5 bullet 2): collect distinct
     // (provider, sender.id) pairs from the full event window, batch-query the
     // user_identities table, and apply overrides so old events render under the
@@ -601,16 +609,19 @@ export class ContextBuilder {
       !generation && this.claims && options.selfSessionId
         ? this.claims.snapshotForBuild(options.timelineKey, options.selfSessionId)
         : undefined;
+    // The recent renderers show a deleted message as the deletion placeholder
+    // (live and generation builds alike: a level-1 summary renders a message
+    // already deleted when it is generated the same way).
     const richRenderer =
       claimSnapshot && claimSnapshot.size > 0
         ? (event: CanonicalChatEvent) =>
-            renderRichMessage(event, { claimedBy: (externalId) => claimSnapshot.get(externalId) })
-        : renderRichMessage;
+            renderRecentRichMessage(event, { claimedBy: (externalId) => claimSnapshot.get(externalId) })
+        : (event: CanonicalChatEvent) => renderRecentRichMessage(event);
 
     const compacted = compactTimelineEvents(
       compactionInput,
       richRenderer,
-      renderCompactMessage,
+      renderRecentCompactMessage,
       this.config.context.tiers,
       {
         timelineKey: options.timelineKey,
@@ -965,13 +976,14 @@ export class ContextBuilder {
       if (event) triggerEvents.push(event);
     }
     triggerEvents.sort((a, b) => a.timestamp - b.timestamp || a.id.localeCompare(b.id));
+    const shownTriggerEvents = this.markDeletedReplies(triggerEvents);
     // Use explicit override when provided (spec PER-AGENT-MODEL-OVERRIDES FIX 5).
     const imageBlocks = await this.selectImageBlocks(
       options.trigger,
       options.replyModelCanSeeImages ?? this.replyModelCanSeeImages(options.sessionType),
     );
-    this.markImageBlocks(triggerEvents, new Set(imageBlocks.map((b) => b.attachmentId)));
-    const renderedTrigger = triggerEvents.map((e) => renderRichMessage(e)).join("\n\n---\n\n");
+    this.markImageBlocks(shownTriggerEvents, new Set(imageBlocks.map((b) => b.attachmentId)));
+    const renderedTrigger = shownTriggerEvents.map((e) => renderRichMessage(e)).join("\n\n---\n\n");
     // A follow-up fold prepends a one-line preamble so the resumed rollout sees the
     // appended turn as a quick same-sender follow-up (§10); a plain reply-resume has none.
     const triggerContent = options.triggerPreamble
@@ -1071,7 +1083,7 @@ export class ContextBuilder {
     // `query` returns the NEWEST `limit` rows (then ascending), so an overflow drop
     // is always of the OLDEST window messages — older than anything we will keep.
     const ceilingOverflow = windowAsc.length > RESUME_GAP_FETCH_CEILING;
-    const gapEvents = windowAsc.filter((e) => !triggerGroupIds.has(e.id));
+    const gapEvents = this.markDeletedReplies(windowAsc.filter((e) => !triggerGroupIds.has(e.id)));
     if (gapEvents.length === 0) return null;
 
     const claimSnapshot = this.claims?.snapshotForBuild(timelineKey, selfSessionId);
@@ -1087,7 +1099,7 @@ export class ContextBuilder {
     let totalTokens = 0;
     let omitted = 0;
     for (let i = gapEvents.length - 1; i >= 0; i--) {
-      const text = renderRichMessage(gapEvents[i]!, claimedBy ? { claimedBy } : undefined);
+      const text = renderRecentRichMessage(gapEvents[i]!, claimedBy ? { claimedBy } : undefined);
       const tokens = estimateTokens(text);
       const messageCapHit = gap.maxMessages > 0 && kept.length >= gap.maxMessages;
       const tokenCapHit = gap.maxTokens > 0 && kept.length > 0 && totalTokens + tokens > gap.maxTokens;
@@ -1368,14 +1380,14 @@ export class ContextBuilder {
    * rich_target_tokens).
    */
   private estimateCompactTierTokens(events: CanonicalChatEvent[]): number {
-    const perEventCompact = events.map((e) => estimateTokens(renderCompactMessage(e)));
+    const perEventCompact = events.map((e) => estimateTokens(renderRecentCompactMessage(e)));
     const totalCompactRendered = perEventCompact.reduce((sum, t) => sum + t, 0);
     const richTarget = this.config.context.tiers.rich_target_tokens;
     let richTailTokens = 0;
     let richTailStart = events.length;
     for (let i = events.length - 1; i >= 0; i--) {
       if (richTailTokens >= richTarget) break;
-      richTailTokens += estimateTokens(renderRichMessage(events[i]!));
+      richTailTokens += estimateTokens(renderRecentRichMessage(events[i]!));
       richTailStart = i;
     }
     const richTailCompactCost = perEventCompact.slice(richTailStart).reduce((sum, t) => sum + t, 0);
@@ -1513,6 +1525,11 @@ export class ContextBuilder {
     }
   }
 
+  /** Quotes of deleted messages show the deletion placeholder (render-time). */
+  private markDeletedReplies(events: CanonicalChatEvent[]): CanonicalChatEvent[] {
+    return markDeletedReplyTargets(events, (timelineKey, ids) => this.storage.getDeletedMessages(timelineKey, ids));
+  }
+
   private hydrateEvents(events: CanonicalChatEvent[]): CanonicalChatEvent[] {
     // Shared with search_messages (§9e) so search hits render at the same fidelity.
     // Note: reaction aggregates (View A) are attached separately, on the live
@@ -1639,8 +1656,9 @@ export class ContextBuilder {
       selfUserId?: string;
     },
   ): ReactionLine[] {
+    // A deleted message shows no reactions (its placeholder carries none).
     const targets = events.filter(
-      (e) => e.externalId !== undefined && (!opts.assistantOnly || e.role === "assistant"),
+      (e) => e.externalId !== undefined && !e.deleted && (!opts.assistantOnly || e.role === "assistant"),
     );
     const externalIds = targets
       .map((e) => e.externalId)
@@ -1846,7 +1864,13 @@ export class ContextBuilder {
   private selectImageAttachments(
     trigger: CanonicalChatEvent,
   ): Array<{ eventId: string; attachment: AttachmentMeta }> {
-    const triggerGroupAssets = this.storage.getMediaAssetsForTriggerGroup(trigger.id);
+    // A quote of a deleted message shows the placeholder, so its images never
+    // become pixels either: drop the reply media of members replying to one.
+    let deletedReplies: Set<string> | undefined;
+    const deletedReplyEventIds = () => (deletedReplies ??= this.deletedReplyEventIds(trigger));
+    const triggerGroupAssets = this.storage
+      .getMediaAssetsForTriggerGroup(trigger.id)
+      .filter((a) => !(a.role === "reply_attachment" && deletedReplyEventIds().has(a.event_id)));
     if (triggerGroupAssets.length > 0) {
       return this.applyImagePriorityCascade(trigger.id, triggerGroupAssets);
     }
@@ -1854,7 +1878,7 @@ export class ContextBuilder {
     const triggerImages = imageAttachments(trigger).map((attachment) => ({ eventId: trigger.id, attachment }));
     if (triggerImages.length > 0) return triggerImages;
 
-    const replyImages = (trigger.replyTo?.attachments ?? [])
+    const replyImages = (trigger.replyTo?.attachments?.length && !deletedReplyEventIds().has(trigger.id) ? trigger.replyTo.attachments : [])
       .filter((attachment) => attachment.mediaType === "image" && attachment.localPath)
       .map((attachment) => ({ eventId: trigger.replyTo?.externalId ?? trigger.id, attachment }));
     if (replyImages.length > 0) return replyImages;
@@ -1867,6 +1891,16 @@ export class ContextBuilder {
     }
 
     return [];
+  }
+
+  /** Trigger-group members (the trigger included) whose reply target is a deleted message. */
+  private deletedReplyEventIds(trigger: CanonicalChatEvent): Set<string> {
+    const members: CanonicalChatEvent[] = [];
+    for (const id of this.resolveTriggerGroupIds(trigger)) {
+      const event = id === trigger.id ? trigger : this.store.getById(id);
+      if (event?.replyTo?.externalId) members.push(event);
+    }
+    return new Set(this.markDeletedReplies(members).filter((e) => e.replyTo?.deleted).map((e) => e.id));
   }
 
   private applyImagePriorityCascade(

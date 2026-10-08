@@ -43,7 +43,7 @@ export interface AppHarness {
   say(body: string, opts?: { mention?: boolean; dm?: boolean; replyTo?: string; id?: string; attachments?: AttachmentMeta[]; sender?: { id: string; displayName: string; username?: string }; timestamp?: number; timelineKey?: string; roomId?: string }): string;
   /** Edit a stored message (`m.replace`); `mention` = the new content mentions the bot. */
   edit(targetExternalId: string, body: string, opts?: { mention?: boolean; sender?: { id: string; displayName: string; username?: string }; timestamp?: number }): void;
-  /** Delete a stored message (a tombstone through the edit path). */
+  /** Delete a stored message, as a Discord deletion arrives (no deleter named). */
   remove(targetExternalId: string): void;
   /** A Matrix redaction of `targetExternalId`, as the Matrix provider emits it (default: by its sender, alice). */
   redact(targetExternalId: string, opts?: { by?: string; timestamp?: number; dm?: boolean }): void;
