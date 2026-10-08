@@ -200,10 +200,13 @@ The embedder has the same three kinds of provider and the same decision rule. On
 
 A late-interaction model encodes text into one small vector per token (e.g. 128 dimensions). The score of a passage for a query is the sum, over query tokens, of each one's best match among the passage's tokens (MaxSim). The passage side does not depend on the query, so it is computed once at index time and stored.
 
-**Indexing is not latency-critical; query time is the whole budget** (owner, 2026-10-08). The recency layer (ARCHITECTURE.md §9c) shows the newest diary files in full at all times, so a block only needs to be retrievable once it leaves that layer, days after it is written. That is a very long buffer.
-- **Indexing runs in the background, on CPU by default, even for a large document model.** It uses a low-priority worker, so it never competes with query-time work.
-  - Rough scale: a 9B document model on CPU is on the order of seconds per block, so a few blocks a day is nothing. A full rebuild of ~4k blocks takes hours, run once.
-  - A GPU is optional, only to shorten a one-off rebuild. It is never needed to keep up.
+**Indexing is not latency-critical; query time is the whole budget** (owner, 2026-10-08). The recency layer (ARCHITECTURE.md §9c) shows the newest diary blocks in full at all times, so a block only needs to be retrievable once it leaves that layer.
+- **How long the buffer is depends on the deployment:** the layer's token budget, block length, and how many entries the agent writes (more channels mean more entries). An operator can judge it.
+- **One busy deployment, measured 2026-10-08:**
+  - A 4,000-token layer holds about 12 blocks.
+  - That agent writes ~12–39 blocks a day (typically ~20, ~5–8k tokens), with one peak day of 73 and at most 9 in one hour.
+  - So the buffer is about 15 hours normally, and about an hour in the worst burst.
+- **Seconds per block is therefore ample.** Indexing runs in a low-priority background worker, on CPU, using the same model as the query side, and never competes with query-time work.
 - **Index lag is a metric.** Startup and the indexer warn if a block has left the recency layer without vectors.
 - **The index** is a token-vector store (`memory_late_<model>`, one blob per chunk, keyed by chunk hash like the vector index).
   - Size: about 350 MB at fp16 for ~4k blocks of ~340 tokens, half at int8, less again with token pooling.
@@ -211,11 +214,47 @@ A late-interaction model encodes text into one small vector per token (e.g. 128 
 
 **Query-time cost has two parts, and both must fit the latency budget:**
 1. **Query encoding,** in proportion to the query model's size times the query's tokens.
-   - A model of a few hundred million active parameters over a few dozen tokens is expected to take tens of milliseconds on CPU (to be measured). A multi-billion model needs a GPU at query time.
-   - So the useful shape is a large document model with a small query model in the same space, with no GPU on the hot path. Whether the small query model loses quality against the large one's index is a measurement (small/small, small-query/large-doc, large/large).
+   - A model of a few hundred million active parameters over a few dozen tokens is expected to take tens of milliseconds on CPU (to be measured).
+   - **A multi-billion model on the query side is rejected** (owner, 2026-10-08). It would need a GPU at query time: ~17–18 GB for a 9B in bf16/fp16, nearly a whole 24 GB card, held permanently, for a marginal retrieval gain. The query model is small and runs on CPU.
+   - **A large model on the index side is an option, if it is worthwhile** (owner). Index time is off the hot path (above), so the large model's cost is paid in the background:
+     - seconds per block on CPU for increments, within the buffer;
+     - a one-off rebuild of hours on CPU, or about half an hour on a GPU that is released afterwards.
+     A small model in the same space then queries that index on CPU.
+   - **Published gain of this asymmetric pair** (pplx-embed-v2-late: 0.6B queries on a 9B index, against 0.6B on both sides): ViDoRe v3 image 62.3 → 63.5, and +1.6 points on Perplexity's domain-specific set. 9B on both sides is better still, but needs the GPU at query time.
+   - **Whether it is worthwhile is a measurement on the §9 set.** Compare small/small, small-query/large-index, and the best small CPU alternative (e.g. an ONNX late model).
+     - **Weigh the gain against the costs:** the large model's index-time compute, and the serving path. Today the pplx late models have no ONNX export and use linear-attention layers with no known fast CPU kernel, so even the small query encoder may need a PyTorch sidecar (see the survey).
 2. **MaxSim,** in proportion to query tokens × document tokens scored × dimensions.
    - Exhaustive over ~1.4M document tokens with a 32-token query is about 11 GFLOP. That is tens of milliseconds as a vectorised native matrix product across cores, and seconds in plain JavaScript.
    - So scoring runs **off the event loop (a worker thread) on a native matrix path** (the ONNX runtime the embedder already uses, or equivalent), with the window's vectors resident in memory.
+
+**Compressed vectors and a fused kernel: TurboQuant** (owner, 2026-10-08).
+
+*What it is.* TurboQuant applies a random rotation, then quantises each coordinate to 2–4 bits against fixed Lloyd-Max levels.
+- It is data-oblivious: there is no codebook to train. Each block is quantised on its own as it is indexed, so incremental indexing works and nothing is retrained as the corpus grows.
+- Scoring reads the codes directly: rotate the query tokens once, then use SIMD table lookups.
+
+*Measured* (2026-10-08, one 24-core AVX2 server under moderate load, random unit vectors, 1.36M document token vectors × 32 query tokens, about one deployment's whole corpus):
+
+| Path | Time | Size |
+|---|---|---|
+| fp32 matrix product (OpenBLAS via numpy) + per-block max + sum | 100–150 ms (90–150 GFLOP/s, far below peak: a 32-column product and an unfused reduction) | 696 MB |
+| TurboQuant 4-bit, fused SIMD scan (turbovec 1.0, MIT, Rust) | 15 ms | 93 MB |
+| TurboQuant 2-bit | 7 ms | 49 MB |
+
+The turbovec figure is a top-k scan, which does the same per-token work as MaxSim's per-block max.
+
+*Consequences:*
+- The off-the-shelf matrix path fits today's corpus within the budget, but with little headroom.
+- A fused kernel on quantised codes is about 7–15× faster and 7–14× smaller. That keeps "search everything" affordable for years of growth.
+- This needs native code: no ONNX op scores quantised codes with a per-block max, and plain JavaScript is far slower. The repo already builds a Rust N-API crate into the image, so the kernel belongs there, reusing a TurboQuant library's quantiser and SIMD layout (turbovec, MIT) with a MaxSim reduction (max per block over its tokens, sum over query tokens).
+
+*Quality guard: approximate scan, exact rescoring.*
+- The quantised scan picks the top `late.rescore` blocks (default 60).
+- Those blocks are re-scored exactly from the stored fp16 vectors: ~5 MB read, a few ms.
+- The scan therefore only has to keep the true top 20 inside its top 60, which is far more forgiving than ranking them exactly. The noise also biases a max over many tokens upward, which could otherwise favour long blocks.
+- Measured on the §9 set: TurboQuant 4/3/2-bit, with and without rescoring and token pooling, against exact MaxSim (top-20 overlap and labelled relevance).
+
+*Storage:* fp16 vectors on disk (SQLite blobs) for rescoring, plus the TurboQuant codes resident in memory for the scan. The exact fp32 matrix path stays as the portable fallback when the native module is unavailable.
 
 **Two branches, one score** (owner, 2026-10-08):
 - **Exhaustive window.** The newest `late.exhaustive_blocks` indexed blocks outside the recency layer are all scored on every query, newest first.
@@ -227,7 +266,7 @@ A late-interaction model encodes text into one small vector per token (e.g. 128 
 - **Sizing the window.**
   - Cost is linear in the document tokens scored. A bench command measures throughput on the host for the configured query length and model, and prints the window that fits a target (default 100 ms for MaxSim).
   - The setting is a block count, or `"all"` when the whole corpus fits.
-  - Token pooling and int8 vectors widen the window for the same budget; their quality cost is measured on the §9 set.
+  - TurboQuant codes (above) and token pooling widen the window for the same budget; their quality cost is measured on the §9 set.
   - A scoring pass that overruns `late.timeout_ms` is abandoned for that query, and the hybrid lanes alone carry recall.
 - **Not assumed strictly better.** Late interaction usually beats single-vector retrieval at similar scale, but not on every query type, and a small late model can lose to a strong dense one. The §9 harness compares exhaustive late interaction with dense recall over the same window. The dense index stays maintained either way: it is the fallback when the late query encoder is unavailable, and the signal beyond the window.
 
@@ -243,22 +282,39 @@ A late-interaction model encodes text into one small vector per token (e.g. 128 
 [retrieval.late]
 enabled = false
 model = "..."                 # the document-side model; the index belongs to it
-query_model = ""              # default: model; may be a smaller model sharing its space
+query_model = ""              # default: model; a smaller shared-space model (large index, small CPU query)
 query_max_tokens = 64
 exhaustive_blocks = 0         # newest N indexed blocks outside the recency layer, scored exhaustively; "all"; 0 = re-rank only
 top_n = 20                    # candidates passed on to the cross-encoder
 timeout_ms = 300              # query encode + MaxSim; past it, the hybrid lanes alone carry recall
-resident = true               # keep the exhaustive window's vectors in memory
+resident = true               # keep the exhaustive window's scan codes in memory
+quantization = "turboquant"   # scan codes: "turboquant" (native kernel) | "none" (exact fp32 path)
+bits = 4                      # TurboQuant bits per coordinate (2–4)
+rescore = 60                  # blocks re-scored exactly from fp16 after the quantised scan
 chain = ["builtin"]           # document encoding providers, all serving `model`; background, low priority
 ```
 
-### 5.0c Model survey and measurements (to do before implementation)
+### 5.0c Model survey and measurements
+
+**Desk survey done:** `spec/MEMORY-RETRIEVAL-SURVEY.md` (2026-10-08). Its findings for this pipeline:
+- **pplx-embed-v2-late:**
+  - It has no text-retrieval benchmarks yet, and no ONNX, GGUF or server support.
+  - Its hybrid linear-attention layers have no known fast CPU kernel, so even its small query encoder may need a PyTorch sidecar.
+- **mLateOn** (Apache, multilingual, official int8 ONNX) is the practical CPU late-interaction candidate. It is first in the one independent comparison, ahead of bge-reranker-v2-m3.
+- **The built-in embedder runtime (fastembed-js 2.1.0) has three defects:**
+  - its model download source now returns 403;
+  - it applies e5 prefixes to every model;
+  - it pools by CLS only.
+
+  New built-in models therefore need a direct onnxruntime-node path.
+
+Still to do: the measurements below, on real hardware and the labelled set.
 
 A companion `spec/MEMORY-RETRIEVAL-SURVEY.md`, like DECISION-MODEL-SURVEY.md. For re-rankers (cross-encoder and late interaction) and embedders it records:
 - **Open-weights candidates:** quality on retrieval benchmarks and languages, size, VRAM at the serving precision, GPU latency, CPU latency on ONNX, and licence.
 - **API candidates:** quality, price, latency, rate limits, and **ZDR status, verified per provider and route** (direct and through aggregators).
 - **Measurements on the deployment's own hardware** for the shortlist: latency for ~60 × ~400-token pairs, VRAM held, CPU time; for late interaction, index build time (GPU and CPU), index size and query-side CPU time.
-- **Corpus shape:** the share of blocks longer than each shortlisted model's input window (the only segmentation question left, §5.0).
+- **Corpus shape:** the share of blocks longer than each shortlisted model's input window (the only segmentation question left, §5.0). Measured on one deployment: none. The pipeline caps blocks at 512 tokens, and the average is ~336.
 - **Offline quality** on the §9 labelled items.
 
 ## 5. Relevance judgement: the `memory` decision point
@@ -480,5 +536,5 @@ Remaining:
 - **Late interaction details to settle with measurements (§5.0d):**
   - the exhaustive window's default budget (proposed 100 ms of MaxSim);
   - the late query's content (trigger plus reply target, or a short conversation tail too);
-  - whether a small query model holds quality against a large-model index;
+  - whether a large model on the index side, queried by a small one, is worth its index-time cost;
   - whether the dense lane still adds anything inside the window.
