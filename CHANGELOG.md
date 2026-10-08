@@ -69,7 +69,11 @@ Unreleased section; it is not part of any release's notes.
   with every candidate's fate (shown as a retrieval card in the console's session
   view, with the items the fallback rule chose marked), the follow-up rate (sessions
   that open a cited memory), and memory-point calibration and a recall-ceiling audit
-  in `scripts/calibrate-checks.ts`. A new **`/memory` console page** shows the
+  in `scripts/calibrate-checks.ts`. Its `--point filter --filter <key>` mode calibrates
+  a judged memory filter's threshold over the agent's diary blocks (every block
+  matching an enrichment set plus a seeded sample of the rest, reported per stratum
+  and as a population estimate), and accepts a filter defined only in a side file
+  (`--filter-file`). A new **`/memory` console page** shows the
   follow-up rate, the source mix (judged, judged plus fallback, fallback, unjudged)
   and the filters audit, read through three new agent routes:
   `GET /api/sessions/:id/memory-retrievals`, `GET /api/memory/filter-hits` and

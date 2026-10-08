@@ -11,6 +11,7 @@
  *   npx tsx scripts/calibrate-checks.ts --db <path> --labeller <models key> --any-refusal [options]
  *   npx tsx scripts/calibrate-checks.ts --db <path> --labeller <models key> --point memory [options]
  *   npx tsx scripts/calibrate-checks.ts --db <path> --labeller <models key> --point memory --recall-ceiling [options]
+ *   npx tsx scripts/calibrate-checks.ts --db <path> --labeller <models key> --point filter --filter <key> [options]
  *
  * `--any-refusal` measures "is this output a refusal of any kind", the decision
  * that acts in production: the score is the highest probability among every
@@ -81,6 +82,33 @@
  *   --per-build <n>         items labelled per build (default 60; judged and kept items first)
  *   --agent, --since, --seed, --concurrency, --json   as above
  *
+ * `--point filter --filter <key>` calibrates one judged memory filter's `threshold`
+ * (src/audit/filter-calibration.ts). Items are the agent's diary blocks from
+ * `memory_chunks` (the unit the filters judge; blocks outside the filter's time
+ * scope or missing its keyword/pattern pre-gate are excluded and counted), sampled
+ * in two strata: every block matching the enrichment set, plus a seeded random
+ * sample of the rest. The labeller labels whether the block matches the filter's
+ * description (its examples as criteria); the judge asks the live filter question
+ * (the memory point's filter question over the cleaned block) and gives P(matches).
+ * The report has per-stratum and population-weighted precision/recall/F1, the blocks
+ * hidden at each threshold, histograms per stratum, the suggested thresholds and the
+ * labeller's and judge's usage and cost; never block text, and no per-item lines
+ * (`--json` adds ids, strata, labels and probabilities).
+ *   --filter <key>          the filter: [retrieval.filters.<key>] (with the agent's overrides)
+ *   --filter-file <toml>    a side file defining the filter as [retrieval.filters.<key>] (or a
+ *                           top-level [<key>] table), merged over the configuration: the filter
+ *                           need not be in the live config yet
+ *   --agent <name>          whose diary blocks and filter overrides (required with several agents)
+ *   --enrich-keywords a,b   enrichment: case-insensitive substrings (repeatable)
+ *   --enrich-patterns <re>  enrichment: one regular expression per flag, `(?i)` prefix for
+ *                           case-insensitive (repeatable)
+ *   --enrich-max <n>        sample at most n enriched blocks (default all)
+ *   --sample <n>            non-enriched blocks to sample (default 150)
+ *   --member <models key>   judge chain head (default: [retrieval.filters].model, else the memory
+ *                           point's chain: [decisions.memory].model, else [decisions].model)
+ *   --chain                 let the head's fallbacks answer as live (default: the head only)
+ *   --seed, --thresholds, --target-precision, --concurrency, --json   as above
+ *
  * Safety:
  * - The database is opened read-only (`query_only`); run it on a copy if you prefer.
  * - The tool refuses to start when the environment sets endpoint or proxy
@@ -91,14 +119,33 @@
  *   content. It is instructed never to reproduce content, and its answer is
  *   reduced to enums before anything is printed.
  */
+import { readFileSync } from "node:fs";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
-import { buildCheckCatalogue } from "../src/checks/catalogue.js";
+import { buildCheckCatalogue, compileCheckPattern } from "../src/checks/catalogue.js";
 import { CHECK_SOURCES, type CheckSource } from "../src/checks/types.js";
 import { loadConfig } from "../src/config/index.js";
 import { ChannelVisibilityResolver, type VisibilityConfig } from "../src/visibility/index.js";
 import { createModelFromConfig } from "../src/agent/factory.js";
 import { DecisionClient } from "../src/decisions/client.js";
-import { decisionsFor, duplicateKnobs, isDecisionModel, memoryPointKnobs } from "../src/decisions/config.js";
+import {
+  calibratedThreshold,
+  decisionsFor,
+  duplicateKnobs,
+  isDecisionModel,
+  memoryPointKnobs,
+  pointSettings,
+} from "../src/decisions/config.js";
+import {
+  calibrationFilters,
+  createFilterJudge,
+  DEFAULT_FILTER_SAMPLE,
+  filterReportJson,
+  formatFilterReport,
+  loadDiaryBlocks,
+  newJudgeUsage,
+  runFilterCalibration,
+  sampleFilterBlocks,
+} from "../src/audit/filter-calibration.js";
 import { DEFAULT_DUPLICATE_WINDOW_MS, sampleDuplicateItems } from "../src/audit/duplicate-calibration.js";
 import {
   assertNoEndpointOverrides,
@@ -137,15 +184,20 @@ function fail(message: string): never {
 const argv = process.argv.slice(2);
 const flags = new Map<string, string>();
 const switches = new Set<string>();
+/** Flags that may be given several times (values collected in order). */
+const REPEATABLE = new Set(["enrich-keywords", "enrich-patterns"]);
+const repeated = new Map<string, string[]>();
 for (let i = 0; i < argv.length; i++) {
   const arg = argv[i]!;
   if (!arg.startsWith("--")) fail(`unexpected argument ${arg}`);
   const name = arg.slice(2);
-  if (name === "json" || name === "fired-only" || name === "any-refusal" || name === "recall-ceiling") switches.add(name);
-  else {
+  if (name === "json" || name === "fired-only" || name === "any-refusal" || name === "recall-ceiling" || name === "chain") {
+    switches.add(name);
+  } else {
     const value = argv[i + 1];
     if (value === undefined || value.startsWith("--")) fail(`--${name} needs a value`);
-    flags.set(name, value);
+    if (REPEATABLE.has(name)) repeated.set(name, [...(repeated.get(name) ?? []), value]);
+    else flags.set(name, value);
     i++;
   }
 }
@@ -167,10 +219,24 @@ try {
 
 const anyRefusal = switches.has("any-refusal");
 const pointFlag = flags.get("point");
-if (pointFlag !== undefined && pointFlag !== "memory") fail("--point must be memory");
+if (pointFlag !== undefined && pointFlag !== "memory" && pointFlag !== "filter") fail("--point must be memory or filter");
 const memoryMode = pointFlag === "memory";
+const filterMode = pointFlag === "filter";
 const recallCeiling = switches.has("recall-ceiling");
 if (recallCeiling && !memoryMode) fail("--recall-ceiling needs --point memory");
+const FILTER_ONLY_FLAGS = ["filter", "filter-file", "enrich-max"];
+if (!filterMode) {
+  for (const name of FILTER_ONLY_FLAGS) if (flags.has(name)) fail(`--${name} applies only to --point filter`);
+  for (const name of REPEATABLE) if (repeated.has(name)) fail(`--${name} applies only to --point filter`);
+  if (switches.has("chain")) fail("--chain applies only to --point filter");
+}
+if (filterMode) {
+  if (anyRefusal || recallCeiling || switches.has("fired-only")) fail("--any-refusal, --recall-ceiling and --fired-only do not apply to --point filter");
+  for (const name of ["check", "checkpoint", "source", "question", "per-band", "bands", "window-ms", "per-build", "since"]) {
+    if (flags.has(name)) fail(`--${name} does not apply to --point filter`);
+  }
+  if (!flags.has("filter")) fail("--point filter needs --filter <key>");
+}
 if (memoryMode) {
   if (anyRefusal) fail("--any-refusal does not apply to --point memory");
   if (switches.has("fired-only")) fail("--fired-only does not apply to --point memory");
@@ -249,6 +315,91 @@ const thresholds = flags.has("thresholds")
   ? flags.get("thresholds")!.split(",").map((t) => Number(t)).filter((t) => t >= 0 && t <= 1)
   : undefined;
 const labellerInfo = { model: labellerKey, host: host(labellerConfig.endpoint) };
+
+if (filterMode) {
+  const agentName = flags.get("agent") ?? null;
+  const agentNames = Object.keys(config.agents ?? {});
+  if (agentName === null && agentNames.length > 1) fail(`--agent is required (agents: ${agentNames.join(", ")})`);
+  if (agentName !== null && agentNames.length > 0 && !agentNames.includes(agentName)) fail(`--agent ${agentName} is not a configured agent`);
+  // Diary blocks are stamped with the agent's name in agents mode, NULL in legacy mode.
+  const blockAgent = agentName ?? (agentNames.length === 1 ? agentNames[0]! : null);
+  const key = flags.get("filter")!;
+  let filters;
+  try {
+    const filterFile = flags.get("filter-file");
+    filters = calibrationFilters(
+      config,
+      blockAgent,
+      filterFile !== undefined ? { text: readFileSync(filterFile, "utf8"), name: filterFile } : undefined,
+    );
+  } catch (error) {
+    fail(error instanceof Error ? error.message : String(error));
+  }
+  const filter = filters.filters.find((f) => f.key === key) ?? fail(`no filter ${key} (in the configuration or --filter-file)`);
+  if (!filter.description) fail(`filter ${key} is not judged (no description): keyword and pattern filters need no calibration`);
+
+  let enrichPatterns: RegExp[];
+  try {
+    enrichPatterns = (repeated.get("enrich-patterns") ?? []).map((source) => compileCheckPattern(source));
+  } catch (error) {
+    fail(`--enrich-patterns: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const enrichKeywords = (repeated.get("enrich-keywords") ?? [])
+    .flatMap((v) => v.split(","))
+    .map((k) => k.trim())
+    .filter((k) => k.length > 0);
+
+  // The judge: the memory point's settings as live (forced on: the point may still be off).
+  const memoryRaw = (decisions.memory ?? {}) as Record<string, unknown>;
+  const settings =
+    pointSettings({ ...decisions, enabled: true, memory: { ...memoryRaw, enabled: true } } as typeof decisions, "memory") ??
+    fail("no decision model: set [decisions].model or pass --member");
+  const headKey = flags.get("member") ?? filters.model ?? settings.model;
+  const headConfig = config.models[headKey] ?? fail(`--member ${headKey} is not a [models.*] key`);
+  if (!isDecisionModel(headConfig)) fail(`--member ${headKey} must be a system-one decision model`);
+  if (headConfig.decision?.state_shapes === "text_or_conversation") {
+    fail(`--member ${headKey} reads only judge-shaped states; the memory point sends an object state`);
+  }
+  const chain = switches.has("chain");
+  const members = chain ? new DecisionClient({ models: config.models }).chain(headKey) : [{ logicalId: headKey, config: headConfig }];
+  const fetchGuard = guardFetch([labellerConfig.endpoint, ...members.map((m) => m.config.endpoint)]);
+  globalThis.fetch = fetchGuard;
+  const labeller = buildLabeller(fetchGuard);
+  const client = new DecisionClient({ models: config.models, fetchImpl: fetchGuard });
+  const judgeUsage = newJudgeUsage();
+  const judge = createFilterJudge({ client, chainHead: headKey, filter, settings, chain, usage: judgeUsage });
+  const db = openReadOnly(dbPath);
+  try {
+    const sample = sampleFilterBlocks(loadDiaryBlocks(db, blockAgent), filter, {
+      enrich: { keywords: enrichKeywords, patterns: enrichPatterns },
+      sample: num("sample", DEFAULT_FILTER_SAMPLE),
+      seed: num("seed", 1),
+      enrichMax: num("enrich-max", 0),
+    });
+    const report = await runFilterCalibration({
+      sample,
+      filter,
+      agent: blockAgent,
+      configuredThreshold: calibratedThreshold(settings, headKey, `filter.${key}`, filter.threshold),
+      ...(thresholds ? { thresholds } : {}),
+      targetPrecision: num("target-precision", 0.9),
+      concurrency: num("concurrency", 2),
+      enrichment: { keywords: enrichKeywords.length, patterns: enrichPatterns.length, max: num("enrich-max", 0) || null },
+      labeller,
+      judge,
+      judgeUsage,
+      labellerInfo,
+      judgeInfo: { head: headKey, host: host(headConfig.endpoint), chain, members: members.map((m) => m.logicalId) },
+    });
+    process.stdout.write(switches.has("json") ? filterReportJson(report) : formatFilterReport(report));
+  } catch (error) {
+    // Error texts here are the tool's own (guards, configuration, HTTP status): never content.
+    fail(error instanceof Error ? error.message : String(error));
+  } finally {
+    db.close();
+  }
+  process.exit(0);
+}
 
 if (memoryMode) {
   const agentName = flags.get("agent") ?? null;
