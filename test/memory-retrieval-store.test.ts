@@ -9,7 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { Storage } from "../src/storage/index.js";
-import { capReportJson, MemoryRetrievalStore, REPORT_MAX_ITEMS } from "../src/storage/memory-retrieval-store.js";
+import { capReportJson, MemoryRetrievalStore, PRUNE_BATCH, REPORT_MAX_ITEMS } from "../src/storage/memory-retrieval-store.js";
 
 test("report cap: kept, hidden and judged items stay, the best-scored rest fill the cap, the others are counted", () => {
   const items = Array.from({ length: 4000 }, (_, i) => ({
@@ -53,6 +53,40 @@ test("retention: rows older than the configured days are pruned (in the backgrou
     const ids = storage.read((db) => (db.prepare(`select id from memory_retrievals order by id`).all() as Array<{ id: string }>).map((r) => r.id));
     assert.deepEqual(ids, ["new", "recent"]);
     assert.equal(await new MemoryRetrievalStore(storage, { retrievalsRetentionDays: 0 }).pruneRetrievals(now * 2), 0, "0 keeps forever");
+  } finally {
+    await storage.waitForIdle();
+    storage.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("retention: the prune deletes in small batches and yields to the event loop between them", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "miku-retr-"));
+  const storage = await Storage.open({ databasePath: path.join(dir, "t.db") });
+  try {
+    assert.ok(PRUNE_BATCH <= 500, "a batch is a few ms of the writer");
+    const day = 86_400_000;
+    const now = 400 * day;
+    const writer = new MemoryRetrievalStore(storage, { retrievalsRetentionDays: 0 });
+    for (let i = 0; i < 45; i++) {
+      await writer.insertRetrieval({
+        id: `old${i}`, agentSessionId: "s", agent: null, timelineKey: null, ts: now - 100 * day, source: "none", decisionGroup: null,
+        candidates: 0, judged: 0, kept: 0, hidden: 0, tokens: 0, ms: 0, reportJson: null,
+      });
+    }
+    await storage.waitForIdle();
+    let ticks = 0;
+    let ticking = true;
+    const tick = () => {
+      if (!ticking) return;
+      ticks += 1;
+      setImmediate(tick);
+    };
+    setImmediate(tick);
+    const deleted = await new MemoryRetrievalStore(storage, { retrievalsRetentionDays: 30 }).pruneRetrievals(now, 10);
+    ticking = false;
+    assert.equal(deleted, 45);
+    assert.ok(ticks >= 4, `the event loop ran between the 5 batches (${ticks} ticks)`);
   } finally {
     await storage.waitForIdle();
     storage.close();

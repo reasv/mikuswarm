@@ -164,7 +164,8 @@ const PRUNE_EVERY_MS = 3_600_000;
 const SENDER_BACKFILL_KEY = "memory_sender_names_backfill";
 /** Timeline rows per back-fill batch (a few ms of the writer each). */
 const SENDER_BACKFILL_ROWS = 500;
-const PRUNE_BATCH = 5000;
+/** Retention-prune rows per write; the event loop runs between batches. */
+export const PRUNE_BATCH = 200;
 /** Distinct display names kept per sender in the history read on every build. */
 const NAME_HISTORY_MAX = 6;
 
@@ -890,11 +891,12 @@ export class MemoryRetrievalStore {
   }
 
   /**
-   * Delete `memory_retrievals` rows older than the retention (in bounded
-   * batches, each its own write, so the writer queue is never held for long).
-   * Returns the number deleted.
+   * Delete `memory_retrievals` rows older than the retention in small
+   * batches ({@link PRUNE_BATCH} rows, each its own write) with a yield to the
+   * event loop between them, so a large backlog never holds the single
+   * connection for long. Returns the number deleted.
    */
-  async pruneRetrievals(now: number): Promise<number> {
+  async pruneRetrievals(now: number, batch = PRUNE_BATCH): Promise<number> {
     const days = this.opts.retrievalsRetentionDays ?? 90;
     if (days <= 0) return 0;
     const cutoff = now - days * 86_400_000;
@@ -904,10 +906,11 @@ export class MemoryRetrievalStore {
         (db) =>
           db
             .prepare(`delete from memory_retrievals where rowid in (select rowid from memory_retrievals where ts < ? limit ?)`)
-            .run(cutoff, PRUNE_BATCH).changes,
+            .run(cutoff, batch).changes,
       );
       total += n;
-      if (n < PRUNE_BATCH) return total;
+      if (n < batch) return total;
+      await new Promise<void>((resolve) => setImmediate(resolve));
     }
   }
 
