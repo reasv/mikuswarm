@@ -27,6 +27,7 @@
 import Database from "better-sqlite3";
 import { prefilterAllows } from "../checks/catalogue.js";
 import { assistantText, buildCheckState, type CheckContext, type CheckSources, type StateMessage } from "../checks/state.js";
+import { buildDuplicateState } from "../checks/duplicate.js";
 import type { CheckCatalogue, CheckDefinition, CheckQuestion, CheckSource, Checkpoint } from "../checks/types.js";
 import { BUILTIN_REFUSAL_REASONS } from "../checks/types.js";
 import { classifyApiRefusal } from "../refusals/signals.js";
@@ -627,6 +628,11 @@ export interface CalibrationRunOptions {
   scorer: Scorer;
   labellerInfo: { model: string; host: string };
   memberInfo: { model: string; host: string };
+  /**
+   * Items sampled already (the duplicate check's, `sampleDuplicateItems`); default:
+   * sampled here over the check's outputs at the checkpoint.
+   */
+  sampled?: SampleResult;
   /** State budget of the shared state (labeller and member). Default 6000 tokens. */
   stateTokens?: number;
   thinkingTailTokens?: number;
@@ -635,7 +641,7 @@ export interface CalibrationRunOptions {
 
 /** Sample, label, score and aggregate. Never returns message text. */
 export async function runCalibration(opts: CalibrationRunOptions): Promise<CalibrationReport> {
-  const sampled = sampleCalibrationItems(opts.db, {
+  const sampled = opts.sampled ?? sampleCalibrationItems(opts.db, {
     catalogue: opts.catalogue,
     check: opts.check,
     checkpoint: opts.checkpoint,
@@ -648,10 +654,13 @@ export async function runCalibration(opts: CalibrationRunOptions): Promise<Calib
   });
   const reasons = labelReasons(opts.check);
   const stateFor = (item: CalibrationItem) => (budget: number) =>
-    buildCheckState(
-      { context: item.context, sources: item.sources, scope: "full", thinkingTailTokens: opts.thinkingTailTokens ?? 800 },
-      budget,
-    );
+    // A duplicate item is judged over its own `{ earlier, draft }` state.
+    item.context.duplicate
+      ? buildDuplicateState(item.context.duplicate, item.sources.message ?? "", budget)
+      : buildCheckState(
+          { context: item.context, sources: item.sources, scope: "full", thinkingTailTokens: opts.thinkingTailTokens ?? 800 },
+          budget,
+        );
   const all = [...sampled.knownPositives, ...sampled.items];
   const rows: CalibrationRow[] = new Array(all.length);
   let next = 0;
@@ -705,7 +714,7 @@ export async function runCalibration(opts: CalibrationRunOptions): Promise<Calib
   const count = (label: CalibrationRow["label"]) => rows.filter((r) => r.label === label).length;
   return {
     check: opts.check.code,
-    question: `${opts.check.code}__${opts.question.source}`,
+    question: `${opts.check.code}__${opts.question.name ?? opts.question.source}`,
     checkpoint: opts.checkpoint,
     source: opts.question.source,
     configuredThreshold,
@@ -801,7 +810,8 @@ export function createDecisionScorer(opts: {
     const input: ChecksCallInput = {
       items: [item!],
       shape: judge ? "conversation" : "object",
-      scope: "full",
+      // A duplicate question reads `{ earlier, draft }` (or its judge conversation).
+      scope: calibrationItem.context.duplicate ? "duplicate" : "full",
       context: calibrationItem.context,
       sources: calibrationItem.sources,
       thinkingTailTokens: opts.thinkingTailTokens ?? 800,

@@ -27,6 +27,8 @@
  *                           else [decisions].model); only this member is called, never its fallbacks
  *   --checkpoint send|ending  (default send)
  *   --source <source>       which question of the check (default: message at send, text at ending)
+ *   --question <name>       a named question of the check (e.g. the duplicate check's `repeats`);
+ *                           required for a check with several questions over one source
  *   --agent <name>          use this agent's catalogue overrides of the check
  *   --sample <n>            items to label (default 200)
  *   --fired-only            only outputs the check already fired on (precision at the threshold)
@@ -36,6 +38,13 @@
  *   --target-precision <p>  for the suggested threshold (default 0.9)
  *   --concurrency <n>       parallel items (default 2)
  *   --json                  print the report as JSON
+ *
+ * The duplicate-send check (`--check duplicate`, or any check of kind duplicate, at send): items are
+ * rebuilt from history (src/audit/duplicate-calibration.ts): each posting call whose target timeline
+ * holds messages of the same agent's other sessions that the session had not seen, the newest within
+ * --window-ms of the draft (default 60000), judged over the live gate's `{ earlier, draft }` state.
+ * The member defaults to the duplicate chain's head ([decisions.checks.duplicate].model, else
+ * [decisions].model).
  *
  * --any-refusal options (instead of --check, --sample, --fired-only):
  *   --per-band <n>          items sampled per score band (default 25; all of a band if fewer)
@@ -59,7 +68,8 @@ import { CHECK_SOURCES, type CheckSource } from "../src/checks/types.js";
 import { loadConfig } from "../src/config/index.js";
 import { createModelFromConfig } from "../src/agent/factory.js";
 import { DecisionClient } from "../src/decisions/client.js";
-import { decisionsFor, isDecisionModel } from "../src/decisions/config.js";
+import { decisionsFor, duplicateKnobs, isDecisionModel } from "../src/decisions/config.js";
+import { DEFAULT_DUPLICATE_WINDOW_MS, sampleDuplicateItems } from "../src/audit/duplicate-calibration.js";
 import {
   assertNoEndpointOverrides,
   createDecisionScorer,
@@ -131,12 +141,16 @@ const config = await loadConfig(configDir, { env: { envFile: flags.get("env") ??
 const labellerConfig = config.models[labellerKey] ?? fail(`--labeller ${labellerKey} is not a [models.*] key`);
 if (isDecisionModel(labellerConfig)) fail(`--labeller ${labellerKey} is a decision model; it must be a chat model`);
 const decisions = decisionsFor(config, flags.get("agent") ?? null);
-const memberKey = flags.get("member") ?? decisions.checks?.model ?? decisions.model ?? fail("--member is required (no [decisions] model)");
+const catalogue = buildCheckCatalogue(config);
+const agent = flags.get("agent") ?? null;
+const checkCode = flags.get("check");
+const duplicateCheck = checkCode !== undefined && catalogue.get(checkCode, agent)?.kind === "duplicate";
+// The duplicate check runs on its own chain (default [decisions].model, not the checks point's).
+const defaultMember = duplicateCheck ? duplicateKnobs(decisions).model : decisions.checks?.model ?? decisions.model;
+const memberKey = flags.get("member") ?? defaultMember ?? fail("--member is required (no [decisions] model)");
 const memberConfig = config.models[memberKey] ?? fail(`--member ${memberKey} is not a [models.*] key`);
 if (!isDecisionModel(memberConfig)) fail(`--member ${memberKey} must be a system-one decision model`);
 
-const catalogue = buildCheckCatalogue(config);
-const agent = flags.get("agent") ?? null;
 const sourceFlag = flags.get("source");
 if (sourceFlag !== undefined && !(CHECK_SOURCES as readonly string[]).includes(sourceFlag)) {
   fail(`--source must be one of ${CHECK_SOURCES.join(", ")}`);
@@ -250,7 +264,18 @@ if (anyRefusal) {
 const code = required("check");
 const check = catalogue.get(code, agent) ?? fail(`unknown check ${code}`);
 const source = (sourceFlag ?? (checkpoint === "send" ? "message" : "text")) as CheckSource;
-const question = check.questions.find((q) => q.source === source) ?? fail(`check ${code} has no question over ${source}`);
+const questionName = flags.get("question");
+const question = questionName !== undefined
+  ? (check.questions.find((q) => q.name === questionName) ??
+    fail(`check ${code} has no question named ${questionName} (${check.questions.map((q) => q.name ?? q.source).join(", ")})`))
+  : (() => {
+      const matching = check.questions.filter((q) => q.source === source);
+      if (matching.length > 1) {
+        fail(`check ${code} has several questions over ${source}; pick one with --question (${matching.map((q) => q.name ?? q.source).join(", ")})`);
+      }
+      return matching[0] ?? fail(`check ${code} has no question over ${source}`);
+    })();
+if (duplicateCheck && checkpoint !== "send") fail("the duplicate check judges sends: --checkpoint send");
 const scorer = createDecisionScorer({
   client,
   memberKey,
@@ -263,12 +288,27 @@ const scorer = createDecisionScorer({
 
 const db = openReadOnly(dbPath);
 try {
+  const knobs = duplicateKnobs(decisions);
+  const sampled = duplicateCheck
+    ? sampleDuplicateItems(db, {
+        sample: num("sample", 200),
+        seed: num("seed", 1),
+        ...(sinceMs !== undefined ? { since: sinceMs } : {}),
+        windowMs: num("window-ms", DEFAULT_DUPLICATE_WINDOW_MS),
+        maxEarlier: knobs.maxEarlier,
+        earlierMaxTokens: knobs.earlierMaxTokens,
+        proactiveSessionType: config.proactive?.session_type ?? "proactive",
+        codes: new Set(catalogue.all(agent).filter((c) => c.kind === "duplicate").map((c) => c.code)),
+        ...(switches.has("fired-only") ? { firedOnly: true } : {}),
+      })
+    : undefined;
   const report = await runCalibration({
     db,
     catalogue,
     check,
     question,
     checkpoint,
+    ...(sampled ? { sampled } : {}),
     sample: num("sample", 200),
     ...(switches.has("fired-only") ? { firedOnly: true } : {}),
     seed: num("seed", 1),

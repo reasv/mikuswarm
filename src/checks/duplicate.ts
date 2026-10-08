@@ -130,12 +130,13 @@ export function withSeenStamp<T extends object>(message: T, stamp: SeenStamp): T
  * Fold a session's live messages into what it has seen. `rejections` maps a
  * tool call id to the messages its duplicate rejection quoted; they count as
  * seen while that call's tool result, carrying the rejection, is on the list.
- * A legacy transcript without a build stamp falls back to its head turn's
- * timestamp.
+ * A legacy transcript without a build stamp falls back to `fallbackSince`
+ * (e.g. the session's start), else its head turn's timestamp.
  */
 export function seenFromMessages(
   messages: readonly unknown[],
   rejections: ReadonlyMap<string, readonly string[]> = new Map(),
+  fallbackSince?: number,
 ): SeenState {
   const state: SeenState = { watermarks: new Map(), eventIds: new Set() };
   let headTimestamp: number | undefined;
@@ -164,7 +165,8 @@ export function seenFromMessages(
       }
     }
   }
-  if (state.since === undefined && headTimestamp !== undefined) state.since = headTimestamp;
+  if (state.since === undefined) state.since = fallbackSince ?? headTimestamp;
+  if (state.since === undefined) delete state.since;
   return state;
 }
 
