@@ -15,6 +15,7 @@ import type { YotsubaPreviewPayload, YotsubaPostNode, YotsubaPostFile } from "..
 import { backlinksLine, fileElement, omittedElement, threadOpenTag, boardLabel } from "../yotsuba/format.js";
 import type { FileRenderInfo } from "../yotsuba/format.js";
 import { escapeAttr, escapeXml } from "./xml.js";
+import { deletedPlaceholder } from "../timeline/deletions.js";
 import { compactAgentTimestamp, formatAgentTimestamp } from "../time/index.js";
 
 export type RenderTier = "rich" | "compact";
@@ -98,9 +99,38 @@ export interface RenderRichOptions {
    * compact prefix byte-identical (§4.3). Undefined for every non-live-build caller.
    */
   claimedBy?: (externalId: string) => { sessionId?: string } | undefined;
+  /**
+   * Render a deleted message (`event.deleted`) as the deletion placeholder: the
+   * envelope (sender, time, ids) and `[message deleted]`, never its content.
+   * Set by the recent tiers and level-1 summary inputs (ARCHITECTURE.md §6
+   * "Message edits"); search and the history tools leave it unset and render the
+   * stored content.
+   */
+  deletedPlaceholder?: boolean;
+}
+
+/** Options of {@link renderCompactMessage}. */
+export interface RenderCompactOptions {
+  /** As {@link RenderRichOptions.deletedPlaceholder}. */
+  deletedPlaceholder?: boolean;
+}
+
+/** The recent tiers' rich renderer: a deleted message shows the deletion placeholder. */
+export function renderRecentRichMessage(event: CanonicalChatEvent, opts?: RenderRichOptions): string {
+  return renderRichMessage(event, { ...opts, deletedPlaceholder: true });
+}
+
+/** The recent tiers' compact renderer: a deleted message shows the deletion placeholder. */
+export function renderRecentCompactMessage(event: CanonicalChatEvent): string {
+  return renderCompactMessage(event, { deletedPlaceholder: true });
 }
 
 export function renderRichMessage(event: CanonicalChatEvent, opts?: RenderRichOptions): string {
+  // Deleted (recent tiers only): the envelope without content-derived attributes,
+  // and the placeholder in place of everything the message carried.
+  if (opts?.deletedPlaceholder && event.deleted) {
+    return `<message ${buildMessageAttrs(event, { content: false })}>\n${escapeXml(deletedPlaceholder(event.deleted, event.sender.id))}\n</message>`;
+  }
   const attrs = buildMessageAttrs(event);
 
   // UTD: keep the <message> envelope (sender/time attrs) but emit only the lock
@@ -160,9 +190,14 @@ function renderReactions(reactions: ReactionAggregate[]): string {
   return `<reactions>${items}</reactions>`;
 }
 
-export function renderCompactMessage(event: CanonicalChatEvent): string {
+export function renderCompactMessage(event: CanonicalChatEvent, opts?: RenderCompactOptions): string {
   const time = compactTime(event.timestamp);
   const sender = compactSenderLabel(event);
+
+  // Deleted (recent tiers only): the `[time] sender:` prefix and the placeholder.
+  if (opts?.deletedPlaceholder && event.deleted) {
+    return `[${time}] ${sender}: ${deletedPlaceholder(event.deleted, event.sender.id)}`;
+  }
 
   // UTD: keep the `[time] sender:` prefix but emit only the lock placeholder,
   // never the body/attachments (absent and never to be leaked).
@@ -182,7 +217,7 @@ export function renderCompactMessage(event: CanonicalChatEvent): string {
   return `[${time}] ${sender}${reply}: ${truncate(normalizeWhitespace(event.body), 6000)}${attachments}${linked}${links}${crossNote}`;
 }
 
-function buildMessageAttrs(event: CanonicalChatEvent): string {
+function buildMessageAttrs(event: CanonicalChatEvent, opts?: { content?: boolean }): string {
   // §6.2 rendering rule: human-facing label is `username ?? id`; raw `id` is
   // reserved for `external_id` only (the declared exception for tool addressing).
   const handle = event.sender.username ?? event.sender.id;
@@ -193,7 +228,7 @@ function buildMessageAttrs(event: CanonicalChatEvent): string {
     pairs.push(["display_name", truncate(event.sender.displayName, MAX_DISPLAY_NAME)]);
   }
   pairs.push(["time", formatAgentTimestamp(event.timestamp)]);
-  if (event.mentions?.mentionedSelf) pairs.push(["mentions_you", "true"]);
+  if (opts?.content !== false && event.mentions?.mentionedSelf) pairs.push(["mentions_you", "true"]);
   if (event.externalId) pairs.push(["external_id", event.externalId]);
   if (event.agentSessionId) pairs.push(["agent_session_id", event.agentSessionId]);
   return pairs.map(([k, v]) => `${k}="${escapeAttr(v)}"`).join(" ");
@@ -212,6 +247,12 @@ function renderReply(reply: ReplyContext): string {
   if (reply.timestamp) pairs.push(["time", formatAgentTimestamp(reply.timestamp)]);
   if (reply.externalId) pairs.push(["external_id", reply.externalId]);
   if (reply.agentSessionId) pairs.push(["agent_session_id", reply.agentSessionId]);
+
+  const attrStrDeleted = pairs.map(([k, v]) => `${k}="${escapeAttr(v)}"`).join(" ");
+  // A quote of a deleted message shows the placeholder, never the stored quote.
+  if (reply.deleted) {
+    return `<reply_to ${attrStrDeleted}>\n${escapeXml(deletedPlaceholder(reply.deleted, reply.sender?.id))}\n</reply_to>`;
+  }
 
   const innerParts: string[] = [];
   if (reply.body && reply.body.trim().length > 0) innerParts.push(escapeXml(reply.body));
@@ -591,6 +632,10 @@ function compactReply(reply: ReplyContext): string {
     // providers without one (Matrix) fall back to "unknown", preserving pre-3a byte-identity.
     : (reply.sender?.username != null ? replyHandle : "unknown");
   const time = reply.timestamp ? ` At: ${compactTime(reply.timestamp)}` : "";
+  // A quote of a deleted message shows the placeholder, never the stored quote.
+  if (reply.deleted) {
+    return `\n\n(Replying to: > [From: ${senderDisplay}${time}]: ${deletedPlaceholder(reply.deleted, reply.sender?.id)})\n\n`;
+  }
   const body = reply.body ? `: ${truncate(normalizeWhitespace(reply.body), 4096)}` : "";
   // Reply-context media is carried at compact tier too (it was previously
   // dropped): a reply to a media-only message must not render as empty.

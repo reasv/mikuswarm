@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { startHarness, type AppHarness } from "./helpers/app-harness.js";
 import { isRecordTurnRequest, messageText, type FakeLlmReply, type FakeLlmRequest } from "./helpers/fake-llm.js";
+import type { CanonicalChatEvent } from "../src/types.js";
 
 const LATE = (over: Record<string, number> = {}): string => {
   const knobs = { hold_ms: 1500, extend_ms: 500, max_hold_ms: 5000, first_event_wait_ms: 3000, ...over };
@@ -168,8 +169,13 @@ test("late input: deleting the trigger before anything was sent cancels the sess
     assert.equal(h.sends.length, 0, "nothing sent");
     assert.equal(sessionRows(h)[0]!.status, "discarded");
     assert.ok(hasLog(h, "late_input_cancelled"));
-    const [row] = h.query<{ body: string }>("select body from timeline_events where external_id = ?", id);
-    assert.equal(row?.body, "oops wrong room", "a deletion never changes stored history");
+    const [row] = h.query<{ body: string; event_json: string }>("select body, event_json from timeline_events where external_id = ?", id);
+    assert.equal(row?.body, "oops wrong room", "a deletion keeps the stored content");
+    const stored = JSON.parse(row!.event_json) as CanonicalChatEvent;
+    assert.equal(stored.body, "oops wrong room");
+    assert.equal(typeof stored.deleted?.at, "number", "the deletion is marked with its time");
+    assert.equal(stored.deleted?.by, undefined, "a deletion without a known deleter (Discord) records none");
+    assert.ok(!hasLog(h, "edit_applied"), "a deletion is not applied as an edit");
   } finally {
     await h.stop();
   }
@@ -183,19 +189,20 @@ test("late input: a Matrix redaction of the trigger by its sender cancels the se
   try {
     const id = h.say("oops wrong room", { mention: true });
     await h.until(() => h.llm.requests.length >= 1, "first request");
-    h.redact(id);
+    h.redact(id, { timestamp: 4_242 });
     await h.until(settledAll(h), "settled");
     assert.equal(h.sends.length, 0, "nothing sent");
     assert.equal(sessionRows(h)[0]!.status, "discarded");
     assert.ok(hasLog(h, "late_input_cancelled"));
-    const [row] = h.query<{ body: string }>("select body from timeline_events where external_id = ?", id);
-    assert.equal(row?.body, "oops wrong room", "a deletion never changes stored history");
+    const [row] = h.query<{ body: string; event_json: string }>("select body, event_json from timeline_events where external_id = ?", id);
+    assert.equal(row?.body, "oops wrong room", "a deletion keeps the stored content");
+    assert.deepEqual((JSON.parse(row!.event_json) as CanonicalChatEvent).deleted, { at: 4_242, by: "@alice:fake" });
   } finally {
     await h.stop();
   }
 });
 
-test("late input: a moderator's redaction of the trigger changes nothing", async () => {
+test("late input: a moderator's redaction of the trigger only marks the message", async () => {
   const h = await startHarness({
     toml: LATE(),
     script: (req) => (isRecordTurnRequest(req) ? { text: "NO_REPLY" } : { ...send("answer"), delayMs: 500 }),
@@ -207,8 +214,9 @@ test("late input: a moderator's redaction of the trigger changes nothing", async
     await h.until(() => settledAll(h)() && h.sends.length >= 1, "answered");
     assert.ok(!hasLog(h, "late_input_cancelled"));
     assert.ok(hasLog(h, "late_input_ignored", { reason: "deleted_by_other" }));
-    const [row] = h.query<{ body: string }>("select body from timeline_events where external_id = ?", id);
-    assert.equal(row?.body, "a question", "a deletion never changes stored history");
+    const [row] = h.query<{ body: string; event_json: string }>("select body, event_json from timeline_events where external_id = ?", id);
+    assert.equal(row?.body, "a question", "a deletion keeps the stored content");
+    assert.equal((JSON.parse(row!.event_json) as CanonicalChatEvent).deleted?.by, "@mod:fake", "the moderator is recorded");
   } finally {
     await h.stop();
   }

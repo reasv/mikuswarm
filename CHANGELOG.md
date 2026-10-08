@@ -46,8 +46,8 @@ Unreleased section; it is not part of any release's notes.
   fresh session that such a follow-up used to start. A reply to the request belongs to
   it without any judgement; after the run ended it triggers like a reply to the bot's
   message. A Matrix redaction of a message is a deletion like a Discord one (only the
-  sender's own redaction withdraws a request; a moderator's only updates the stored
-  message), and a session evicted by a restart cannot be revived.
+  sender's own redaction withdraws a request; a moderator's leaves the request alone),
+  and a session evicted by a restart cannot be revived.
   A discarded rollout is kept as a branch with the message that caused it. The console
   session view labels redo, revival and aborted-turn branches with that message, shows
   how long a call was held, labels each interjection's kind, and marks redone sessions
@@ -55,6 +55,16 @@ Unreleased section; it is not part of any release's notes.
   behaviour statistics and the send-contract records. Database schema v30 adds
   `agent_sessions.redo_count`, `agent_session_branches.cause_event_id` and
   `usage_events.estimated`. See ARCHITECTURE.md §8 "Late input".
+- **Deleted messages show as deleted** (Discord and Matrix). A deleted Discord message
+  or a redacted Matrix message keeps its stored content and gets a deletion marker
+  (when, and by whom when Matrix says). Sessions then see it as a placeholder in their
+  recent history, the way clients show it: its place, its sender and
+  `[message deleted]` (`[message deleted by <moderator>]` when someone else deleted
+  it), never its text, attachments or captions. Quotes of it, the decision points'
+  recent chat, and a level-1 summary written after the deletion show the same
+  placeholder. Search, `read_messages` and the other history tools still show the
+  message, and summaries written before the deletion are never remade. See
+  ARCHITECTURE.md §6 "Message edits" and §9 "Deleted messages".
 - **Tool effect classes.** Every tool is classified as `redo_safe` (no external
   effect), `repeatable` (no visible effect, but repeating it costs money or time),
   `undoable` (`react`, pinning and unpinning) or `irreversible`. MCP tools take their
@@ -300,6 +310,13 @@ Unreleased section; it is not part of any release's notes.
 
 ### Changed
 
+- **A deletion no longer wipes the stored message.** A Discord deletion used to empty
+  the stored message's body and attachments through the edit path (and a Matrix
+  redaction did the same for a short time), re-indexing and re-summarizing it. Now
+  only the deletion marker is recorded, and nothing is re-indexed, re-enriched or
+  re-summarized. Database schema v31 marks the messages the old path wiped (their
+  content cannot be recovered), so they show as the placeholder instead of an empty
+  message.
 - **A reply to the bot always triggers.** A reply to a bot message starts a session like a
   mention does, whatever `[agent.sessions.resume]` says. Before, a reply without a mention
   (such as a Discord reply with the ping turned off) triggered only where resume was on.

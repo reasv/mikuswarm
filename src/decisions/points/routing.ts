@@ -10,6 +10,7 @@
  */
 
 import type { AppConfig } from "../../config/index.js";
+import { deletedPlaceholder } from "../../timeline/deletions.js";
 import type { DecisionsRawConfig } from "../../config/schema.js";
 import type { DecisionPoint } from "../registry.js";
 import { clipText, packNewest } from "../state.js";
@@ -252,14 +253,16 @@ export function routingInputFrom(args: {
 }): RoutingInput {
   const request: RoutingInput["request"] = toTranscriptMessage(args.trigger, 2000);
   const reply = args.trigger.replyTo;
-  if (reply && (reply.body || reply.sender)) {
-    request.reply_to = { from: senderName(reply.sender), text: clipText(reply.body ?? "", 600) };
+  if (reply && (reply.body || reply.sender || reply.deleted)) {
+    // A quote of a deleted message shows the placeholder (§6 "Message edits").
+    const text = reply.deleted ? deletedPlaceholder(reply.deleted, reply.sender?.id) : clipText(reply.body ?? "", 600);
+    request.reply_to = { from: senderName(reply.sender), text };
   }
   const limit = args.routing.recent_messages ?? 10;
   const recent = args.recent
     .filter((event) => event.id !== args.trigger.id)
     .slice(-limit)
-    .map((event) => toTranscriptMessage(event, 400));
+    .map((event) => toTranscriptMessage(event, 400, { deletedPlaceholder: true }));
   return {
     request,
     recent,

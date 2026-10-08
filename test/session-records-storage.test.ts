@@ -25,8 +25,8 @@ async function withStorage(fn: (storage: Storage) => Promise<void>): Promise<voi
 
 // ── migration: schema version and table existence ─────────────────────────────
 
-test("migration: LATEST_SCHEMA_VERSION is 30", () => {
-  assert.equal(LATEST_SCHEMA_VERSION, 30);
+test("migration: LATEST_SCHEMA_VERSION is 31", () => {
+  assert.equal(LATEST_SCHEMA_VERSION, 31);
 });
 
 test("migration: session_records table exists in a fresh DB", async () => {

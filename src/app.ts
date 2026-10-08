@@ -26,7 +26,9 @@ import {
   applyEditToCanonical,
   AssistantEchoResolver,
   channelTypeOf,
+  deletedPlaceholder,
   editStatus,
+  markDeletedReplyTargets,
   needsEnrichment,
   roomIdFromTimelineKey,
   sendViaProvider,
@@ -2097,7 +2099,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     const [trigger, ...recent] = hydrateEvents(storage, [stored, ...latest.filter((e) => e.id !== stored.id)]);
     return {
       request: trigger ? [toTranscriptMessage(trigger, 1200)] : [],
-      recent: recent.slice(-recentMessages).map((event) => toTranscriptMessage(event, 400)),
+      recent: recent.slice(-recentMessages).map((event) => toTranscriptMessage(event, 400, { deletedPlaceholder: true })),
     };
   };
 
@@ -2954,7 +2956,10 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
             );
             const last = events[events.length - 1];
             const before = last && last.body === session.trigger_body ? events.slice(0, -1) : events;
-            return before.slice(-limit).map((event) => toTranscriptMessage(event, 400));
+            // As the chat stood when the session ran: a message deleted later shows.
+            return before
+              .slice(-limit)
+              .map((event) => toTranscriptMessage(event, 400, { deletedPlaceholder: session.created_at }));
           },
           // Stop claiming while every member of the audit chain is over an `audit` budget.
           shouldPause: () => {
@@ -3538,19 +3543,28 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       if (!storedKey) return;
       inbound = { ...inbound, timelineKey: storedKey, event: { ...inbound.event, timelineKey: storedKey } };
     }
-    // A deletion never changes stored history: the message stays in the timeline,
-    // summaries and search as it was. It only corrects a request still being
-    // answered (late input); `after` is the deleted view, built in memory.
+    // A deletion only marks the stored message (when, and by whom when the
+    // provider says), keeping its content (§6 "Message edits"): the recent tiers
+    // render it as a placeholder, search and summaries keep it. Nothing is
+    // re-indexed, re-summarized or re-enriched, and no quote is touched. A
+    // message the store does not have is dropped, never parked. It also corrects
+    // a request still being answered (late input); `after` is the deleted view,
+    // built in memory. A repeated deletion changes nothing.
     if (inbound.edit!.deleted === true) {
-      const stored = lateInputSettings.enabled
-        ? timeline.getByExternalId(inbound.provider, targetExternalId, inbound.timelineKey)
-        : undefined;
+      const deletedBy = inbound.edit!.deletedBy;
+      const marked = await timeline.markDeleted(inbound.provider, targetExternalId, inbound.timelineKey, {
+        at: inbound.event.timestamp,
+        ...(deletedBy !== undefined ? { by: deletedBy } : {}),
+      });
       logger.info("message_deletion_observed", {
         timelineKey: inbound.timelineKey,
         targetExternalId,
-        stored: stored !== undefined,
+        stored: marked !== undefined,
+        ...(marked ? { marked: marked.changed } : {}),
       });
-      if (stored) onRequestEdited(inbound, stored, { ...stored, body: "", attachments: [] });
+      if (!marked?.changed) return;
+      const { deleted: _marker, ...prior } = marked.event;
+      onRequestEdited(inbound, prior, { ...prior, body: "", attachments: [] });
       return;
     }
     // Late input (§8 "Late input"): the message before the edit, for the request
@@ -3692,12 +3706,13 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     groupIds.add(triggerEventId);
 
     const lookbackMs = config.matrix.trigger_group_lookback_ms ?? 20_000;
+    // A deleted message never joins a request (users no longer see it).
     const lookback = timeline.query({
       timelineKey: inbound.timelineKey,
       toTimestamp: inbound.event.timestamp,
       fromTimestamp: inbound.event.timestamp - lookbackMs,
       limit: 50,
-    });
+    }).filter((event) => !event.deleted);
 
     let attachmentEventIndex = -1;
     for (let i = lookback.length - 1; i >= 0; i--) {
@@ -4204,6 +4219,8 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         attachments: hydratedTarget.attachments,
         linkedMedia: hydratedTarget.linkedMedia,
         linkPreviews: hydratedTarget.linkPreviews,
+        // A quote of a deleted message shows the placeholder (§6 "Message edits").
+        ...(target.deleted ? { deleted: target.deleted } : {}),
       },
     };
   }
@@ -5161,7 +5178,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     const spawnHint = externalId
       ? `call spawn_session(message_id="${escapeAttr(externalId)}")`
       : `handle it separately`;
-    const rendered = renderRichMessage(hydrated);
+    // A quote of a deleted message shows the placeholder (§6 "Message edits").
+    const [shown] = markDeletedReplyTargets([hydrated], (timelineKey, ids) => storage.getDeletedMessages(timelineKey, ids));
+    const rendered = renderRichMessage(shown!);
     if (form === "media") {
       return (
         `<interjection reason="follow-up-media">\n` +
@@ -5584,7 +5603,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
 
   /**
    * A trigger-group message was edited or deleted (§8 "Late input"). Called by
-   * `applyEdit` once the stored row changed (a deletion: without changing it). Edits by anyone but the message's
+   * `applyEdit` once the stored row changed (a deletion: once it is first marked). Edits by anyone but the message's
    * own human sender are content updates only; a formatting-only edit is a no-op.
    */
   function onRequestEdited(inbound: InboundChatEvent, prior: CanonicalChatEvent, after: CanonicalChatEvent): void {
@@ -5595,7 +5614,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       if (!deleted) maybeTriggerOnAddedMention(inbound, prior, after);
       return;
     }
-    // A deletion by someone else (a moderator's redaction) only updates the
+    // A deletion by someone else (a moderator's redaction) only marks the
     // stored message; one by an unknown deleter (a Discord deletion) is the sender's.
     if (deleted && inbound.edit?.deletedBy !== undefined && inbound.edit.deletedBy !== prior.sender.id) {
       logger.info("late_input_ignored", { sessionId: entry.sessionId, kind: "delete", reason: "deleted_by_other" });
@@ -7576,6 +7595,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       const sender = inbound.trigger?.triggeredBy ?? inbound.event.sender;
       const nameOf = (e: { sender?: { displayName?: string; username?: string; id?: string } }) =>
         e.sender?.displayName ?? e.sender?.username ?? e.sender?.id ?? "unknown";
+      const recordsText = (e: CanonicalChatEvent) => (e.deleted ? deletedPlaceholder(e.deleted, e.sender?.id) : e.body ?? "");
       // The trigger's media as the routing point renders it (captions, link
       // previews), off the hydrated stored event.
       const storedTrigger = timeline.getById(inbound.event.id) ?? inbound.event;
@@ -7584,11 +7604,12 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         from: nameOf({ sender }),
         text: inbound.event.body ?? "",
         ...(attachments?.length ? { attachments } : {}),
-        ...(replyEvent ? { reply_to: { from: nameOf(replyEvent), text: replyEvent.body ?? "" } } : {}),
+        ...(replyEvent ? { reply_to: { from: nameOf(replyEvent), text: recordsText(replyEvent) } } : {}),
       };
+      // The recent chat as the tiers show it: a deleted message is its placeholder.
       const chat = window.map((e) => ({
         from: nameOf(e),
-        text: e.body ?? "",
+        text: recordsText(e),
         age: ageLabel(inbound.event.timestamp, e.timestamp),
         ...(e.role === "assistant" || e.sender?.isSelf ? { self: true as const } : {}),
       }));
@@ -7599,7 +7620,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           record: ownRecord(replyTarget)!.text,
           isReplyTarget: true,
           request,
-          replyTo: { from: nameOf(replyEvent!), text: replyEvent!.body ?? "" },
+          replyTo: { from: nameOf(replyEvent!), text: recordsText(replyEvent!) },
         });
       }
       for (const row of recent) {
@@ -8128,7 +8149,11 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
       const before = limit > 0
         ? timeline.query({ timelineKey: session.timelineKey, toTimestamp: stored.timestamp, limit: limit + 1 })
         : [];
-      const [trigger, ...recent] = hydrateEvents(storage, [stored, ...before]);
+      // A quote of a deleted message shows the placeholder (§6 "Message edits").
+      const [trigger, ...recent] = markDeletedReplyTargets(
+        hydrateEvents(storage, [stored, ...before]),
+        (timelineKey, ids) => storage.getDeletedMessages(timelineKey, ids),
+      );
       const input = routingInputFrom({ trigger: trigger!, recent, listedSkills, routing: routingConfig });
       if (!routingHasQuestions(input)) return undefined;
       const outcome = await decisionEngine.evaluate(routingPoint, input, {

@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import type { Storage, TimelineCompactionState, TimelineCursor } from "../storage/index.js";
-import type { CanonicalChatEvent, TimelineState } from "../types.js";
+import type { CanonicalChatEvent, DeletionMarker, TimelineState } from "../types.js";
 import { applyEditToCanonical, editStatus, type EditReplacement } from "./edits.js";
 
 export interface TimelineQuery {
@@ -222,6 +222,8 @@ export class TimelineStore {
         // persists text/html only); the echo's attachments hold the mxc refs the
         // enrichment worker downloads from. Never clobber them.
         attachments: event.attachments?.length ? event.attachments : existing.attachments,
+        // A deletion already recorded on the echo-created row stays recorded.
+        ...(existing.deleted ? { deleted: existing.deleted } : {}),
       };
       db.prepare(
         `update timeline_events
@@ -474,6 +476,19 @@ export class TimelineStore {
       updater,
       computeStatus,
     );
+  }
+
+  /**
+   * Mark a stored message deleted, keeping its content (see
+   * {@link Storage.markTimelineEventDeleted}). `undefined` when it is not stored.
+   */
+  markDeleted(
+    provider: string,
+    externalId: string,
+    timelineKey: string,
+    marker: DeletionMarker,
+  ): Promise<{ event: CanonicalChatEvent; changed: boolean } | undefined> {
+    return this.storage.markTimelineEventDeleted(provider, externalId, timelineKey, marker);
   }
 
   setTriggerGroup(triggerEventId: string, eventIds: string[]): Promise<void> {

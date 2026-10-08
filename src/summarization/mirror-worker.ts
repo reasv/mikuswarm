@@ -6,7 +6,7 @@ import type { Logger } from "../observability/index.js";
 import type { SummarizationIndexer } from "./indexer.js";
 import type { AppConfig } from "../config/index.js";
 import { estimateTokens } from "../context/tokens.js";
-import { renderCompactMessage, renderRichMessage } from "../context/renderer.js";
+import { renderRecentCompactMessage, renderRecentRichMessage } from "../context/renderer.js";
 import { hydrateEvents } from "../context/hydrate.js";
 import { selectSummaryCoverage } from "../context/summary-layer.js";
 import type { TimelineStore } from "../timeline/index.js";
@@ -399,19 +399,19 @@ export class MirrorWorker {
       : store.queryForContext(secondaryKey, store.getCompactionState(secondaryKey));
     if (rawEvents.length === 0) return;
     const events = hydrateEvents(storage, rawEvents);
-    // Carve off the rich tail (mirrors indexer logic — uses renderRichMessage so
+    // Carve off the rich tail (mirrors indexer logic — uses the recent renderers so
     // the token estimate for native-flip eligibility matches the indexer's threshold).
     const richTarget = tiers.rich_target_tokens;
     let richTailTokens = 0;
     let richTailStart = events.length;
     for (let i = events.length - 1; i >= 0; i--) {
       if (richTailTokens >= richTarget) break;
-      richTailTokens += estimateTokens(renderRichMessage(events[i]!));
+      richTailTokens += estimateTokens(renderRecentRichMessage(events[i]!));
       richTailStart = i;
     }
     const compactEvents = events.slice(0, richTailStart);
     const compactTotal = compactEvents.reduce(
-      (sum, e) => sum + estimateTokens(renderCompactMessage(e)),
+      (sum, e) => sum + estimateTokens(renderRecentCompactMessage(e)),
       0,
     );
     const threshold = config.generation_threshold_tokens ?? 6000;

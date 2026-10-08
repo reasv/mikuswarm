@@ -3,7 +3,7 @@ import type { ExaResearchRequest, ExaRun } from "../exa/types.js";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "../observability/index.js";
-import type { AttachmentMeta, CanonicalChatEvent, MentionInfo, TimelineState } from "../types.js";
+import type { AttachmentMeta, CanonicalChatEvent, DeletionMarker, MentionInfo, TimelineState } from "../types.js";
 import { nanoid } from "nanoid";
 import type { RawTokenUsage, SessionUsageTotals } from "../agent/usage.js";
 import { buildTimelineKey, parseTimelineKey, roomIdFromTimelineKeyOpt, threadKeyLikePattern } from "./timeline-key.js";
@@ -3900,6 +3900,69 @@ export class Storage {
       }
       return { applied: true, event: updated, status };
     });
+  }
+
+  /**
+   * Record that a stored message was deleted (ARCHITECTURE.md §6 "Message
+   * edits"): sets `deleted = marker` in its `event_json` and changes nothing
+   * else (not the body, attachments, other columns, `updated_at`, quotes or any
+   * index; no trigger watches `event_json`). Located like an edit target, by
+   * `(provider, externalId, timelineKey)`. Idempotent: an already-deleted message
+   * keeps its first marker (`changed: false`). `undefined` when no such message
+   * is stored: a deletion is never parked.
+   */
+  markTimelineEventDeleted(
+    provider: string,
+    externalId: string,
+    timelineKey: string,
+    marker: DeletionMarker,
+  ): Promise<{ event: CanonicalChatEvent; changed: boolean } | undefined> {
+    return this.write((db) => {
+      const row = db
+        .prepare(
+          `select id, event_json from timeline_events
+           where provider = ? and external_id = ? and timeline_key = ? limit 1`,
+        )
+        .get(provider, externalId, timelineKey) as { id: string; event_json: string } | undefined;
+      if (!row) return undefined;
+      const existing = JSON.parse(row.event_json) as CanonicalChatEvent;
+      if (existing.deleted) return { event: existing, changed: false };
+      const deleted: DeletionMarker = { at: marker.at, ...(marker.by !== undefined ? { by: marker.by } : {}) };
+      const updated: CanonicalChatEvent = { ...existing, deleted };
+      db.prepare(`update timeline_events set event_json = ? where id = ?`).run(JSON.stringify(updated), row.id);
+      return { event: updated, changed: true };
+    });
+  }
+
+  /**
+   * The deletion markers of the deleted messages among `externalIds` stored in
+   * the room of `timelineKey` or one of its threads (scoped like
+   * {@link getEditedBody}), keyed by external id. Used to render a quote of a
+   * deleted message as the deletion placeholder.
+   */
+  getDeletedMessages(timelineKey: string, externalIds: readonly string[]): Map<string, DeletionMarker> {
+    const found = new Map<string, DeletionMarker>();
+    const parsed = parseTimelineKey(timelineKey);
+    if (!parsed || externalIds.length === 0) return found;
+    const roomKey = buildTimelineKey({ ...parsed, threadId: undefined });
+    const unique = [...new Set(externalIds)];
+    this.read((db) => {
+      for (let i = 0; i < unique.length; i += 400) {
+        const chunk = unique.slice(i, i + 400);
+        const rows = db
+          .prepare(
+            `select external_id, json_extract(event_json, '$.deleted') as deleted from timeline_events
+             where provider = ? and external_id in (${chunk.map(() => "?").join(", ")})
+               and (timeline_key = ? or timeline_key like ? escape '\\')
+               and json_extract(event_json, '$.deleted') is not null`,
+          )
+          .all(parsed.provider, ...chunk, roomKey, threadKeyLikePattern(roomKey)) as Array<{ external_id: string; deleted: string }>;
+        for (const r of rows) {
+          if (!found.has(r.external_id)) found.set(r.external_id, JSON.parse(r.deleted) as DeletionMarker);
+        }
+      }
+    });
+    return found;
   }
 
   /**
@@ -12627,7 +12690,7 @@ ${EXA_RESEARCH_SCHEMA}`;
 // in place (it stays idempotent) and, only if a column/table rename or a data
 // transform on existing rows is needed that `create if not exists` cannot
 // express, bump LATEST_SCHEMA_VERSION and add an ordered step to MIGRATIONS.
-export const LATEST_SCHEMA_VERSION = 30;
+export const LATEST_SCHEMA_VERSION = 31;
 
 /**
  * v1 → v2 (data-only, no DDL): one-off cleanup of duplicated bot self-messages.
@@ -13617,6 +13680,30 @@ function addLateInputColumns(db: Database.Database): void {
   }
 }
 
+/**
+ * v30→v31 (data-only, ARCHITECTURE.md §6 "Message edits"): messages wiped by the
+ * old deletion path. A deletion used to go through the edit path as an empty
+ * replacement, leaving the row with an empty body, no attachments and
+ * `last_edit_timestamp` set to the deletion's time; the content is gone. Each
+ * such user message gets the deletion marker (`deleted.at` = that time, deleter
+ * unknown), so the recent tiers show the deletion placeholder instead of an
+ * empty message. Nothing else on the row changes. Idempotent: a row already
+ * marked is left alone.
+ */
+function markWipedDeletions(db: Database.Database): void {
+  const exists = (db.prepare(`select count(*) as n from sqlite_master where type = 'table' and name = 'timeline_events'`).get() as { n: number }).n > 0;
+  if (!exists) return;
+  db.prepare(
+    `update timeline_events
+     set event_json = json_set(event_json, '$.deleted', json_object('at', last_edit_timestamp))
+     where role = 'user'
+       and body = ''
+       and last_edit_timestamp is not null
+       and coalesce(json_array_length(json_extract(event_json, '$.attachments')), 0) = 0
+       and json_extract(event_json, '$.deleted') is null`,
+  ).run();
+}
+
 // Ordered migration steps, indexed so the step at index `i` migrates a database
 // at `user_version = i` up to `user_version = i + 1`. Index 0 (v0→v1) is
 // deliberately absent: a v0 stamp only ever belongs to a fresh DB, which SCHEMA
@@ -13655,6 +13742,7 @@ const MIGRATIONS: Array<((db: Database.Database) => void) | undefined> = [
   },                                   // v27→v28 paid service provenance
   (db) => db.exec(EXA_RESEARCH_SCHEMA),  // v28→v29 durable Exa research
   addLateInputColumns,                  // v29→v30 late input
+  markWipedDeletions,                   // v30→v31 deletion markers on wiped rows
 ];
 
 // PRAGMA user_version-based migration runner. Runs inside open()'s write

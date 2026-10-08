@@ -142,8 +142,20 @@ export interface AttachmentMeta {
   };
 }
 
+/** A message's deletion: when, and by whom when the provider says. */
+export interface DeletionMarker {
+  at: number;
+  by?: string;
+}
+
 export interface ReplyContext {
   externalId?: string;
+  /**
+   * The quoted message has been deleted: its marker. A render-time projection
+   * set for the recent tiers (never persisted): the quote then shows the
+   * deletion placeholder users see, never the stored content.
+   */
+  deleted?: DeletionMarker;
   /**
    * The quoted message's agent session (spec SESSION-RECORDS §5) when it is a
    * bot message sent from a session; rendered so a reply to a bot message
@@ -264,6 +276,17 @@ export interface CanonicalChatEvent {
    */
   undecryptable?: { sessionId?: string; reason?: string };
   /**
+   * Set when the message was deleted on its platform (a Discord deletion, a
+   * Matrix redaction): when (the deletion's own time) and by whom (`by`, when the
+   * provider says: a Matrix redaction's sender; absent for a Discord deletion).
+   * The stored body, attachments and everything else stay as they were. The
+   * recent-history tiers a session sees (and the decision points' recent-chat
+   * windows, and a level-1 summary's input) render a deleted message as a
+   * placeholder, as clients do; search, the history tools and existing summaries
+   * are unaffected (ARCHITECTURE.md §6 "Message edits").
+   */
+  deleted?: DeletionMarker;
+  /**
    * Cross-channel context note (spec CROSS-CHANNEL-MESSAGING §6). Stored locally
    * in `event_json` only — never transmitted over the wire. Set on
    * `send_dm` / `send_to_channel` assistant events; absent on all inbound events
@@ -313,16 +336,19 @@ export interface InboundChatEvent {
    */
   /**
    * An edit of `targetExternalId` (the replacement rides on `event`). `deleted`
-   * marks a deletion routed through the edit path as a tombstone (empty body).
+   * marks a deletion routed through the edit path: it carries no content, and
+   * the stored message only gains a deletion marker (`CanonicalChatEvent.deleted`,
+   * at `event.timestamp`); its content is never changed.
    */
   edit?: {
     targetExternalId: string;
     deleted?: true;
     /**
      * Who deleted the message, when the provider knows it (a Matrix redaction's
-     * sender). Only a deletion by the message's own sender withdraws it (late
-     * input); anyone else's is a content update only. Absent: unknown (a
-     * Discord deletion), taken as the sender's.
+     * sender). Recorded on the marker. Only a deletion by the message's own
+     * sender withdraws it from a running request (late input); anyone else's
+     * leaves the request alone. Absent: unknown (a Discord deletion), taken as
+     * the sender's.
      */
     deletedBy?: string;
     /**
