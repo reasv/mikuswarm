@@ -162,14 +162,14 @@ const DISTILLATION: ReasonText = {
 };
 const SAFETY: ReasonText = {
   grounds:
-    "because it considers the request harmful, dangerous, illegal or against a safety or content policy (for example weapons, malware, self-harm or violence)",
+    "because it considers the request harmful, dangerous, illegal or against a safety or content policy (for example weapons, malware, self-harm or violence), whether it says so or turns a real request down with a joke",
   notThis:
     "Adding a safety note while still answering is not this refusal. Telling the user no, warning them or advising against what they ask about (\"should I…?\"), or planning to, answers the request: it is not a refusal. " +
     "Declining on other grounds (sexual content, privacy, copyright, inability) is not this refusal either.",
 };
 const SEXUAL_CONTENT: ReasonText = {
   grounds:
-    "because the request involves sexual, lewd or NSFW content (explicit writing, erotic roleplay, sexual descriptions or images, or flirting and innuendo it will not engage with)",
+    "because the request involves sexual, lewd or NSFW content (explicit writing, erotic roleplay, sexual descriptions or images, or flirting and innuendo it will not engage with), whether it says so or turns a real request down with a joke",
   notThis:
     "Discussing sex, relationships or anatomy plainly, joking along, or answering a request that only mentions something sexual is not this refusal; declining on other grounds (violence, illegality, privacy, inability) is not this refusal either.",
 };
