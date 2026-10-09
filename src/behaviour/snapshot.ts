@@ -81,6 +81,8 @@ export interface CheckBehaviour {
   minChars: number | null;
   /** Short hash of the detection metadata (API signals, patterns, words, question texts). */
   detection: string;
+  /** The check's own judging chain head (`[checks.<code>].model`); absent = the point's chain. */
+  model?: string;
 }
 
 export interface DecisionPointBehaviour {
@@ -285,7 +287,9 @@ export function buildBehaviourSnapshot({ config, catalogue, code }: BuildBehavio
         thresholds: check.questions.map((q) => q.threshold),
         minChars: check.minChars ?? null,
         detection: detectionHash(check),
+        ...(check.model ? { model: check.model } : {}),
       };
+      if (check.model) reference(check.model);
     }
 
     const points: Record<string, DecisionPointBehaviour> = {};

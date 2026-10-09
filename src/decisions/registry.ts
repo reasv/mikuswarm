@@ -246,7 +246,8 @@ export interface EvaluateContext {
   /**
    * Run on this chain (a system-one `[models.*]` key) instead of the point's
    * `model`; the point's other settings apply. The duplicate check uses it
-   * (its chain defaults to `[decisions].model`, ARCHITECTURE.md §8j).
+   * (its chain defaults to `[decisions].model`, ARCHITECTURE.md §8j), and so
+   * does a check with its own `[checks.<code>].model`.
    */
   chainHead?: string;
 }

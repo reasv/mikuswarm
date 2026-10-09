@@ -102,6 +102,13 @@ export interface CheckDefinition {
   prefilter?: RegExp[];
   /** Style checks: skip messages shorter than this (overrides `[decisions.checks].style_min_chars`). */
   minChars?: number;
+  /**
+   * Head of the decision chain that judges this check's questions (a
+   * system-one `[models.*]` key), asked in a call of its own beside the
+   * point's calls, in the same evaluation. Undefined = the point's chain (the
+   * duplicate chain, for a duplicate check).
+   */
+  model?: string;
   questions: CheckQuestion[];
   builtin: boolean;
 }

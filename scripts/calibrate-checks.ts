@@ -26,8 +26,9 @@
  * Options:
  *   --config <dir>          config directory (default ./config); its .env is loaded over the shell's
  *   --env <file>            the .env file (default ./.env)
- *   --member <models key>   decision member to score with (default: the head of [decisions.checks].model,
- *                           else [decisions].model); only this member is called, never its fallbacks
+ *   --member <models key>   decision member to score with (default: the check's own chain head,
+ *                           [checks.<code>].model, else the head of [decisions.checks].model, else
+ *                           [decisions].model); only this member is called, never its fallbacks
  *   --checkpoint send|ending  (default send)
  *   --source <source>       which question of the check (default: message at send, text at ending)
  *   --question <name>       a named question of the check (e.g. the duplicate check's `repeats`);
@@ -46,8 +47,8 @@
  * rebuilt from history (src/audit/duplicate-calibration.ts): each posting call whose target timeline
  * holds messages of the same agent's other sessions that the session had not seen, the newest within
  * --window-ms of the draft (default 60000), judged over the live gate's `{ earlier, draft }` state.
- * The member defaults to the duplicate chain's head ([decisions.checks.duplicate].model, else
- * [decisions].model).
+ * The member defaults to the check's own chain head ([checks.<code>].model), else the duplicate
+ * chain's head ([decisions.checks.duplicate].model, else [decisions].model).
  *
  * --any-refusal options (instead of --check, --sample, --fired-only):
  *   --per-band <n>          items sampled per score band (default 25; all of a band if fewer)
@@ -480,9 +481,12 @@ if (memoryMode) {
 const catalogue = buildCheckCatalogue(config);
 const agent = flags.get("agent") ?? null;
 const checkCode = flags.get("check");
-const duplicateCheck = checkCode !== undefined && catalogue.get(checkCode, agent)?.kind === "duplicate";
-// The duplicate check runs on its own chain (default [decisions].model, not the checks point's).
-const defaultMember = duplicateCheck ? duplicateKnobs(decisions).model : decisions.checks?.model ?? decisions.model;
+const checkDef = checkCode !== undefined ? catalogue.get(checkCode, agent) : undefined;
+const duplicateCheck = checkDef?.kind === "duplicate";
+// A check with its own chain ([checks.<code>].model) is judged there; the duplicate
+// check runs on the duplicate chain (default [decisions].model, not the checks point's).
+const defaultMember =
+  checkDef?.model ?? (duplicateCheck ? duplicateKnobs(decisions).model : decisions.checks?.model ?? decisions.model);
 const memberKey = flags.get("member") ?? defaultMember ?? fail("--member is required (no [decisions] model)");
 const memberConfig = config.models[memberKey] ?? fail(`--member ${memberKey} is not a [models.*] key`);
 if (!isDecisionModel(memberConfig)) fail(`--member ${memberKey} must be a system-one decision model`);

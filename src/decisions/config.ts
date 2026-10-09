@@ -419,12 +419,14 @@ function collectChatModelRefs(config: AppConfig, decisionKeys: Set<string>): Arr
     // `[models.*]` is the registry itself (fallback chains are checked
     // separately), `[decisions]` is where decision models belong, and
     // `[[limits]].models` is a budget selector that may name any model.
-    if (top === "models" || top === "decisions" || top === "limits") continue;
+    // `[checks.<code>].model` names the decision model that judges the check
+    // (validateCheckModels).
+    if (top === "models" || top === "decisions" || top === "limits" || top === "checks") continue;
     if (top === "agents" && isPlainObject(value)) {
       for (const [agentName, block] of Object.entries(value)) {
         if (!isPlainObject(block)) continue;
         for (const [k, v] of Object.entries(block)) {
-          if (k === "decisions") continue;
+          if (k === "decisions" || k === "checks") continue;
           walk(v, `agents.${agentName}.${k}`, k);
         }
       }
@@ -475,6 +477,7 @@ export function validateDecisionsConfig(config: AppConfig, opts: DecisionValidat
     );
   }
   validateFilterModels(config, decisionKeys);
+  validateCheckModels(config, decisionKeys);
 
   const agentNames: Array<string | null> = [null, ...Object.keys(config.agents ?? {})];
   for (const agentName of agentNames) {
@@ -589,6 +592,37 @@ function validateFilterModels(config: AppConfig, decisionKeys: Set<string>): voi
   }
 }
 
+/**
+ * `[checks.<code>].model` and `[agents.<name>.checks.<code>].model` name the
+ * chain head that judges one check's questions (ARCHITECTURE.md §8j): a
+ * `[models.*]` block with `api = "system-one"`, like every decision chain.
+ */
+function validateCheckModels(config: AppConfig, decisionKeys: Set<string>): void {
+  for (const [code, raw] of Object.entries(config.checks ?? {})) {
+    requireDecisionModel(config, decisionKeys, raw?.model, `checks.${code}.model`);
+  }
+  for (const [name, block] of Object.entries(config.agents ?? {})) {
+    for (const [code, raw] of Object.entries(block?.checks ?? {})) {
+      requireDecisionModel(config, decisionKeys, raw?.model, `agents.${name}.checks.${code}.model`);
+    }
+  }
+}
+
+/**
+ * The check chain heads (`[checks.<code>].model`) an agent's calibration may
+ * apply to: the global ones and the agent's own; for the global table (null),
+ * every agent's too, since an agent without a `[decisions]` block inherits it.
+ */
+function checkModelHeads(config: AppConfig, agentName: string | null): string[] {
+  const heads: string[] = [];
+  for (const raw of Object.values(config.checks ?? {})) if (raw?.model) heads.push(raw.model);
+  for (const [name, block] of Object.entries(config.agents ?? {})) {
+    if (agentName !== null && name !== agentName) continue;
+    for (const raw of Object.values(block?.checks ?? {})) if (raw?.model) heads.push(raw.model);
+  }
+  return heads;
+}
+
 function requireDecisionModel(
   config: AppConfig,
   decisionKeys: Set<string>,
@@ -652,6 +686,7 @@ function validateEffective(
   }
   requireDecisionModel(config, decisionKeys, decisions.checks?.duplicate?.model, `${where}.checks.duplicate.model`);
   addChain(decisions.checks?.duplicate?.model);
+  for (const head of checkModelHeads(config, agentName)) addChain(head);
   // Vision chains (DECISION-MODEL §3.5): system-one, and every member reads images.
   requireVisionChain(config, decisionKeys, decisions.vision_model, `${where}.vision_model`);
   addChain(decisions.vision_model);

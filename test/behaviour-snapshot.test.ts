@@ -160,6 +160,18 @@ test("diff: preference, routing task, rule and check events", () => {
   assert.match(disabled[0]!.sentence, /check `style_x`: disabled/);
 });
 
+test("diff: a check's own judging model is behaviour; unset adds nothing to the snapshot", () => {
+  const q = { source: "message", instructions: "x", criteria: { true: "a", false: "b" }, threshold: 0.8 };
+  const prev = snap(config((c) => (c.checks.style_q = { kind: "style", questions: [q] })));
+  assert.equal("model" in prev.agents["agent_a"]!.checks["style_q"]!, false);
+  const next = snap(config((c) => (c.checks.style_q = { kind: "style", questions: [q], model: "decider" })));
+  assert.equal(next.agents["agent_a"]!.checks["style_q"]!.model, "decider");
+  const events = diffBehaviourSnapshots(prev, next);
+  assert.deepEqual(kinds(events), ["check_changed", "check_changed"]);
+  assert.match(events[0]!.sentence, /check `style_q`: judge model the point's → decider/);
+  assert.deepEqual(events[0]!.models, ["decider"]);
+});
+
 test("diff: code change, generic config_changed fallback, version change suppresses structural events", () => {
   const prev = snap();
   const nextCode = buildBehaviourSnapshot({ config: config(), catalogue: buildCheckCatalogue(config()), code: { version: "1.0.0", revision: "def456" } });

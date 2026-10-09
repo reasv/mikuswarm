@@ -1492,6 +1492,9 @@ const CheckSchema = StrictObject({
   // Question gate: questions are asked only when one of these matches (same syntax as patterns).
   prefilter: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
   min_chars: Type.Optional(Type.Integer({ minimum: 0 })),
+  // Decision chain of this check's questions (a system-one [models.*] key), in a
+  // call of its own. Unset = the point's chain (the duplicate chain for a duplicate check).
+  model: Type.Optional(Type.String({ minLength: 1 })),
   questions: Type.Optional(Type.Array(CheckQuestionSchema)),
   // Per-question thresholds, keyed by question name (or source, for an unnamed
   // question): overrides the thresholds of the built-in or configured questions.

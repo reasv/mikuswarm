@@ -192,6 +192,7 @@ function diffCheck(agent: string, code: string, a: CheckBehaviour | undefined, b
     if (!same(a.checkpoints, b.checkpoints)) parts.push(`checkpoints now ${list(b.checkpoints)}`);
     if (a.minChars !== b.minChars) parts.push(`min chars ${a.minChars ?? "default"} → ${b.minChars ?? "default"}`);
     if (a.detection !== b.detection) parts.push("detection changed");
+    if (a.model !== b.model) parts.push(`judge model ${a.model ?? "the point's"} → ${b.model ?? "the point's"}`);
     if (a.kind !== b.kind) parts.push(`kind ${a.kind} → ${b.kind}`);
   }
   return [{
@@ -202,7 +203,7 @@ function diffCheck(agent: string, code: string, a: CheckBehaviour | undefined, b
     new: b ?? null,
     agents: agentList(agent),
     sites: [],
-    models: [],
+    models: uniq([a?.model, b?.model]),
   }];
 }
 

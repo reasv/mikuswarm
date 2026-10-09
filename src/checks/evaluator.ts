@@ -13,8 +13,10 @@
  *   ignores it); refusal checks have no floor.
  * - **Prefilter.** A check with `prefilter` patterns asks a question only when
  *   one of them matches that question's source text; no match skips it.
- * - **One call by default**, split by the fits ({@link planCheckCalls}); every
- *   call of one evaluation shares a `decisionGroup`.
+ * - **One call by default**, split by the fits ({@link planCheckCalls}); a
+ *   check with its own `model` is asked of that chain in a call of its own, in
+ *   parallel ({@link CheckEvaluator.judgeByChain}); every call of one
+ *   evaluation shares a `decisionGroup`.
  * - **Per-check verdict**: a check fires when any of its questions reaches its
  *   own (calibrated) threshold; its probability is the highest among them.
  *
@@ -385,7 +387,7 @@ export class CheckEvaluator {
       if (took) evaluation.checks.push(check);
     }
     const items = assignItemIds(raw);
-    const judged = this.judgeSafely(evaluation, items);
+    const judged = this.judgeByChain(evaluation, items);
     evaluation.done = judged.then((partial) => {
       const completedAt = this.now();
       evaluation.completedAt = completedAt;
@@ -442,7 +444,7 @@ export class CheckEvaluator {
     for (const check of checks) if (!evaluation.checks.includes(check)) evaluation.checks.push(check);
     const items = assignItemIds(raw);
     const knobs = this.duplicateKnobs(scope.agent);
-    const stage = this.judgeSafely(evaluation, items, {
+    const stage = this.judgeByChain(evaluation, items, {
       context: { ...subject.context, duplicate: ctx },
       ...(knobs.model ? { chainHead: knobs.model } : {}),
       duplicate: ctx,
@@ -462,6 +464,49 @@ export class CheckEvaluator {
       return result;
     });
     return true;
+  }
+
+  /**
+   * Judge `items` on their chains: the questions of a check with its own
+   * `model` (`[checks.<code>].model`) go to that chain, the rest to
+   * `opts.chainHead` (undefined = the point's chain); a check naming that same
+   * chain shares its call. One chain = one {@link judgeSafely}, exactly as
+   * without check models; several run in parallel in the evaluation's decision
+   * group, under its deadline, and their verdicts merge like the duplicate
+   * stage's (fired concatenated, the first unjudged reason kept). A failing
+   * chain leaves its questions unjudged and the other calls unaffected.
+   */
+  private judgeByChain(
+    evaluation: CheckEvaluation,
+    items: CheckItem[],
+    opts: JudgeOptions = {},
+  ): Promise<{ fired: FiredCheck[]; unjudgedReason?: string }> {
+    const defaultHead = opts.chainHead;
+    const pointHead = this.options.engine?.settings(this.pointName, evaluation.scope.agent)?.model;
+    const modelOf = new Map(evaluation.checks.map((c) => [c.code, c.model]));
+    const parts = new Map<string | undefined, CheckItem[]>();
+    for (const item of items) {
+      let head = modelOf.get(item.code) ?? defaultHead;
+      if (head !== undefined && head === (defaultHead ?? pointHead)) head = defaultHead;
+      const part = parts.get(head);
+      if (part) part.push(item);
+      else parts.set(head, [item]);
+    }
+    const withHead = (head: string | undefined): JudgeOptions => {
+      const { chainHead: _default, ...rest } = opts;
+      return head !== undefined ? { ...rest, chainHead: head } : rest;
+    };
+    if (parts.size <= 1) {
+      const [head, part] = [...parts][0] ?? [defaultHead, items];
+      return this.judgeSafely(evaluation, part, head === defaultHead ? opts : withHead(head));
+    }
+    return Promise.all([...parts].map(([head, part]) => this.judgeSafely(evaluation, part, withHead(head)))).then(
+      (results) => {
+        const unjudgedReason = results.find((r) => r.unjudgedReason !== undefined)?.unjudgedReason;
+        const fired = results.flatMap((r) => r.fired);
+        return unjudgedReason ? { fired, unjudgedReason } : { fired };
+      },
+    );
   }
 
   private judgeSafely(

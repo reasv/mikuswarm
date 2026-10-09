@@ -191,12 +191,14 @@ function applyCheckConfig(
     ...(prefilter && prefilter.length > 0 ? { prefilter } : {}),
     words: raw.words ?? base?.words ?? [],
     minChars: raw.min_chars ?? base?.minChars,
+    model: raw.model ?? base?.model,
     questions: thresholded,
     builtin: base?.builtin ?? false,
   };
   if (def.agentExplanation === undefined) delete def.agentExplanation;
   if (def.reason === undefined) delete def.reason;
   if (def.minChars === undefined) delete def.minChars;
+  if (def.model === undefined) delete def.model;
   validateCheck(def, where);
   return def;
 }
@@ -240,6 +242,9 @@ function validateCheck(def: CheckDefinition, where: string): void {
   }
   if (def.prefilter && def.prefilter.length > 0 && def.questions.length === 0) {
     throw new Error(`${where}: prefilter gates questions; a check without questions cannot have one`);
+  }
+  if (def.model !== undefined && def.questions.length === 0) {
+    throw new Error(`${where}: model judges the check's questions; a check without questions cannot have one`);
   }
   if (def.checkpoints.length === 0) {
     throw new Error(`${where}: checkpoints must not be empty (set enabled = false to turn the check off)`);
