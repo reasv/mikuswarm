@@ -22,6 +22,7 @@ import { wrapToolsWithOutputGate, type OutputGate } from "../checks/gate.js";
 import { createSessionOutputGate, withGateTap, type OutputGateServices } from "../checks/session.js";
 import { estimateLiveSliceTokens } from "./live-token-estimate.js";
 import { extractLlmRequestClass, withRequestRetry } from "./request-retry.js";
+import { withTruncatedToolCallsAsLength } from "./truncated-tool-calls.js";
 import {
   defaultPriorityForSessionType,
   modelHealthKey,
@@ -1018,7 +1019,15 @@ export class AgentSessionFactory {
       const built = buildModelFallback(headOnly ? chain.slice(0, 1) : chain, {
         consumer: "agent",
         makeBase: (cfg) => {
-          const base = withSdkRetriesDisabled((cfg.streaming ?? true) ? streamSimple : wrapCompleteAsStream);
+          const base = withTruncatedToolCallsAsLength(
+            withSdkRetriesDisabled((cfg.streaming ?? true) ? streamSimple : wrapCompleteAsStream),
+            (info) =>
+              this.options.logger?.warn("llm_tool_call_truncated", {
+                sessionId: session.id,
+                timelineKey: session.timelineKey,
+                ...info,
+              }),
+          );
           // Gated per serving member, like the onPayload injectors below.
           // `declare_deferred_tools` makes a tool load append-only for the member
           // (declared-tools.ts), so its prefix then changes only on a resume.

@@ -1272,7 +1272,7 @@ function withheldTurnEvents(
 }
 
 /** Build a terminal `error` event mirroring the shape pi-ai providers emit. */
-function synthesizeErrorEvent(
+export function synthesizeErrorEvent(
   model: Parameters<StreamFn>[0],
   message: string,
   stopReason: "error" | "aborted" = "error",
