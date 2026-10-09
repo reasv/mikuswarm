@@ -79,6 +79,11 @@ export interface NormalizedUserLimitRule {
   /** Cascades INDEPENDENTLY of the budget block. */
   messageTemplate?: string;
   /**
+   * `fallback_chains = "after_preferences"`: per-user selection tries every
+   * preference's own model before any preference's fallback chain.
+   */
+  chainsAfterPreferences?: boolean;
+  /**
    * Agent/account scope (spec MULTI-AGENT-SUPPORT §8): when set, this rule only
    * resolves for sessions whose `timeline_key` starts with one of these prefixes.
    * Constraints from this rule only count events from the matching accounts.
@@ -137,6 +142,8 @@ export interface UserLimitResolution {
   banned: boolean;
   /** Ordered preference set (REQUESTED names); undefined = session-type default. */
   models?: string[];
+  /** From the budget rule's `fallback_chains`: own models of all preferences before chains. */
+  chainsAfterPreferences?: boolean;
   constraints: ResolvedConstraint[];
   /**
    * The DISTINCT shared-pool partition keys this session may denormalize onto its
@@ -655,6 +662,7 @@ export class UserLimitEngine {
       active,
       banned,
       models: budgetRule.models,
+      ...(budgetRule.chainsAfterPreferences ? { chainsAfterPreferences: true } : {}),
       constraints,
       ledgerPartitionKeys,
       messageTemplate,

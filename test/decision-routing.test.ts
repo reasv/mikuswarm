@@ -508,6 +508,39 @@ test("factory (per-user): the cascade is tried first; unaffordable entries fall 
   });
 });
 
+test("factory (per-user): fallback_chains = after_preferences tries every preference's own model before any chain", async () => {
+  await withWorkspace(async (root) => {
+    // "big" is over its [[limits]] cap and has "mid" in its chain; "plain" is the next preference.
+    const run = async (chainsAfterPreferences: boolean) => {
+      const { builder } = capturingBuilder();
+      const config = factoryConfig(root);
+      config.models.big = { ...config.models.big, fallback: ["mid"] };
+      const factory = new AgentSessionFactory({
+        config,
+        contextBuilder: builder,
+        getActiveSessions: () => [],
+        budget: { engine: { isModelAvailable: (id: string) => id !== "big", check: () => ({ allowed: true }) } } as any,
+      });
+      const selected: string[] = [];
+      const engine: any = {
+        affordable: () => ({ ok: true, maxOutput: 4096, remainingUsd: 1 }),
+        bindingConstraint: () => undefined,
+        noteSelection: (_s: string, _u: string, _r: string, m: string) => selected.push(m),
+      };
+      const resolution = {
+        matched: true, active: true, banned: false, models: ["big", "plain"], constraints: [], ledgerPartitionKeys: [],
+        ...(chainsAfterPreferences ? { chainsAfterPreferences: true } : {}),
+      } as unknown as UserLimitResolution;
+      const ctx = { userId: "@u:hs", roomId: "!r" } as UserLimitContext;
+      const { agent } = await factory.create(session(), [fakeTool("send_message")], { userLimit: { engine, resolution, ctx } });
+      await agent.prompt({ role: "user", content: "hi", timestamp: 20 } as any).catch(() => {});
+      return selected[0];
+    };
+    assert.equal(await run(false), "big", "default: the capped head's chain (mid) keeps big selectable");
+    assert.equal(await run(true), "plain", "after_preferences: the next preference's own model wins over big's chain");
+  });
+});
+
 // --- storage: v21→v22 -----------------------------------------------------------
 
 test("storage: v21→v22 adds agent_sessions.initial_preloads; set/get round-trip", async () => {

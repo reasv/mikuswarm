@@ -1007,10 +1007,15 @@ export class AgentSessionFactory {
       workspaceRoot,
       sessionId: session.id,
     });
-    const buildFor = (logicalId: string): BuiltModelFallback => {
-      const cached = builtFallbacks.get(logicalId);
+    // `headOnly`: the model alone, without its fallback chain (per-user selection under
+    // `fallback_chains = "after_preferences"`, where the next preference, not this
+    // model's chain, takes over when it cannot serve).
+    const buildFor = (logicalId: string, headOnly = false): BuiltModelFallback => {
+      const cacheKey = headOnly ? `${logicalId}\u0000head` : logicalId;
+      const cached = builtFallbacks.get(cacheKey);
       if (cached) return cached;
-      const built = buildModelFallback(resolveModelChain(logicalId, this.options.config.models), {
+      const chain = resolveModelChain(logicalId, this.options.config.models);
+      const built = buildModelFallback(headOnly ? chain.slice(0, 1) : chain, {
         consumer: "agent",
         makeBase: (cfg) => {
           const base = withSdkRetriesDisabled((cfg.streaming ?? true) ? streamSimple : wrapCompleteAsStream);
@@ -1065,7 +1070,7 @@ export class AgentSessionFactory {
         primaryAttemptsPerRequest: recovery?.llm_primary_attempts_per_request,
         backgroundProbe: true,
       });
-      builtFallbacks.set(logicalId, built);
+      builtFallbacks.set(cacheKey, built);
       return built;
     };
     // The default (session-type head) composite — also the representative descriptor
@@ -1104,6 +1109,12 @@ export class AgentSessionFactory {
        * OpenAI-effort / thinking-off models.
        */
       thinkingBudgetTokens: number;
+      /**
+       * The requested model without its chain, dispatched when the first pass of
+       * `fallback_chains = "after_preferences"` picks this preference: a failure then
+       * moves the next attempt to the next preference, not into this model's chain.
+       */
+      headFallback?: BuiltModelFallback;
     }
     const selectables: Selectable[] = [];
     if (userSelection) {
@@ -1124,6 +1135,7 @@ export class AgentSessionFactory {
         selectables.push({
           requestedLogicalId: logicalId,
           fallback: buildFor(logicalId),
+          ...(userLimit!.resolution.chainsAfterPreferences ? { headFallback: buildFor(logicalId, true) } : {}),
           thinkingBudgetTokens: additiveThinkingBudgetTokens(requestedConfig, thinkingLevel),
         });
       }
@@ -1265,6 +1277,11 @@ export class AgentSessionFactory {
         ctxCounter.lastRequestAtMs > 0 && Date.now() - ctxCounter.lastRequestAtMs < PROMPT_CACHE_TTL_MS;
       let sawHealthyFit = false; // found a fits+healthy selectable (unaffordable) → budget cause
       let sawFit = false;        // found a selectable whose chain can fit the context at all
+      // `fallback_chains = "after_preferences"`: a first pass accepts a preference only
+      // when its OWN model (the chain head) would serve; the usual any-member pass runs
+      // only when no preference's own model can.
+      const passes = userLimit!.resolution.chainsAfterPreferences ? [true, false] : [false];
+      for (const headOnly of passes)
       for (const s of selectables) {
         // Fits-any check (ignoring health): the largest member's window accommodates the context?
         if (s.fallback.maxOperativeContextWindow >= observed) sawFit = true;
@@ -1276,7 +1293,9 @@ export class AgentSessionFactory {
           isModelAvailable: isModelAvailableFn,
           observedContextTokens: observed,
         });
-        const viable = probe.reason !== "all-unhealthy";
+        const viable = headOnly
+          ? probe.reason === "primary" || probe.reason === "canary"
+          : probe.reason !== "all-unhealthy";
         // Prompt caches do not cross upstreams: the credited prefix exists only at
         // the (endpoint, wire-model) domain that served the prior committed request.
         // Credit the cache-read discount only when THIS candidate's predicted serving
@@ -1299,7 +1318,7 @@ export class AgentSessionFactory {
           return {
             ok: true,
             selection: {
-              fallback: s.fallback,
+              fallback: headOnly ? s.headFallback ?? s.fallback : s.fallback,
               requestedLogicalId: s.requestedLogicalId,
               maxTokens: aff.maxOutput,
             },

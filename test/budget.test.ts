@@ -1765,3 +1765,18 @@ test("paid service gate never bypasses limits for colliding zero-cost model id",
   const gate = makeToolBudgetGate({ engine: () => engine, toolName: "exa_search", timelineKey: "matrix:account:room:!a", formatResetsAt: String, paidService: true });
   assert.match(gate("exa/search")!, /Over budget/);
 });
+
+test("normalizeUserLimits + resolve: fallback_chains = after_preferences reaches the resolution", () => {
+  const opts = { defaultTz: "UTC", knownModelIds: new Set(["default", "big"]) };
+  const on = normalizeUserLimits(
+    [{ user: "*", models: ["big", "default"], max_usd: 5, fallback_chains: "after_preferences" }],
+    opts,
+  );
+  assert.equal(on.fatal.length, 0);
+  assert.equal(on.rules[0]!.chainsAfterPreferences, true);
+  const resolved = userEngineWith(on.rules).resolve({ userId: "@u:hs", roomId: "!r" } as UserLimitContext);
+  assert.equal(resolved.chainsAfterPreferences, true);
+  const off = normalizeUserLimits([{ user: "*", models: ["big"], max_usd: 5, fallback_chains: "per_preference" }], opts);
+  assert.equal(off.rules[0]!.chainsAfterPreferences, undefined);
+  assert.equal(userEngineWith(off.rules).resolve({ userId: "@u:hs", roomId: "!r" } as UserLimitContext).chainsAfterPreferences, undefined);
+});

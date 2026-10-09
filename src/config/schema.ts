@@ -2470,6 +2470,14 @@ const UserLimitRuleSchema = StrictObject({
   window: Type.Optional(LimitWindowSchema),
   // Templated refusal (§12); cascades INDEPENDENTLY of the model-budget block.
   trigger_rejection_message: Type.Optional(Type.String()),
+  // When a preference's `fallback` chain may serve. "per_preference" (default): a
+  // preference is selectable when any member of its chain is healthy, in budget and
+  // fits, so its chain serves before the next preference is considered (suits
+  // same-model chains, e.g. one model on two providers). "after_preferences": every
+  // preference's OWN model is tried first, in order; a chain member serves only
+  // when no preference's own model can (suits chains of last-resort models).
+  // Travels with the model-budget block (the rule that supplies `models`).
+  fallback_chains: Type.Optional(Type.Union([Type.Literal("per_preference"), Type.Literal("after_preferences")])),
   // Agent/account scope (spec MULTI-AGENT-SUPPORT §8): same semantics as
   // [[limits]].agent/account — counts only events from the named agent/account.
   agent: Type.Optional(Type.String({ minLength: 1 })),

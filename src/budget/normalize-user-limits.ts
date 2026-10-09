@@ -38,6 +38,7 @@ export interface RawUserLimitRule {
   max_usd?: number;
   window?: RawWindow;
   trigger_rejection_message?: string;
+  fallback_chains?: "per_preference" | "after_preferences";
   /** Agent/account scope (spec MULTI-AGENT-SUPPORT §8). */
   agent?: string;
   account?: string;
@@ -362,6 +363,7 @@ export function normalizeUserLimits(
         constraints,
         messageTemplate: entry.trigger_rejection_message,
         timelineKeyPrefixes,
+        ...(entry.fallback_chains === "after_preferences" ? { chainsAfterPreferences: true } : {}),
       });
     }
   });
