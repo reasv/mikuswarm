@@ -196,7 +196,7 @@ test("max_judged: the fallback rule covers only sent passages without a verdict,
 
 test("max_judged: with the whole chain down the full fallback is unchanged (no over-cap cut)", async () => {
   const hits = Array.from({ length: 20 }, (_, i) => scored(hit(`Topic block ${i} about pancakes and syrup ${i}`, NOW - (40 + i) * DAY), 0.95 - i * 0.01));
-  const config = resolveRetrievalConfig({ enabled: true, auto: { max_judged: 6, person_recent: 0 } } as any);
+  const config = resolveRetrievalConfig({ enabled: true, auto: { judge_mode: "filter", max_judged: 6, person_recent: 0 } } as any);
   const engine = { ...stubEngine([]), evaluate: async () => { throw new Error("chain down"); } };
   const pipeline = new MemoryRetrievalPipeline({
     search: { searchScored: async () => ({ scored: hits, mode: "hybrid" }), userLaneScored: async () => [], unitScorer: undefined } as any,
@@ -390,7 +390,7 @@ test("finish now: the plan resolves with the judged keepers so far plus the fall
   const pipeline = new MemoryRetrievalPipeline({
     search: { searchScored: async () => ({ scored: hits, mode: "hybrid" }), userLaneScored: async () => [], unitScorer: undefined } as any,
     store: stubStore(new Map(), inserted),
-    config: resolveRetrievalConfig({ enabled: true, auto: { max_results: 10, max_tokens: 20000, fallback_max_results: 2, fallback_min_score: 0.5 } } as any),
+    config: resolveRetrievalConfig({ enabled: true, auto: { judge_mode: "filter", max_results: 10, max_tokens: 20000, fallback_max_results: 2, fallback_min_score: 0.5 } } as any),
     engine: () => engine as any,
   });
   const finishNow = new AbortController();

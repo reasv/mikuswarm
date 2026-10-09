@@ -16,7 +16,7 @@ import { GptTokenizer } from "../src/context/tokenizer/index.js";
 import { buildDiaryHeader } from "../src/diary/header.js";
 import { configureAgentTimezone, resetAgentTimezone, parseZonedWallClock } from "../src/time/index.js";
 import { MemoryRetrievalStore } from "../src/storage/memory-retrieval-store.js";
-import { MemoryRetrievalPipeline, orderJudged, rerankQuery, JUDGED_NOTE, UNJUDGED_NOTE } from "../src/retrieval/auto/pipeline.js";
+import { MemoryRetrievalPipeline, orderJudged, rerankQuery, JUDGED_NOTE, ORDERED_NOTE, UNJUDGED_NOTE } from "../src/retrieval/auto/pipeline.js";
 import type { PlanInput } from "../src/retrieval/auto/types.js";
 import { DecisionClient, DecisionEngine, type DecisionEvaluationRow } from "../src/decisions/index.js";
 import { MemoryFilterService } from "../src/retrieval/filters/index.js";
@@ -105,7 +105,8 @@ async function withStack(
   const storage = await Storage.open({ databasePath: path.join(dir, "t.db") });
   const config = resolveRetrievalConfig({
     enabled: true,
-    auto: { ...(opts.auto ?? {}) },
+    // The suite covers judge_mode "filter"; order-mode tests opt in.
+    auto: { judge_mode: "filter", ...(opts.auto ?? {}) },
     ...(opts.rerank
       ? { rerank: { enabled: true, chain: ["fake"], ...(opts.rerank.query ? { query: opts.rerank.query } : {}), providers: { fake: { kind: "remote", endpoint: "http://rerank.invalid", zdr: true, min_score: opts.rerank.minScore } } } }
       : {}),
@@ -517,4 +518,116 @@ test("rerank query: the pipeline sends the configured query (request by default)
     const tail = mode === "conversation" ? "\nbob: we talked about breakfast" : "";
     assert.deepEqual(queries, [`alice: what did we decide about the pancake recipe${tail}`]);
   }
+});
+
+// ── judge_mode = "order" (the default) ──────────────────────────────────────
+
+const ALICE = { provider: "matrix", senderId: "@a:x", name: "alice", role: "requester" as const };
+/** Cross-encoder score from an `RRnn` marker in the passage (0.nn), else 0.05. */
+const rrScore = (doc: string) => {
+  const m = /RR(\d\d)/.exec(doc);
+  return m ? Number(m[1]) / 100 : 0.05;
+};
+
+test("order mode: judged-relevant first, then the cross-encoder order; only neither-axis passages are left out", async () => {
+  const files = {
+    "2026-05-20.md":
+      block("2026-05-20", "09:00", "kitchen", "KEEP RR30 the pancake recipe needs buttermilk, we decided.") +
+      block("2026-05-20", "10:00", "kitchen", "ABOUT RR90 alice brought pancake syrup to the party.") +
+      block("2026-05-20", "11:00", "kitchen", "ABOUT RR60 alice and the pancake griddle story.") +
+      block("2026-05-20", "12:00", "kitchen", "RR99 pancake recipe decided, weather small talk."),
+  };
+  const opts = { auto: { judge_mode: "order" }, rerank: { minScore: 0.5, score: rrScore } };
+  await withStack(files, opts, async ({ pipeline }) => {
+    const plan = await pipeline.plan(input({ participants: [ALICE] }));
+    const r = plan.report;
+    assert.equal(r.source, "model");
+    assert.ok(plan.block!.includes(ORDERED_NOTE));
+    // The judged keeper leads despite its low cross-encoder score; the person
+    // passages follow in cross-encoder order.
+    const b = plan.block!;
+    assert.ok(b.indexOf("buttermilk") < b.indexOf("syrup"));
+    assert.ok(b.indexOf("syrup") < b.indexOf("griddle"));
+    // Judged neither relevant nor about a participant: left out, even at the top of the cross-encoder.
+    assert.ok(!b.includes("small talk"));
+    const vetoed = r.items.find((i) => i.rerank === 0.99)!;
+    assert.equal(vetoed.stage, "dropped");
+    assert.equal(r.kept, 3);
+    assert.ok(r.items.filter((i) => i.stage === "kept").every((i) => i.selectedBy === "judge"));
+  });
+});
+
+test("order mode: no passage judged relevant still shows the participant's memories", async () => {
+  const files = {
+    "2026-05-21.md":
+      block("2026-05-21", "09:00", "kitchen", "ABOUT RR40 alice once burned the pancakes.") +
+      block("2026-05-21", "10:00", "kitchen", "RR50 pancake trivia with nobody in particular."),
+  };
+  await withStack(files, { auto: { judge_mode: "order" }, rerank: { minScore: 0.5, score: rrScore } }, async ({ pipeline }) => {
+    const plan = await pipeline.plan(input({ participants: [ALICE] }));
+    assert.equal(plan.report.kept, 1);
+    assert.ok(plan.block!.includes("burned the pancakes"));
+  });
+  // The same passages in filter mode: nothing is judged relevant, so no block.
+  await withStack(files, { auto: { judge_mode: "filter" }, rerank: { minScore: 0.5, score: rrScore } }, async ({ pipeline }) => {
+    const plan = await pipeline.plan(input({ participants: [ALICE] }));
+    assert.equal(plan.block, null);
+  });
+});
+
+test("order mode: unanswered passages stay eligible in cross-encoder order; chain down shows the cross-encoder top", async () => {
+  const files = {
+    "2026-05-22.md":
+      block("2026-05-22", "09:00", "kitchen", "KEEP RR20 the pancake recipe needs buttermilk, we decided.") +
+      block("2026-05-22", "10:00", "kitchen", "SLOW RR80 pancake recipe decided pancake recipe one") +
+      block("2026-05-22", "11:00", "kitchen", "SLOW RR70 pancake recipe decided pancake recipe two"),
+  };
+  const opts = { hang: /SLOW/, decisionsConfig: { timeout_ms: 150 }, auto: { judge_mode: "order" }, rerank: { minScore: 0.9, score: rrScore } };
+  await withStack(files, opts, async ({ pipeline }) => {
+    const plan = await pipeline.plan(input());
+    const r = plan.report;
+    assert.equal(r.source, "model");
+    assert.equal(r.unjudged, 2);
+    assert.equal(r.fellBack, 2);
+    assert.equal(r.kept, 3);
+    const b = plan.block!;
+    assert.ok(b.indexOf("buttermilk") < b.indexOf("recipe one"));
+    assert.ok(b.indexOf("recipe one") < b.indexOf("recipe two"));
+  });
+  await withStack(files, { fail: true, auto: { judge_mode: "order", max_results: 2 }, rerank: { minScore: 0.9, score: rrScore } }, async ({ pipeline }) => {
+    const plan = await pipeline.plan(input());
+    assert.equal(plan.report.source, "fallback");
+    assert.equal(plan.report.kept, 2);
+    assert.ok(plan.block!.includes(ORDERED_NOTE));
+    assert.ok(plan.block!.includes("recipe one") && plan.block!.includes("recipe two"));
+  });
+});
+
+test("order mode: person-cued passages get a cross-encoder score (never cut by it)", async () => {
+  const files = {
+    "2026-05-23.md": block("2026-05-23", "10:00", "kitchen", "ABOUT RR10 garden talk with carol"),
+  };
+  const queries: string[] = [];
+  await withStack(files, { auto: { judge_mode: "order", person_recent: 2 }, rerank: { minScore: 0.5, score: rrScore, queries } }, async ({ pipeline, store, storage }) => {
+    const [row] = storage.read((db) => db.prepare("select content_hash as h from memory_chunks where text like '%garden talk%'").all() as Array<{ h: string }>);
+    await store.setProvenance({
+      agent: "",
+      contentHash: row!.h,
+      status: "tagged",
+      summaryId: "sum1",
+      timelineKey: "matrix:acc:!room",
+      participants: [{ provider: "matrix", senderId: "@carol:x", count: 3 }],
+      at: 1,
+    });
+    const plan = await pipeline.plan(
+      input({
+        request: { from: "carol", text: "hey" },
+        participants: [{ provider: "matrix", senderId: "@carol:x", name: "carol", role: "requester" }],
+        activePeople: [{ provider: "matrix", senderId: "@carol:x", name: "carol" }],
+      }),
+    );
+    const item = plan.report.items.find((i) => i.lanes.includes("person"))!;
+    assert.equal(item.rerank, 0.1);
+    assert.equal(item.stage, "kept");
+  });
 });

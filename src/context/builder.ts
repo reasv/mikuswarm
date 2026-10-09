@@ -787,9 +787,11 @@ export class ContextBuilder {
       if (ticket) {
         const onError = (error: unknown) =>
           this.logger?.warn("auto_retrieval_failed", { error: error instanceof Error ? error.message : String(error) });
+        const waitStarted = Date.now();
         let plan = await awaitPlan(ticket.plan, ticket.waitMs, onError);
         if (!plan) plan = await ticket.bestEffort().catch(() => null);
         if (!plan) ticket.abandon();
+        else plan.report.waitMs = Date.now() - waitStarted;
         retrievedMemory = plan?.block ?? null;
       } else if (!options.selfSessionId) {
         retrievedMemory = renderPreviewMemoryPlaceholder(this.autoRetrieval.pipeline.latestForTimeline(options.timelineKey));

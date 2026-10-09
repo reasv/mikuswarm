@@ -986,6 +986,11 @@ excerpt_max_chars = 600           # recall_memory excerpt length (match-centred,
 #   conversation_messages = 8, plus the usual model / timeout_ms.
 [retrieval.auto]
 judge = true                      # use the memory decision point when [decisions] is on
+# How the judge selects. "order": the passages judged relevant (relevance_threshold)
+# first, then the rest by the cross-encoder; only a passage judged neither relevant
+# nor about a participant is left out, so the block fills up to max_results.
+# "filter": only the passages judged relevant are shown (often none).
+judge_mode = "order"
 max_results = 4                   # items in the block (judged or not)
 # Unjudged selection floor (no decision model): see [retrieval.query].min_score.
 # With the saturating BM25 transform this reliably excludes weak common-word-only matches.

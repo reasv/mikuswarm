@@ -5,7 +5,8 @@
  *   ─► recency-layer and filter exclusions
  *   ─► late interaction (exhaustive recent window + re-score of the rest) ─► top_n
  *   ─► cross-encoder ─► top_n
- *   ─► the `memory` decision point as the final filter (one passage per request)
+ *   ─► the `memory` decision point (one passage per request): orders and vetoes
+ *      (`judge_mode = "order"`), or is the final filter (`"filter"`)
  *   ─► excerpts ─► `<retrieved_memory>` (0..N items within a token budget)
  *
  * Every stage is optional and degrades in order: no late interaction → the
@@ -49,12 +50,22 @@ import type {
 export const JUDGED_NOTE =
   "Memories from your diary, judged relevant to this conversation. Read-only; open a cited " +
   "file:lines with your read tools for the full entry.";
+export const ORDERED_NOTE =
+  "Memories from your diary that may bear on this conversation or the people in it, most " +
+  "relevant first. Read-only; open a cited file:lines with your read tools for the full entry.";
 export const UNJUDGED_NOTE =
   "Past diary entries that may bear on this conversation. Read-only; open a cited file:lines " +
   "with your read tools for the full entry.";
 
 /** Conversation tail joined to the request for the cross-encoder query. */
 const RERANK_TAIL_MESSAGES = 3;
+
+/**
+ * `judge_mode = "order"`: a judged passage is left out only when the judge
+ * answers no on both axes (`relevant` and `about_participant` below this).
+ * It is the yes/no boundary of a `noul` answer, not a tuned threshold.
+ */
+const ORDER_VETO = 0.5;
 
 /**
  * The cross-encoder's query (`[retrieval.rerank].query`). `"request"`: the
@@ -587,15 +598,18 @@ export class MemoryRetrievalPipeline {
     // ── 4. Cross-encoder ──────────────────────────────────────────────────
     let rerankRan = false;
     let rerankCutoff: number | undefined;
-    if (this.deps.rerank && cfg.rerank.enabled && pool.length > 0 && !aborted() && !cut()) {
+    // Order mode: the person-cued passages are scored too (never cut by it), so
+    // every passage the selection orders has a cross-encoder score.
+    const toScore = auto.judgeMode === "order" ? [...pool, ...personCued] : pool;
+    if (this.deps.rerank && cfg.rerank.enabled && toScore.length > 0 && !aborted() && !cut()) {
       const q = rerankQuery(input, cfg.rerank.query, cfg.rerank.queryMaxChars);
       const t0 = this.now();
       try {
-        const docs = pool.map((c) => cleanBlockText(c.chunk.text).lines.join("\n"));
+        const docs = toScore.map((c) => cleanBlockText(c.chunk.text).lines.join("\n"));
         const res = await this.deps.rerank.run((p, s) => p.score(q, docs, s), { signal: stageSignal });
         rerankRan = true;
         rerankCutoff = cfg.rerank.providers[res.provider.name]?.minScore;
-        pool.forEach((c, i) => (c.rerank = res.value[i]));
+        toScore.forEach((c, i) => (c.rerank = res.value[i]));
         pool.sort((a, b) => b.rerank! - a.rerank!);
         for (const c of pool.slice(cfg.rerank.topN)) itemStage.set(c.chunk.contentHash, "cut_rerank");
         pool = pool.slice(0, cfg.rerank.topN);
@@ -718,7 +732,37 @@ export class MemoryRetrievalPipeline {
         c.hiddenBy = { key: c.pendingFilters[0]!.key, kind: "judged", pending: true };
       }
       report.judged = modelVerdicts;
-      if (modelVerdicts > 0) {
+      const failReason = () => {
+        const reasons = judgedOutcomes.map((o) => o?.reason).filter(Boolean);
+        return cut() ? "wait_budget" : (reasons[0] ?? (toJudge.length === 0 ? "max_judged" : "error"));
+      };
+      if (auto.judgeMode === "order") {
+        // The judge orders and vetoes; it does not gate (§9d "Judge mode").
+        // With verdicts: the sent passages; with none (the chain did not
+        // answer): every passage, over-cap ones included, unvetoed.
+        source = modelVerdicts > 0 ? "model" : "fallback";
+        if (modelVerdicts === 0) report.reason = failReason();
+        const vetoed = (c: Candidate) => {
+          const v = verdicts.get(c.chunk.contentHash);
+          return v !== undefined && (v.relevant ?? 0) < ORDER_VETO && (v.aboutParticipant ?? 0) < ORDER_VETO;
+        };
+        const eligible: Candidate[] = [];
+        for (const c of pool) {
+          if (c.hiddenBy) itemStage.set(c.chunk.contentHash, "hidden");
+          else if (modelVerdicts > 0 && !sent.has(c)) itemStage.set(c.chunk.contentHash, "over_cap");
+          else if (vetoed(c)) itemStage.set(c.chunk.contentHash, "dropped");
+          else eligible.push(c);
+        }
+        if (modelVerdicts > 0) {
+          const overCap = pool.length - sent.size;
+          if (overCap > 0) report.overCap = overCap;
+          const unjudged = toJudge.filter((c) => !verdicts.has(c.chunk.contentHash) && !c.hiddenBy).length;
+          if (unjudged > 0) report.unjudged = unjudged;
+        }
+        // Excerpts are made only for what can still fit.
+        selected = orderRanked(eligible, verdicts).slice(0, auto.maxResults * 2);
+        for (const c of selected) if (!verdicts.has(c.chunk.contentHash)) fallbackSelected.add(c.chunk.contentHash);
+      } else if (modelVerdicts > 0) {
         source = "model";
         const keptList = pool.filter((c) => verdicts.get(c.chunk.contentHash)?.keep && !c.hiddenBy);
         for (const c of pool) {
@@ -749,8 +793,7 @@ export class MemoryRetrievalPipeline {
         selected = [...orderJudged(keptList, verdicts), ...rescued];
       } else {
         source = "fallback";
-        const reasons = judgedOutcomes.map((o) => o?.reason).filter(Boolean);
-        report.reason = cut() ? "wait_budget" : (reasons[0] ?? (toJudge.length === 0 ? "max_judged" : "error"));
+        report.reason = failReason();
         for (const c of pool) if (c.hiddenBy) itemStage.set(c.chunk.contentHash, "hidden");
         selected = this.selectWithoutJudge(pool.filter((c) => !c.hiddenBy), {
           cap: auto.fallbackMaxResults,
@@ -806,7 +849,12 @@ export class MemoryRetrievalPipeline {
 
     // ── 6. Excerpts and packing ───────────────────────────────────────────
     // The judged note only when every shown item was judged.
-    const note = source === "model" && !selected.some((c) => fallbackSelected.has(c.chunk.contentHash)) ? JUDGED_NOTE : UNJUDGED_NOTE;
+    const note =
+      judge && auto.judgeMode === "order" && source !== "none"
+        ? ORDERED_NOTE
+        : source === "model" && !selected.some((c) => fallbackSelected.has(c.chunk.contentHash))
+          ? JUDGED_NOTE
+          : UNJUDGED_NOTE;
     const wrapper = `<retrieved_memory note="${note}">\n</retrieved_memory>`;
     let budget = auto.maxTokens - estimateTokens(wrapper);
     const lines: string[] = [];
@@ -1047,6 +1095,24 @@ export function orderJudged(list: Candidate[], verdicts: Map<string, MemoryPassa
       (b.late ?? -Infinity) - (a.late ?? -Infinity) ||
       b.score - a.score,
   );
+}
+
+/**
+ * `judge_mode = "order"`: the passages the judge kept (`relevant ≥
+ * relevance_threshold`) first, in {@link orderJudged} order; then the rest
+ * (judged or not) by the cross-encoder, then the late, then the hybrid score.
+ */
+export function orderRanked(list: Candidate[], verdicts: Map<string, MemoryPassageVerdict>): Candidate[] {
+  const promoted = list.filter((c) => verdicts.get(c.chunk.contentHash)?.keep === true);
+  const rest = list
+    .filter((c) => !promoted.includes(c))
+    .sort(
+      (a, b) =>
+        (b.rerank ?? -Infinity) - (a.rerank ?? -Infinity) ||
+        (b.late ?? -Infinity) - (a.late ?? -Infinity) ||
+        b.score - a.score,
+    );
+  return [...orderJudged(promoted, verdicts), ...rest];
 }
 
 function round3(n: number): number {

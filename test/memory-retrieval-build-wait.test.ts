@@ -128,7 +128,8 @@ test("a live build abandons a plan that outlasts the ticket's wait with nothing 
 test("a live build renders its ticket's block and does not abandon it", async () => {
   await withBuilder(async (builder) => {
     const counts = { abandoned: 0, bestEffort: 0 };
-    const ticket = ticketOf(Promise.resolve(plan(BLOCK)), 1000, async () => null, counts);
+    const ready = plan(BLOCK);
+    const ticket = ticketOf(Promise.resolve(ready), 1000, async () => null, counts);
     const result = await builder.build({
       timelineKey: TK, trigger: ev("ev1", "hello there", 1000), activeSessions: [], workspace: emptyWorkspace,
       selfSessionId: "s1", memoryRetrieval: ticket,
@@ -136,6 +137,9 @@ test("a live build renders its ticket's block and does not abandon it", async ()
     assert.equal(counts.abandoned, 0);
     assert.equal(counts.bestEffort, 0);
     assert.ok(finalContent(result).includes("a memory"));
+    // The build stamps how long it waited for the plan (recorded with the row).
+    assert.equal(typeof ready.report.waitMs, "number");
+    assert.ok(ready.report.waitMs! >= 0);
   });
 });
 

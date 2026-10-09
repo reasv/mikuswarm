@@ -48,6 +48,13 @@ export interface ResolvedRetrievalConfig {
     dedupAgainstRecency: boolean;
     /** Use the `memory` decision point when [decisions] is on (§9d "Judged retrieval"). */
     judge: boolean;
+    /**
+     * How the judge's verdicts select (§9d "Judge mode"): `order` shows the
+     * best passages by the judge's promotion and the cross-encoder, leaving out
+     * only those judged neither relevant nor about a participant; `filter`
+     * shows only the passages judged relevant (`relevance_threshold`).
+     */
+    judgeMode: "order" | "filter";
     /** Wide recall: candidates kept after fusing every query and lane. */
     candidates: number;
     /** Pre-decay relevance floor of the recall lanes. */
@@ -210,6 +217,7 @@ export function resolveRetrievalConfig(config: RetrievalConfig | undefined): Res
       maxTokens: auto.max_tokens ?? 2000,
       dedupAgainstRecency: auto.dedup_against_recency ?? true,
       judge: auto.judge ?? true,
+      judgeMode: auto.judge_mode ?? "order",
       candidates: auto.candidates ?? 60,
       candidateMinScore: auto.candidate_min_score ?? 0.25,
       userLaneCandidates: auto.user_lane_candidates ?? 8,

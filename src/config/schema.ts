@@ -510,6 +510,9 @@ const RetrievalSchema = StrictObject({
       query_messages: Type.Optional(Type.Integer({ minimum: 0, maximum: 50 })),
       // A kept block up to this many tokens is shown whole. Default 400.
       excerpt_max_tokens: Type.Optional(Type.Integer({ minimum: 20, maximum: 8192 })),
+      // How the judge's verdicts select: "order" (default) ranks and vetoes,
+      // "filter" shows only passages judged relevant (relevance_threshold).
+      judge_mode: Type.Optional(Type.Union([Type.Literal("order"), Type.Literal("filter")])),
       // Person-cued recall: per human active in the conversation, the newest N
       // provenance-tagged entries they took part in (outside the recency layer),
       // straight to the judge. Defaults 2 per person, 8 in total.

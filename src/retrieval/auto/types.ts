@@ -141,6 +141,12 @@ export interface RetrievalReport {
   aborted?: boolean;
   /** True when the build's wait expired and the plan finished with what was ready (`PlanInput.finishNow`). */
   cutShort?: boolean;
+  /**
+   * How long the context build waited for this plan (ms): the part of the
+   * plan's time on the reply's path. Set by the build; absent for a plan no
+   * build awaited.
+   */
+  waitMs?: number;
   stages: {
     recallMs: number;
     /**
