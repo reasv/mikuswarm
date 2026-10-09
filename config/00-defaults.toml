@@ -976,8 +976,8 @@ excerpt_max_chars = 600           # recall_memory excerpt length (match-centred,
 # Auto-retrieval (§9d "Judged retrieval"): wide recall (the trigger, trigger +
 # reply target, and the conversation window as queries, plus user lanes and
 # person-cued recall), operator filters, the optional re-rank stages
-# ([retrieval.late], [retrieval.rerank]), then the `memory` decision point as the
-# final filter, one passage per request. Started at session launch, in parallel
+# ([retrieval.late], [retrieval.rerank]), then the `memory` decision point (one
+# passage per request), which orders and vetoes or filters (judge_mode below). Started at session launch, in parallel
 # with routing. Without a decision model (or judge = false) the selection is
 # today's ranking with readable excerpts. The point's own settings live under
 # [decisions.memory] (on by default whenever [decisions] is on):
@@ -1003,9 +1003,9 @@ user_lane_candidates = 8          # candidate slots reserved for user-lane hits
 query_messages = 6                # messages of the conversation-window query
 person_recent = 2                 # person-cued recall: newest tagged entries per active person
 person_recent_max = 8             # ... in total; these skip the re-rank cuts
-fallback_min_score = 0.6          # decision chain down: hybrid floor of the fallback selection
+fallback_min_score = 0.6          # judge_mode "filter", chain down: hybrid floor of the fallback selection
 fallback_max_results = 2          # ... and its cap
-max_judged = 12                   # most passages judged per build (person-cued included); the rest fall back
+max_judged = 12                   # most passages judged per build (person-cued included); the rest are not shown unless none is judged
 judge_slot_share = 0.5            # most of a decision group's max_in_flight memory judging holds (at least 1 slot)
 dedup_against_recency = true      # skip blocks already in the §10a recency layer
 # User lane (§9d): a lexical-only sub-search keyed on the trigger user's display

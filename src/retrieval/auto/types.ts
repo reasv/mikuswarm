@@ -110,9 +110,10 @@ export interface ReportItem {
   judged?: boolean;
   /**
    * For a kept item: chosen by the judge, by the fallback rule (the decision
-   * chain did not answer for it), or by the unjudged selection (no decision model).
+   * chain did not answer for it), by `judge_mode = "order"`'s ordering (judged,
+   * not kept, not vetoed), or by the unjudged selection (no decision model).
    */
-  selectedBy?: "judge" | "fallback" | "unjudged";
+  selectedBy?: "judge" | "fallback" | "order" | "unjudged";
 }
 
 export type RetrievalSource = "model" | "fallback" | "unjudged" | "none";

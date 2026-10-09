@@ -89,6 +89,8 @@ async function withStack(
     filters?: Record<string, unknown>;
     auto?: Record<string, unknown>;
     rerank?: { minScore: number; score: (doc: string) => number; query?: "request" | "conversation"; queries?: string[] };
+    /** A fake late stage (built with the store); turns `late.enabled` on. */
+    late?: (store: MemoryRetrievalStore) => unknown;
   },
   run: (s: Stack) => Promise<void>,
 ): Promise<void> {
@@ -152,7 +154,9 @@ async function withStack(
         },
       ])
     : undefined;
-  const pipeline = new MemoryRetrievalPipeline({ search, store, config, filters, engine: () => engine, logger, ...(rerank ? { rerank } : {}) });
+  if (opts.late) (config.late as { enabled: boolean }).enabled = true;
+  const late = opts.late?.(store) as ConstructorParameters<typeof MemoryRetrievalPipeline>[0]["late"];
+  const pipeline = new MemoryRetrievalPipeline({ search, store, config, filters, engine: () => engine, logger, ...(rerank ? { rerank } : {}), ...(late ? { late } : {}) });
   try {
     await run({ storage, store, pipeline, workspaceRoot, rows, calls, logs });
   } finally {
@@ -553,7 +557,8 @@ test("order mode: judged-relevant first, then the cross-encoder order; only neit
     const vetoed = r.items.find((i) => i.rerank === 0.99)!;
     assert.equal(vetoed.stage, "dropped");
     assert.equal(r.kept, 3);
-    assert.ok(r.items.filter((i) => i.stage === "kept").every((i) => i.selectedBy === "judge"));
+    const kept = r.items.filter((i) => i.stage === "kept");
+    assert.deepEqual(kept.map((i) => i.selectedBy).sort(), ["judge", "order", "order"]);
   });
 });
 
@@ -630,4 +635,77 @@ test("order mode: person-cued passages get a cross-encoder score (never cut by i
     assert.equal(item.rerank, 0.1);
     assert.equal(item.stage, "kept");
   });
+});
+
+test("order mode: a passage the judge kept is never vetoed, even under a threshold below 0.5", async () => {
+  const files = { "2026-05-24.md": block("2026-05-24", "10:00", "kitchen", "pancake recipe notes, nothing else.") };
+  // relevant answers 0.1 here; a threshold of 0.05 keeps it.
+  const opts = { auto: { judge_mode: "order" }, decisionsConfig: { memory: { relevance_threshold: 0.05 } } };
+  await withStack(files, opts, async ({ pipeline }) => {
+    const plan = await pipeline.plan(input());
+    assert.equal(plan.report.kept, 1);
+    assert.equal(plan.report.items.find((i) => i.stage === "kept")!.selectedBy, "judge");
+  });
+});
+
+test("order mode: shown-but-not-kept passages are selectedBy order", async () => {
+  const files = { "2026-05-25.md": block("2026-05-25", "10:00", "kitchen", "ABOUT alice and the pancake pan.") };
+  await withStack(files, { auto: { judge_mode: "order" } }, async ({ pipeline }) => {
+    const plan = await pipeline.plan(input({ participants: [ALICE] }));
+    assert.equal(plan.report.items.find((i) => i.stage === "kept")!.selectedBy, "order");
+  });
+});
+
+test("the judge's participants include the window's other active people", async () => {
+  const files = { "2026-05-26.md": block("2026-05-26", "10:00", "kitchen", "KEEP pancake one") };
+  await withStack(files, { auto: { judge_mode: "order" } }, async ({ pipeline, calls }) => {
+    await pipeline.plan(
+      input({
+        participants: [ALICE],
+        activePeople: [
+          { provider: "matrix", senderId: "@a:x", name: "alice" },
+          { provider: "matrix", senderId: "@d:x", name: "dave" },
+        ],
+      }),
+    );
+    const c = calls.find((x) => x.state.entry && x.state.conversation)!;
+    assert.deepEqual(c.state.participants, ["alice", "dave"]);
+    assert.ok("about_participant" in c.questions);
+  });
+});
+
+test("order mode: without a judge, person-cued passages are not sent to the cross-encoder", async () => {
+  const files = { "2026-05-27.md": block("2026-05-27", "10:00", "kitchen", "RR90 garden talk with carol") };
+  const docs: string[] = [];
+  const score = (d: string) => (docs.push(d), rrScore(d));
+  await withStack(files, { decisions: false, auto: { judge_mode: "order", person_recent: 2 }, rerank: { minScore: 0.5, score } }, async ({ pipeline, store, storage }) => {
+    const [row] = storage.read((db) => db.prepare("select content_hash as h from memory_chunks where text like '%garden talk%'").all() as Array<{ h: string }>);
+    await store.setProvenance({ agent: "", contentHash: row!.h, status: "tagged", summaryId: "s", timelineKey: "matrix:acc:!room", participants: [{ provider: "matrix", senderId: "@carol:x", count: 3 }], at: 1 });
+    await pipeline.plan(input({ request: { from: "carol", text: "hey" }, activePeople: [{ provider: "matrix", senderId: "@carol:x", name: "carol" }] }));
+    assert.ok(!docs.some((d) => d.includes("garden talk")));
+  });
+});
+
+test("a person-cued block the late stage also returns is one candidate, judged and shown once", async () => {
+  const files = { "2026-05-28.md": block("2026-05-28", "10:00", "kitchen", "KEEP alice adopted a cat named Miso.") };
+  const carol = { provider: "matrix", senderId: "@carol:x" };
+  const late = (store: MemoryRetrievalStore) => ({
+    cutoff: () => undefined,
+    score: async (q: { candidates: Array<{ contentHash: string }> }) => {
+      const rows = store.chunksWithParticipants(null, [carol], 10, 0);
+      const scores = new Map<string, number>();
+      for (const r of rows) scores.set(r.contentHash, 0.5);
+      for (const c of q.candidates) scores.set(c.contentHash, 0.4);
+      return { status: "ok", backend: "fake", ms: 0, windowSize: rows.length, missing: 0, queryModel: "toy", windowChunks: rows, scores, missingHashes: [] };
+    },
+  });
+  for (const mode of ["order", "filter"]) {
+    await withStack(files, { auto: { judge_mode: mode, person_recent: 2 }, late }, async ({ pipeline, store, storage, calls }) => {
+      const [row] = storage.read((db) => db.prepare("select content_hash as h from memory_chunks where text like '%Miso%'").all() as Array<{ h: string }>);
+      await store.setProvenance({ agent: "", contentHash: row!.h, status: "tagged", summaryId: "s", timelineKey: "matrix:acc:!room", participants: [{ ...carol, count: 3 }], at: 1 });
+      const plan = await pipeline.plan(input({ request: { from: "carol", text: "hey" }, activePeople: [{ ...carol, name: "carol" }] }));
+      assert.equal(plan.block!.split("Miso").length - 1, 1, `${mode}: shown once`);
+      assert.equal(calls.filter((c) => c.state.entry?.text.includes("Miso")).length, 1, `${mode}: judged once`);
+    });
+  }
 });

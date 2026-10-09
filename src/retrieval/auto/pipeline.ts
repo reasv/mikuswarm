@@ -296,6 +296,8 @@ export class MemoryRetrievalPipeline {
     const itemStage = new Map<string, ItemStage>();
     /** Items the fallback rule selected (never a model verdict). */
     const fallbackSelected = new Set<string>();
+    /** Order mode: judged items shown by the ordering without being judge-kept. */
+    const orderSelected = new Set<string>();
     const verdicts = new Map<string, MemoryPassageVerdict>();
     const aborted = () => input.signal?.aborted === true;
     // Told to finish now (the build's wait expired): the stages still waiting on
@@ -575,7 +577,8 @@ export class MemoryRetrievalPipeline {
         lateQueryModel = out.queryModel;
         // Merge the exhaustive branch's blocks into the pool.
         const extra: Candidate[] = [];
-        const have = new Set(pool.map((c) => c.chunk.contentHash));
+        // Person-cued passages left the pool but are still candidates: never add them twice.
+        const have = new Set([...pool, ...personCued].map((c) => c.chunk.contentHash));
         for (const row of out.windowChunks) {
           if (have.has(row.contentHash) || itemStage.has(row.contentHash)) continue;
           const c: Candidate = { chunk: row, hybrid: 0, score: 0, laneRelevance: { late_window: 0 }, presence: false, pendingFilters: [] };
@@ -598,9 +601,9 @@ export class MemoryRetrievalPipeline {
     // ── 4. Cross-encoder ──────────────────────────────────────────────────
     let rerankRan = false;
     let rerankCutoff: number | undefined;
-    // Order mode: the person-cued passages are scored too (never cut by it), so
-    // every passage the selection orders has a cross-encoder score.
-    const toScore = auto.judgeMode === "order" ? [...pool, ...personCued] : pool;
+    // Order mode with a judge: the person-cued passages are scored too (never
+    // cut by it), so every passage the selection orders has a cross-encoder score.
+    const toScore = auto.judgeMode === "order" && this.judgeOn(agent) ? [...pool, ...personCued] : pool;
     if (this.deps.rerank && cfg.rerank.enabled && toScore.length > 0 && !aborted() && !cut()) {
       const q = rerankQuery(input, cfg.rerank.query, cfg.rerank.queryMaxChars);
       const t0 = this.now();
@@ -664,6 +667,13 @@ export class MemoryRetrievalPipeline {
       report.decisionGroup = decisionGroup;
       const knobs = memoryPointKnobs(engine.raw(agent));
       const conversation = input.conversation.slice(-(knobs.conversationMessages ?? DEFAULT_MEMORY_CONVERSATION_MESSAGES));
+      // The people the judge's `about_participant` asks about: the participants
+      // (with earlier names) plus the other active people of the window, whose
+      // entries person-cued recall brings.
+      const judgeNames = [...laneNames];
+      for (const p of input.activePeople ?? []) {
+        if (!judgeNames.some((n) => n.toLowerCase() === p.name.toLowerCase())) judgeNames.push(p.name);
+      }
       // On finish-now, unanswered passages count as not judged (the fallback
       // rule), and their requests are aborted, freeing the group's slots.
       const judgedOutcomes = await Promise.all(
@@ -682,7 +692,7 @@ export class MemoryRetrievalPipeline {
                     },
                   }
                 : {}),
-              participants: laneNames,
+              participants: judgeNames,
               passage: {
                 date: agentDateStamp(c.chunk.entryTs),
                 room: c.chunk.room,
@@ -744,7 +754,7 @@ export class MemoryRetrievalPipeline {
         if (modelVerdicts === 0) report.reason = failReason();
         const vetoed = (c: Candidate) => {
           const v = verdicts.get(c.chunk.contentHash);
-          return v !== undefined && (v.relevant ?? 0) < ORDER_VETO && (v.aboutParticipant ?? 0) < ORDER_VETO;
+          return v !== undefined && !v.keep && (v.relevant ?? 0) < ORDER_VETO && (v.aboutParticipant ?? 0) < ORDER_VETO;
         };
         const eligible: Candidate[] = [];
         for (const c of pool) {
@@ -761,7 +771,13 @@ export class MemoryRetrievalPipeline {
         }
         // Excerpts are made only for what can still fit.
         selected = orderRanked(eligible, verdicts).slice(0, auto.maxResults * 2);
-        for (const c of selected) if (!verdicts.has(c.chunk.contentHash)) fallbackSelected.add(c.chunk.contentHash);
+        for (const c of selected) {
+          if (!verdicts.has(c.chunk.contentHash)) fallbackSelected.add(c.chunk.contentHash);
+          else if (!verdicts.get(c.chunk.contentHash)!.keep) orderSelected.add(c.chunk.contentHash);
+        }
+        for (const c of eligible) {
+          if (modelVerdicts > 0 && !verdicts.has(c.chunk.contentHash) && !selected.includes(c)) itemStage.set(c.chunk.contentHash, "not_judged");
+        }
       } else if (modelVerdicts > 0) {
         source = "model";
         const keptList = pool.filter((c) => verdicts.get(c.chunk.contentHash)?.keep && !c.hiddenBy);
@@ -926,7 +942,15 @@ export class MemoryRetrievalPipeline {
         item.relevant = v.relevant;
         item.aboutParticipant = v.aboutParticipant;
       }
-      if (item.stage === "kept") item.selectedBy = fallbackSelected.has(c.chunk.contentHash) ? "fallback" : v ? "judge" : "unjudged";
+      if (item.stage === "kept") {
+        item.selectedBy = fallbackSelected.has(c.chunk.contentHash)
+          ? "fallback"
+          : orderSelected.has(c.chunk.contentHash)
+            ? "order"
+            : v
+              ? "judge"
+              : "unjudged";
+      }
       if (c.hiddenBy) item.hiddenBy = c.hiddenBy;
       return item;
     });

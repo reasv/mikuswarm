@@ -137,6 +137,7 @@ describe('fallback markers', () => {
 		expect(r.items[1]).toMatchObject({ judged: true, selectedBy: 'judge' });
 		expect(r.items.map(selectionLabel)).toEqual(['fallback', null, null]);
 		expect(selectionLabel({ stage: 'kept', selectedBy: 'unjudged' })).toBe('unjudged');
+		expect(selectionLabel({ stage: 'kept', selectedBy: 'order' })).toBe('ordered');
 		expect(stageLabel('aborted')).toBe('plan aborted, not shown');
 		const old = parseRetrievalReport(JSON.stringify({ source: 'model', items: [{ contentHash: 'a', citation: 'c', stage: 'kept' }] }))!;
 		expect(old.fellBack).toBeUndefined();

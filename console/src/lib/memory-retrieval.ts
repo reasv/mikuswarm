@@ -261,6 +261,7 @@ export function selectionLabel(item: Pick<ReportItem, 'stage' | 'selectedBy'>): 
 	if (item.stage !== 'kept') return null;
 	if (item.selectedBy === 'fallback') return 'fallback';
 	if (item.selectedBy === 'unjudged') return 'unjudged';
+	if (item.selectedBy === 'order') return 'ordered';
 	return null;
 }
 
