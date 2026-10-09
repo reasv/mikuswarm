@@ -208,7 +208,7 @@ test("normalize fatals: no match dimension, unknown model, sub-cap rules", () =>
     [{ user: "*", models: ["glm-cheap"], limits: [{ max_usd: 2, window: ROLL24, models: ["opus-premium"] }] }],
     { defaultTz: "UTC", knownModelIds: KNOWN_MODELS },
   );
-  assert.ok(subForeign.fatal.some((f) => /not in the rule's models/.test(f)));
+  assert.ok(subForeign.fatal.some((f) => /neither in the rule's models nor a refusal-rule or routing model/.test(f)));
 });
 
 test("normalize fatals: bad partition var, shorthand+limits, >1 shared pool", () => {

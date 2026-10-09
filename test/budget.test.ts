@@ -1780,3 +1780,15 @@ test("normalizeUserLimits + resolve: fallback_chains = after_preferences reaches
   assert.equal(off.rules[0]!.chainsAfterPreferences, undefined);
   assert.equal(userEngineWith(off.rules).resolve({ userId: "@u:hs", roomId: "!r" } as UserLimitContext).chainsAfterPreferences, undefined);
 });
+
+test("normalizeUserLimits: a sub-cap may name a refusal-rule/routing model outside the preference list", () => {
+  const base = { defaultTz: "UTC", knownModelIds: new Set(["default", "k3", "other"]) };
+  const rule = (m: string): RawUserLimitRule[] => [
+    { user: "*", models: ["default"], limits: [{ max_usd: 1, window: { type: "calendar", period: "day", tz: "UTC" }, models: [m] }] },
+  ];
+  assert.ok(normalizeUserLimits(rule("k3"), base).fatal.some((f) => /sub-cap model "k3"/.test(f)));
+  const ok = normalizeUserLimits(rule("k3"), { ...base, requestableModelIds: new Set(["k3"]) });
+  assert.deepEqual(ok.fatal, []);
+  assert.deepEqual(ok.rules[0]!.constraints[0]!.models, ["k3"]);
+  assert.ok(normalizeUserLimits(rule("other"), { ...base, requestableModelIds: new Set(["k3"]) }).fatal.length > 0);
+});

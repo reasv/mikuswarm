@@ -138,6 +138,13 @@ export function normalizeUserLimits(
     agentAccountPrefixes?: Map<string, string[]>;
     /** All configured account prefixes ("provider:accountKey") — validates `account` matchers. */
     knownAccountPrefixes?: Set<string>;
+    /**
+     * Models a session can request outside a rule's preference list: refusal-rule
+     * entries (the pinned redo model is the requested model) and routing-task
+     * cascades. A sub-cap may name one of these without listing it in `models`,
+     * so it can be capped per user without becoming an ordinary preference.
+     */
+    requestableModelIds?: Set<string>;
   },
 ): NormalizeUserLimitsResult {
   const rules: NormalizedUserLimitRule[] = [];
@@ -248,8 +255,10 @@ export function normalizeUserLimits(
           for (const m of c.models) {
             if (!opts.knownModelIds.has(m)) {
               fatal.push(`${label} limits[${index}]: unknown model "${m}"`);
-            } else if (models && !models.includes(m)) {
-              fatal.push(`${label} limits[${index}]: sub-cap model "${m}" not in the rule's models`);
+            } else if (models && !models.includes(m) && !opts.requestableModelIds?.has(m)) {
+              fatal.push(
+                `${label} limits[${index}]: sub-cap model "${m}" is neither in the rule's models nor a refusal-rule or routing model`,
+              );
             }
           }
         }

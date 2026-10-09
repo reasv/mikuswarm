@@ -209,6 +209,7 @@ import { CheckEvaluator } from "./checks/evaluator.js";
 import { createBackgroundChecks, type BackgroundChecks } from "./checks/gate.js";
 import { AuditWorkerPool } from "./audit/index.js";
 import { normalizeRefusalRules, validateRefusalRules } from "./refusals/rules.js";
+import { SAME_MODEL_KEY } from "./checks/types.js";
 import type { SyntheticCallSpec } from "./agent/synthetic-calls.js";
 import { SauceNaoRateLimiter } from "./saucenao/rate-limiter.js";
 import { setEgressGuardEnabled } from "./tools/ssrf.js";
@@ -2438,9 +2439,27 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
     // `[[user_limits]]` is absent/empty. Cross-field validation fails fast here,
     // mirroring `normalizeLimits` (the explicit-deployment-config convention).
     {
+      // Models a session can request outside the preference list (a refusal-rule
+      // pin, a routed cascade): a per-user sub-cap may cap them directly.
+      const requestableModelIds = new Set<string>();
+      for (const rule of config.refusal_fallback ?? []) {
+        for (const entry of rule.models ?? []) {
+          const key = typeof entry === "string" ? entry : entry.model;
+          if (key !== SAME_MODEL_KEY) requestableModelIds.add(key);
+        }
+      }
+      for (const decisions of [config.decisions, ...Object.values(config.agents ?? {}).map((a) => a.decisions)]) {
+        for (const task of Object.values(decisions?.routing?.tasks ?? {})) {
+          for (const key of task.models ?? (task.model ? [task.model] : [])) requestableModelIds.add(key);
+        }
+        for (const cascade of Object.values(decisions?.routing?.difficulty?.models ?? {})) {
+          for (const key of cascade) requestableModelIds.add(key);
+        }
+      }
       const normalizedUser = normalizeUserLimits(config.user_limits as never, {
         defaultTz: config.agent.timezone ?? "UTC",
         knownModelIds,
+        requestableModelIds,
         // §6.4: warn when a partition var is used by no enabled provider.
         enabledProviders: [...providers.keys()],
         isAgentsMode,
