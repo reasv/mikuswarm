@@ -1679,6 +1679,8 @@ export class AgentSessionFactory {
         onRequestCommitted: (message: AssistantMessage) => commitRequest(message),
         // A request the run aborted on the wire is billed by the provider (§8b
         // "Aborted requests"): one estimated ledger row through the same commit.
+        repetitionGuard: () =>
+          this.options.config.models[servedModelForAttempt ?? resolvedMember.logicalId]?.repetition_guard,
         onRequestAborted: (info) => {
           const servedId = servedModelForAttempt ?? resolvedMember.logicalId;
           refreshRunningContext();

@@ -1094,6 +1094,23 @@ const ModelSchema = StrictObject({
   // Ignored on other wire APIs. Default: unset (off).
   // Enable with: cache_breakpoints = "explicit"
   cache_breakpoints: Type.Optional(Type.Literal("explicit")),
+  // Repetition guard (ARCHITECTURE.md §8a): abort an agent-loop attempt from this
+  // model whose streamed output (text, thinking, or a tool call's arguments)
+  // collapses into a loop — one unit of at most `max_period` characters repeated
+  // back to back, exactly, for at least `min_chars` characters and `min_repeats`
+  // copies — then retry it (health-neutral; billed for what streamed). For models
+  // known to degenerate on long outputs. Default: unset (off). Enable with an
+  // empty table for the defaults: [models.<name>.repetition_guard]
+  repetition_guard: Type.Optional(
+    Type.Object(
+      {
+        min_chars: Type.Optional(Type.Integer({ minimum: 64 })),
+        max_period: Type.Optional(Type.Integer({ minimum: 1, maximum: 4096 })),
+        min_repeats: Type.Optional(Type.Integer({ minimum: 2 })),
+      },
+      { additionalProperties: false },
+    ),
+  ),
   // Default model-prompt profile (a `[model_prompts.*]` name) for every session
   // type this model serves; a session type's `model_prompts` overrides it
   // (ARCHITECTURE.md §8 "Model prompts"). Unset = no model prompt.

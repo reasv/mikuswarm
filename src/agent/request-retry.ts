@@ -10,6 +10,7 @@ import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Logger } from "../observability/logger.js";
 import type { LlmRequestRecord, LlmRequestRing } from "./request-ring.js";
 import type { PriorityClass } from "./scheduler.js";
+import { RepetitionDetector, type RepetitionGuardConfig, type RepetitionTrip } from "./repetition-guard.js";
 
 // =============================================================================
 // Layer 0 — transparent request-level LLM retry.
@@ -55,6 +56,17 @@ import type { PriorityClass } from "./scheduler.js";
  * teardown. The caller's own abort (drain / Stop) never carries it.
  */
 export const LLM_STALL_ABORT_REASON = "mikuswarm:llm-stall";
+
+/**
+ * Abort reason Layer 0 attaches when the repetition guard (§8a) cuts off an
+ * attempt whose output collapsed into a loop. The attempt counts as a
+ * retryable failure that is neutral for the model's health (the model is
+ * serving; this sample went bad).
+ */
+export const LLM_DEGENERATE_ABORT_REASON = "mikuswarm:llm-degenerate";
+
+/** Most repetition-guard trips one request may take before it gives up. */
+export const MAX_DEGENERATE_TRIPS_PER_REQUEST = 3;
 
 /** True when `signal` was aborted by Layer 0's wall-clock budget (a stall). */
 export function isStallAbort(signal: AbortSignal | undefined): boolean {
@@ -188,6 +200,13 @@ export interface RequestRetryContext {
    * abort, which is an environmental failure.
    */
   onRequestAborted?: (info: AbortedRequestInfo) => Usage | undefined;
+  /**
+   * The repetition guard of the member serving the current attempt (§8a),
+   * read at the attempt's first streamed delta; undefined = off. A trip aborts
+   * the attempt, bills it through {@link onRequestAborted}, and retries it as a
+   * health-neutral environmental failure with a fresh wall-clock budget.
+   */
+  repetitionGuard?: () => Partial<RepetitionGuardConfig> | undefined;
   /**
    * Pre-flight context-budget check (spec TOKEN-USAGE-TRACKING §6.2). Evaluated
    * ONCE per request, before the first attempt (every Layer-0 attempt replays
@@ -598,23 +617,30 @@ export function withRequestRetry(
     // surfaced budget abort is re-labelled as wait-exhaustion below (the caller
     // did not abort — the clock did).
     const maxWaitMs = options.maxWaitMs;
-    const deadline = maxWaitMs === undefined ? Infinity : Date.now() + maxWaitMs;
+    let deadline = Infinity;
     let budgetCtrl: AbortController | undefined;
     let budgetTimer: ReturnType<typeof setTimeout> | undefined;
-    if (maxWaitMs !== undefined) {
-      budgetCtrl = new AbortController();
-      budgetTimer = setTimeout(() => budgetCtrl!.abort(), maxWaitMs);
-      budgetTimer.unref?.();
-    }
-    const budgetSignal = budgetCtrl?.signal;
+    let budgetSignal: AbortSignal | undefined;
     // The inter-attempt backoff sleep is pure waiting and produces no tokens, so
     // BOTH the caller's abort and the budget expiry must cut it short (§6). The
     // sleep is the one place the budget always composes — the immunity rule
     // applies only to a token-producing attempt, never to a wait.
-    const sleepSignal =
-      callerSignal && budgetSignal
-        ? AbortSignal.any([callerSignal, budgetSignal])
-        : (callerSignal ?? budgetSignal);
+    let sleepSignal: AbortSignal | undefined = callerSignal;
+    // (Re)start the budget. Armed once per request; re-armed after a repetition-
+    // guard trip, whose attempt spent the clock generating, which the budget
+    // never bounds — the retry gets a fresh wait.
+    const armBudget = (): void => {
+      if (maxWaitMs === undefined) return;
+      if (budgetTimer) clearTimeout(budgetTimer);
+      deadline = Date.now() + maxWaitMs;
+      const ctrl = new AbortController();
+      budgetCtrl = ctrl;
+      budgetTimer = setTimeout(() => ctrl.abort(), maxWaitMs);
+      budgetTimer.unref?.();
+      budgetSignal = ctrl.signal;
+      sleepSignal = callerSignal ? AbortSignal.any([callerSignal, ctrl.signal]) : ctrl.signal;
+    };
+    armBudget();
 
     const tap = (attempt: number, event: AssistantMessageEvent): void => {
       try {
@@ -730,6 +756,9 @@ export function withRequestRetry(
         // ever fails to converge (it self-bounds by the preference-set size). No
         // realistic per-user model set degrades more times than this.
         let budgetReselects = 0;
+        // Repetition-guard trips in this request (§8a), bounded by
+        // MAX_DEGENERATE_TRIPS_PER_REQUEST.
+        let degenerateTrips = 0;
         const maxBudgetReselects = 16;
         // One per request: the fallback resolver's per-request pass over the chain.
         const attemptState: RequestAttemptState = {
@@ -774,6 +803,10 @@ export function withRequestRetry(
           let firstEventSeen = false;
           let firstEventAt: number | undefined;
           const streamedDeltas: string[] | undefined = ctx.onRequestAborted ? [] : undefined;
+          // Repetition guard (§8a): resolved at the attempt's first delta, when
+          // the served member is known; null = off for this attempt.
+          let repetitionDetector: RepetitionDetector | null | undefined;
+          let degenerate: RepetitionTrip | undefined;
 
           // Per-attempt abort: the caller's abort (drain/Stop) always reaches
           // the inner stream; the budget's abort reaches it ONLY while the
@@ -838,6 +871,34 @@ export function withRequestRetry(
                 // the attempt is now immune to the wall-clock budget.
                 producedTokens = true;
                 detachBudget();
+              }
+              if (event.type === "text_delta" || event.type === "thinking_delta" || event.type === "toolcall_delta") {
+                if (repetitionDetector === undefined) {
+                  let cfg: Partial<RepetitionGuardConfig> | undefined;
+                  try {
+                    cfg = ctx.repetitionGuard?.();
+                  } catch {
+                    cfg = undefined;
+                  }
+                  repetitionDetector = cfg ? new RepetitionDetector(cfg) : null;
+                }
+                const trip = repetitionDetector?.push(event.contentIndex, event.delta);
+                if (trip) {
+                  // The generation collapsed into a loop: stop paying for it. The
+                  // abort reaches the wire; the attempt settles below as a
+                  // degenerate (retryable, health-neutral) failure.
+                  degenerate = trip;
+                  attemptCtrl.abort(LLM_DEGENERATE_ABORT_REASON);
+                  // Settle on the stream's own partial message: it names the member
+                  // that served the attempt (and any usage it already reported),
+                  // which the aborted-request billing keys on.
+                  errorEvent = {
+                    type: "error",
+                    reason: "aborted",
+                    error: { ...event.partial, stopReason: "aborted", errorMessage: "aborted by the repetition guard" },
+                  };
+                  break;
+                }
               }
               // A clean terminal `done` ends the inner iteration on its own.
             }
@@ -942,6 +1003,14 @@ export function withRequestRetry(
           const failure = errorEvent.error;
           let verdict = classifyLlmError(failure?.errorMessage, failure?.stopReason, failure?.rawStopReason);
 
+          // A repetition-guard trip (the caller did not abort): the attempt spent
+          // the clock generating, so the retry gets a fresh wall-clock budget.
+          const degenerateTrip = degenerate !== undefined && verdict === "aborted" && callerSignal?.aborted !== true;
+          if (degenerateTrip) {
+            degenerateTrips++;
+            armBudget();
+          }
+
           // Budget expiry on a ZERO-token attempt (a stuck/silent stream or a
           // mid-admission wait) arrives as an abort of the per-attempt signal.
           // When the CALLER did not abort, the clock did: re-label as
@@ -972,9 +1041,11 @@ export function withRequestRetry(
           // "Aborted requests"): the hook records it once, with estimated usage,
           // in place of the reported-usage capture below. Never retried, so no
           // later attempt can count it again.
+          // A repetition-guard trip is billed the same way: the provider charges
+          // for what streamed before the abort.
           const abortedOnWire =
             verdict === "aborted" &&
-            callerSignal?.aborted === true &&
+            (callerSignal?.aborted === true || degenerateTrip) &&
             !abortedAtStart &&
             attemptState.awaitingAdmission !== true &&
             ctx.onRequestAborted !== undefined;
@@ -1026,6 +1097,33 @@ export function withRequestRetry(
             }
           }
 
+          if (degenerateTrip) {
+            const trip = degenerate!;
+            const message =
+              `degenerate output: a ${trip.period}-character unit repeated over ${trip.runChars} characters ` +
+              `(content block ${trip.contentIndex}, ${trip.blockChars} characters streamed); aborted by the repetition guard`;
+            ctx.logger?.warn("llm_degenerate_output", {
+              sessionId: ctx.sessionId,
+              timelineKey: ctx.timelineKey,
+              sessionType: ctx.sessionType,
+              model: (model as { id?: string }).id ?? "unknown",
+              servedModel: ctx.getServedModel?.(),
+              attempt: attempt + 1,
+              trips: degenerateTrips,
+              period: trip.period,
+              runChars: trip.runChars,
+              blockChars: trip.blockChars,
+              contentIndex: trip.contentIndex,
+            });
+            verdict = "environmental";
+            errorEvent = synthesizeErrorEvent(model, message);
+            if (attemptRecord) {
+              attemptRecord.outcome = "error";
+              attemptRecord.class = "environmental";
+              attemptRecord.errorMessage = message;
+            }
+          }
+
           if (verdict === "environmental") {
             // Every environmental failure is logged — including the first
             // attempt (spec §9.3 closes the audit gap where first-attempt
@@ -1041,6 +1139,10 @@ export function withRequestRetry(
               producedTokens,
               errorMessage: errorEvent.error?.errorMessage,
             });
+            if (degenerateTrips > MAX_DEGENERATE_TRIPS_PER_REQUEST) {
+              surface(errorEvent, verdict);
+              return;
+            }
             if (Date.now() >= deadline || budgetExpired) {
               ctx.logger?.warn("llm_request_wait_exhausted", {
                 sessionId: ctx.sessionId,
