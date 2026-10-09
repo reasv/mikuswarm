@@ -573,17 +573,27 @@ Also decided (rev 5):
     - It sits before the cross-encoder. Its code is implemented regardless of the model choice.
 12. **Segmentation is not a problem here** (owner): memories are discrete blocks, so every stage scores whole blocks (§5.0).
 
-Decided by measurement (2026-10-08 evaluation: 80 real queries, pooled relevance labels from a self-hosted labeller, every method through the production search path):
-13. **The cross-encoder stage is on**, with bge-reranker-v2-m3 on a GPU. Precision@8 after re-ranking is ~0.37, against 0.17 for the hybrid's own top 8.
-14. **Late interaction is not used.**
-    - On its own it is weaker than BM25, even with the pipeline's real query: R@60 0.27 for mLateOn, against 0.375 for BM25.
-    - Added to an RRF of BM25 and dense, it significantly *lowers* precision@8 after re-ranking: −0.03 with mLateOn, −0.05 with pplx-0.6b.
-    - A 9B index (queried by 0.6B or 9B) gave no gain over 0.6B.
-    - The code stays, default off. TurboQuant 4-bit kept 90–95% of the exact top 20 in its top 60; 2-bit is not usable.
-15. **Recall uses reciprocal-rank fusion** (`fusion = "rrf"`, k = 60) of BM25 and the built-in vectors: R@60 0.264 → 0.375, and P@8 after re-ranking 0.308 → 0.373.
-    - A stronger embedder (Qwen3-Embedding-4B) added +0.02, which is not significant, so the built-in embedder stays.
-    - The weighted sum's vector half was actively hurting recall on this corpus.
-16. **Recall is not the bottleneck.** 94% of builds have at least one relevant entry in the recall set; ranking is where the gain was. The old unjudged selection showed entries that were only 10% relevant, no better than the recall set at random.
+Decided by measurement (2026-10-08/09 evaluation; method and caveats below):
+- **Method.**
+  - **Queries:** 1,500 interactive sessions over 90 days. A self-hosted labeller kept the 123 (8.2%) whose reply benefits from memory beyond who the person is: most messages need none.
+  - **Labels:** every pooled (query, entry) pair got two labels, *topical* and *person*. The graded metric scores 3 for both, 2 for topical only, 1 for person only.
+  - **Baseline:** the newest 8 entries involving the participants. Any retrieval must beat it, or the simpler person-based approach wins.
+  - **Labeller check:** a stronger model on 100 items confirmed the labeller's topical negatives, but only about a third of its topical positives (shared words or themes). A stricter prompt did not generalise.
+  - **So:** absolute topical numbers are inflated. Rankings and paired comparisons held, including under the stricter subset. The first run, which counted "about the same person" as relevant and had no baseline, was discarded.
+13. **Retrieval beats the person baseline.** On graded nDCG@8 the live pipeline is ahead by +0.19, and the best tested setup by +0.29, both significant.
+14. **The cross-encoder is the largest single gain** (graded nDCG@8 +0.14).
+    - It is queried with the request alone (trigger plus reply target, speaker names kept), which measured better than the request plus a conversation tail.
+    - With names in its query, it orders the person's memories by topic on its own: 91–95% of its top 8 are about a participant.
+    - Qwen3-Reranker-0.6B beats bge-reranker-v2-m3 by +0.03 to +0.05 topical P@8 (significant), at about twice the latency.
+15. **Recall uses RRF (k = 60)** of BM25 and the dense lane.
+    - The previous weighted sum let a weak embedder's compressed scores drown the lexical signal.
+    - Qwen3-Embedding-4B beats the built-in bge-small at the recall stage (significant). Behind a cross-encoder its gain is marginal.
+16. **Not used:**
+    - **Late interaction:** no gain once a cross-encoder runs. A 9B index gave nothing over 0.6B. The code stays, default off.
+    - **Person-first scoping and tiered topic/person merging:** no significant gain, since participant tags cover over half the corpus.
+    - **Topic extraction:** an LLM-written topic line in the cross-encoder query gave a small gain that did not survive the label check; used as the whole query it hurts. Optional, not built.
+    - **TurboQuant:** 4-bit keeps 90–95% of the exact top 20 in its top 60; 2-bit is not usable.
+17. **The decision model's relevance score** ranks topical entries well (AUC ~0.87) but is compressed: about 30% precise at 0.7. It suits ordering or soft promotion, not a hard filter on topic.
 
 Remaining:
 - **The survey and measurements of §5.0c,** which choose the models: GPU primary, API fallback (or primary), and the built-in CPU models. These run in parallel with the implementation.
