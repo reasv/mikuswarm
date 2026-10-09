@@ -1527,13 +1527,12 @@ export class AgentSessionFactory {
         // member's health key (endpoint::wire-model — the upstream identity a
         // prompt cache is scoped to). The next pre-flight credits the cache-read
         // discount only to candidates predicted to be served from this same
-        // domain; any other candidate is priced as a cache miss. The logical-id
-        // fallback (member not found in the dispatched composite — shouldn't
-        // happen) can only mismatch, i.e. deny credit: conservative.
-        ctxCounter.cacheDomainAtLast =
-          activeSelection.fallback.survivorMembers.find(
-            (m) => m.logicalId === resolvedMember.logicalId,
-          )?.healthKey ?? resolvedMember.logicalId;
+        // domain; any other candidate is priced as a cache miss. Derived from the
+        // served member's own config, not from `activeSelection`: a request
+        // dispatched on a refusal pin (sessionStreamFn) never updates the
+        // selection, so its member is absent from that composite and every
+        // later pin pre-flight would be priced as a full cache miss.
+        ctxCounter.cacheDomainAtLast = healthKeyOf(resolvedMember.logicalId);
       }
       const budget = this.options.budget;
       if (budget?.record) {

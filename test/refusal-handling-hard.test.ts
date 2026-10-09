@@ -628,6 +628,43 @@ test("per-user selection + routing: an unaffordable entry is skipped; the pin ov
   });
 });
 
+test("per-user selection: a pinned model keeps the cache-read credit of its own previous request", async () => {
+  await withEnv({ "/a/": "filter" }, async ({ stub, storage, root }) => {
+    await addSessionRow(storage, "s11b");
+    const estimates: Array<{ model: string; withinCacheTtl?: boolean }> = [];
+    const resolution = {
+      matched: true, active: true, banned: false, models: ["default"], constraints: [], ledgerPartitionKeys: [],
+    } as unknown as UserLimitResolution;
+    const ctx = { userId: "@u:hs", roomId: "!r:hs" } as UserLimitContext;
+    const engine = {
+      affordable: (_r: unknown, model: string, estimate: { withinCacheTtl?: boolean }) => {
+        estimates.push({ model, withinCacheTtl: estimate.withinCacheTtl });
+        return { ok: true, maxOutput: 200, remainingUsd: 5 };
+      },
+      bindingConstraint: () => undefined,
+      noteSelection: () => {},
+    } as never;
+    const factory = makeFactory({
+      root,
+      storage,
+      models: { default: oai(stub.port, "a-wire", "a"), redo1: oai(stub.port, "r1-wire", "r1") },
+      rules: [{ name: "r", models: ["redo1"] }],
+    });
+    const created = await factory.create(session("s11b"), [], { userLimit: { engine, resolution, ctx } });
+    await runFirst(created);
+    stub.behaviour["/a/"] = "ok";
+    const before = estimates.length;
+    await created.agent.prompt({ role: "user", content: "next", timestamp: 2 } as any);
+    assert.deepEqual(prefixes(stub), ["a", "r1", "r1"]);
+    const pinChecks = estimates.slice(before).filter((e) => e.model === "redo1");
+    assert.ok(pinChecks.length > 0, "the pinned request's pre-flight priced the pin");
+    assert.ok(
+      pinChecks.every((e) => e.withinCacheTtl === true),
+      "the pin's previous request established the cache domain the pin is served from",
+    );
+  });
+});
+
 // ── Anthropic category through the real stream ──────────────────────────────
 
 test("classifier end to end: the Anthropic stop_details category reaches the rule and the event row", async () => {
