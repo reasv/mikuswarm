@@ -2377,8 +2377,8 @@ export class AgentSessionFactory {
       streamFn,
       getApiKey: () => modelConfig.api_key,
       // Explicit prompt-cache breakpoints (Bedrock's checkpoint-based cache for
-      // OpenAI models; extra Anthropic cache_control markers on the stable
-      // timeline).  The injector is installed for every
+      // OpenAI models and for explicit-only Chat Completions models such as Kimi
+      // K3; extra Anthropic cache_control markers on the stable timeline).  The injector is installed for every
       // session; it gates on the serving member's Model descriptor
       // (compat.cacheBreakpoints === "explicit", set in createModelFromConfig) so
       // fallback members without the option — e.g. a direct-OpenAI model in the
@@ -3576,7 +3576,8 @@ export function createModelFromConfig(model: ModelConfig, contextWindow?: number
       openRouterRouting: model.compat?.openrouter_routing as OpenRouterRouting | undefined,
       // Carry the explicit cache_breakpoints preference on the wire Model
       // descriptor so the onPayload injector can gate per serving member (not per
-      // chain head).  Read for openai-responses and anthropic-messages members;
+      // chain head).  Read for openai-responses, anthropic-messages and
+      // openai-completions members;
       // undefined on all other models so the injector passes their payloads through.
       cacheBreakpoints: model.cache_breakpoints,
       // Carry the prefill text on the wire Model descriptor so the onPayload

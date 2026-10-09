@@ -1086,6 +1086,11 @@ const ModelSchema = StrictObject({
   // stable timeline item) next to the system-prompt and last-message markers
   // the driver already places, within Anthropic's limit of 4. Without them a
   // new session re-writes the whole room timeline to the cache.
+  // openai-completions: for providers whose Chat Completions cache is
+  // explicit-only (no automatic breakpoint, e.g. Kimi K3 on Amazon Bedrock),
+  // `prompt_cache_breakpoint` markers on the same three stable messages plus
+  // the last message and the previous request's last message, so each
+  // agent-loop request reads what the one before it wrote.
   // Ignored on other wire APIs. Default: unset (off).
   // Enable with: cache_breakpoints = "explicit"
   cache_breakpoints: Type.Optional(Type.Literal("explicit")),

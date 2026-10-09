@@ -583,3 +583,89 @@ test("anthropic: option off or other API leaves the payload alone", () => {
   // An openai-responses member with the option sees no `input` array → identity.
   assert.equal(inject(payload, { api: "openai-responses", compat: { cacheBreakpoints: "explicit" } }), payload);
 });
+
+// ── Chat Completions (explicit-only Bedrock cache, e.g. Kimi K3) ─────────────
+
+const chatModel = { api: "openai-completions", compat: { cacheBreakpoints: "explicit" as const } };
+const BP = { prompt_cache_breakpoint: { mode: "explicit" } };
+const big = (tag: string) => `${tag} ${"x".repeat(5000)}`;
+
+function chatMarked(payload: unknown): number[] {
+  const messages = (payload as { messages: Array<{ content: unknown }> }).messages;
+  return messages.flatMap((m, i) =>
+    Array.isArray(m.content) && m.content.some((p) => (p as Record<string, unknown>)["prompt_cache_breakpoint"]) ? [i] : [],
+  );
+}
+
+function chatPayload(...messages: object[]) {
+  return { model: "awsm.moonshotai.kimi-k3", messages };
+}
+
+test("chat: first request marks system, summary, stable item and the last message", () => {
+  const inject = makeBreakpointInjector(estimateTokens);
+  const payload = chatPayload(
+    { role: "developer", content: big("instructions") },
+    { role: "user", content: "<conversation_summary>" + big("s") + "</conversation_summary>" },
+    { role: "user", content: [{ type: "text", text: big("older batch") }] },
+    { role: "user", content: [{ type: "text", text: "latest batch" }] },
+    { role: "user", content: [{ type: "text", text: "<system>tail</system>" }] },
+  );
+  const out = inject(payload, chatModel) as { messages: Array<{ content: unknown }> };
+  assert.deepEqual(chatMarked(out), [0, 1, 2, 4]);
+  assert.deepEqual(out.messages[0]!.content, [{ type: "text", text: big("instructions"), ...BP }]);
+  assert.equal(chatMarked(payload).length, 0, "original payload is not mutated");
+});
+
+test("chat: an agent-loop request repeats the previous request's last-message marker", () => {
+  const inject = makeBreakpointInjector(estimateTokens);
+  const call = (id: string) => ({ role: "assistant", content: null, tool_calls: [{ id, type: "function", function: { name: "f", arguments: "{}" } }] });
+  const first = chatPayload(
+    { role: "system", content: big("instructions") },
+    { role: "user", content: "<system>tail</system>" },
+    call("c1"),
+    { role: "tool", tool_call_id: "c1", content: big("result one") },
+  );
+  // (e) = the trigger (last message of request 1); (d) = the tool result.
+  assert.deepEqual(chatMarked(inject(first, chatModel)), [0, 1, 3]);
+  const second = chatPayload(...first.messages, call("c2"), { role: "tool", tool_call_id: "c2", content: "r2" });
+  assert.deepEqual(chatMarked(inject(second, chatModel)), [0, 3, 5]);
+  // Parallel calls: the message before the assistant turn is still the previous last message.
+  const parallel = chatPayload(
+    { role: "system", content: big("instructions") },
+    { role: "user", content: "<system>tail</system>" },
+    { role: "assistant", content: null, tool_calls: [] },
+    { role: "tool", tool_call_id: "a", content: "ra" },
+    { role: "tool", tool_call_id: "b", content: "rb" },
+  );
+  assert.deepEqual(chatMarked(inject(parallel, chatModel)), [0, 1, 4]);
+});
+
+test("chat: small requests and tool-call-only assistant turns get no marker", () => {
+  const inject = makeBreakpointInjector(estimateTokens);
+  const small = chatPayload({ role: "system", content: "Be terse." }, { role: "user", content: "hi" });
+  assert.equal(inject(small, chatModel), small);
+  const endsOnAssistant = chatPayload(
+    { role: "system", content: big("instructions") },
+    { role: "user", content: "q" },
+    { role: "assistant", content: null, tool_calls: [] },
+  );
+  // The assistant turn has no text part to mark; the user message before it is marked.
+  assert.deepEqual(chatMarked(inject(endsOnAssistant, chatModel)), [0, 1]);
+});
+
+test("chat: the marker goes on the last text part, never on an image part", () => {
+  const inject = makeBreakpointInjector(estimateTokens);
+  const payload = chatPayload(
+    { role: "system", content: big("instructions") },
+    { role: "user", content: [{ type: "text", text: "look" }, { type: "image_url", image_url: { url: "data:image/png;base64,AA" } }] },
+  );
+  const out = inject(payload, chatModel) as { messages: Array<{ content: Array<Record<string, unknown>> }> };
+  assert.deepEqual(out.messages[1]!.content[0], { type: "text", text: "look", ...BP });
+  assert.equal(out.messages[1]!.content[1]!["prompt_cache_breakpoint"], undefined);
+});
+
+test("chat: option off leaves the payload alone", () => {
+  const inject = makeBreakpointInjector(estimateTokens);
+  const payload = chatPayload({ role: "system", content: big("instructions") }, { role: "user", content: "q" });
+  assert.equal(inject(payload, { api: "openai-completions", compat: {} }), payload);
+});
