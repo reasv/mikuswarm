@@ -598,7 +598,7 @@ function chatMarked(payload: unknown): number[] {
 }
 
 function chatPayload(...messages: object[]) {
-  return { model: "awsm.moonshotai.kimi-k3", messages };
+  return { model: "moonshotai.kimi-k3", messages };
 }
 
 test("chat: first request marks system, summary, stable item and the last message", () => {
