@@ -287,17 +287,20 @@ export function tailTokens(text: string, maxTokens: number): string {
   return `…${tail.trimStart()}`;
 }
 
-/** Clip a text to `maxTokens` from its start (with an ellipsis). */
+/** Clip a text to `maxTokens` from its start (with an ellipsis), keeping its line breaks. */
 export function headTokens(text: string, maxTokens: number): string {
   if (estimateTokens(text) <= maxTokens) return text;
   let chars = Math.max(1, maxTokens * 4);
-  let head = clipText(text, chars);
+  let head = clipText(text, chars, { keepLines: true });
   while (chars > 1 && estimateTokens(head) > maxTokens) {
     chars = Math.floor(chars * 0.8);
-    head = clipText(text, chars);
+    head = clipText(text, chars, { keepLines: true });
   }
   return head;
 }
+
+/** The judged texts keep their line breaks: style questions judge layout (lists, headings). */
+const LINES = { keepLines: true } as const;
 
 /** Which state a call's questions read (spec §6.2 split by state shape). */
 export type CheckStateScope = "full" | "message_only" | "duplicate";
@@ -317,7 +320,7 @@ export interface CheckStateInput {
 export function buildCheckState(input: CheckStateInput, budgetTokens: number): Record<string, unknown> {
   const { context, sources } = input;
   if (input.scope === "message_only") {
-    const message = clipText(sources.message ?? "", STATE_CLIPS.message);
+    const message = clipText(sources.message ?? "", STATE_CLIPS.message, LINES);
     return { message: headTokens(message, Math.max(16, budgetTokens - 8)) };
   }
   const fixed: Record<string, unknown> = {};
@@ -325,13 +328,13 @@ export function buildCheckState(input: CheckStateInput, budgetTokens: number): R
   if (request.length > 0) fixed["request"] = request;
   fixed["action"] = context.action;
   if (context.nudges !== undefined && context.nudges > 0) fixed["nudges"] = context.nudges;
-  if (context.firstAttempt) fixed["first_attempt"] = clipText(context.firstAttempt, STATE_CLIPS.firstAttempt);
+  if (context.firstAttempt) fixed["first_attempt"] = clipText(context.firstAttempt, STATE_CLIPS.firstAttempt, LINES);
   const texts: Array<[string, string]> = [];
-  if (hasSource(sources, "message")) texts.push(["message", clipText(sources.message!, STATE_CLIPS.message)]);
-  if (hasSource(sources, "analysis")) texts.push(["analysis", clipText(sources.analysis!, STATE_CLIPS.analysis)]);
-  if (hasSource(sources, "text")) texts.push(["text", clipText(sources.text!, STATE_CLIPS.text)]);
+  if (hasSource(sources, "message")) texts.push(["message", clipText(sources.message!, STATE_CLIPS.message, LINES)]);
+  if (hasSource(sources, "analysis")) texts.push(["analysis", clipText(sources.analysis!, STATE_CLIPS.analysis, LINES)]);
+  if (hasSource(sources, "text")) texts.push(["text", clipText(sources.text!, STATE_CLIPS.text, LINES)]);
   if (hasSource(sources, "thinking")) texts.push(["thinking", tailTokens(sources.thinking!, input.thinkingTailTokens)]);
-  if (hasSource(sources, "artifact")) texts.push(["artifact", clipText(sources.artifact!, STATE_CLIPS.artifact)]);
+  if (hasSource(sources, "artifact")) texts.push(["artifact", clipText(sources.artifact!, STATE_CLIPS.artifact, LINES)]);
   for (const [key, value] of texts) fixed[key] = value;
   if (hasSource(sources, "rollout")) {
     fixed["rollout"] = sources.rollout!.filter((t) => t.trim()).map((t) => clipText(t, STATE_CLIPS.rolloutItem));

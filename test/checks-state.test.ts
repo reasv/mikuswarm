@@ -139,6 +139,25 @@ test("buildCheckState: message-only scope for the style split", () => {
   assert.deepEqual(state, { message: "hello" });
 });
 
+test("buildCheckState: judged texts keep their line breaks (style questions judge layout), chat is flattened", () => {
+  const message = "Quick rundown:\r\n\n\n\n- first   point  \n-\tsecond point\n\n**Bottom line:** fine";
+  const context = { action: "send_message", request: [{ from: "A", text: "how was it?\nreally" }], recent: [{ from: "B", text: "one\ntwo" }] };
+  const full = buildCheckState({ context, sources: { message, analysis: "a\nb" }, scope: "full", thinkingTailTokens: 800 }, 8000) as {
+    message: string;
+    analysis: string;
+    request: Array<{ text: string }>;
+    recent: Array<{ text: string }>;
+  };
+  assert.equal(full.message, "Quick rundown:\n\n- first point\n- second point\n\n**Bottom line:** fine");
+  assert.equal(full.analysis, "a\nb");
+  assert.equal(full.request[0]!.text, "how was it? really");
+  assert.equal(full.recent[0]!.text, "one two");
+  const only = buildCheckState({ context, sources: { message }, scope: "message_only", thinkingTailTokens: 800 }, 8000);
+  assert.deepEqual(only, { message: full.message });
+  const clipped = buildCheckState({ context, sources: { message: "- item\n".repeat(400) }, scope: "message_only", thinkingTailTokens: 800 }, 60) as { message: string };
+  assert.match(clipped.message, /^- item\n- item\n/, "clipping to the budget keeps the lines");
+});
+
 test("buildCheckState: recent is packed newest-first and fixed fields shrink to the budget", () => {
   const recent = Array.from({ length: 40 }, (_, i) => ({ from: "U", text: `message ${i} ${"pad ".repeat(30)}` }));
   const state = buildCheckState(

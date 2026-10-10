@@ -7,9 +7,15 @@
 
 import { jsonTokens } from "./client.js";
 
-/** Collapse whitespace and clip a chat text to `maxChars` (with an ellipsis). */
-export function clipText(text: string, maxChars: number): string {
-  const flat = text.replace(/\s+/g, " ").trim();
+/**
+ * Collapse whitespace and clip a chat text to `maxChars` (with an ellipsis).
+ * `keepLines` keeps line breaks (runs of spaces and of blank lines still collapse),
+ * for texts whose layout a question may judge (a message's lists and headings).
+ */
+export function clipText(text: string, maxChars: number, options: { keepLines?: boolean } = {}): string {
+  const flat = options.keepLines
+    ? text.replace(/[^\S\n]+/g, " ").replace(/ ?\n ?/g, "\n").replace(/\n{3,}/g, "\n\n").trim()
+    : text.replace(/\s+/g, " ").trim();
   const chars = Array.from(flat);
   if (chars.length <= maxChars) return flat;
   return `${chars.slice(0, Math.max(1, maxChars - 1)).join("")}…`;
