@@ -89,6 +89,8 @@ async function withStack(
     filters?: Record<string, unknown>;
     auto?: Record<string, unknown>;
     rerank?: { minScore: number; score: (doc: string) => number; query?: "request" | "conversation"; queries?: string[] };
+    /** Extra `[models.*]` blocks (e.g. a separate filter model). */
+    models?: Record<string, unknown>;
     /** A fake late stage (built with the store); turns `late.enabled` on. */
     late?: (store: MemoryRetrievalStore) => unknown;
   },
@@ -130,7 +132,7 @@ async function withStack(
     },
   };
   const appConfig = {
-    models: { decider: decider() },
+    models: { decider: decider(), ...(opts.models ?? {}) },
     decisions: opts.decisions === false ? undefined : { enabled: true, model: "decider", ...(opts.decisionsConfig ?? {}) },
     retrieval: { enabled: true, ...(opts.filters ? { filters: opts.filters } : {}) },
   } as unknown as AppConfig;
@@ -708,4 +710,25 @@ test("a person-cued block the late stage also returns is one candidate, judged a
       assert.equal(calls.filter((c) => c.state.entry?.text.includes("Miso")).length, 1, `${mode}: judged once`);
     });
   }
+});
+
+test("judged filters with their own model get a filter-only call to it, not the relevance call", async () => {
+  const files = {
+    "2026-05-29.md": block("2026-05-29", "10:00", "kitchen", "KEEP pancake recipe HABIT the assistant did the thing") +
+      block("2026-05-29", "11:00", "kitchen", "KEEP pancake recipe fine"),
+  };
+  const filters = { model: "decider_f", unwanted: { description: "The entry describes the assistant doing the thing." } };
+  const models = { decider_f: { ...decider(), id: "vendor/decider-f" } };
+  await withStack(files, { filters, models }, async ({ pipeline, calls }) => {
+    const plan = await pipeline.plan(input());
+    assert.equal(plan.report.kept, 1);
+    assert.ok(!plan.block!.includes("HABIT"));
+    const relevance = calls.filter((c) => c.questions["relevant"]);
+    assert.ok(relevance.length >= 2);
+    assert.ok(relevance.every((c) => !c.questions["filter__unwanted"] && c.model === "vendor/decider-1"), "relevance calls carry no filter question");
+    const filterOnly = calls.filter((c) => c.questions["filter__unwanted"]);
+    assert.equal(filterOnly.length, 2);
+    assert.ok(filterOnly.every((c) => c.model === "vendor/decider-f" && !c.questions["relevant"]), "the filter's own model answers it");
+    assert.ok(plan.report.items.some((i) => i.stage === "hidden" && i.hiddenBy?.key === "unwanted"));
+  });
 });

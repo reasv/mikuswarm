@@ -674,9 +674,30 @@ export class MemoryRetrievalPipeline {
       for (const p of input.activePeople ?? []) {
         if (!judgeNames.some((n) => n.toLowerCase() === p.name.toLowerCase())) judgeNames.push(p.name);
       }
+      // Judged filters ride in the relevance call only when they are judged by
+      // the memory point's own chain. With their own `[retrieval.filters].model`
+      // (calibrated on another model), the sent passages with pending filters
+      // get a filter-only call to that chain, in parallel.
+      const filters = this.deps.filters;
+      const filterHead = filters?.chainHead(agent);
+      const rideFilters = !filterHead || filterHead === pointSettings(engine.raw(agent), "memory")?.model;
+      const separate = !rideFilters && filters ? toJudge.filter((c) => c.pendingFilters.length > 0) : [];
+      const separateStates =
+        separate.length > 0 && filters && !cut()
+          ? untilAborted(
+              filters.enforce(agent, separate.map((c) => filterBlockOf(c.chunk)), {
+                surface: "auto_retrieval",
+                attribution: input.attribution,
+                priority: MEMORY_PRIORITY,
+                share: { name: MEMORY_SLOT_SHARE, fraction: auto.judgeSlotShare },
+                signal: stageSignal,
+              }),
+              input.finishNow,
+            ).catch(() => null)
+          : Promise.resolve(null);
       // On finish-now, unanswered passages count as not judged (the fallback
       // rule), and their requests are aborted, freeing the group's slots.
-      const judgedOutcomes = await Promise.all(
+      const judgedOutcomesPromise = Promise.all(
         toJudge.map((c) => {
           if (cut()) return Promise.resolve(undefined);
           const outcome = engine.evaluate(
@@ -698,7 +719,7 @@ export class MemoryRetrievalPipeline {
                 room: c.chunk.room,
                 text: cleanBlockText(c.chunk.text).lines.join("\n"),
               },
-              filters: c.pendingFilters,
+              filters: rideFilters ? c.pendingFilters : [],
               meta: {
                 citation: formatCitation(c.chunk),
                 contentHash: c.chunk.contentHash,
@@ -718,6 +739,13 @@ export class MemoryRetrievalPipeline {
           return untilAborted(outcome, input.finishNow).catch(() => undefined);
         }),
       );
+      const [judgedOutcomes, filterStates] = await Promise.all([judgedOutcomesPromise, separateStates]);
+      for (const c of separate) {
+        const st = filterStates?.get(c.chunk.contentHash);
+        if (!st) continue; // not judged: the pending policy below applies
+        if (st.hidden && !c.hiddenBy) c.hiddenBy = st.hiddenBy;
+        c.pendingFilters = st.pendingJudged;
+      }
       report.stages.judgeMs = this.now() - t0;
       const byCandidate = new Map(toJudge.map((c, i) => [c, judgedOutcomes[i]]));
       let modelVerdicts = 0;
@@ -737,7 +765,7 @@ export class MemoryRetrievalPipeline {
       // the sent passages without a verdict, and every passage when none was judged.
       const hidePending = this.deps.filters?.pendingPolicy(agent) === "hide";
       for (const c of pool) {
-        if (verdicts.has(c.chunk.contentHash) || c.pendingFilters.length === 0 || !hidePending) continue;
+        if ((rideFilters && verdicts.has(c.chunk.contentHash)) || c.pendingFilters.length === 0 || !hidePending) continue;
         if (modelVerdicts > 0 && !sent.has(c)) continue;
         c.hiddenBy = { key: c.pendingFilters[0]!.key, kind: "judged", pending: true };
       }
