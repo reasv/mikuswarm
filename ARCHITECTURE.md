@@ -2715,7 +2715,7 @@ A system-one model is never offered to pi-ai. Startup (`validateDecisionsConfig`
 
 ### Client (`src/decisions/client.ts`)
 
-`DecisionClient.decide(modelKey, request, options)` is a **fetch-shaped consumer** like captioning and `x_search`: it composes `runFetchWithFallback` (§8a) over the model's chain, so per-model health, the group throttle on 429/503 with `Retry-After`, 529 as a health strike, the canary, scheduler admission, and at most one attempt per member per call all apply unchanged. The outcome taxonomy:
+`DecisionClient.decide(modelKey, request, options)` is a **fetch-shaped consumer** like captioning and `x_search` (over the process-wide fetch, or, with `[decisions].http2` / `keep_alive_ms`, undici's fetch over a dedicated `Agent` with `allowH2` and that idle keep-alive, created in `app.ts` and closed on shutdown: a point's burst of parallel calls then reuses one warm connection instead of opening a TLS connection per call): it composes `runFetchWithFallback` (§8a) over the model's chain, so per-model health, the group throttle on 429/503 with `Retry-After`, 529 as a health strike, the canary, scheduler admission, and at most one attempt per member per call all apply unchanged. The outcome taxonomy:
 
 | response | outcome |
 |---|---|
@@ -2896,6 +2896,8 @@ A text request is byte-identical to one without the feature. Vision attempts get
 enabled = false            # master switch; a point runs only when this AND the point's `enabled` are true
 model = "decider"          # default chain for every point (a system-one [models.*] key; its fallback applies)
 timeout_ms = 3000
+# http2 = true             # decision calls over a dedicated pool, multiplexed on one HTTP/2 connection
+# keep_alive_ms = 300000   # ... whose idle connections are kept this long (unset: the process-wide fetch)
 min_confidence = 0.6
 state_max_tokens = 8000    # clamped further to each member's state budget
 persona = ""               # short operator-written summary, used in question instructions (never in state)

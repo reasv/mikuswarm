@@ -21,6 +21,7 @@
  *   member and the chain moves on.
  */
 
+import { fetch as undiciFetch, type Dispatcher, type RequestInit as UndiciRequestInit } from "undici";
 import type { AppConfig } from "../config/index.js";
 
 type ModelConfig = AppConfig["models"]["default"];
@@ -155,8 +156,13 @@ export interface DecisionClientOptions {
   models: Record<string, ModelConfig>;
   scheduler?: LlmScheduler;
   logger?: Logger;
-  /** Test seam; defaults to the global fetch. */
+  /** Test seam; defaults to the global fetch (or undici's, over `dispatcher`). */
   fetchImpl?: typeof fetch;
+  /**
+   * Connection pool for decision calls (`[decisions].http2` / `keep_alive_ms`).
+   * Unset = the process-wide fetch and its default pool.
+   */
+  dispatcher?: Dispatcher;
 }
 
 /** Why a member does not fit a request (undefined = fits). Pure; exported for tests. */
@@ -251,7 +257,13 @@ export class DecisionClient {
   private readonly configErrorsLogged = new Set<string>();
 
   constructor(private readonly options: DecisionClientOptions) {
-    this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
+    const dispatcher = options.dispatcher;
+    this.fetchImpl =
+      options.fetchImpl ??
+      (dispatcher
+        ? (((input: string, init?: RequestInit) =>
+            undiciFetch(input, { ...(init as UndiciRequestInit), dispatcher })) as unknown as typeof fetch)
+        : globalThis.fetch.bind(globalThis));
   }
 
   /** The chain behind a decision model key, head first. */

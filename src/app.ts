@@ -1,4 +1,5 @@
 import { ExaResearchService } from "./exa/research.js";
+import { Agent as UndiciAgent } from "undici";
 import { createExaResearchTools } from "./tools/exa-research.js";
 import { ExaClient } from "./exa/client.js";
 import { resolveExaConfig } from "./exa/config.js";
@@ -2161,6 +2162,17 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   }
   // Decision models (ARCHITECTURE.md §8h). Built only when some point can run, so a
   // deployment without decision points never constructs a client.
+  // `[decisions].http2` / `keep_alive_ms`: a dedicated connection pool, so a
+  // build's burst of parallel decision calls reuses one warm connection.
+  const decisionDispatcher =
+    anyDecisionPointEnabled(config) && (config.decisions?.http2 || config.decisions?.keep_alive_ms)
+      ? new UndiciAgent({
+          allowH2: config.decisions?.http2 === true,
+          ...(config.decisions?.keep_alive_ms
+            ? { keepAliveTimeout: config.decisions.keep_alive_ms, keepAliveMaxTimeout: Math.max(config.decisions.keep_alive_ms, 600_000) }
+            : {}),
+        })
+      : undefined;
   const decisionEngine = anyDecisionPointEnabled(config)
     ? new DecisionEngine({
         config,
@@ -2168,6 +2180,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
           models: config.models,
           scheduler: llmScheduler,
           logger: logger.child("decisions"),
+          ...(decisionDispatcher ? { dispatcher: decisionDispatcher } : {}),
         }),
         scheduler: llmScheduler,
         // Subject images of vision-chain evaluations (ARCHITECTURE.md §8h).
@@ -10319,6 +10332,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         await captionPool.stop();
         if (retrieval) await retrieval.stop();
         if (auditPool) await auditPool.stop();
+        await decisionDispatcher?.close().catch(() => undefined);
         if (diaryPool) await diaryPool.stop();
         // Stop the mirror worker before the summarization pool so the in-flight
         // sweep doesn't try to insert mirrored summaries after the pool stops.

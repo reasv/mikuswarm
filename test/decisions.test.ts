@@ -662,3 +662,23 @@ test("engine: no fitting member → reason no_fitting_member", async () => {
   const { engine } = makeEngine(config, fakeFetch([() => json(200, okBody())]).fn);
   assert.equal((await engine.evaluate(testPoint, { text: "x" }, ctx)).reason, "no_fitting_member");
 });
+
+test("client: a configured dispatcher carries the request ([decisions].http2 / keep_alive_ms)", async () => {
+  const { MockAgent } = await import("undici");
+  const mock = new MockAgent();
+  mock.disableNetConnect();
+  const seen: any[] = [];
+  mock
+    .get("https://gw.example")
+    .intercept({ path: "/decisions", method: "POST" })
+    .reply(200, (opts: any) => {
+      seen.push(JSON.parse(String(opts.body)));
+      return okBody();
+    }, { headers: { "content-type": "application/json" } });
+  const client = new DecisionClient({ models: { decider: decider() }, dispatcher: mock });
+  const result = await client.decide("decider", request(), callOpts);
+  assert.equal(result.servedVersion, "vendor/decider-1-20261001");
+  assert.equal(seen.length, 1, "the request went through the dispatcher");
+  assert.equal(seen[0].model, "vendor/decider-1");
+  await mock.close();
+});

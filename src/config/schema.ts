@@ -1562,6 +1562,14 @@ const DecisionsSchema = StrictObject({
   model: Type.Optional(Type.String({ minLength: 1 })),
   // Hard timeout per evaluation (whole chain). Default 3000.
   timeout_ms: Type.Optional(Type.Integer({ minimum: 100 })),
+  // Connection reuse for decision calls. Points send bursts of parallel
+  // requests minutes apart; with the default pool (HTTP/1.1, idle sockets kept
+  // 4 s) each burst opens fresh TLS connections, which costs a handshake per
+  // request on a high-latency link. http2 = true multiplexes them over one
+  // connection to the endpoint; keep_alive_ms keeps idle connections that long.
+  // Both unset (default) = the process-wide fetch, as before.
+  http2: Type.Optional(Type.Boolean()),
+  keep_alive_ms: Type.Optional(Type.Integer({ minimum: 1000, maximum: 3_600_000 })),
   // Default confidence floor for choice/score verdicts. Default 0.6.
   min_confidence: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
   // Default state cap (tokens). Default 8000.
