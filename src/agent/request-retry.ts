@@ -106,6 +106,23 @@ export interface RequestAttemptState {
    * for it (ARCHITECTURE.md §8b "Aborted requests"). Reset per attempt.
    */
   awaitingAdmission?: boolean;
+  /**
+   * Health keys of the members that stalled on THIS request: an attempt that
+   * produced no token before its first-token deadline or the wall-clock budget.
+   * Like {@link refused}, never re-hit within the request, across passes too
+   * (ARCHITECTURE.md §8a "Stalls fall over").
+   */
+  stalled: Set<string>;
+  /**
+   * Set at dispatch by the fallback resolver: should THIS attempt stall,
+   * another member (not stalled, not refused, healthy, in budget, fits) can
+   * take the request.
+   */
+  stallFalloverAvailable: boolean;
+  /** Set at dispatch by the fallback resolver: the serving member's own first-token deadline. */
+  firstTokenTimeoutMs?: number;
+  /** Called by `withSchedulerAdmission` once THIS attempt holds a slot (the request is about to hit the wire). */
+  onAdmitted?: () => void;
 }
 
 export const REQUEST_ATTEMPT_STATE: unique symbol = Symbol("mikuswarm.requestAttemptState");
@@ -137,6 +154,15 @@ export interface RequestRetryOptions {
   backoffBaseMs: number;
   /** Ceiling for the (pre-jitter) backoff delay. `recovery.llm_request_backoff_max_ms`. */
   backoffMaxMs: number;
+  /**
+   * First-token deadline per attempt (`recovery.llm_first_token_timeout_ms`;
+   * a member's `models.*.llm_first_token_timeout_ms` wins). Measured from the
+   * attempt's admission (from its start without a scheduler); an attempt with
+   * no model-produced event by then is a stall: aborted, struck against its
+   * model, and the request moves to another chain member. The factory passes it
+   * for interactive-class work only. Undefined = no per-attempt deadline.
+   */
+  firstTokenTimeoutMs?: number;
 }
 
 export interface RequestRetryContext {
@@ -766,6 +792,8 @@ export function withRequestRetry(
           failoverOnFailure: false,
           refused: new Set(),
           refusalFalloverAvailable: false,
+          stalled: new Set(),
+          stallFalloverAvailable: false,
         };
         // Whether a refusal may move to another chain member, read once per
         // request (§8a "Refusals"); the record turn turns it off.
@@ -837,10 +865,36 @@ export function withRequestRetry(
           const detachCaller = () => {
             callerSignal?.removeEventListener("abort", onCallerAbort);
           };
+          // First-token deadline (§8a "Stalls fall over"): armed once the attempt
+          // holds its admission slot, cleared by its first model-produced event.
+          // Firing aborts a zero-token attempt as a stall.
+          let stallTimer: ReturnType<typeof setTimeout> | undefined;
+          let stallTimerArmed = false;
+          let stalledByTimer = false;
+          let stallTimeoutMs: number | undefined;
+          const armStallTimer = (): void => {
+            if (stallTimerArmed || producedTokens) return;
+            stallTimerArmed = true;
+            stallTimeoutMs = attemptState.firstTokenTimeoutMs ?? options.firstTokenTimeoutMs;
+            if (stallTimeoutMs === undefined) return;
+            stallTimer = setTimeout(() => {
+              if (producedTokens || attemptCtrl.signal.aborted) return;
+              stalledByTimer = true;
+              attemptCtrl.abort(LLM_STALL_ABORT_REASON);
+            }, stallTimeoutMs);
+            stallTimer.unref?.();
+          };
+          const clearStallTimer = (): void => {
+            if (stallTimer) clearTimeout(stallTimer);
+            stallTimer = undefined;
+          };
           attemptState.failoverOnFailure = false;
           attemptState.servedKey = undefined;
           attemptState.refusalFalloverAvailable = false;
+          attemptState.stallFalloverAvailable = false;
+          attemptState.firstTokenTimeoutMs = undefined;
           attemptState.awaitingAdmission = undefined;
+          attemptState.onAdmitted = armStallTimer;
           const attemptOptions = {
             ...((streamOptions as object | undefined) ?? {}),
             signal: attemptCtrl.signal,
@@ -849,6 +903,9 @@ export function withRequestRetry(
 
           try {
             const inner = await base(model, context, attemptOptions);
+            // No admission wrapper flagged a slot wait: the request is on the
+            // wire now, so the first-token clock starts here.
+            if (attemptState.awaitingAdmission === undefined) armStallTimer();
             for await (const event of inner) {
               tap(attempt + 1, event);
               if (event.type === "error") {
@@ -871,6 +928,7 @@ export function withRequestRetry(
                 // the attempt is now immune to the wall-clock budget.
                 producedTokens = true;
                 detachBudget();
+                clearStallTimer();
               }
               if (event.type === "text_delta" || event.type === "thinking_delta" || event.type === "toolcall_delta") {
                 if (repetitionDetector === undefined) {
@@ -920,6 +978,8 @@ export function withRequestRetry(
             // token arrived).
             detachBudget();
             detachCaller();
+            clearStallTimer();
+            attemptState.onAdmitted = undefined;
           }
 
           if (!errorEvent) {
@@ -1018,13 +1078,26 @@ export function withRequestRetry(
           // the failure parks instead of settling. A token-producing attempt
           // detached the budget listener, so its abort never reaches here (§6).
           const budgetExpired = budgetCtrl?.signal.aborted === true && callerSignal?.aborted !== true;
-          if (verdict === "aborted" && budgetExpired) {
+          // A stall (§8a "Stalls fall over"): the attempt produced no token before
+          // its first-token deadline or the wall-clock budget. Its member is never
+          // re-hit for this request; another member takes it when one can.
+          let stallHit = false;
+          if (verdict === "aborted" && stalledByTimer && callerSignal?.aborted !== true) {
             verdict = "environmental";
+            stallHit = true;
+            errorEvent = synthesizeErrorEvent(
+              model,
+              `llm stall: no first token within ${stallTimeoutMs}ms`,
+            );
+          } else if (verdict === "aborted" && budgetExpired) {
+            verdict = "environmental";
+            stallHit = !producedTokens;
             errorEvent = synthesizeErrorEvent(
               model,
               `llm request wall-clock budget (${maxWaitMs}ms) exhausted: ${failure?.errorMessage ?? "aborted"}`,
             );
           }
+          if (stallHit && attemptState.servedKey !== undefined) attemptState.stalled.add(attemptState.servedKey);
           const attemptRecord = recordAttempt(
             attempt + 1,
             attemptStart,
@@ -1142,6 +1215,24 @@ export function withRequestRetry(
             if (degenerateTrips > MAX_DEGENERATE_TRIPS_PER_REQUEST) {
               surface(errorEvent, verdict);
               return;
+            }
+            // A stalled member never ends the request while another member can
+            // take it: move on at once, with a fresh wall-clock budget when the
+            // stall spent it. Bounded — every stall adds a member to `stalled`,
+            // which is never re-hit, so the chain runs out.
+            if (stallHit && attemptState.stallFalloverAvailable) {
+              ctx.logger?.warn("llm_request_stall_fallover", {
+                sessionId: ctx.sessionId,
+                timelineKey: ctx.timelineKey,
+                sessionType: ctx.sessionType,
+                member: ctx.getServedModel?.(),
+                attempt: attempt + 1,
+                stalled: [...attemptState.stalled],
+                budgetRearmed: budgetExpired || Date.now() >= deadline,
+              });
+              if (budgetExpired || Date.now() >= deadline) armBudget();
+              tapDiscarded(attempt + 1, errorEvent.error?.errorMessage ?? "stalled");
+              continue;
             }
             if (Date.now() >= deadline || budgetExpired) {
               ctx.logger?.warn("llm_request_wait_exhausted", {

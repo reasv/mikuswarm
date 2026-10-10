@@ -288,6 +288,13 @@ llm_probe_backoff_max_ms = 300000
 # one attempt per remaining member, with no backoff between members. A zero-token
 # attempt cut off by llm_request_max_wait_ms counts as a failure of its model.
 llm_primary_attempts_per_request = 2
+# First-token deadline per attempt (interactive class, like the budget): an attempt with no
+# model-produced event this long after admission is a stall — a strike against its
+# model, and the request moves to another chain member at once (a stalled member is
+# never re-hit by that request). A stall cut off by llm_request_max_wait_ms falls
+# over the same way; the request parks only when no other member can serve it.
+# Unset = no per-attempt deadline. Per-model override: models.*.llm_first_token_timeout_ms.
+# llm_first_token_timeout_ms = 45000
 # Optional static phrase sent to the room when a user-triggered session gives
 # up (parks failed-resumable / build-wait timeout). Empty = silent (default).
 # The actual error is never included. Proactive/synthetic sessions never send it.

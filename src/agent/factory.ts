@@ -1617,6 +1617,9 @@ export class AgentSessionFactory {
         maxWaitMs: interactiveBudget ? interactiveMaxWaitMs : undefined,
         backoffBaseMs: recovery?.llm_request_backoff_base_ms ?? 500,
         backoffMaxMs: recovery?.llm_request_backoff_max_ms ?? 15_000,
+        // Interactive-class only, like the budget: background work waits out a slow
+        // prefill (a long summary input on a local model is not a stall).
+        firstTokenTimeoutMs: interactiveBudget ? recovery?.llm_first_token_timeout_ms : undefined,
       },
       {
         logger: this.options.logger,

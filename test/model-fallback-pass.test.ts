@@ -310,3 +310,85 @@ test("the caller's own abort stays neutral (no strike)", async () => {
   for await (const _ of stream) { /* drain */ }
   assert.equal(scheduler.snapshot().models.find((m) => m.key === X_KEY), undefined, "no health entry: nothing counted");
 });
+
+// ---------------------------------------------------------------------------
+// Stalls fall over (§8a): a member that hangs with zero tokens never ends a
+// request another chain member can serve.
+// ---------------------------------------------------------------------------
+
+/** makeBase where wire ids in `hung` never answer until aborted; the rest answer `done`. */
+function hangingBase(calls: string[], hung: Set<string>): (cfg: any) => StreamFn {
+  return () => ((model, _ctx, opts) => {
+    calls.push(model.id);
+    const stream = createAssistantMessageEventStream();
+    const signal = (opts as { signal?: AbortSignal }).signal;
+    if (hung.has(model.id)) {
+      const fail = () => {
+        const err = message(model, "aborted", "Request aborted");
+        stream.push({ type: "error", reason: "aborted", error: err });
+        stream.end(err);
+      };
+      if (signal?.aborted) queueMicrotask(fail);
+      else signal?.addEventListener("abort", fail, { once: true });
+    } else {
+      queueMicrotask(() => {
+        const done = message(model, "stop");
+        stream.push({ type: "done", reason: "stop", message: done });
+        stream.end(done);
+      });
+    }
+    return stream;
+  }) as StreamFn;
+}
+
+function stallComposite(
+  chain: ModelChainEntry[],
+  calls: string[],
+  hung: Set<string>,
+  scheduler: LlmScheduler,
+  retry: { maxWaitMs?: number; firstTokenTimeoutMs?: number },
+): StreamFn {
+  const fb = buildModelFallback(chain, {
+    consumer: "test",
+    makeBase: hangingBase(calls, hung),
+    makeModel,
+    scheduler,
+    admission: { priority: "interactive" },
+  });
+  return withRequestRetry(fb.streamFn, { backoffBaseMs: 10, backoffMaxMs: 10, ...retry });
+}
+
+test("a head that hangs past the wall-clock budget falls over instead of parking", async () => {
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 3 } });
+  const calls: string[] = [];
+  const last = await run(stallComposite([X, Y], calls, new Set(["wire-X"]), scheduler, { maxWaitMs: 50 }));
+  assert.equal(last.type, "done", "the fallback answered");
+  assert.deepEqual(calls, ["wire-X", "wire-Y"], "the stalled head is not re-hit, the fallback is tried");
+  scheduler.stop();
+});
+
+test("the first-token deadline cuts a stall short and falls over without retrying the head", async () => {
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 3 } });
+  const calls: string[] = [];
+  const started = Date.now();
+  const last = await run(
+    stallComposite([X, Y], calls, new Set(["wire-X"]), scheduler, { maxWaitMs: 60_000, firstTokenTimeoutMs: 30 }),
+  );
+  assert.equal(last.type, "done");
+  assert.deepEqual(calls, ["wire-X", "wire-Y"], "a stall exhausts the head for this request (no second head attempt)");
+  assert.ok(Date.now() - started < 5_000, "fell over at the first-token deadline, not the wall-clock budget");
+  const snap = scheduler.snapshot().models.find((m) => m.key === X_KEY);
+  assert.equal(snap?.consecutiveFailures, 1, "the stall is a strike against the head");
+  scheduler.stop();
+});
+
+test("every member stalling still ends the request (bounded), after each was tried once", async () => {
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 3 } });
+  const calls: string[] = [];
+  const last = await run(
+    stallComposite([X, Y], calls, new Set(["wire-X", "wire-Y"]), scheduler, { maxWaitMs: 200, firstTokenTimeoutMs: 20 }),
+  );
+  assert.equal(last.type, "error");
+  assert.deepEqual(calls.slice(0, 2), ["wire-X", "wire-Y"], "both members were tried before giving up");
+  scheduler.stop();
+});

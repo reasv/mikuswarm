@@ -1249,6 +1249,12 @@ export function withSchedulerAdmission(
         });
         if (attemptState) attemptState.awaitingAdmission = false;
         try {
+          // The first-token clock starts at the slot, not in the queue (§8a "Stalls fall over").
+          attemptState?.onAdmitted?.();
+        } catch {
+          /* observe-only */
+        }
+        try {
           options.onAdmissionWait?.(Date.now() - acquireStart);
         } catch {
           /* observe-only */

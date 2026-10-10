@@ -985,6 +985,10 @@ const ModelSchema = StrictObject({
   // interactive-class sessions (chat/proactive); background-class work is
   // unbounded regardless.
   llm_request_max_wait_ms: Type.Optional(Type.Number({ minimum: 1 })),
+  // Per-model first-token deadline (ARCHITECTURE.md §8a "Stalls fall over"):
+  // overrides `recovery.llm_first_token_timeout_ms` while this model serves an
+  // attempt — a model with a slow prefill can be given more. Unset = the global.
+  llm_first_token_timeout_ms: Type.Optional(Type.Number({ minimum: 1 })),
   // Per-model override of the unhealthy-probe backoff CEILING (spec MODEL-FALLBACK
   // §4.1). While this model is unhealthy the scheduler probes on a capped
   // exponential backoff (base → ×2 → cap); a model with an especially poor
@@ -2389,6 +2393,12 @@ const RecoverySchema = StrictObject({
   // `failed-resumable` for manual console resume. Background-class work
   // (summaries/diaries) is deliberately unbounded — it waits out any outage.
   llm_request_max_wait_ms: Type.Optional(Type.Number({ minimum: 1 })),
+  // First-token deadline per attempt, interactive class (ARCHITECTURE.md §8a
+  // "Stalls fall over"): an attempt with no model-produced event this long after
+  // its admission is a stall — aborted, struck against its model, and the request
+  // moves to another chain member. Unset = no per-attempt deadline (a stall then
+  // ends only at the wall-clock budget, which also falls over).
+  llm_first_token_timeout_ms: Type.Optional(Type.Number({ minimum: 1 })),
   // Per-model health (spec §5): consecutive environmental failures before the
   // model turns unhealthy (half-open admission).
   llm_unhealthy_threshold: Type.Optional(Type.Number({ minimum: 1 })),

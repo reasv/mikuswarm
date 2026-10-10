@@ -218,6 +218,8 @@ interface Candidate {
   dispatch: StreamFn;
   /** Member's own operative window for the fits predicate (spec PER-MEMBER-CONTEXT-FITS §2.1). */
   operativeWindow: number;
+  /** Member's own first-token deadline (`models.*.llm_first_token_timeout_ms`); undefined = the global one. */
+  firstTokenTimeoutMs?: number;
 }
 
 /**
@@ -318,6 +320,7 @@ export function buildModelFallback(
       base,
       dispatch,
       operativeWindow: memberWindow,
+      firstTokenTimeoutMs: entry.config.llm_first_token_timeout_ms,
     };
   });
 
@@ -343,6 +346,11 @@ export function buildModelFallback(
     return {
       streamFn: (model, context, streamOptions) => {
         options.onResolve?.(only.logicalId, "primary");
+        const pass = getRequestAttemptState(streamOptions);
+        if (pass) {
+          pass.servedKey = only.healthKey;
+          pass.firstTokenTimeoutMs = only.firstTokenTimeoutMs;
+        }
         return only.dispatch(only.model, context, adjustOptions(streamOptions, only));
       },
       operativeContextWindow,
@@ -370,8 +378,10 @@ export function buildModelFallback(
       // factory.create's §5.3 running counter; fetch consumers omit it → fits skipped.
       observedContextTokens: options.getObservedContextTokens?.(),
       // Members that refused this request are never chosen again for it, in
-      // any pass (§8a "Refusals").
+      // any pass (§8a "Refusals"); nor are members that stalled on it (§8a
+      // "Stalls fall over").
       refused: pass?.refused,
+      stalled: pass?.stalled,
     };
     const passDeps = pass
       ? { ...baseDeps, requestAttempts: pass.attempts, primaryAttemptsPerRequest }
@@ -398,6 +408,15 @@ export function buildModelFallback(
       // right now? Only a member that has not refused it and is viable
       // (healthy, in budget, fits); else the refusal is terminal (§8a).
       pass.servedKey = candidate.healthKey;
+      pass.firstTokenTimeoutMs = candidate.firstTokenTimeoutMs;
+      // Should this attempt stall, can another member take the request? Any
+      // member that has not stalled or refused and is viable, regardless of
+      // this pass's quotas: a stall never ends a request another member can serve.
+      pass.stallFalloverAvailable =
+        chooseChainMember(candidates, {
+          ...baseDeps,
+          stalled: new Set([...pass.stalled, candidate.healthKey]),
+        }).reason !== "all-unhealthy";
       pass.refusalFalloverAvailable =
         chooseChainMember(candidates, {
           ...baseDeps,
@@ -573,6 +592,12 @@ export function chooseChainMember(
      * member that did not refuse remains.
      */
     refused?: Set<string>;
+    /**
+     * Health keys of members that stalled on the current request (§8a "Stalls
+     * fall over"): never viable, never the canary, and never the `all-unhealthy`
+     * target while a member that did not stall or refuse remains.
+     */
+    stalled?: Set<string>;
   },
 ): { index: number; reason: FallbackReason } {
   const scheduler = deps.scheduler;
@@ -596,9 +621,11 @@ export function chooseChainMember(
    * operative window (§2.1; skipped when observed is undefined), and in-budget.
    */
   const refused = deps.refused;
+  const stalled = deps.stalled;
   const viable = (m: ChooseMember, i: number): boolean => {
     if (tried?.has(m.logicalId)) return false;
     if (refused?.has(m.healthKey)) return false;
+    if (stalled?.has(m.healthKey)) return false;
     if (exhausted(m, i)) return false;
     const healthy = !scheduler || scheduler.modelHealth(m.healthKey) === "healthy";
     if (!healthy) return false;
@@ -629,6 +656,7 @@ export function chooseChainMember(
   if (
     !tried?.has(head.logicalId) &&
     !refused?.has(head.healthKey) &&
+    !stalled?.has(head.healthKey) &&
     !exhausted(head, 0) &&
     !scheduler?.hasProber(head.healthKey) &&
     headState === "unhealthy" &&
@@ -645,7 +673,7 @@ export function chooseChainMember(
       const reason: FallbackReason =
         refused?.has(head.healthKey)
           ? "refusal-fallback"
-          : headState === "unhealthy"
+          : headState === "unhealthy" || stalled?.has(head.healthKey)
           ? "health-fallback"
           : !headInBudget
           ? "budget-fallback"
@@ -660,7 +688,9 @@ export function chooseChainMember(
   // Nothing healthy + in-budget + fits — route to the head so it fails and the caller's
   // own budget/retry decides whole-chain park/wait, and §8a gets a probe waiter. A
   // head that refused this request is passed over for the first member that did not.
-  const target = refused ? members.findIndex((m) => !refused.has(m.healthKey)) : 0;
+  // A member that stalled on it is passed over the same way.
+  let target = members.findIndex((m) => !refused?.has(m.healthKey) && !stalled?.has(m.healthKey));
+  if (target < 0) target = refused ? members.findIndex((m) => !refused.has(m.healthKey)) : 0;
   return { index: target >= 0 ? target : 0, reason: "all-unhealthy" };
 }
 
