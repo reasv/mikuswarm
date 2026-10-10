@@ -107,18 +107,18 @@ export interface RequestAttemptState {
    */
   awaitingAdmission?: boolean;
   /**
-   * Health keys of the members that stalled on THIS request: an attempt that
-   * produced no token before its first-token deadline or the wall-clock budget.
-   * Like {@link refused}, never re-hit within the request, across passes too
-   * (ARCHITECTURE.md §8a "Stalls fall over").
+   * Health keys of the members that failed THIS request in a way that moves it
+   * on: a stall (no token before the first-token deadline or the wall-clock
+   * budget) or a content-class error. Like {@link refused}, never re-hit within
+   * the request, across passes too (ARCHITECTURE.md §8a "Failures fall over").
    */
-  stalled: Set<string>;
+  excluded: Set<string>;
   /**
-   * Set at dispatch by the fallback resolver: should THIS attempt stall,
-   * another member (not stalled, not refused, healthy, in budget, fits) can
-   * take the request.
+   * Set at dispatch by the fallback resolver: should THIS attempt fail, another
+   * member (not excluded, not refused, healthy, in budget, fits) can take the
+   * request.
    */
-  stallFalloverAvailable: boolean;
+  falloverAvailable: boolean;
   /** Set at dispatch by the fallback resolver: the serving member's own first-token deadline. */
   firstTokenTimeoutMs?: number;
   /** Called by `withSchedulerAdmission` once THIS attempt holds a slot (the request is about to hit the wire). */
@@ -792,8 +792,8 @@ export function withRequestRetry(
           failoverOnFailure: false,
           refused: new Set(),
           refusalFalloverAvailable: false,
-          stalled: new Set(),
-          stallFalloverAvailable: false,
+          excluded: new Set(),
+          falloverAvailable: false,
         };
         // Whether a refusal may move to another chain member, read once per
         // request (§8a "Refusals"); the record turn turns it off.
@@ -865,7 +865,7 @@ export function withRequestRetry(
           const detachCaller = () => {
             callerSignal?.removeEventListener("abort", onCallerAbort);
           };
-          // First-token deadline (§8a "Stalls fall over"): armed once the attempt
+          // First-token deadline (§8a "Failures fall over"): armed once the attempt
           // holds its admission slot, cleared by its first model-produced event.
           // Firing aborts a zero-token attempt as a stall.
           let stallTimer: ReturnType<typeof setTimeout> | undefined;
@@ -891,7 +891,7 @@ export function withRequestRetry(
           attemptState.failoverOnFailure = false;
           attemptState.servedKey = undefined;
           attemptState.refusalFalloverAvailable = false;
-          attemptState.stallFalloverAvailable = false;
+          attemptState.falloverAvailable = false;
           attemptState.firstTokenTimeoutMs = undefined;
           attemptState.awaitingAdmission = undefined;
           attemptState.onAdmitted = armStallTimer;
@@ -1078,7 +1078,7 @@ export function withRequestRetry(
           // the failure parks instead of settling. A token-producing attempt
           // detached the budget listener, so its abort never reaches here (§6).
           const budgetExpired = budgetCtrl?.signal.aborted === true && callerSignal?.aborted !== true;
-          // A stall (§8a "Stalls fall over"): the attempt produced no token before
+          // A stall (§8a "Failures fall over"): the attempt produced no token before
           // its first-token deadline or the wall-clock budget. Its member is never
           // re-hit for this request; another member takes it when one can.
           let stallHit = false;
@@ -1097,7 +1097,7 @@ export function withRequestRetry(
               `llm request wall-clock budget (${maxWaitMs}ms) exhausted: ${failure?.errorMessage ?? "aborted"}`,
             );
           }
-          if (stallHit && attemptState.servedKey !== undefined) attemptState.stalled.add(attemptState.servedKey);
+          if (stallHit && attemptState.servedKey !== undefined) attemptState.excluded.add(attemptState.servedKey);
           const attemptRecord = recordAttempt(
             attempt + 1,
             attemptStart,
@@ -1212,27 +1212,39 @@ export function withRequestRetry(
               producedTokens,
               errorMessage: errorEvent.error?.errorMessage,
             });
-            if (degenerateTrips > MAX_DEGENERATE_TRIPS_PER_REQUEST) {
-              surface(errorEvent, verdict);
-              return;
-            }
-            // A stalled member never ends the request while another member can
-            // take it: move on at once, with a fresh wall-clock budget when the
-            // stall spent it. Bounded — every stall adds a member to `stalled`,
-            // which is never re-hit, so the chain runs out.
-            if (stallHit && attemptState.stallFalloverAvailable) {
+            // A member that stalled, used up the wall-clock budget, or tripped the
+            // repetition guard too often never ends the request while another
+            // member can take it: it is excluded, and the request moves on at once
+            // with a fresh wall-clock budget when the old one is spent (§8a
+            // "Failures fall over"). Bounded — every such failure grows
+            // `excluded`, which is never re-hit, so the chain runs out.
+            const spent = budgetExpired || Date.now() >= deadline;
+            const degenerateOut = degenerateTrips > MAX_DEGENERATE_TRIPS_PER_REQUEST;
+            if (
+              (stallHit || spent || degenerateOut) &&
+              callerSignal?.aborted !== true &&
+              attemptState.servedKey !== undefined &&
+              attemptState.falloverAvailable
+            ) {
+              attemptState.excluded.add(attemptState.servedKey);
               ctx.logger?.warn("llm_request_stall_fallover", {
                 sessionId: ctx.sessionId,
                 timelineKey: ctx.timelineKey,
                 sessionType: ctx.sessionType,
                 member: ctx.getServedModel?.(),
                 attempt: attempt + 1,
-                stalled: [...attemptState.stalled],
-                budgetRearmed: budgetExpired || Date.now() >= deadline,
+                cause: stallHit ? "stall" : degenerateOut ? "degenerate" : "budget",
+                excluded: [...attemptState.excluded],
+                budgetRearmed: spent,
               });
-              if (budgetExpired || Date.now() >= deadline) armBudget();
-              tapDiscarded(attempt + 1, errorEvent.error?.errorMessage ?? "stalled");
+              if (spent) armBudget();
+              if (degenerateOut) degenerateTrips = 0;
+              tapDiscarded(attempt + 1, errorEvent.error?.errorMessage ?? "request failed");
               continue;
+            }
+            if (degenerateOut) {
+              surface(errorEvent, verdict);
+              return;
             }
             if (Date.now() >= deadline || budgetExpired) {
               ctx.logger?.warn("llm_request_wait_exhausted", {
@@ -1383,7 +1395,33 @@ export function withRequestRetry(
             return;
           }
 
-          // `content` and `aborted` surface immediately — never retried (§4.3).
+          // A content-class failure (a 4xx the member will answer the same way
+          // again — though a gateway may use one for "no capacity") is never
+          // re-sent to that member, but never ends a request another member can
+          // take (§8a "Failures fall over"): it moves on at once, no strike, no
+          // backoff. Bounded by the chain like a stall.
+          if (
+            verdict === "content" &&
+            callerSignal?.aborted !== true &&
+            attemptState.servedKey !== undefined &&
+            attemptState.falloverAvailable
+          ) {
+            attemptState.excluded.add(attemptState.servedKey);
+            ctx.logger?.warn("llm_request_content_fallover", {
+              sessionId: ctx.sessionId,
+              timelineKey: ctx.timelineKey,
+              sessionType: ctx.sessionType,
+              member: ctx.getServedModel?.(),
+              attempt: attempt + 1,
+              excluded: [...attemptState.excluded],
+              errorMessage: (errorEvent.error?.errorMessage ?? "").slice(0, 300),
+            });
+            if (budgetExpired || Date.now() >= deadline) armBudget();
+            tapDiscarded(attempt + 1, errorEvent.error?.errorMessage ?? "content error");
+            continue;
+          }
+          // `aborted` (the caller's own), and `content` with no other member left,
+          // surface immediately — never retried (§4.3).
           surface(errorEvent, verdict);
           return;
         }

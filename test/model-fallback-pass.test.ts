@@ -392,3 +392,76 @@ test("every member stalling still ends the request (bounded), after each was tri
   assert.deepEqual(calls.slice(0, 2), ["wire-X", "wire-Y"], "both members were tried before giving up");
   scheduler.stop();
 });
+
+/** makeBase answering per wire id: a terminal error message after `delayMs`, or `done`. */
+function failingBase(calls: string[], fail: Map<string, { error: string; delayMs: number }>): (cfg: any) => StreamFn {
+  return () => ((model) => {
+    calls.push(model.id);
+    const stream = createAssistantMessageEventStream();
+    const f = fail.get(model.id);
+    setTimeout(() => {
+      if (f) {
+        const err = message(model, "error", f.error);
+        stream.push({ type: "error", reason: "error", error: err });
+        stream.end(err);
+      } else {
+        const done = message(model, "stop");
+        stream.push({ type: "done", reason: "stop", message: done });
+        stream.end(done);
+      }
+    }, f?.delayMs ?? 0);
+    return stream;
+  }) as StreamFn;
+}
+
+function failingComposite(
+  chain: ModelChainEntry[],
+  calls: string[],
+  fail: Map<string, { error: string; delayMs: number }>,
+  scheduler: LlmScheduler,
+  maxWaitMs: number,
+): StreamFn {
+  const fb = buildModelFallback(chain, {
+    consumer: "test",
+    makeBase: failingBase(calls, fail),
+    makeModel,
+    scheduler,
+    admission: { priority: "interactive" },
+  });
+  return withRequestRetry(fb.streamFn, { maxWaitMs, backoffBaseMs: 10, backoffMaxMs: 10 });
+}
+
+const NO_KEYS = '400 {"type":"error","error":{"type":"proxy_no_keys_available","message":"No AWS Bedrock keys available"}}';
+
+test("a content-class 4xx from the head falls over to the next member (no strike)", async () => {
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 3 } });
+  const calls: string[] = [];
+  const fail = new Map([["wire-X", { error: NO_KEYS, delayMs: 0 }]]);
+  const last = await run(failingComposite([X, Y], calls, fail, scheduler, 60_000));
+  assert.equal(last.type, "done", "the fallback answered");
+  assert.deepEqual(calls, ["wire-X", "wire-Y"], "the head is not re-sent the request");
+  const snap = scheduler.snapshot().models.find((m) => m.key === X_KEY);
+  assert.ok(!snap || snap.consecutiveFailures === 0, "a content error is not a health strike");
+  scheduler.stop();
+});
+
+test("a content-class error with no other member left still surfaces", async () => {
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 3 } });
+  const calls: string[] = [];
+  const fail = new Map([["wire-X", { error: NO_KEYS, delayMs: 0 }], ["wire-Y", { error: NO_KEYS, delayMs: 0 }]]);
+  const last = await run(failingComposite([X, Y], calls, fail, scheduler, 60_000));
+  assert.equal(last.type, "error");
+  assert.deepEqual(calls, ["wire-X", "wire-Y"], "each member tried once");
+  scheduler.stop();
+});
+
+test("an environmental error that lands after the budget is spent falls over instead of parking", async () => {
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 3 } });
+  const calls: string[] = [];
+  // The head answers 502 only after the whole budget has elapsed.
+  const fail = new Map([["wire-X", { error: "OpenAI API error (502): 502 status code (no body)", delayMs: 80 }]]);
+  const last = await run(failingComposite([X, Y], calls, fail, scheduler, 50));
+  assert.equal(last.type, "done");
+  assert.deepEqual(calls, ["wire-X", "wire-Y"]);
+  scheduler.stop();
+});

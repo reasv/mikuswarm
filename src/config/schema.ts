@@ -985,7 +985,7 @@ const ModelSchema = StrictObject({
   // interactive-class sessions (chat/proactive); background-class work is
   // unbounded regardless.
   llm_request_max_wait_ms: Type.Optional(Type.Number({ minimum: 1 })),
-  // Per-model first-token deadline (ARCHITECTURE.md §8a "Stalls fall over"):
+  // Per-model first-token deadline (ARCHITECTURE.md §8a "Failures fall over"):
   // overrides `recovery.llm_first_token_timeout_ms` while this model serves an
   // attempt — a model with a slow prefill can be given more. Unset = the global.
   llm_first_token_timeout_ms: Type.Optional(Type.Number({ minimum: 1 })),
