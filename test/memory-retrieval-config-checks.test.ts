@@ -79,3 +79,13 @@ test("memory capacity warning counts the real per-build maximum plus routing and
   assert.equal(withRecords?.needed, 17);
   assert.equal(at(17, { routing: { enabled: true }, records: { enabled: true, candidates: 3 } }), undefined);
 });
+
+test("rerank providers: openrouter_routing resolves onto the provider", () => {
+  const r = resolveRetrievalConfig({
+    enabled: true,
+    rerank: { enabled: true, chain: ["api"], providers: { api: { kind: "remote", endpoint: "https://gw.example/v1/", zdr: true, model: "m", openrouter_routing: { zdr: true } } } },
+  } as any);
+  assert.deepEqual(r.rerank.providers.api!.openrouterRouting, { zdr: true });
+  const plain = resolveRetrievalConfig({ enabled: true, rerank: { enabled: true, chain: ["gpu"], providers: { gpu: { kind: "remote", endpoint: "http://x", self_hosted: true } } } } as any);
+  assert.equal(plain.rerank.providers.gpu!.openrouterRouting, undefined);
+});

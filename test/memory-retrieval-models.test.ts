@@ -145,6 +145,23 @@ test("remote rerank: the documents and texts request formats", async () => {
   assert.equal(seen[0].body.model, "m1");
   assert.equal(seen[1].url, "/v1/rerank");
   assert.ok(Array.isArray(seen[1].body.texts));
+  assert.equal(seen[0].body.provider, undefined, "no provider object unless configured");
+});
+
+test("remote rerank: openrouter_routing is sent as the provider object", async () => {
+  const seen: any[] = [];
+  await withServer(
+    (body) => {
+      seen.push(body);
+      return { results: body.documents.map((_d: string, index: number) => ({ index, relevance_score: 0.5 })) };
+    },
+    async (base) => {
+      const p = new RemoteRerankProvider(providerCfg({ endpoint: base, model: "m1", zdr: true, selfHosted: false, openrouterRouting: { zdr: true, only: ["fireworks"] } }));
+      await p.score("q", ["a"], new AbortController().signal);
+    },
+  );
+  assert.deepEqual(seen[0].provider, { zdr: true, only: ["fireworks"] });
+  assert.equal(seen[0].return_documents, false);
 });
 
 test("remote late encoder: token matrices, normalized rows, input type, query cap", async () => {

@@ -315,6 +315,11 @@ const RetrievalModelProviderSchema = StrictObject({
   // remote re-rankers: "documents" ({ model, query, documents }, the Cohere/Jina
   // /vLLM/Infinity/llama.cpp shape, default) or "texts" ({ query, texts }, TEI).
   request_format: Type.Optional(Type.Union([Type.Literal("documents"), Type.Literal("texts")])),
+  // remote re-rankers with request_format "documents": OpenRouter
+  // provider-routing preferences, sent verbatim as the request's top-level
+  // `provider` object (e.g. { zdr = true } so OpenRouter routes only to
+  // zero-data-retention endpoints). Unset = no `provider` object is sent.
+  openrouter_routing: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
   // Per-member call deadline; unset = the stage's timeout_ms.
   timeout_ms: Type.Optional(Type.Integer({ minimum: 50, maximum: 120_000 })),
   // Calibrated cutoff of THIS provider's scores (scores differ across models).

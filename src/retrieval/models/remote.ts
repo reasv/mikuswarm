@@ -123,7 +123,14 @@ export class RemoteRerankProvider implements RerankProvider {
       const body =
         this.cfg.requestFormat === "texts"
           ? { query, texts: batch, raw_scores: false, truncate: true }
-          : { ...(this.model ? { model: this.model } : {}), query, documents: batch, top_n: batch.length, return_documents: false };
+          : {
+              ...(this.model ? { model: this.model } : {}),
+              query,
+              documents: batch,
+              top_n: batch.length,
+              return_documents: false,
+              ...(this.cfg.openrouterRouting ? { provider: this.cfg.openrouterRouting } : {}),
+            };
       const json = await postJson(url, body, { apiKey: this.cfg.apiKey, signal, dispatcher: this.dispatcher, maxResponseBytes: this.maxResponseBytes });
       out.push(...parseRerankResponse(json, batch.length));
     }

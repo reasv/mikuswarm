@@ -167,6 +167,8 @@ export interface ResolvedModelProvider {
   zdr: boolean;
   selfHosted: boolean;
   requestFormat: "documents" | "texts";
+  /** Remote re-rankers ("documents"): sent as the request's `provider` object (OpenRouter routing). */
+  openrouterRouting?: Record<string, unknown>;
   timeoutMs?: number;
   minScore?: number;
   modelDir?: string;
@@ -293,6 +295,7 @@ function resolveProviders(
       zdr: p.zdr === true,
       selfHosted: p.self_hosted === true,
       requestFormat: p.request_format ?? "documents",
+      ...(p.openrouter_routing ? { openrouterRouting: p.openrouter_routing } : {}),
       timeoutMs: p.timeout_ms,
       minScore: p.min_score,
       modelDir: p.model_dir,
