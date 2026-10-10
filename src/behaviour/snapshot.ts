@@ -83,6 +83,8 @@ export interface CheckBehaviour {
   detection: string;
   /** The check's own judging chain head (`[checks.<code>].model`); absent = the point's chain. */
   model?: string;
+  /** Its questions are also asked in the point's call as a backup (`point_backup`); absent = off. */
+  pointBackup?: true;
 }
 
 export interface DecisionPointBehaviour {
@@ -288,6 +290,7 @@ export function buildBehaviourSnapshot({ config, catalogue, code }: BuildBehavio
         minChars: check.minChars ?? null,
         detection: detectionHash(check),
         ...(check.model ? { model: check.model } : {}),
+        ...(check.pointBackup ? { pointBackup: true as const } : {}),
       };
       if (check.model) reference(check.model);
     }

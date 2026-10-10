@@ -192,6 +192,7 @@ function applyCheckConfig(
     words: raw.words ?? base?.words ?? [],
     minChars: raw.min_chars ?? base?.minChars,
     model: raw.model ?? base?.model,
+    ...((raw.point_backup ?? base?.pointBackup) ? { pointBackup: true as const } : {}),
     questions: thresholded,
     builtin: base?.builtin ?? false,
   };
@@ -242,6 +243,14 @@ function validateCheck(def: CheckDefinition, where: string): void {
   }
   if (def.prefilter && def.prefilter.length > 0 && def.questions.length === 0) {
     throw new Error(`${where}: prefilter gates questions; a check without questions cannot have one`);
+  }
+  if (def.pointBackup && def.questions.length === 0) {
+    throw new Error(
+      `${where}: point_backup asks the check's questions in the point's call; a check without questions cannot have one`,
+    );
+  }
+  if (def.pointBackup && def.model === undefined) {
+    throw new Error(`${where}: point_backup backs up the check's own model; set model, or remove point_backup`);
   }
   if (def.model !== undefined && def.questions.length === 0) {
     throw new Error(`${where}: model judges the check's questions; a check without questions cannot have one`);

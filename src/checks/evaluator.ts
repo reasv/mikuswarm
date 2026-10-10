@@ -15,8 +15,10 @@
  *   one of them matches that question's source text; no match skips it.
  * - **One call by default**, split by the fits ({@link planCheckCalls}); a
  *   check with its own `model` is asked of that chain in a call of its own, in
- *   parallel ({@link CheckEvaluator.judgeByChain}); every call of one
- *   evaluation shares a `decisionGroup`.
+ *   parallel ({@link CheckEvaluator.judgeByChain}); with `point_backup` its
+ *   questions are also asked in the point's call, whose answers stand in for
+ *   the ones its own chain left unanswered; every call of one evaluation shares
+ *   a `decisionGroup`.
  * - **Per-check verdict**: a check fires when any of its questions reaches its
  *   own (calibrated) threshold; its probability is the highest among them.
  *
@@ -197,6 +199,12 @@ const CHECKPOINT_PRIORITY: Record<Checkpoint, PriorityClass> = {
 interface CallRecord {
   row: DecisionEvaluationRow;
   verdict: ChecksCallVerdict;
+  /**
+   * Question ids this call answered only as a backup (`point_backup`) that the
+   * check's own chain answered too: its own answer stands, this one is set
+   * aside (recorded under `superseded`, never fires).
+   */
+  superseded?: ReadonlySet<string>;
 }
 
 /**
@@ -474,7 +482,8 @@ export class CheckEvaluator {
    * without check models; several run in parallel in the evaluation's decision
    * group, under its deadline, and their verdicts merge like the duplicate
    * stage's (fired concatenated, the first unjudged reason kept). A failing
-   * chain leaves its questions unjudged and the other calls unaffected.
+   * chain leaves its questions unjudged and the other calls unaffected. A check
+   * with `pointBackup` is asked on both chains ({@link judgeWithBackup}).
    */
   private judgeByChain(
     evaluation: CheckEvaluation,
@@ -483,19 +492,30 @@ export class CheckEvaluator {
   ): Promise<{ fired: FiredCheck[]; unjudgedReason?: string }> {
     const defaultHead = opts.chainHead;
     const pointHead = this.options.engine?.settings(this.pointName, evaluation.scope.agent)?.model;
-    const modelOf = new Map(evaluation.checks.map((c) => [c.code, c.model]));
+    const checkOf = new Map(evaluation.checks.map((c) => [c.code, c]));
     const parts = new Map<string | undefined, CheckItem[]>();
-    for (const item of items) {
-      let head = modelOf.get(item.code) ?? defaultHead;
-      if (head !== undefined && head === (defaultHead ?? pointHead)) head = defaultHead;
+    const add = (head: string | undefined, item: CheckItem): void => {
       const part = parts.get(head);
       if (part) part.push(item);
       else parts.set(head, [item]);
+    };
+    // Questions also asked in the default chain's call as a backup.
+    const backupIds = new Set<string>();
+    for (const item of items) {
+      const check = checkOf.get(item.code);
+      let head = check?.model ?? defaultHead;
+      if (head !== undefined && head === (defaultHead ?? pointHead)) head = defaultHead;
+      add(head, item);
+      if (head !== defaultHead && check?.pointBackup) {
+        add(defaultHead, item);
+        backupIds.add(item.id);
+      }
     }
     const withHead = (head: string | undefined): JudgeOptions => {
       const { chainHead: _default, ...rest } = opts;
       return head !== undefined ? { ...rest, chainHead: head } : rest;
     };
+    if (backupIds.size > 0) return this.judgeWithBackup(evaluation, items, parts, backupIds, opts, withHead);
     if (parts.size <= 1) {
       const [head, part] = [...parts][0] ?? [defaultHead, items];
       return this.judgeSafely(evaluation, part, head === defaultHead ? opts : withHead(head));
@@ -509,18 +529,91 @@ export class CheckEvaluator {
     );
   }
 
+  /**
+   * The `point_backup` merge: every chain's calls run in parallel as in
+   * {@link judgeByChain}; then, per backed-up question, the answer of the
+   * check's own chain stands when it gave one, and the default chain's answer
+   * is used only when it did not (that call's copy is set aside as
+   * `superseded`). The verdicts are formed once over the merged answers, so a
+   * backed-up check is one check, never two. A chain's unjudged reason counts
+   * only while some of its questions are left without any answer.
+   */
+  private async judgeWithBackup(
+    evaluation: CheckEvaluation,
+    items: CheckItem[],
+    parts: Map<string | undefined, CheckItem[]>,
+    backupIds: ReadonlySet<string>,
+    opts: JudgeOptions,
+    withHead: (head: string | undefined) => JudgeOptions,
+  ): Promise<{ fired: FiredCheck[]; unjudgedReason?: string }> {
+    const defaultHead = opts.chainHead;
+    const runs = await Promise.all(
+      [...parts].map(async ([head, part]) => ({
+        isDefault: head === defaultHead,
+        part,
+        ...(await this.callsSafely(evaluation, part, withHead(head))),
+      })),
+    );
+    const ownAnswered = new Set<string>();
+    for (const run of runs) {
+      if (run.isDefault) continue;
+      for (const call of run.records) for (const r of call.verdict.results) if (backupIds.has(r.id)) ownAnswered.add(r.id);
+    }
+    const effective: CallRecord[] = [];
+    for (const run of runs) {
+      for (const call of run.records) {
+        if (!run.isDefault) {
+          effective.push(call);
+          continue;
+        }
+        const superseded = new Set(call.verdict.results.filter((r) => ownAnswered.has(r.id)).map((r) => r.id));
+        if (superseded.size === 0) {
+          effective.push(call);
+          continue;
+        }
+        call.superseded = superseded;
+        effective.push({
+          row: call.row,
+          verdict: { ...call.verdict, results: call.verdict.results.filter((r) => !superseded.has(r.id)) },
+        });
+      }
+    }
+    const answered = new Set(effective.flatMap((call) => call.verdict.results.map((r) => r.id)));
+    const unjudgedReason = runs.find(
+      (run) => run.unjudgedReason !== undefined && !run.part.every((item) => answered.has(item.id)),
+    )?.unjudgedReason;
+    const fired = this.firedFrom(evaluation, effective, items, opts);
+    return unjudgedReason ? { fired, unjudgedReason } : { fired };
+  }
+
   private judgeSafely(
     evaluation: CheckEvaluation,
     items: CheckItem[],
     opts: JudgeOptions = {},
   ): Promise<{ fired: FiredCheck[]; unjudgedReason?: string }> {
     return this.judge(evaluation, items, opts).catch((error): { fired: FiredCheck[]; unjudgedReason?: string } => {
-      this.options.logger?.warn("check_gate_call_failed", {
-        sessionId: evaluation.scope.sessionId,
-        checkpoint: evaluation.checkpoint,
-        error: error instanceof Error ? error.message : String(error),
-      });
+      this.logCallFailed(evaluation, error);
       return { fired: [], unjudgedReason: "error" };
+    });
+  }
+
+  /** {@link judgeCalls} that never rejects (a failure leaves the items unjudged). */
+  private callsSafely(
+    evaluation: CheckEvaluation,
+    items: CheckItem[],
+    opts: JudgeOptions,
+  ): Promise<{ records: CallRecord[]; unjudgedReason?: string }> {
+    return this.judgeCalls(evaluation, items, opts).catch((error): { records: CallRecord[]; unjudgedReason?: string } => {
+      this.logCallFailed(evaluation, error);
+      return { records: [], unjudgedReason: "error" };
+    });
+  }
+
+  private logCallFailed(evaluation: CheckEvaluation, error: unknown): void {
+    this.options.logger?.warn("check_gate_call_failed", {
+      sessionId: evaluation.scope.sessionId,
+      checkpoint: evaluation.checkpoint,
+      error: error instanceof Error ? error.message : String(error),
     });
   }
 
@@ -529,8 +622,19 @@ export class CheckEvaluator {
     items: CheckItem[],
     opts: JudgeOptions = {},
   ): Promise<{ fired: FiredCheck[]; unjudgedReason?: string }> {
+    const { records, unjudgedReason } = await this.judgeCalls(evaluation, items, opts);
+    const fired = this.firedFrom(evaluation, records, items, opts);
+    return unjudgedReason ? { fired, unjudgedReason } : { fired };
+  }
+
+  /** Run the planned calls of `items` on one chain; each completed call is added to `evaluation.calls`. */
+  private async judgeCalls(
+    evaluation: CheckEvaluation,
+    items: CheckItem[],
+    opts: JudgeOptions = {},
+  ): Promise<{ records: CallRecord[]; unjudgedReason?: string }> {
     const engine = this.options.engine;
-    if (items.length === 0 || !engine) return { fired: [] };
+    if (items.length === 0 || !engine) return { records: [] };
     const { scope, subject } = evaluation;
     const checkpoint = evaluation.checkpoint;
     const attribution = {
@@ -541,7 +645,7 @@ export class CheckEvaluator {
     };
     if (scope.sessionId && this.options.isPayeeOverBudget?.(scope.sessionId)) {
       // Never refuse or delay the output for budget: it proceeds unjudged.
-      if (evaluation.budgetRow) return { fired: [], unjudgedReason: "payee_budget" };
+      if (evaluation.budgetRow) return { records: [], unjudgedReason: "payee_budget" };
       evaluation.budgetRow = {
         ts: this.now(),
         decisionGroup: evaluation.decisionGroup,
@@ -563,7 +667,7 @@ export class CheckEvaluator {
         inputTokens: null,
         costUsd: null,
       };
-      return { fired: [], unjudgedReason: "payee_budget" };
+      return { records: [], unjudgedReason: "payee_budget" };
     }
     const knobs = this.knobs(scope.agent);
     // The deadline only stops the waiting; the call itself may finish later and
@@ -621,12 +725,27 @@ export class CheckEvaluator {
           });
         }
         if (record.row) {
-          evaluation.calls.push({ row: record.row, verdict: record.verdict });
-          records.push({ row: record.row, verdict: record.verdict });
+          const call: CallRecord = { row: record.row, verdict: record.verdict };
+          evaluation.calls.push(call);
+          records.push(call);
         }
       }),
     );
+    return unjudgedReason ? { records, unjudgedReason } : { records };
+  }
 
+  /**
+   * The checks fired by `records`' answers to `items` (§4.2): a check fires
+   * when any of its questions reached its threshold; the reported probability
+   * and source are those of the strongest question.
+   */
+  private firedFrom(
+    evaluation: CheckEvaluation,
+    records: readonly CallRecord[],
+    items: readonly CheckItem[],
+    opts: JudgeOptions,
+  ): FiredCheck[] {
+    const checksByCode = new Map(evaluation.checks.map((c) => [c.code, c]));
     // Per check: fired when any question reached its threshold; the reported
     // probability and source are those of the strongest question (§4.2).
     const fired: FiredCheck[] = [];
@@ -664,7 +783,7 @@ export class CheckEvaluator {
       }
       fired.push(hit);
     }
-    return unjudgedReason ? { fired, unjudgedReason } : { fired };
+    return fired;
   }
 
   /**
@@ -729,7 +848,8 @@ export class CheckEvaluator {
     // A judged check links to the row of the call whose answer fired it.
     for (const call of evaluation.calls) {
       // A check verdict whichever point judged it (the audit runs under its own).
-      await insert({ ...toInsert(call.row), point: "checks", ...anchorFields }, firedCodes(call));
+      const codes = firedCodes(call);
+      await insert({ ...withSuperseded(toInsert(call.row), call.superseded, codes), point: "checks", ...anchorFields }, codes);
     }
     if (evaluation.budgetRow) await insert({ ...toInsert(evaluation.budgetRow), ...anchorFields }, []);
 
@@ -811,7 +931,38 @@ function firedOf(check: CheckDefinition, extra: Omit<FiredCheck, "code" | "kind"
 }
 
 function firedCodes(call: CallRecord): string[] {
-  return [...new Set(call.verdict.results.filter((r) => r.fired).map((r) => r.code))];
+  const results = call.verdict.results.filter((r) => r.fired && !call.superseded?.has(r.id));
+  return [...new Set(results.map((r) => r.code))];
+}
+
+/**
+ * A backup call's row (`point_backup`): the answers set aside because the
+ * check's own chain answered move from `results` to `superseded`, and `fired`
+ * names only what the remaining answers fired, so the row reads as what it
+ * contributed to the verdict.
+ */
+function withSuperseded(
+  row: DecisionEvaluationInsert,
+  superseded: ReadonlySet<string> | undefined,
+  fired: string[],
+): DecisionEvaluationInsert {
+  if (!superseded || superseded.size === 0 || !row.verdict_json) return row;
+  try {
+    const verdict = JSON.parse(row.verdict_json) as { results?: Array<{ id: string }> };
+    if (!Array.isArray(verdict.results)) return row;
+    const kept = verdict.results.filter((r) => !superseded.has(r.id));
+    return {
+      ...row,
+      verdict_json: JSON.stringify({
+        ...verdict,
+        fired,
+        results: kept,
+        superseded: verdict.results.filter((r) => superseded.has(r.id)),
+      }),
+    };
+  } catch {
+    return row;
+  }
 }
 
 /** The engine's camelCase row as a storage insert (the anchor is added by the caller). */

@@ -109,6 +109,13 @@ export interface CheckDefinition {
    * duplicate chain, for a duplicate check).
    */
   model?: string;
+  /**
+   * With `model`: this check's questions are also asked in the point's own
+   * call(s), as a backup. A question the check's chain answered keeps that
+   * answer; one it left unanswered (error, timeout, no usable member) takes the
+   * point call's. Present only when true.
+   */
+  pointBackup?: true;
   questions: CheckQuestion[];
   builtin: boolean;
 }

@@ -193,6 +193,7 @@ function diffCheck(agent: string, code: string, a: CheckBehaviour | undefined, b
     if (a.minChars !== b.minChars) parts.push(`min chars ${a.minChars ?? "default"} → ${b.minChars ?? "default"}`);
     if (a.detection !== b.detection) parts.push("detection changed");
     if (a.model !== b.model) parts.push(`judge model ${a.model ?? "the point's"} → ${b.model ?? "the point's"}`);
+    if (a.pointBackup !== b.pointBackup) parts.push(`point backup ${b.pointBackup ? "on" : "off"}`);
     if (a.kind !== b.kind) parts.push(`kind ${a.kind} → ${b.kind}`);
   }
   return [{

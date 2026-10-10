@@ -379,6 +379,209 @@ test("duplicate stage: a duplicate check's own model wins over the duplicate cha
   }
 });
 
+// ------------------------------------------------------------ point backup
+// `[checks.<code>].point_backup`: the check's questions are also asked in the
+// point's call; per question, the own chain's answer stands when it gave one,
+// else the point call's answer is used.
+
+const byModelAnswer = (answers: Record<string, number>) => (model: string) => answers[model] ?? 0.1;
+
+test("point_backup: asked on both chains in parallel; the own chain's answer wins over a point firing", async () => {
+  const t = await setup({
+    checks: { op_refusal: refusal(), op_style: style({ model: "other", point_backup: true }) },
+    answer: byModelAnswer({ "vendor/decider-1": 0.9, "vendor/other-1": 0.1 }),
+  });
+  t.server.hold();
+  const evaluation = start(t.evaluator);
+  for (let i = 0; i < 200 && t.server.calls.length < 2; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(t.server.calls.length, 2, "both calls in flight at once");
+  const byModel = new Map(t.server.calls.map((c) => [c.model, c.questions]));
+  assert.deepEqual(byModel.get("vendor/decider-1"), ["op_refusal__message", "op_style__message"]);
+  assert.deepEqual(byModel.get("vendor/other-1"), ["op_style__message"]);
+  t.server.release();
+  const result = await evaluation.done;
+  assert.deepEqual(result.fired.map((f) => f.code), ["op_refusal"], "op_style: other's 0.1 stands over decider's 0.9");
+  assert.equal(result.unjudgedReason, undefined);
+  assert.equal(result.judgedQuestions, 2, "a backed-up question counts once");
+  const rows = await recorded(t, evaluation);
+  assert.equal(rows.length, 2);
+  assert.equal(new Set(rows.map((r) => r.decision_group)).size, 1);
+  const decider = JSON.parse(rows.find((r) => r.served_model === "decider")!.verdict_json!);
+  assert.deepEqual(decider.fired, ["op_refusal"], "the superseded firing is not the row's");
+  assert.deepEqual(decider.results.map((r: any) => r.id), ["op_refusal__message"]);
+  assert.deepEqual(decider.superseded.map((r: any) => [r.id, r.fired]), [["op_style__message", true]]);
+  const other = JSON.parse(rows.find((r) => r.served_model === "other")!.verdict_json!);
+  assert.equal("superseded" in other, false);
+  t.storage.close();
+});
+
+test("point_backup: both chains fire a refusal check: one verdict, its event linked to the own chain's row", async () => {
+  const t = await setup({
+    checks: { op_refusal: refusal({ model: "other", point_backup: true }) },
+    answer: byModelAnswer({ "vendor/decider-1": 0.95, "vendor/other-1": 0.85 }),
+  });
+  const evaluation = start(t.evaluator);
+  const result = await evaluation.done;
+  assert.equal(result.fired.length, 1);
+  assert.equal(result.fired[0]!.probability, 0.85, "the own chain's answer, not the stronger backup");
+  const rows = await recorded(t, evaluation);
+  const events = t.storage.listRefusalEvents(SESSION);
+  assert.equal(events.length, 1);
+  assert.equal(events[0]!.decision_evaluation_id, rows.find((r) => r.served_model === "other")!.id);
+  t.storage.close();
+});
+
+test("point_backup: the own chain fails: the point call's answer is used, fired or not", async () => {
+  for (const [p, expected] of [
+    [0.9, ["op_refusal", "op_style"]],
+    [0.1, []],
+  ] as const) {
+    const t = await setup({
+      checks: { op_refusal: refusal(), op_style: style({ model: "other", point_backup: true }) },
+      down: new Set(["vendor/other-1"]),
+      answer: () => p,
+    });
+    const evaluation = start(t.evaluator);
+    const result = await evaluation.done;
+    assert.deepEqual(result.fired.map((f) => f.code).sort(), [...expected]);
+    assert.equal(result.unjudgedReason, undefined, "every question was answered by one chain");
+    assert.equal(result.judgedQuestions, 2);
+    const rows = await recorded(t, evaluation);
+    assert.deepEqual(rows.map((r) => r.source).sort(), ["heuristic", "model"]);
+    const decider = JSON.parse(rows.find((r) => r.served_model === "decider")!.verdict_json!);
+    assert.equal("superseded" in decider, false, "nothing set aside: the backup answer is the verdict");
+    assert.deepEqual(decider.results.map((r: any) => r.id), ["op_refusal__message", "op_style__message"]);
+    if (p === 0.9) {
+      const styleHit = result.fired.find((f) => f.code === "op_style")!;
+      assert.equal(styleHit.method, "judged");
+      assert.equal(styleHit.probability, 0.9);
+    }
+    t.storage.close();
+  }
+});
+
+test("point_backup: the backup uses the point member's calibration", async () => {
+  const t = await setup({
+    checks: { op_style: style({ model: "other", point_backup: true }) },
+    calibration: { decider: { "checks.op_style": 0.5 }, other: { "checks.op_style": 0.95 } },
+    down: new Set(["vendor/other-1"]),
+    answer: () => 0.6,
+  });
+  const result = await start(t.evaluator).done;
+  assert.deepEqual(result.fired.map((f) => f.code), ["op_style"], "0.6 fires at decider's 0.5");
+  t.storage.close();
+});
+
+test("point_backup: both chains fail: unjudged as before", async () => {
+  const t = await setup({
+    checks: { op_style: style({ model: "other", point_backup: true }) },
+    down: new Set(["vendor/other-1", "vendor/decider-1"]),
+    answer: () => 0.9,
+  });
+  const result = await start(t.evaluator).done;
+  assert.deepEqual(result.fired, []);
+  assert.ok(result.unjudgedReason);
+  t.storage.close();
+});
+
+test("point_backup: the point call fails: its own questions stay unjudged, the backed-up check keeps its own verdict", async () => {
+  const t = await setup({
+    checks: { op_refusal: refusal(), op_style: style({ model: "other", point_backup: true }) },
+    down: new Set(["vendor/decider-1"]),
+    answer: () => 0.9,
+  });
+  const result = await start(t.evaluator).done;
+  assert.deepEqual(result.fired.map((f) => f.code), ["op_style"]);
+  assert.ok(result.unjudgedReason, "op_refusal was left unjudged");
+  t.storage.close();
+
+  // Only backed-up questions in the point call: its failure leaves nothing unjudged.
+  const only = await setup({
+    checks: { op_style: style({ model: "other", point_backup: true }) },
+    down: new Set(["vendor/decider-1"]),
+    answer: () => 0.9,
+  });
+  const alone = await start(only.evaluator).done;
+  assert.deepEqual(alone.fired.map((f) => f.code), ["op_style"]);
+  assert.equal(alone.unjudgedReason, undefined);
+  only.storage.close();
+});
+
+test("point_backup off (or on a check sharing the point's chain): unchanged", async () => {
+  const off = await setup({
+    checks: { op_style: style({ model: "other", point_backup: false }) },
+    answer: () => 0.9,
+  });
+  await start(off.evaluator).done;
+  assert.deepEqual(off.server.calls.map((c) => c.model), ["vendor/other-1"]);
+  off.storage.close();
+
+  const same = await setup({
+    checks: { op_refusal: refusal(), op_style: style({ model: "decider", point_backup: true }) },
+  });
+  await start(same.evaluator).done;
+  assert.equal(same.server.calls.length, 1);
+  assert.deepEqual(same.server.calls[0]!.questions, ["op_refusal__message", "op_style__message"]);
+  same.storage.close();
+});
+
+test("point_backup per agent: [agents.<name>.checks.<code>].point_backup applies to that agent only", async () => {
+  const t = await setup({
+    checks: { op_style: style({ model: "other" }) },
+    agents: { agent_b: { checks: { op_style: { point_backup: true } } } },
+  });
+  await start(t.evaluator).done;
+  assert.deepEqual(t.server.calls.map((c) => c.model), ["vendor/other-1"], "global: own chain only");
+  t.server.calls.length = 0;
+  await t.evaluator.start(
+    { agent: "agent_b", site: "default", sessionId: SESSION, sessionType: "default", timelineKey: TIMELINE },
+    { context: { action: "send_message" }, sources: { message: "I will not help with that request, sorry." } },
+    { checkpoint: "send" },
+  ).done;
+  assert.deepEqual(t.server.calls.map((c) => c.model).sort(), ["vendor/decider-1", "vendor/other-1"]);
+  t.storage.close();
+});
+
+test("point_backup in the offline audit and the duplicate stage: backed up on that stage's chain", async () => {
+  const audit = await setup({
+    models: { auditor: decider("vendor/auditor-1") },
+    checks: { op_style: style({ model: "other", point_backup: true }) },
+    audit: true,
+    down: new Set(["vendor/other-1"]),
+    answer: () => 0.9,
+  });
+  const audited = await start(audit.evaluator).done;
+  const byModel = new Map(audit.server.calls.map((c) => [c.model, c.questions]));
+  assert.deepEqual(byModel.get("vendor/auditor-1"), ["op_style__message"]);
+  assert.deepEqual(audited.fired.map((f) => f.code), ["op_style"]);
+  audit.storage.close();
+
+  const ctx: DuplicateContext = {
+    targetTimelineKey: TIMELINE,
+    ownTimelineKey: TIMELINE,
+    draftAt: 10_000,
+    earlier: [
+      { eventIds: ["e1"], sessionId: "s-other", receivedAt: 9_000, text: "It is 42.", answering: { from: "bob", text: "6*7?" } },
+    ],
+    draftAnswering: { from: "bob", text: "6*7?" },
+    earlierMaxTokens: 1500,
+  };
+  const dup = await setup({
+    checks: {
+      dup: { kind: "duplicate", model: "other", point_backup: true, questions: [{ name: "repeats", ...question("message") }] },
+    },
+    down: new Set(["vendor/other-1"]),
+    answer: () => 0.9,
+  });
+  const evaluation = start(dup.evaluator, "The answer is 42.");
+  assert.equal(dup.evaluator.extendDuplicate(evaluation, ctx), true);
+  const result = await evaluation.done;
+  assert.deepEqual(dup.server.calls.map((c) => c.model).sort(), ["vendor/decider-1", "vendor/other-1"]);
+  assert.deepEqual(result.fired.map((f) => f.code), ["dup"]);
+  assert.ok(result.fired[0]!.standalone, "the duplicate rejection is written from the backup's verdict");
+  dup.storage.close();
+});
+
 // ----------------------------------------------------------------- validation
 
 const BASE_CONFIG = `
@@ -503,4 +706,44 @@ test("validation: a check without questions cannot set model", () => {
     () => buildCheckCatalogue({ checks: { op: { kind: "style", patterns: ["x"], model: "decider" } }, agents: {} } as any, []),
     /\[checks\.op\]: model judges the check's questions; a check without questions cannot have one/,
   );
+});
+
+test("validation: point_backup needs model and questions; per agent over a global model is fine", async () => {
+  assert.throws(
+    () => buildCheckCatalogue({ checks: { op: { kind: "style", questions: [question("message")], point_backup: true } }, agents: {} } as any, []),
+    /\[checks\.op\]: point_backup backs up the check's own model; set model, or remove point_backup/,
+  );
+  assert.throws(
+    () => buildCheckCatalogue({ checks: { op: { kind: "style", patterns: ["x"], model: "decider", point_backup: true } }, agents: {} } as any, []),
+    /\[checks\.op\]: point_backup asks the check's questions in the point's call; a check without questions cannot have one/,
+  );
+  assert.throws(
+    () => buildCheckCatalogue({
+      checks: { op: { kind: "style", questions: [question("message")] } },
+      agents: { agent_b: { checks: { op: { point_backup: true } } } },
+    } as any, []),
+    /\[agents\.agent_b\.checks\.op\]: point_backup backs up the check's own model/,
+  );
+  const perAgent = buildCheckCatalogue({
+    checks: { op: { kind: "style", questions: [question("message")], model: "decider" } },
+    agents: { agent_b: { checks: { op: { point_backup: true } } } },
+  } as any, []);
+  assert.equal(perAgent.get("op")!.pointBackup, undefined);
+  assert.equal(perAgent.get("op", "agent_b")!.pointBackup, true);
+  const off = buildCheckCatalogue({ checks: { op: { kind: "style", questions: [question("message")], point_backup: false } }, agents: {} } as any, []);
+  assert.equal("pointBackup" in off.get("op")!, false, "false without model is accepted and leaves nothing behind");
+
+  const loaded = await load(`
+[checks.op]
+kind = "style"
+model = "decider"
+point_backup = true
+  [[checks.op.questions]]
+  source = "message"
+  instructions = "x"
+  criteria = { true = "a", false = "b" }
+  threshold = 0.8
+`);
+  validateDecisionsConfig(loaded);
+  assert.equal(buildCheckCatalogue(loaded, []).get("op")!.pointBackup, true);
 });

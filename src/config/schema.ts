@@ -1512,6 +1512,9 @@ const CheckSchema = StrictObject({
   // Decision chain of this check's questions (a system-one [models.*] key), in a
   // call of its own. Unset = the point's chain (the duplicate chain for a duplicate check).
   model: Type.Optional(Type.String({ minLength: 1 })),
+  // With `model`: also ask the questions in the point's call, as a backup used
+  // only for questions the check's own chain leaves unanswered. Default false.
+  point_backup: Type.Optional(Type.Boolean()),
   questions: Type.Optional(Type.Array(CheckQuestionSchema)),
   // Per-question thresholds, keyed by question name (or source, for an unnamed
   // question): overrides the thresholds of the built-in or configured questions.
