@@ -33,6 +33,12 @@ import type { CheckDefinition, CheckQuestion } from "../types.js";
 /** Default threshold of the starter style questions (calibrated later, §15). */
 export const STYLE_THRESHOLD = 0.85;
 
+/**
+ * `style_essay_formatting`: measured on Jev against labelled real chat messages, the question separates
+ * cleanly (AUC ~0.99) but true cases score 0.6–0.85, so 0.85 missed most of them.
+ */
+const ESSAY_THRESHOLD = 0.7;
+
 /** Shared near miss: someone else's words, or the construction as the topic. */
 const QUOTED =
   "Quoting or reporting what someone else wrote, or showing the construction as an example because the conversation is about it, is not the assistant's own phrasing.";
@@ -127,27 +133,25 @@ export const BUILTIN_STYLE_CHECKS: readonly CheckDefinition[] = [
     "Rhetorical contrast: 'not X, but Y' or 'X, not Y'",
     'Uses a contrast primarily for rhetorical impact ("not X, but Y" or "X, not Y"). State the point directly.',
     {
-      questions: [
-        messageQuestion(
-          "`message` uses \"not X, but Y\" or an equivalent (\"it's not X, it's Y\", \"not just X, but Y\", " +
-            "\"less X, more Y\", \"this isn't about X, it's about Y\") primarily to add rhetorical impact: " +
-            "making a characterization sound more emphatic, profound, dramatic, or validating.",
-          {
-            true: "The contrast mainly adds emphasis or rhetorical weight; stating Y directly would convey substantially the same information.",
-            false: "The contrast makes a concrete factual correction, explains a useful practical distinction, or is only quoted or discussed.",
-          },
-          0.60,
-        ),
-        messageQuestion(
-          "In `message`, the assistant uses \"X, not Y\" primarily to add rhetorical impact: " +
-            "making a characterization sound more emphatic, profound, dramatic, or validating.",
-          {
-            true: "The contrast mainly adds emphasis or rhetorical weight; stating X directly would convey substantially the same information.",
-            false: "The contrast makes a concrete factual correction, explains a useful practical distinction, or is only quoted or discussed.",
-          },
-          0.60,
-        ),
-      ],
+      // One question: the contrast as a reframe or slogan for effect, against contrasts that inform. Replaced two
+      // OR-combined questions at 0.60 that also fired on corrections, either/or answers and plain negation
+      // (on Jev, against labelled real chat messages, about half the errors of the old pair).
+      question: messageQuestion(
+        "`message` contains a rhetorical contrast (\"it's not X, it's Y\", \"X, not Y\", \"not just X but Y\", \"less X, more Y\", " +
+          "\"this isn't about X, it's about Y\", \"It isn't X. It's Y.\") used for effect rather than information.",
+        {
+          true:
+            "A contrast in `message` exists to make a point sound more emphatic, profound, dramatic, witty or validating: a reframe or " +
+            "slogan (\"that's not failure, it's practice\", \"you're not lazy, you're recharging\", \"progress, not perfection\", \"it's not " +
+            "a song, it's a mood\"), including reframes of the user's own self-judgment and playful in-character ones.",
+          false:
+            "The contrast carries information: correcting a fact or choice the user stated or asked about, answering an either/or " +
+            "question, a practical do-this-not-that instruction, ruling out a likely cause, a comparison that was asked for. Idioms like " +
+            "\"not gonna lie\" or \"not bad\", plain negation, clauses joined by but without a reframe, quoted or discussed constructions, " +
+            "and messages with no contrast are not it either.",
+        },
+        0.55,
+      ),
     },
   ),
   styleCheck(
@@ -269,6 +273,7 @@ export const BUILTIN_STYLE_CHECKS: readonly CheckDefinition[] = [
             "for one), nor is a code block, a short enumeration inside a sentence, or a structured answer to a structured " +
             `request. ${QUOTED}`,
         },
+        ESSAY_THRESHOLD,
       ),
     },
   ),

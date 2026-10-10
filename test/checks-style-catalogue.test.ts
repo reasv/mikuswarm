@@ -75,15 +75,15 @@ test("questions read the message and name their near misses in the false criteri
   for (const c of BUILTIN_STYLE_CHECKS) {
     for (const q of c.questions) {
       assert.equal(q.source, "message", c.code);
-      assert.ok(q.threshold > 0.5 && q.threshold <= 1, c.code);
+      assert.ok(q.threshold >= 0.5 && q.threshold <= 1, c.code);
       assert.match(q.instructions, /`message`/);
       assert.ok(q.criteria.false.length > 40, `${c.code} names its near misses`);
     }
   }
-  assert.deepEqual(check("style_not_x_but_y").questions.map((q) => q.threshold), [0.60, 0.60]);
-  for (const q of check("style_not_x_but_y").questions) {
-    assert.match(q.criteria.false, /concrete factual correction/);
-  }
+  assert.deepEqual(check("style_not_x_but_y").questions.map((q) => q.threshold), [0.55]);
+  assert.match(check("style_not_x_but_y").questions[0]!.criteria.false, /correcting a fact or choice/);
+  assert.match(check("style_not_x_but_y").questions[0]!.criteria.true, /reframe or slogan/);
+  assert.deepEqual(check("style_essay_formatting").questions.map((q) => q.threshold), [0.7]);
   assert.match(check("style_essay_formatting").questions[0]!.criteria.false, /list the user asked for is not essay formatting/);
   assert.match(check("style_load_bearing").questions[0]!.criteria.false, /Quoting .* is not the assistant's own phrasing/);
   assert.match(check("style_ai_disclaimer").questions[0]!.criteria.false, /AI as a subject/);
