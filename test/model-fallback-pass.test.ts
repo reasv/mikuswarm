@@ -465,3 +465,46 @@ test("an environmental error that lands after the budget is spent falls over ins
   assert.deepEqual(calls, ["wire-X", "wire-Y"]);
   scheduler.stop();
 });
+
+test("moving to another member gives it a fresh wall-clock budget (never the leftovers)", async () => {
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 3 } });
+  const calls: string[] = [];
+  // The head burns most of the 100 ms budget before its 502; the fallback hangs 60 ms before answering.
+  const fb = buildModelFallback([X, Y], {
+    consumer: "test",
+    makeBase: () => ((model, _ctx, opts) => {
+      calls.push(model.id);
+      const stream = createAssistantMessageEventStream();
+      let settled = false;
+      (opts as { signal?: AbortSignal }).signal?.addEventListener("abort", () => {
+        if (settled) return;
+        settled = true;
+        const err = message(model, "aborted", "Request aborted");
+        stream.push({ type: "error", reason: "aborted", error: err });
+        stream.end(err);
+      }, { once: true });
+      setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        if (model.id === "wire-X") {
+          const err = message(model, "error", "OpenAI API error (502): 502 status code (no body)");
+          stream.push({ type: "error", reason: "error", error: err });
+          stream.end(err);
+        } else {
+          const done = message(model, "stop");
+          stream.push({ type: "done", reason: "stop", message: done });
+          stream.end(done);
+        }
+      }, model.id === "wire-X" ? 80 : 60);
+      return stream;
+    }) as StreamFn,
+    makeModel,
+    scheduler,
+    admission: { priority: "interactive" },
+    primaryAttemptsPerRequest: 1,
+  });
+  const last = await run(withRequestRetry(fb.streamFn, { maxWaitMs: 100, backoffBaseMs: 1, backoffMaxMs: 1 }));
+  assert.equal(last.type, "done", "the fallback was not cut off by the head's spent time");
+  assert.deepEqual(calls, ["wire-X", "wire-Y"]);
+  scheduler.stop();
+});

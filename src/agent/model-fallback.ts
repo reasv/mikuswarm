@@ -348,6 +348,7 @@ export function buildModelFallback(
         options.onResolve?.(only.logicalId, "primary");
         const pass = getRequestAttemptState(streamOptions);
         if (pass) {
+          pass.attempts.set(only.healthKey, (pass.attempts.get(only.healthKey) ?? 0) + 1);
           pass.servedKey = only.healthKey;
           pass.firstTokenTimeoutMs = only.firstTokenTimeoutMs;
         }

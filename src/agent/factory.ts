@@ -21,7 +21,7 @@ import { withSeenStamp } from "../checks/duplicate.js";
 import { wrapToolsWithOutputGate, type OutputGate } from "../checks/gate.js";
 import { createSessionOutputGate, withGateTap, type OutputGateServices } from "../checks/session.js";
 import { estimateLiveSliceTokens } from "./live-token-estimate.js";
-import { extractLlmRequestClass, getRequestAttemptState, withRequestRetry } from "./request-retry.js";
+import { extractLlmRequestClass, getRequestAttemptState, withRequestRetry, type RequestAttemptState } from "./request-retry.js";
 import { withTruncatedToolCallsAsLength } from "./truncated-tool-calls.js";
 import {
   defaultPriorityForSessionType,
@@ -32,6 +32,7 @@ import {
 import {
   buildModelFallback,
   chooseChainMember,
+  DEFAULT_PRIMARY_ATTEMPTS_PER_REQUEST,
   resolveModelChain,
   type BuiltModelFallback,
 } from "./model-fallback.js";
@@ -1278,9 +1279,27 @@ export class AgentSessionFactory {
     // (spec PER-MEMBER-CONTEXT-FITS §2.4) — the independent fits comparison is removed.
     // Terminal-cause attribution is extended (§2.4): "nothing fits context" is now
     // distinguished from "nothing healthy" in the parked-session error message.
-    // `failed`: the current request's excluded/refused members (§8a "Failures fall
-    // over"), which no preference may be served by again within it.
+    // `failed`: the current request's state (§8a "Failures fall over"). Members it
+    // excluded or that refused it are never served again within it; a member that
+    // failed it is passed over while another can serve — the request's first member
+    // after `llm_primary_attempts_per_request` attempts, any other after one. With
+    // nothing else left, a new pass ignores the attempt counts (like the chain's).
+    const primaryQuota = recovery?.llm_primary_attempts_per_request ?? DEFAULT_PRIMARY_ATTEMPTS_PER_REQUEST;
     const resolveUserSelection = (
+      failed?: Pick<RequestAttemptState, "excluded" | "refused"> & Partial<Pick<RequestAttemptState, "attempts" | "firstServedKey">>,
+    ): { ok: true; selection: typeof activeSelection } | { ok: false; budget: boolean; contextDenied: boolean } => {
+      if (failed?.attempts && failed.attempts.size > 0) {
+        const skip = new Set(failed.excluded);
+        for (const [key, n] of failed.attempts) {
+          if (n >= (key === failed.firstServedKey ? primaryQuota : 1)) skip.add(key);
+        }
+        const pick = resolveUserSelectionOnce({ excluded: skip, refused: failed.refused });
+        if (pick.ok) return pick;
+        failed.attempts.clear();
+      }
+      return resolveUserSelectionOnce(failed);
+    };
+    const resolveUserSelectionOnce = (
       failed?: { excluded?: Set<string>; refused?: Set<string> },
     ): { ok: true; selection: typeof activeSelection } | { ok: false; budget: boolean; contextDenied: boolean } => {
       refreshRunningContext();
@@ -1360,12 +1379,18 @@ export class AgentSessionFactory {
           // serve without the member now dispatched counts too: a member failure
           // never ends a request another preference can take (§8a "Failures fall over").
           const pass = getRequestAttemptState(streamOptions);
-          if (pass && !pass.falloverAvailable && pass.servedKey !== undefined) {
+          if (pass && pass.servedKey !== undefined) {
             try {
-              pass.falloverAvailable = resolveUserSelection({
+              const others = resolveUserSelectionOnce({
                 excluded: new Set([...pass.excluded, pass.servedKey]),
                 refused: pass.refused,
               }).ok;
+              if (!pass.falloverAvailable) pass.falloverAvailable = others;
+              // Should this attempt fail, the next goes to another preference when
+              // this member has used its attempts: no local backoff then.
+              const used = pass.attempts.get(pass.servedKey) ?? 0;
+              const quota = pass.firstServedKey === undefined || pass.firstServedKey === pass.servedKey ? primaryQuota : 1;
+              if (others && used >= quota) pass.failoverOnFailure = true;
             } catch {
               /* keep the chain's answer */
             }

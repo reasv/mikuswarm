@@ -541,6 +541,76 @@ test("factory (per-user): fallback_chains = after_preferences tries every prefer
   });
 });
 
+test("factory (per-user, after_preferences): a failing first choice falls over down the preferences to one that answers", async () => {
+  const { createServer } = await import("node:http");
+  // Fake Anthropic upstream: "opus" has no keys (400), "sol"/"luna" 502, "mimo" answers.
+  const hits: string[] = [];
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      const wire = (JSON.parse(body) as { model: string }).model;
+      hits.push(wire);
+      if (wire === "opus-wire") {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ type: "error", error: { type: "proxy_no_keys_available", message: "No keys" } }));
+        return;
+      }
+      if (wire !== "mimo-wire") {
+        res.writeHead(502, { "content-type": "text/plain" });
+        res.end("bad gateway");
+        return;
+      }
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      const ev = (type: string, data: unknown) => res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+      ev("message_start", { type: "message_start", message: { id: "m1", type: "message", role: "assistant", content: [], model: wire, stop_reason: null, stop_sequence: null, usage: { input_tokens: 5, output_tokens: 1 } } });
+      ev("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+      ev("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } });
+      ev("content_block_stop", { type: "content_block_stop", index: 0 });
+      ev("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 2 } });
+      ev("message_stop", { type: "message_stop" });
+      res.end();
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const port = (server.address() as { port: number }).port;
+  const endpoint = `http://127.0.0.1:${port}`;
+  try {
+    await withWorkspace(async (root) => {
+      const { builder } = capturingBuilder();
+      const config = factoryConfig(root, {
+        recovery: { llm_request_max_wait_ms: 10_000, llm_request_backoff_base_ms: 1, llm_request_backoff_max_ms: 1 },
+      });
+      config.models = {
+        default: model("opus-wire", { endpoint, reasoning: false }),
+        opus: model("opus-wire", { endpoint, reasoning: false }),
+        sol: model("sol-wire", { endpoint, reasoning: false }),
+        luna: model("luna-wire", { endpoint, reasoning: false }),
+        mimo: model("mimo-wire", { endpoint, reasoning: false }),
+      };
+      const factory = new AgentSessionFactory({ config, contextBuilder: builder, getActiveSessions: () => [] });
+      const engine: any = {
+        affordable: () => ({ ok: true, maxOutput: 4096, remainingUsd: 1 }),
+        bindingConstraint: () => undefined,
+        noteSelection: () => {},
+      };
+      const resolution = {
+        matched: true, active: true, banned: false, models: ["opus", "sol", "luna", "mimo"], constraints: [], ledgerPartitionKeys: [],
+        chainsAfterPreferences: true,
+      } as unknown as UserLimitResolution;
+      const ctx = { userId: "@u:hs", roomId: "!r" } as UserLimitContext;
+      const { agent } = await factory.create(session(), [fakeTool("send_message")], { userLimit: { engine, resolution, ctx } });
+      await agent.prompt({ role: "user", content: "hi", timestamp: 20 } as any);
+      const last = agent.state.messages[agent.state.messages.length - 1] as any;
+      assert.equal(last?.role, "assistant");
+      assert.notEqual(last?.stopReason, "error", `the request was answered (${last?.errorMessage ?? ""})`);
+      assert.deepEqual(hits, ["opus-wire", "sol-wire", "luna-wire", "mimo-wire"], "each failing preference is tried once, in order, then the next one answers");
+    });
+  } finally {
+    server.close();
+  }
+});
+
 // --- storage: v21→v22 -----------------------------------------------------------
 
 test("storage: v21→v22 adds agent_sessions.initial_preloads; set/get round-trip", async () => {

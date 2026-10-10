@@ -119,6 +119,12 @@ export interface RequestAttemptState {
    * request.
    */
   falloverAvailable: boolean;
+  /**
+   * Health key of the member that served this request's FIRST attempt (set by
+   * Layer 0). Only it gets the head's per-request retry; any other member is
+   * passed over after one failure (§8a "Failures fall over").
+   */
+  firstServedKey?: string;
   /** Set at dispatch by the fallback resolver: the serving member's own first-token deadline. */
   firstTokenTimeoutMs?: number;
   /** Called by `withSchedulerAdmission` once THIS attempt holds a slot (the request is about to hit the wire). */
@@ -803,6 +809,7 @@ export function withRequestRetry(
         } catch {
           /* a throwing getter keeps the default */
         }
+        let previousServedKey: string | undefined;
         for (let attempt = 0; ; attempt++) {
           // Reset per-attempt served-model tracking so a stale value from a
           // prior attempt is never read at this attempt's settle (§ served-model
@@ -905,6 +912,18 @@ export function withRequestRetry(
 
           try {
             const inner = await base(model, context, attemptOptions);
+            // The resolver named the serving member synchronously at dispatch.
+            // Moving to a different member than the previous attempt gives it a
+            // fresh wall-clock budget: a member is never cut short by the time
+            // the ones before it spent failing (§8a "Failures fall over").
+            const servedKey = attemptState.servedKey;
+            if (attempt === 0) attemptState.firstServedKey = servedKey;
+            else if (servedKey !== undefined && servedKey !== previousServedKey && maxWaitMs !== undefined && !producedTokens) {
+              detachBudget();
+              armBudget();
+              if (budgetSignal) budgetSignal.addEventListener("abort", onBudgetAbort, { once: true });
+            }
+            previousServedKey = servedKey;
             // No admission wrapper flagged a slot wait: the request is on the
             // wire now, so the first-token clock starts here.
             if (attemptState.awaitingAdmission === undefined) armStallTimer();
