@@ -66,6 +66,9 @@ export interface EnforceContext {
   signal?: AbortSignal;
   /** Deadline of the judging calls (default the memory point's timeout). */
   timeoutMs?: number;
+  /** Group the judging calls' rows with a caller's evaluation (auto-retrieval's build). */
+  decisionGroup?: string;
+  triggerEventId?: string | null;
   /**
    * false = cached verdicts only, no decision call: blocks without a fresh
    * verdict follow `pending` (a room preview, which has no session to bill).
@@ -296,6 +299,8 @@ export class MemoryFilterService {
                   ...(ctx.share ? { share: ctx.share } : {}),
                   signal: ctx.signal,
                   ...(ctx.timeoutMs !== undefined ? { timeoutMs: ctx.timeoutMs } : {}),
+                  ...(ctx.decisionGroup ? { decisionGroup: ctx.decisionGroup } : {}),
+                  ...(ctx.triggerEventId !== undefined ? { triggerEventId: ctx.triggerEventId } : {}),
                   ...(this.chainHead(agent) ? { chainHead: this.chainHead(agent) } : {}),
                 },
               )

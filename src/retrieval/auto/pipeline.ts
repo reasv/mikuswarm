@@ -691,6 +691,8 @@ export class MemoryRetrievalPipeline {
                 priority: MEMORY_PRIORITY,
                 share: { name: MEMORY_SLOT_SHARE, fraction: auto.judgeSlotShare },
                 signal: stageSignal,
+                decisionGroup,
+                triggerEventId: input.triggerEventId ?? null,
               }),
               input.finishNow,
             ).catch(() => null)

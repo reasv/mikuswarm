@@ -719,8 +719,9 @@ test("judged filters with their own model get a filter-only call to it, not the 
   };
   const filters = { model: "decider_f", unwanted: { description: "The entry describes the assistant doing the thing." } };
   const models = { decider_f: { ...decider(), id: "vendor/decider-f" } };
-  await withStack(files, { filters, models }, async ({ pipeline, calls }) => {
+  await withStack(files, { filters, models }, async ({ pipeline, calls, rows }) => {
     const plan = await pipeline.plan(input());
+    assert.ok(rows.length >= 4 && rows.every((r) => r.decisionGroup === plan.report.decisionGroup), "filter-only rows share the build's group");
     assert.equal(plan.report.kept, 1);
     assert.ok(!plan.block!.includes("HABIT"));
     const relevance = calls.filter((c) => c.questions["relevant"]);

@@ -1565,11 +1565,17 @@ const DecisionsSchema = StrictObject({
   // Connection reuse for decision calls. Points send bursts of parallel
   // requests minutes apart; with the default pool (HTTP/1.1, idle sockets kept
   // 4 s) each burst opens fresh TLS connections, which costs a handshake per
-  // request on a high-latency link. http2 = true multiplexes them over one
-  // connection to the endpoint; keep_alive_ms keeps idle connections that long.
-  // Both unset (default) = the process-wide fetch, as before.
+  // request on a high-latency link. Either knob gives decision calls a pool of
+  // their own: http2 = true negotiates HTTP/2, whose idle connections stay open
+  // (pinged) between bursts; keep_alive_ms keeps idle HTTP/1.1 sockets that long
+  // (servers often close them sooner). POSTs are not multiplexed, so the pool
+  // grows to the largest burst. connection_ttl_ms (default 1800000 with the
+  // pool) retires a pooled connection after that long, so one that died
+  // silently (a network drop) cannot linger. All unset (default) = the
+  // process-wide fetch, as before.
   http2: Type.Optional(Type.Boolean()),
   keep_alive_ms: Type.Optional(Type.Integer({ minimum: 1000, maximum: 3_600_000 })),
+  connection_ttl_ms: Type.Optional(Type.Integer({ minimum: 60_000, maximum: 86_400_000 })),
   // Default confidence floor for choice/score verdicts. Default 0.6.
   min_confidence: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
   // Default state cap (tokens). Default 8000.

@@ -2163,11 +2163,14 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
   // Decision models (ARCHITECTURE.md §8h). Built only when some point can run, so a
   // deployment without decision points never constructs a client.
   // `[decisions].http2` / `keep_alive_ms`: a dedicated connection pool, so a
-  // build's burst of parallel decision calls reuses one warm connection.
+  // build's burst of parallel decision calls reuses warm connections instead
+  // of opening one per call (undici does not multiplex POSTs over HTTP/2; the
+  // pool keeps as many as the largest burst, retired after connection_ttl_ms).
   const decisionDispatcher =
     anyDecisionPointEnabled(config) && (config.decisions?.http2 || config.decisions?.keep_alive_ms)
       ? new UndiciAgent({
           allowH2: config.decisions?.http2 === true,
+          clientTtl: config.decisions?.connection_ttl_ms ?? 1_800_000,
           ...(config.decisions?.keep_alive_ms
             ? { keepAliveTimeout: config.decisions.keep_alive_ms, keepAliveMaxTimeout: Math.max(config.decisions.keep_alive_ms, 600_000) }
             : {}),
@@ -10332,7 +10335,6 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         await captionPool.stop();
         if (retrieval) await retrieval.stop();
         if (auditPool) await auditPool.stop();
-        await decisionDispatcher?.close().catch(() => undefined);
         if (diaryPool) await diaryPool.stop();
         // Stop the mirror worker before the summarization pool so the in-flight
         // sweep doesn't try to insert mirrored summaries after the pool stops.
@@ -10357,6 +10359,9 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         // drain (a queued waiter belongs to a run; stopping earlier would surface
         // synthetic errors into runs that could still finish cleanly).
         llmScheduler.stop();
+        // Decision calls of the drained runs and pools are done; close() lets
+        // any still in flight finish.
+        await decisionDispatcher?.close().catch(() => undefined);
         // After in-flight runs drain, disconnect the browser (closes our CDP link
         // and any lingering tabs; does NOT stop the operator-run Manager).
         // Legacy mode: one global session. Agents mode: all per-agent sessions.
