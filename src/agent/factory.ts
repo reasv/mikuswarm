@@ -21,7 +21,7 @@ import { withSeenStamp } from "../checks/duplicate.js";
 import { wrapToolsWithOutputGate, type OutputGate } from "../checks/gate.js";
 import { createSessionOutputGate, withGateTap, type OutputGateServices } from "../checks/session.js";
 import { estimateLiveSliceTokens } from "./live-token-estimate.js";
-import { extractLlmRequestClass, withRequestRetry } from "./request-retry.js";
+import { extractLlmRequestClass, getRequestAttemptState, withRequestRetry } from "./request-retry.js";
 import { withTruncatedToolCallsAsLength } from "./truncated-tool-calls.js";
 import {
   defaultPriorityForSessionType,
@@ -1278,7 +1278,11 @@ export class AgentSessionFactory {
     // (spec PER-MEMBER-CONTEXT-FITS §2.4) — the independent fits comparison is removed.
     // Terminal-cause attribution is extended (§2.4): "nothing fits context" is now
     // distinguished from "nothing healthy" in the parked-session error message.
-    const resolveUserSelection = (): { ok: true; selection: typeof activeSelection } | { ok: false; budget: boolean; contextDenied: boolean } => {
+    // `failed`: the current request's excluded/refused members (§8a "Failures fall
+    // over"), which no preference may be served by again within it.
+    const resolveUserSelection = (
+      failed?: { excluded?: Set<string>; refused?: Set<string> },
+    ): { ok: true; selection: typeof activeSelection } | { ok: false; budget: boolean; contextDenied: boolean } => {
       refreshRunningContext();
       const observed = ctxCounter.running;
       const newTokens = Math.max(0, observed - ctxCounter.cachedAtLast);
@@ -1301,6 +1305,8 @@ export class AgentSessionFactory {
           scheduler,
           isModelAvailable: isModelAvailableFn,
           observedContextTokens: observed,
+          excluded: failed?.excluded,
+          refused: failed?.refused,
         });
         const viable = headOnly
           ? probe.reason === "primary" || probe.reason === "canary"
@@ -1348,7 +1354,23 @@ export class AgentSessionFactory {
             sel.maxTokens !== undefined
               ? ({ ...(streamOptions ?? {}), maxTokens: sel.maxTokens } as typeof streamOptions)
               : streamOptions;
-          return sel.fallback.streamFn(m, context, opts2);
+          const out = sel.fallback.streamFn(m, context, opts2);
+          // The chain's resolver set `falloverAvailable` for its own members at
+          // dispatch (a head-only chain has none). Another preference that can
+          // serve without the member now dispatched counts too: a member failure
+          // never ends a request another preference can take (§8a "Failures fall over").
+          const pass = getRequestAttemptState(streamOptions);
+          if (pass && !pass.falloverAvailable && pass.servedKey !== undefined) {
+            try {
+              pass.falloverAvailable = resolveUserSelection({
+                excluded: new Set([...pass.excluded, pass.servedKey]),
+                refused: pass.refused,
+              }).ok;
+            } catch {
+              /* keep the chain's answer */
+            }
+          }
+          return out;
         }
       : fallback.streamFn;
     // Per-user affordability of a specific model now (spec PER-USER-LIMITS §5.3),
@@ -1753,7 +1775,7 @@ export class AgentSessionFactory {
         // a violation synthesizes a `content`-class terminal error WITHOUT
         // consuming retry budget. Inert when no ceiling resolves (unlimited). The
         // first request is never blocked (combined cost is 0 before any commit).
-        checkCostBudget: () => {
+        checkCostBudget: (attemptState) => {
           // §8d per-run ceiling (unchanged). Evaluated first; either it or the §6
           // period rules below can synthesize the same `content`-class terminal.
           if (costCeiling !== undefined) {
@@ -1843,7 +1865,7 @@ export class AgentSessionFactory {
             }
             userLimit!.engine.noteSelection(session.id, userLimit!.ctx.userId, userLimit!.ctx.roomId, pinnedForUser);
           } else if (userSelectionActive) {
-            const picked = resolveUserSelection();
+            const picked = resolveUserSelection(attemptState);
             if (picked.ok) {
               activeSelection = picked.selection;
               // Surface the live selection for the console (spec §14).

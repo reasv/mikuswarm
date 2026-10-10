@@ -254,7 +254,7 @@ export interface RequestRetryContext {
    * A violation is synthesized into the same `content`-class terminal error,
    * without consuming retry budget. The hook owns its own logging.
    */
-  checkCostBudget?: () => string | undefined;
+  checkCostBudget?: (state?: RequestAttemptState) => string | undefined;
   /**
    * Budget-capped-truncation decision (spec PER-USER-LIMITS §5.4). Fired AFTER
    * {@link onRequestCommitted} when a clean `done` carries `stopReason: "length"`,
@@ -811,7 +811,9 @@ export function withRequestRetry(
           // A billed failed attempt can exhaust the budget before its retry.
           if (attempt > 0) {
             let violation: string | undefined;
-            try { violation = ctx.checkCostBudget?.(); } catch { /* same best-effort policy as initial pre-flight */ }
+            // The request's state lets a per-request model selector skip the members
+            // this request already excluded or that refused it (§8a "Failures fall over").
+            try { violation = ctx.checkCostBudget?.(attemptState); } catch { /* same best-effort policy as initial pre-flight */ }
             if (violation !== undefined) {
               const error = synthesizeErrorEvent(model, violation, "error");
               recordAttempt(attempt + 1, Date.now(), "error", { cls: "content" });
