@@ -88,7 +88,7 @@ async function withStack(
     decisionsConfig?: Record<string, unknown>;
     filters?: Record<string, unknown>;
     auto?: Record<string, unknown>;
-    rerank?: { minScore: number; score: (doc: string) => number; query?: "request" | "conversation"; queries?: string[] };
+    rerank?: { minScore: number; score: (doc: string) => number; query?: "request" | "conversation"; queries?: string[]; maxDocuments?: number; seen?: string[][] };
     /** Extra `[models.*]` blocks (e.g. a separate filter model). */
     models?: Record<string, unknown>;
     /** A fake late stage (built with the store); turns `late.enabled` on. */
@@ -112,7 +112,7 @@ async function withStack(
     // The suite covers judge_mode "filter"; order-mode tests opt in.
     auto: { judge_mode: "filter", ...(opts.auto ?? {}) },
     ...(opts.rerank
-      ? { rerank: { enabled: true, chain: ["fake"], ...(opts.rerank.query ? { query: opts.rerank.query } : {}), providers: { fake: { kind: "remote", endpoint: "http://rerank.invalid", zdr: true, min_score: opts.rerank.minScore } } } }
+      ? { rerank: { enabled: true, chain: ["fake"], ...(opts.rerank.query ? { query: opts.rerank.query } : {}), providers: { fake: { kind: "remote", endpoint: "http://rerank.invalid", zdr: true, min_score: opts.rerank.minScore, ...(opts.rerank.maxDocuments ? { max_documents: opts.rerank.maxDocuments } : {}) } } } }
       : {}),
   } as any);
   const indexer = new MemoryIndexer({ storage, workspaceRoot, config, tokenizer: new GptTokenizer() });
@@ -150,7 +150,7 @@ async function withStack(
   const rerank = rerankScore
     ? new ProviderChain<RerankProvider>("rerank", [
         {
-          provider: { name: "fake", kind: "remote", score: async (q: string, docs: string[]) => (opts.rerank!.queries?.push(q), docs.map(rerankScore)), close: async () => {} } as unknown as RerankProvider,
+          provider: { name: "fake", kind: "remote", score: async (q: string, docs: string[]) => (opts.rerank!.queries?.push(q), opts.rerank!.seen?.push(docs), docs.map(rerankScore)), close: async () => {} } as unknown as RerankProvider,
           enabled: true,
           timeoutMs: 1000,
         },
@@ -731,5 +731,27 @@ test("judged filters with their own model get a filter-only call to it, not the 
     assert.equal(filterOnly.length, 2);
     assert.ok(filterOnly.every((c) => c.model === "vendor/decider-f" && !c.questions["relevant"]), "the filter's own model answers it");
     assert.ok(plan.report.items.some((i) => i.stage === "hidden" && i.hiddenBy?.key === "unwanted"));
+  });
+});
+
+test("rerank max_documents: the member scores only the first ranked candidates (plus person-cued); the rest rank after", async () => {
+  const files = {
+    "2026-05-30.md":
+      block("2026-05-30", "09:00", "kitchen", "pancake recipe decided pancake recipe RR10 one") +
+      block("2026-05-30", "10:00", "kitchen", "pancake recipe decided RR20 two") +
+      block("2026-05-30", "11:00", "kitchen", "pancake recipe RR99 three") +
+      block("2026-05-30", "12:00", "kitchen", "pancake RR98 four"),
+  };
+  const seen: string[][] = [];
+  const opts = { decisions: false, auto: { judge_mode: "order" }, rerank: { minScore: 0, score: rrScore, maxDocuments: 2, seen } };
+  await withStack(files, opts, async ({ pipeline }) => {
+    const plan = await pipeline.plan(input());
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0]!.length, 2, "only two documents went to the member");
+    const scored = plan.report.items.filter((i) => i.rerank !== undefined);
+    assert.equal(scored.length, 2);
+    // The two scored passages are the first two in recall order; the high-RR ones
+    // further down were never scored, so they report no cross-encoder score.
+    assert.ok(plan.report.items.filter((i) => i.rerank === undefined && i.lanes.length > 0).length >= 2);
   });
 });

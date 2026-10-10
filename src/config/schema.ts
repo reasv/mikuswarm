@@ -322,6 +322,11 @@ const RetrievalModelProviderSchema = StrictObject({
   openrouter_routing: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
   // Per-member call deadline; unset = the stage's timeout_ms.
   timeout_ms: Type.Optional(Type.Integer({ minimum: 50, maximum: 120_000 })),
+  // Re-rankers: score at most this many of the ranked candidates (the first in
+  // recall order; person-cued passages are always scored), so a slow member
+  // such as a CPU fallback stays within its deadline. The unscored candidates
+  // rank after the scored ones. Unset = every candidate.
+  max_documents: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_000 })),
   // Calibrated cutoff of THIS provider's scores (scores differ across models).
   min_score: Type.Optional(Type.Number()),
   // local: a directory holding the model files instead of a download.

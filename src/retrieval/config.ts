@@ -170,6 +170,8 @@ export interface ResolvedModelProvider {
   /** Remote re-rankers ("documents"): sent as the request's `provider` object (OpenRouter routing). */
   openrouterRouting?: Record<string, unknown>;
   timeoutMs?: number;
+  /** Re-rankers: the most ranked candidates this member scores (recall order); unset = all. */
+  maxDocuments?: number;
   minScore?: number;
   modelDir?: string;
   /** local: the pinned Hugging Face revision (a commit) of a downloaded model. */
@@ -297,6 +299,7 @@ function resolveProviders(
       requestFormat: p.request_format ?? "documents",
       ...(p.openrouter_routing ? { openrouterRouting: p.openrouter_routing } : {}),
       timeoutMs: p.timeout_ms,
+      ...(p.max_documents !== undefined ? { maxDocuments: p.max_documents } : {}),
       minScore: p.min_score,
       modelDir: p.model_dir,
       revision: p.revision,

@@ -89,3 +89,11 @@ test("rerank providers: openrouter_routing resolves onto the provider", () => {
   const plain = resolveRetrievalConfig({ enabled: true, rerank: { enabled: true, chain: ["gpu"], providers: { gpu: { kind: "remote", endpoint: "http://x", self_hosted: true } } } } as any);
   assert.equal(plain.rerank.providers.gpu!.openrouterRouting, undefined);
 });
+
+test("rerank providers: max_documents resolves onto the provider", () => {
+  const r = resolveRetrievalConfig({
+    enabled: true,
+    rerank: { enabled: true, chain: ["cpu"], providers: { cpu: { kind: "local", model: "org/m", max_documents: 20 } } },
+  } as any);
+  assert.equal(r.rerank.providers.cpu!.maxDocuments, 20);
+});

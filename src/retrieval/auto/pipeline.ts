@@ -609,13 +609,32 @@ export class MemoryRetrievalPipeline {
       const t0 = this.now();
       try {
         const docs = toScore.map((c) => cleanBlockText(c.chunk.text).lines.join("\n"));
-        const res = await this.deps.rerank.run((p, s) => p.score(q, docs, s), { signal: stageSignal });
+        // A member's max_documents: the first ranked candidates (recall order)
+        // plus every person-cued one; the rest rank after them, unscored.
+        const rankedCount = pool.length;
+        const scoredIndices = (name: string): number[] | null => {
+          const cap = cfg.rerank.providers[name]?.maxDocuments;
+          if (cap === undefined || cap >= rankedCount) return null;
+          return toScore.map((_c, i) => i).filter((i) => i < cap || i >= rankedCount);
+        };
+        const res = await this.deps.rerank.run(
+          async (p, s) => {
+            const subset = scoredIndices(p.name);
+            if (!subset) return p.score(q, docs, s);
+            const scores = await p.score(q, subset.map((i) => docs[i]!), s);
+            const out = new Array<number>(docs.length).fill(-Infinity);
+            subset.forEach((i, k) => (out[i] = scores[k]!));
+            return out;
+          },
+          { signal: stageSignal },
+        );
         rerankRan = true;
         rerankCutoff = cfg.rerank.providers[res.provider.name]?.minScore;
         toScore.forEach((c, i) => (c.rerank = res.value[i]));
         pool.sort((a, b) => b.rerank! - a.rerank!);
         for (const c of pool.slice(cfg.rerank.topN)) itemStage.set(c.chunk.contentHash, "cut_rerank");
         pool = pool.slice(0, cfg.rerank.topN);
+        for (const c of toScore) if (c.rerank === -Infinity) c.rerank = undefined;
         report.stages.rerank = { status: "ok", provider: res.provider.name, ms: this.now() - t0 };
       } catch (error) {
         const aborted = error instanceof Error && error.name === "AbortError";
