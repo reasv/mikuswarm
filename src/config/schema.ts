@@ -985,6 +985,13 @@ const ModelSchema = StrictObject({
   // interactive-class sessions (chat/proactive); background-class work is
   // unbounded regardless.
   llm_request_max_wait_ms: Type.Optional(Type.Number({ minimum: 1 })),
+  // Failure group (ARCHITECTURE.md §8a "Failure groups"): models sharing an
+  // upstream whose outages are correlated. Once one member has failed a request
+  // (stall, attempts used up on environmental failures, or a status listed under
+  // `[failure_groups.<name>]`), the request skips the group's other members on its
+  // fallback path, trying them only as a last resort. Request-scoped only: no
+  // health state, no probes. Unset = the model is its own group.
+  failure_group: Type.Optional(Type.String({ minLength: 1 })),
   // Per-model first-token deadline (ARCHITECTURE.md §8a "Failures fall over"):
   // overrides `recovery.llm_first_token_timeout_ms` while this model serves an
   // attempt — a model with a slow prefill can be given more. Unset = the global.
@@ -2951,6 +2958,14 @@ export const AppConfigSchema = StrictObject({
   observability: Type.Optional(ObservabilitySchema),
   browser: Type.Optional(BrowserSchema),
   recovery: Type.Optional(RecoverySchema),
+  // Failure groups (ARCHITECTURE.md §8a "Failure groups"), keyed by the name a
+  // model's `failure_group` gives. Optional: a group needs no entry. `statuses`:
+  // HTTP statuses that, besides stalls and environmental failures, mark the group
+  // failed for the request at once (e.g. a gateway that answers an upstream outage
+  // with a 4xx).
+  failure_groups: Type.Optional(Type.Record(Type.String({ minLength: 1 }), StrictObject({
+    statuses: Type.Optional(Type.Array(Type.Integer({ minimum: 100, maximum: 599 }))),
+  }))),
   rate_limits: Type.Optional(RateLimitsSchema),
   // Period cost limits (spec USAGE-COST-LIMITS §5): a centralized array of
   // own-scope budget rules enforced across the app by the BudgetEngine. Unset/

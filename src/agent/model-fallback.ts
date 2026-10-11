@@ -71,6 +71,10 @@ export type FallbackReason =
   | "failover"
   /** The head refused THIS request; another member takes it (§8a "Refusals"). */
   | "refusal-fallback"
+  /** Another member of the head's failure group failed THIS request (§8a "Failure groups"). */
+  | "group-fallback"
+  /** Only members skipped for their failure group were left; the first is tried (§8a "Failure groups"). */
+  | "group-last-resort"
   | "all-unhealthy";
 
 export interface BuildModelFallbackOptions {
@@ -149,12 +153,13 @@ export interface BuildModelFallbackOptions {
    */
   getObservedContextTokens?: () => number | undefined;
   /**
-   * Attempts on the chain head within one Layer-0 request before that request
-   * fails over (§8a one pass per request; `recovery.llm_primary_attempts_per_request`). Every
-   * other member gets one attempt per pass. Default
-   * {@link DEFAULT_PRIMARY_ATTEMPTS_PER_REQUEST}.
+   * Attempts on each member within one Layer-0 request before that request
+   * moves on (§8a one pass per request; `recovery.llm_primary_attempts_per_request`).
+   * Default {@link DEFAULT_PRIMARY_ATTEMPTS_PER_REQUEST}.
    */
   primaryAttemptsPerRequest?: number;
+  /** HTTP statuses listed for a failure group (`[failure_groups.<name>].statuses`, §8a "Failure groups"). */
+  failureGroupStatuses?: (group: string) => readonly number[] | undefined;
   /**
    * Register a background prober for every member with the scheduler (spec
    * §8a background probes), so an unhealthy member recovers out of band instead of through a
@@ -185,7 +190,7 @@ export interface BuiltModelFallback {
    * this model's chain up?" without dispatching. The `operativeWindow` enables step 2 to feed
    * per-attempt observed context sizes without further model-fallback surgery.
    */
-  survivorMembers: { logicalId: string; healthKey: string; operativeWindow: number }[];
+  survivorMembers: { logicalId: string; healthKey: string; operativeWindow: number; failureGroup?: string }[];
   /**
    * Per-surviving-member operative windows (spec PER-MEMBER-CONTEXT-FITS §2.3):
    * `min(member.context_window, contextOverride?)` for each survivor. Keyed by logicalId.
@@ -220,6 +225,9 @@ interface Candidate {
   operativeWindow: number;
   /** Member's own first-token deadline (`models.*.llm_first_token_timeout_ms`); undefined = the global one. */
   firstTokenTimeoutMs?: number;
+  /** Member's failure group (`models.*.failure_group`, §8a "Failure groups") and its listed statuses. */
+  failureGroup?: string;
+  groupStatuses?: readonly number[];
 }
 
 /**
@@ -321,6 +329,8 @@ export function buildModelFallback(
       dispatch,
       operativeWindow: memberWindow,
       firstTokenTimeoutMs: entry.config.llm_first_token_timeout_ms,
+      failureGroup: entry.config.failure_group,
+      groupStatuses: entry.config.failure_group ? options.failureGroupStatuses?.(entry.config.failure_group) : undefined,
     };
   });
 
@@ -338,7 +348,11 @@ export function buildModelFallback(
     logicalId: c.logicalId,
     healthKey: c.healthKey,
     operativeWindow: c.operativeWindow,
+    failureGroup: c.failureGroup,
   }));
+
+  const primaryAttemptsPerRequest =
+    options.primaryAttemptsPerRequest ?? DEFAULT_PRIMARY_ATTEMPTS_PER_REQUEST;
 
   // Single-member chain → no fallback machinery; dispatch the head directly.
   if (candidates.length === 1) {
@@ -348,9 +362,13 @@ export function buildModelFallback(
         options.onResolve?.(only.logicalId, "primary");
         const pass = getRequestAttemptState(streamOptions);
         if (pass) {
-          pass.attempts.set(only.healthKey, (pass.attempts.get(only.healthKey) ?? 0) + 1);
+          const used = (pass.attempts.get(only.healthKey) ?? 0) + 1;
+          pass.attempts.set(only.healthKey, used);
           pass.servedKey = only.healthKey;
           pass.firstTokenTimeoutMs = only.firstTokenTimeoutMs;
+          pass.servedGroup = only.failureGroup;
+          pass.servedGroupStatuses = only.groupStatuses;
+          pass.servedExhausted = used >= primaryAttemptsPerRequest;
         }
         return only.dispatch(only.model, context, adjustOptions(streamOptions, only));
       },
@@ -364,9 +382,6 @@ export function buildModelFallback(
   }
 
   let warnedThinking = false;
-
-  const primaryAttemptsPerRequest =
-    options.primaryAttemptsPerRequest ?? DEFAULT_PRIMARY_ATTEMPTS_PER_REQUEST;
 
   const streamFn: StreamFn = (model, context, streamOptions) => {
     // The request's pass over the chain (§8a), threaded by Layer 0. Absent when
@@ -385,7 +400,7 @@ export function buildModelFallback(
       excluded: pass?.excluded,
     };
     const passDeps = pass
-      ? { ...baseDeps, requestAttempts: pass.attempts, primaryAttemptsPerRequest }
+      ? { ...baseDeps, requestAttempts: pass.attempts, primaryAttemptsPerRequest, failedGroups: pass.failedGroups }
       : baseDeps;
     let { index, reason } = chooseChainMember(candidates, passDeps);
     if (pass && pass.attempts.size > 0 && reason === "all-unhealthy") {
@@ -394,12 +409,17 @@ export function buildModelFallback(
       const fresh = chooseChainMember(candidates, baseDeps);
       if (fresh.reason !== "all-unhealthy") {
         pass.attempts.clear();
+        pass.failedGroups.clear();
         ({ index, reason } = fresh);
       }
     }
     const candidate = candidates[index]!;
     if (pass) {
-      pass.attempts.set(candidate.healthKey, (pass.attempts.get(candidate.healthKey) ?? 0) + 1);
+      const used = (pass.attempts.get(candidate.healthKey) ?? 0) + 1;
+      pass.attempts.set(candidate.healthKey, used);
+      pass.servedGroup = candidate.failureGroup;
+      pass.servedGroupStatuses = candidate.groupStatuses;
+      pass.servedExhausted = used >= primaryAttemptsPerRequest;
       // Should this attempt fail, will the next one go to a DIFFERENT member?
       // Then Layer 0 skips its local backoff — failing over never waits.
       const next = chooseChainMember(candidates, passDeps);
@@ -549,6 +569,8 @@ interface ChooseMember {
    * `min(member.context_window, sessionType.max_context_tokens?)`, resolved at build.
    */
   operativeWindow: number;
+  /** Member's failure group (§8a "Failure groups"); undefined = its own group. */
+  failureGroup?: string;
 }
 
 /**
@@ -600,6 +622,12 @@ export function chooseChainMember(
      * canary, and never the `all-unhealthy` target while another member remains.
      */
     excluded?: Set<string>;
+    /**
+     * Failure groups that failed the current request (§8a "Failure groups"): their
+     * members are passed over while any other member is viable, and the first of
+     * them is tried (`group-last-resort`) only when nothing else is.
+     */
+    failedGroups?: Set<string>;
   },
 ): { index: number; reason: FallbackReason } {
   const scheduler = deps.scheduler;
@@ -610,9 +638,12 @@ export function chooseChainMember(
   const primaryQuota = deps.primaryAttemptsPerRequest ?? DEFAULT_PRIMARY_ATTEMPTS_PER_REQUEST;
 
   /** Has this member used up its attempts in the current request's pass? */
-  const exhausted = (m: ChooseMember, i: number): boolean =>
-    requestAttempts !== undefined &&
-    (requestAttempts.get(m.healthKey) ?? 0) >= (i === 0 ? primaryQuota : 1);
+  const exhausted = (m: ChooseMember, _i: number): boolean =>
+    requestAttempts !== undefined && (requestAttempts.get(m.healthKey) ?? 0) >= primaryQuota;
+  const failedGroups = deps.failedGroups;
+  /** Is this member passed over because another member of its group failed the request? */
+  const groupSkipped = (m: ChooseMember): boolean =>
+    m.failureGroup !== undefined && failedGroups?.has(m.failureGroup) === true;
 
   /** Fits predicate (§2.1): true when observed is undefined (skip) or within the member's window. */
   const fits = (m: ChooseMember): boolean =>
@@ -624,7 +655,7 @@ export function chooseChainMember(
    */
   const refused = deps.refused;
   const excluded = deps.excluded;
-  const viable = (m: ChooseMember, i: number): boolean => {
+  const viableIgnoringGroup = (m: ChooseMember, i: number): boolean => {
     if (tried?.has(m.logicalId)) return false;
     if (refused?.has(m.healthKey)) return false;
     if (excluded?.has(m.healthKey)) return false;
@@ -634,6 +665,7 @@ export function chooseChainMember(
     if (!fits(m)) return false;
     return !deps.isModelAvailable || deps.isModelAvailable(m.logicalId);
   };
+  const viable = (m: ChooseMember, i: number): boolean => !groupSkipped(m) && viableIgnoringGroup(m, i);
 
   if (viable(head, 0)) return { index: 0, reason: "primary" };
 
@@ -659,6 +691,7 @@ export function chooseChainMember(
     !tried?.has(head.logicalId) &&
     !refused?.has(head.healthKey) &&
     !excluded?.has(head.healthKey) &&
+    !groupSkipped(head) &&
     !exhausted(head, 0) &&
     !scheduler?.hasProber(head.healthKey) &&
     headState === "unhealthy" &&
@@ -677,6 +710,8 @@ export function chooseChainMember(
           ? "refusal-fallback"
           : headState === "unhealthy" || excluded?.has(head.healthKey)
           ? "health-fallback"
+          : groupSkipped(head)
+          ? "group-fallback"
           : !headInBudget
           ? "budget-fallback"
           : !headFits
@@ -686,6 +721,11 @@ export function chooseChainMember(
           : "budget-fallback"; // head excluded by `tried` (environmental retry below unhealthy threshold); "budget-fallback" is imprecise but preserves the pre-change reason for this case
       return { index: i, reason };
     }
+  }
+  // Only members skipped for their failure group remain: rather than give up, try
+  // the first of them (the group skip bounds waiting, it never ends a request).
+  for (let i = 0; i < members.length; i++) {
+    if (groupSkipped(members[i]!) && viableIgnoringGroup(members[i]!, i)) return { index: i, reason: "group-last-resort" };
   }
   // Nothing healthy + in-budget + fits — route to the head so it fails and the caller's
   // own budget/retry decides whole-chain park/wait, and §8a gets a probe waiter. A

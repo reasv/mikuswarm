@@ -120,11 +120,18 @@ export interface RequestAttemptState {
    */
   falloverAvailable: boolean;
   /**
-   * Health key of the member that served this request's FIRST attempt (set by
-   * Layer 0). Only it gets the head's per-request retry; any other member is
-   * passed over after one failure (§8a "Failures fall over").
+   * Failure groups (ARCHITECTURE.md §8a "Failure groups") one of whose members
+   * has failed THIS request: their other members are skipped on the fallback
+   * path, tried only when nothing else is left. Request-scoped; a new pass
+   * clears it with the attempt counts.
    */
-  firstServedKey?: string;
+  failedGroups: Set<string>;
+  /** Set at dispatch by the fallback resolver: the serving member's failure group (undefined = none). */
+  servedGroup?: string;
+  /** Set at dispatch: HTTP statuses that mark the serving member's group failed at once. */
+  servedGroupStatuses?: readonly number[];
+  /** Set at dispatch: this attempt uses the serving member's last per-request attempt. */
+  servedExhausted?: boolean;
   /** Set at dispatch by the fallback resolver: the serving member's own first-token deadline. */
   firstTokenTimeoutMs?: number;
   /** Called by `withSchedulerAdmission` once THIS attempt holds a slot (the request is about to hit the wire). */
@@ -800,6 +807,7 @@ export function withRequestRetry(
           refusalFalloverAvailable: false,
           excluded: new Set(),
           falloverAvailable: false,
+          failedGroups: new Set(),
         };
         // Whether a refusal may move to another chain member, read once per
         // request (§8a "Refusals"); the record turn turns it off.
@@ -902,6 +910,9 @@ export function withRequestRetry(
           attemptState.refusalFalloverAvailable = false;
           attemptState.falloverAvailable = false;
           attemptState.firstTokenTimeoutMs = undefined;
+          attemptState.servedGroup = undefined;
+          attemptState.servedGroupStatuses = undefined;
+          attemptState.servedExhausted = undefined;
           attemptState.awaitingAdmission = undefined;
           attemptState.onAdmitted = armStallTimer;
           const attemptOptions = {
@@ -917,8 +928,7 @@ export function withRequestRetry(
             // fresh wall-clock budget: a member is never cut short by the time
             // the ones before it spent failing (§8a "Failures fall over").
             const servedKey = attemptState.servedKey;
-            if (attempt === 0) attemptState.firstServedKey = servedKey;
-            else if (servedKey !== undefined && servedKey !== previousServedKey && maxWaitMs !== undefined && !producedTokens) {
+            if (attempt > 0 && servedKey !== undefined && servedKey !== previousServedKey && maxWaitMs !== undefined && !producedTokens) {
               detachBudget();
               armBudget();
               if (budgetSignal) budgetSignal.addEventListener("abort", onBudgetAbort, { once: true });
@@ -1119,6 +1129,35 @@ export function withRequestRetry(
             );
           }
           if (stallHit && attemptState.servedKey !== undefined) attemptState.excluded.add(attemptState.servedKey);
+          // Failure groups (§8a "Failure groups"): the serving member's group fails
+          // for this request on a stall, a status the group lists, or (below) an
+          // environmental failure on the member's last attempt.
+          const markGroupFailed = (cause: string): void => {
+            const group = attemptState.servedGroup;
+            if (group === undefined || callerSignal?.aborted === true || attemptState.failedGroups.has(group)) return;
+            attemptState.failedGroups.add(group);
+            ctx.logger?.warn("llm_request_group_failed", {
+              sessionId: ctx.sessionId,
+              timelineKey: ctx.timelineKey,
+              sessionType: ctx.sessionType,
+              group,
+              member: ctx.getServedModel?.(),
+              attempt: attempt + 1,
+              cause,
+            });
+          };
+          if (stallHit) markGroupFailed("stall");
+          const failedStatus = extractStatus((errorEvent.error?.errorMessage ?? "").toLowerCase());
+          if (
+            (verdict === "environmental" || verdict === "content") &&
+            !degenerateTrip &&
+            failedStatus !== undefined &&
+            // Read through the wide type: the per-attempt reset above narrows the
+            // field, but the resolver sets it during dispatch.
+            (attemptState as RequestAttemptState).servedGroupStatuses?.includes(failedStatus) === true
+          ) {
+            markGroupFailed(`status ${failedStatus}`);
+          }
           const attemptRecord = recordAttempt(
             attempt + 1,
             attemptStart,
@@ -1241,6 +1280,10 @@ export function withRequestRetry(
             // `excluded`, which is never re-hit, so the chain runs out.
             const spent = budgetExpired || Date.now() >= deadline;
             const degenerateOut = degenerateTrips > MAX_DEGENERATE_TRIPS_PER_REQUEST;
+            // An upstream failure on the member's last attempt (or one that spent
+            // the budget) fails its group; a repetition-guard trip is the sample,
+            // not the upstream.
+            if (!degenerateTrip && ((attemptState as RequestAttemptState).servedExhausted === true || spent)) markGroupFailed("attempts");
             if (
               (stallHit || spent || degenerateOut) &&
               callerSignal?.aborted !== true &&

@@ -283,9 +283,11 @@ llm_probe_backoff_max_ms = 300000
 # Agent-loop models re-test out of band: while unhealthy, the scheduler probes
 # them with a tiny synthetic request on the backoff above, and no live request is
 # routed to an unhealthy model while any other chain member can serve.
-# A model with a fallback chain: within ONE request the head gets this many
+# A model with a fallback chain: within ONE request every member gets this many
 # attempts (one retry absorbs a blip), then the request moves down the chain,
-# one attempt per remaining member, with no backoff between members. A zero-token
+# with no backoff between members. Models sharing an upstream can declare a
+# failure group (models.*.failure_group, optional [failure_groups.<name>].statuses):
+# once one member fails the request, its group-mates are skipped for it. A zero-token
 # attempt cut off by llm_request_max_wait_ms counts as a failure of its model.
 llm_primary_attempts_per_request = 2
 # First-token deadline per attempt (interactive class, like the budget): an attempt with no

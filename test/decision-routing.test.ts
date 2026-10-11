@@ -541,9 +541,18 @@ test("factory (per-user): fallback_chains = after_preferences tries every prefer
   });
 });
 
-test("factory (per-user, after_preferences): a failing first choice falls over down the preferences to one that answers", async () => {
+/**
+ * A per-user `after_preferences` session against a fake Anthropic upstream that
+ * answers per wire model: `fail` maps a wire id to an HTTP status, the rest stream
+ * a reply. Returns the wire ids in the order they were hit and the final message.
+ */
+async function preferenceRun(opts: {
+  preferences: string[];
+  fail: Record<string, number>;
+  groups?: Record<string, string>;
+  groupStatuses?: Record<string, number[]>;
+}): Promise<{ hits: string[]; last: any }> {
   const { createServer } = await import("node:http");
-  // Fake Anthropic upstream: "opus" has no keys (400), "sol"/"luna" 502, "mimo" answers.
   const hits: string[] = [];
   const server = createServer((req, res) => {
     let body = "";
@@ -551,14 +560,10 @@ test("factory (per-user, after_preferences): a failing first choice falls over d
     req.on("end", () => {
       const wire = (JSON.parse(body) as { model: string }).model;
       hits.push(wire);
-      if (wire === "opus-wire") {
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ type: "error", error: { type: "proxy_no_keys_available", message: "No keys" } }));
-        return;
-      }
-      if (wire !== "mimo-wire") {
-        res.writeHead(502, { "content-type": "text/plain" });
-        res.end("bad gateway");
+      const status = opts.fail[wire];
+      if (status !== undefined) {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ type: "error", error: { type: "upstream_error", message: "upstream unavailable" } }));
         return;
       }
       res.writeHead(200, { "content-type": "text/event-stream" });
@@ -573,21 +578,21 @@ test("factory (per-user, after_preferences): a failing first choice falls over d
     });
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
-  const port = (server.address() as { port: number }).port;
-  const endpoint = `http://127.0.0.1:${port}`;
+  const endpoint = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  let last: any;
   try {
     await withWorkspace(async (root) => {
       const { builder } = capturingBuilder();
       const config = factoryConfig(root, {
         recovery: { llm_request_max_wait_ms: 10_000, llm_request_backoff_base_ms: 1, llm_request_backoff_max_ms: 1 },
+        ...(opts.groupStatuses
+          ? { failure_groups: Object.fromEntries(Object.entries(opts.groupStatuses).map(([g, statuses]) => [g, { statuses }])) }
+          : {}),
       });
-      config.models = {
-        default: model("opus-wire", { endpoint, reasoning: false }),
-        opus: model("opus-wire", { endpoint, reasoning: false }),
-        sol: model("sol-wire", { endpoint, reasoning: false }),
-        luna: model("luna-wire", { endpoint, reasoning: false }),
-        mimo: model("mimo-wire", { endpoint, reasoning: false }),
-      };
+      const m = (name: string) =>
+        model(`${name}-wire`, { endpoint, reasoning: false, ...(opts.groups?.[name] ? { failure_group: opts.groups[name] } : {}) });
+      config.models = { default: m(opts.preferences[0]!) };
+      for (const name of opts.preferences) config.models[name] = m(name);
       const factory = new AgentSessionFactory({ config, contextBuilder: builder, getActiveSessions: () => [] });
       const engine: any = {
         affordable: () => ({ ok: true, maxOutput: 4096, remainingUsd: 1 }),
@@ -595,20 +600,75 @@ test("factory (per-user, after_preferences): a failing first choice falls over d
         noteSelection: () => {},
       };
       const resolution = {
-        matched: true, active: true, banned: false, models: ["opus", "sol", "luna", "mimo"], constraints: [], ledgerPartitionKeys: [],
+        matched: true, active: true, banned: false, models: opts.preferences, constraints: [], ledgerPartitionKeys: [],
         chainsAfterPreferences: true,
       } as unknown as UserLimitResolution;
       const ctx = { userId: "@u:hs", roomId: "!r" } as UserLimitContext;
       const { agent } = await factory.create(session(), [fakeTool("send_message")], { userLimit: { engine, resolution, ctx } });
       await agent.prompt({ role: "user", content: "hi", timestamp: 20 } as any);
-      const last = agent.state.messages[agent.state.messages.length - 1] as any;
-      assert.equal(last?.role, "assistant");
-      assert.notEqual(last?.stopReason, "error", `the request was answered (${last?.errorMessage ?? ""})`);
-      assert.deepEqual(hits, ["opus-wire", "sol-wire", "luna-wire", "mimo-wire"], "each failing preference is tried once, in order, then the next one answers");
+      last = agent.state.messages[agent.state.messages.length - 1];
     });
   } finally {
     server.close();
   }
+  return { hits, last };
+}
+
+const answered = (last: any) => last?.role === "assistant" && last?.stopReason !== "error";
+
+test("factory (per-user, after_preferences): without groups every failing preference gets its attempts, then the next answers", async () => {
+  const { hits, last } = await preferenceRun({
+    preferences: ["opus", "sol", "luna", "mimo"],
+    fail: { "opus-wire": 400, "sol-wire": 502, "luna-wire": 502 },
+  });
+  assert.ok(answered(last), "the request was answered");
+  assert.deepEqual(
+    hits,
+    ["opus-wire", "sol-wire", "sol-wire", "luna-wire", "luna-wire", "mimo-wire"],
+    "a 4xx is not re-sent; each environmental failure gets two tries",
+  );
+});
+
+test("failure groups: a listed status on the first choice skips the rest of its group", async () => {
+  const { hits, last } = await preferenceRun({
+    preferences: ["opus", "sol", "luna", "mimo"],
+    fail: { "opus-wire": 400, "sol-wire": 502, "luna-wire": 502 },
+    groups: { opus: "up", sol: "up", luna: "up" },
+    groupStatuses: { up: [400] },
+  });
+  assert.ok(answered(last));
+  assert.deepEqual(hits, ["opus-wire", "mimo-wire"], "the group's other members are not tried");
+});
+
+test("failure groups: an unlisted 4xx excludes only that model; environmental failures then fail the group", async () => {
+  const { hits, last } = await preferenceRun({
+    preferences: ["opus", "sol", "luna", "mimo"],
+    fail: { "opus-wire": 400, "sol-wire": 502, "luna-wire": 502 },
+    groups: { opus: "up", sol: "up", luna: "up" },
+  });
+  assert.ok(answered(last));
+  assert.deepEqual(hits, ["opus-wire", "sol-wire", "sol-wire", "mimo-wire"], "sol's two 502s fail the group; luna is skipped");
+});
+
+test("failure groups: a model skipped only for its group is still tried when nothing else is left", async () => {
+  const { hits, last } = await preferenceRun({
+    preferences: ["opus", "sol"],
+    fail: { "opus-wire": 502 },
+    groups: { opus: "up", sol: "up" },
+  });
+  assert.ok(answered(last), "the last resort answered");
+  assert.deepEqual(hits, ["opus-wire", "opus-wire", "sol-wire"]);
+});
+
+test("failure groups: a working first choice is never affected", async () => {
+  const { hits, last } = await preferenceRun({
+    preferences: ["opus", "sol", "mimo"],
+    fail: {},
+    groups: { opus: "up", sol: "up" },
+    groupStatuses: { up: [400] },
+  });
+  assert.ok(answered(last));
+  assert.deepEqual(hits, ["opus-wire"]);
 });
 
 // --- storage: v21→v22 -----------------------------------------------------------

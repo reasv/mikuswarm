@@ -1078,6 +1078,7 @@ export class AgentSessionFactory {
           ctxCounter.seenMsgs < 0 ? undefined : ctxCounter.running,
         // One pass per request + out-of-band recovery (ARCHITECTURE.md §8a).
         primaryAttemptsPerRequest: recovery?.llm_primary_attempts_per_request,
+        failureGroupStatuses: (group) => this.options.config.failure_groups?.[group]?.statuses,
         backgroundProbe: true,
       });
       builtFallbacks.set(cacheKey, built);
@@ -1281,26 +1282,26 @@ export class AgentSessionFactory {
     // distinguished from "nothing healthy" in the parked-session error message.
     // `failed`: the current request's state (§8a "Failures fall over"). Members it
     // excluded or that refused it are never served again within it; a member that
-    // failed it is passed over while another can serve — the request's first member
-    // after `llm_primary_attempts_per_request` attempts, any other after one. With
-    // nothing else left, a new pass ignores the attempt counts (like the chain's).
+    // used its `llm_primary_attempts_per_request` attempts is passed over while
+    // another can serve, and so are members of a failure group that failed it
+    // (§8a "Failure groups"), tried only when nothing else can. With nothing else
+    // left, a new pass ignores the attempt counts and failed groups (like the chain's).
     const primaryQuota = recovery?.llm_primary_attempts_per_request ?? DEFAULT_PRIMARY_ATTEMPTS_PER_REQUEST;
     const resolveUserSelection = (
-      failed?: Pick<RequestAttemptState, "excluded" | "refused"> & Partial<Pick<RequestAttemptState, "attempts" | "firstServedKey">>,
+      failed?: Pick<RequestAttemptState, "excluded" | "refused"> & Partial<Pick<RequestAttemptState, "attempts" | "failedGroups">>,
     ): { ok: true; selection: typeof activeSelection } | { ok: false; budget: boolean; contextDenied: boolean } => {
       if (failed?.attempts && failed.attempts.size > 0) {
         const skip = new Set(failed.excluded);
-        for (const [key, n] of failed.attempts) {
-          if (n >= (key === failed.firstServedKey ? primaryQuota : 1)) skip.add(key);
-        }
-        const pick = resolveUserSelectionOnce({ excluded: skip, refused: failed.refused });
+        for (const [key, n] of failed.attempts) if (n >= primaryQuota) skip.add(key);
+        const pick = resolveUserSelectionOnce({ excluded: skip, refused: failed.refused, failedGroups: failed.failedGroups });
         if (pick.ok) return pick;
         failed.attempts.clear();
+        failed.failedGroups?.clear();
       }
       return resolveUserSelectionOnce(failed);
     };
     const resolveUserSelectionOnce = (
-      failed?: { excluded?: Set<string>; refused?: Set<string> },
+      failed?: { excluded?: Set<string>; refused?: Set<string>; failedGroups?: Set<string> },
     ): { ok: true; selection: typeof activeSelection } | { ok: false; budget: boolean; contextDenied: boolean } => {
       refreshRunningContext();
       const observed = ctxCounter.running;
@@ -1312,8 +1313,14 @@ export class AgentSessionFactory {
       // `fallback_chains = "after_preferences"`: a first pass accepts a preference only
       // when its OWN model (the chain head) would serve; the usual any-member pass runs
       // only when no preference's own model can.
-      const passes = userLimit!.resolution.chainsAfterPreferences ? [true, false] : [false];
-      for (const headOnly of passes)
+      // A last sweep accepts a member skipped only for its failure group (§8a
+      // "Failure groups"): every preference's other members come first.
+      const passes: { headOnly: boolean; lastResort: boolean }[] = [
+        ...(userLimit!.resolution.chainsAfterPreferences ? [{ headOnly: true, lastResort: false }] : []),
+        { headOnly: false, lastResort: false },
+        ...(failed?.failedGroups && failed.failedGroups.size > 0 ? [{ headOnly: false, lastResort: true }] : []),
+      ];
+      for (const { headOnly, lastResort } of passes)
       for (const s of selectables) {
         // Fits-any check (ignoring health): the largest member's window accommodates the context?
         if (s.fallback.maxOperativeContextWindow >= observed) sawFit = true;
@@ -1326,10 +1333,11 @@ export class AgentSessionFactory {
           observedContextTokens: observed,
           excluded: failed?.excluded,
           refused: failed?.refused,
+          failedGroups: failed?.failedGroups,
         });
         const viable = headOnly
           ? probe.reason === "primary" || probe.reason === "canary"
-          : probe.reason !== "all-unhealthy";
+          : probe.reason !== "all-unhealthy" && (lastResort || probe.reason !== "group-last-resort");
         // Prompt caches do not cross upstreams: the credited prefix exists only at
         // the (endpoint, wire-model) domain that served the prior committed request.
         // Credit the cache-read discount only when THIS candidate's predicted serving
@@ -1388,9 +1396,7 @@ export class AgentSessionFactory {
               if (!pass.falloverAvailable) pass.falloverAvailable = others;
               // Should this attempt fail, the next goes to another preference when
               // this member has used its attempts: no local backoff then.
-              const used = pass.attempts.get(pass.servedKey) ?? 0;
-              const quota = pass.firstServedKey === undefined || pass.firstServedKey === pass.servedKey ? primaryQuota : 1;
-              if (others && used >= quota) pass.failoverOnFailure = true;
+              if (others && (pass.attempts.get(pass.servedKey) ?? 0) >= primaryQuota) pass.failoverOnFailure = true;
             } catch {
               /* keep the chain's answer */
             }

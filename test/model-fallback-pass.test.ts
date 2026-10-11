@@ -109,13 +109,13 @@ function composite(
   return withRequestRetry(fb.streamFn, { maxWaitMs: 60_000, backoffBaseMs, backoffMaxMs: 10_000 });
 }
 
-test("one pass per request: head twice, each fallback once, answered by the first working member", async () => {
+test("one pass per request: every member twice, answered by the first working member", async () => {
   const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 3, probeBackoffBaseMs: 60_000 } });
   const calls: string[] = [];
   const down = new Set(["wire-X", "wire-L"]);
   const last = await run(composite([X, L, Y], calls, down, scheduler));
   assert.equal(last.type, "done");
-  assert.deepEqual(calls, ["wire-X", "wire-X", "wire-L", "wire-Y"], "no member is re-hit within the request");
+  assert.deepEqual(calls, ["wire-X", "wire-X", "wire-L", "wire-L", "wire-Y"], "no member is re-hit past its attempts within the request");
 });
 
 test("failing over to another member never waits out the local backoff", async () => {
@@ -154,7 +154,7 @@ test("every member failed → a new pass starts (after backoff) instead of parki
       const inner = base(cfg);
       return ((model, ctx, opts) => {
         // Y recovers after the first full pass.
-        if (calls.length >= 3) down.delete("wire-Y");
+        if (calls.length >= 4) down.delete("wire-Y");
         return inner(model, ctx, opts);
       }) as StreamFn;
     },
@@ -166,7 +166,7 @@ test("every member failed → a new pass starts (after backoff) instead of parki
   assert.equal(last.type, "done");
   assert.deepEqual(
     calls,
-    ["wire-X", "wire-X", "wire-Y", "wire-X", "wire-X", "wire-Y"],
+    ["wire-X", "wire-X", "wire-Y", "wire-Y", "wire-X", "wire-X", "wire-Y"],
     "pass 1 fails everywhere; pass 2 walks the chain again and reaches the recovered member",
   );
 });
@@ -506,5 +506,72 @@ test("moving to another member gives it a fresh wall-clock budget (never the lef
   const last = await run(withRequestRetry(fb.streamFn, { maxWaitMs: 100, backoffBaseMs: 1, backoffMaxMs: 1 }));
   assert.equal(last.type, "done", "the fallback was not cut off by the head's spent time");
   assert.deepEqual(calls, ["wire-X", "wire-Y"]);
+  scheduler.stop();
+});
+
+// ---------------------------------------------------------------------------
+// Failure groups (§8a): once a member of a group fails the request, the rest of
+// the group is skipped on the fallback path, and tried only as a last resort.
+// ---------------------------------------------------------------------------
+
+const grouped = (entry: ModelChainEntry, group: string): ModelChainEntry => ({
+  ...entry,
+  config: { ...entry.config, failure_group: group },
+});
+
+test("failure group (chain): the head's failures skip its group-mates, the next group answers", async () => {
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 10 } });
+  const calls: string[] = [];
+  const down = new Set(["wire-X", "wire-L"]);
+  const last = await run(composite([grouped(X, "up"), grouped(L, "up"), Y], calls, down, scheduler));
+  assert.equal(last.type, "done");
+  assert.deepEqual(calls, ["wire-X", "wire-X", "wire-Y"], "L shares X's group and is skipped");
+  scheduler.stop();
+});
+
+test("failure group (chain): a stall fails the group at once", async () => {
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 10 } });
+  const calls: string[] = [];
+  const last = await run(
+    stallComposite([grouped(X, "up"), grouped(L, "up"), Y], calls, new Set(["wire-X", "wire-L"]), scheduler, {
+      maxWaitMs: 60_000,
+      firstTokenTimeoutMs: 30,
+    }),
+  );
+  assert.equal(last.type, "done");
+  assert.deepEqual(calls, ["wire-X", "wire-Y"]);
+  scheduler.stop();
+});
+
+test("failure group (chain): a listed status fails the group; an unlisted one excludes only the member", async () => {
+  const mk = (statuses?: number[]) => {
+    const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 10 } });
+    const calls: string[] = [];
+    const fb = buildModelFallback([grouped(X, "up"), grouped(L, "up"), Y], {
+      consumer: "test",
+      makeBase: failingBase(calls, new Map([["wire-X", { error: NO_KEYS, delayMs: 0 }]])),
+      makeModel,
+      scheduler,
+      admission: { priority: "interactive" },
+      failureGroupStatuses: (g) => (g === "up" ? statuses : undefined),
+    });
+    return { calls, scheduler, streamFn: withRequestRetry(fb.streamFn, { maxWaitMs: 60_000, backoffBaseMs: 1, backoffMaxMs: 1 }) };
+  };
+  const listed = mk([400]);
+  assert.equal((await run(listed.streamFn)).type, "done");
+  assert.deepEqual(listed.calls, ["wire-X", "wire-Y"], "400 is listed: L is skipped");
+  listed.scheduler.stop();
+  const unlisted = mk(undefined);
+  assert.equal((await run(unlisted.streamFn)).type, "done");
+  assert.deepEqual(unlisted.calls, ["wire-X", "wire-L"], "400 is not listed: only X is excluded, L answers");
+  unlisted.scheduler.stop();
+});
+
+test("failure group (chain): the group-mate is the last resort when nothing else is left", async () => {
+  const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 10 } });
+  const calls: string[] = [];
+  const last = await run(composite([grouped(X, "up"), grouped(L, "up")], calls, new Set(["wire-X"]), scheduler));
+  assert.equal(last.type, "done");
+  assert.deepEqual(calls, ["wire-X", "wire-X", "wire-L"]);
   scheduler.stop();
 });
