@@ -25,6 +25,10 @@ Unreleased section; it is not part of any release's notes.
 
 ### Added
 
+- **Failure-group strikes**: `[failure_groups.<name>].strike = true` makes the
+  group's listed `statuses` count against the serving model's health, so a model
+  whose upstream reports an outage as a 4xx turns unhealthy and is skipped until
+  its background probe passes, instead of being retried by every request.
 - **Per-model image cap**: `[models.<name>] max_images` keeps only the newest N
   images in each request that model serves and replaces older ones with a text
   placeholder, so a session with many images no longer fails on an upstream that

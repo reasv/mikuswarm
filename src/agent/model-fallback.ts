@@ -161,6 +161,8 @@ export interface BuildModelFallbackOptions {
   primaryAttemptsPerRequest?: number;
   /** HTTP statuses listed for a failure group (`[failure_groups.<name>].statuses`, §8a "Failure groups"). */
   failureGroupStatuses?: (group: string) => readonly number[] | undefined;
+  /** Whether a failure group's listed statuses also strike member health (`[failure_groups.<name>].strike`). */
+  failureGroupStrikes?: (group: string) => boolean;
   /**
    * Register a background prober for every member with the scheduler (spec
    * §8a background probes), so an unhealthy member recovers out of band instead of through a
@@ -293,6 +295,10 @@ export function buildModelFallback(
   }
   const memberWindows: Record<string, number> = Object.fromEntries(memberWindowMap);
 
+  // A group with `strike = true` turns its listed statuses into health strikes.
+  const strikeStatuses = (group: string | undefined): readonly number[] | undefined =>
+    group !== undefined && options.failureGroupStrikes?.(group) === true ? options.failureGroupStatuses?.(group) : undefined;
+
   // Per-candidate dispatch pipelines (§3 #3).
   const candidates: Candidate[] = survivors.map((entry) => {
     // Member's own operative window for fits gating (§2.1) and for the Model
@@ -315,6 +321,7 @@ export function buildModelFallback(
             sessionId: options.admission.sessionId,
             sessionType: options.admission.sessionType,
             onAdmissionWait: options.admission.onAdmissionWait,
+            strikeStatuses: strikeStatuses(entry.config.failure_group),
           })
         : base;
     const dispatch = options.wrapMember ? options.wrapMember(entry.logicalId, admitted) : admitted;

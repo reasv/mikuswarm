@@ -387,6 +387,36 @@ test("admission wrapper releases on error and feeds the group backoff", async ()
   release();
 });
 
+test("strikeStatuses: a listed content status strikes model health; unlisted ones stay neutral", async () => {
+  const scheduler = new LlmScheduler({
+    groups: { default: { max_in_flight: 1 } },
+    health: { unhealthyThreshold: 2, probeBackoffBaseMs: 50_000, probeBackoffMaxMs: 50_000 },
+  });
+  const key = modelHealthKey(MODEL);
+  const plain = withSchedulerAdmission(() => errorStream('400 {"error":"no keys"}'), scheduler, { group: "default", priority: "interactive" });
+  for (let i = 0; i < 3; i++) await drain(plain(MODEL, [], undefined as never));
+  assert.equal(scheduler.modelHealth(key), "healthy", "a 400 without strikeStatuses is content: neutral");
+
+  const otherStatus = withSchedulerAdmission(() => errorStream("422 unprocessable"), scheduler, {
+    group: "default",
+    priority: "interactive",
+    strikeStatuses: [400],
+  });
+  for (let i = 0; i < 3; i++) await drain(otherStatus(MODEL, [], undefined as never));
+  assert.equal(scheduler.modelHealth(key), "healthy", "an unlisted status stays neutral");
+
+  const striking = withSchedulerAdmission(() => errorStream('400 {"error":"no keys"}'), scheduler, {
+    group: "default",
+    priority: "interactive",
+    strikeStatuses: [400],
+  });
+  await drain(striking(MODEL, [], undefined as never));
+  assert.equal(scheduler.modelHealth(key), "healthy", "one strike is under the threshold");
+  await drain(striking(MODEL, [], undefined as never));
+  assert.equal(scheduler.modelHealth(key), "unhealthy", "listed statuses count as environmental strikes");
+  scheduler.stop();
+});
+
 test("injected onResponse feeds precise status + Retry-After once (no double count with the error event) (#9)", async () => {
   const scheduler = new LlmScheduler({
     // Exponential window would be [200,400]ms; the hook's Retry-After is 40ms.

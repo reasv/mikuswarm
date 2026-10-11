@@ -1157,6 +1157,13 @@ export interface AdmissionOptions {
    * request ring entry (spec §9.2) — the one number the gateway cannot see.
    */
   onAdmissionWait?: (waitMs: number) => void;
+  /**
+   * HTTP statuses that count against the model's health even though they
+   * classify as content (§8a "Failure groups", `strike = true`): for an upstream
+   * that reports an outage as a 4xx, so the model turns unhealthy and is skipped
+   * instead of being re-tried by every request.
+   */
+  strikeStatuses?: readonly number[];
 }
 
 /**
@@ -1189,6 +1196,16 @@ export function parseRetryAfterMs(
     if (!Number.isNaN(date)) return Math.max(0, date - Date.now());
   }
   return undefined;
+}
+
+/**
+ * A content-class failure whose status the admission lists in `strikeStatuses`
+ * counts as environmental for the model's health; every other class is unchanged.
+ */
+function strikeClass(cls: LlmErrorClass, status: number | undefined, options: AdmissionOptions): LlmErrorClass {
+  return cls === "content" && status !== undefined && options.strikeStatuses?.includes(status) === true
+    ? "environmental"
+    : cls;
 }
 
 /**
@@ -1318,15 +1335,11 @@ export function withSchedulerAdmission(
               const message = failure?.errorMessage;
               // A stall cut short by Layer 0's wall-clock budget is an
               // environmental failure of THIS model, not a neutral abort.
+              const status = message ? extractStatus(message.toLowerCase()) : undefined;
               const cls = isStallAbort(signal)
                 ? "environmental"
-                : classifyLlmError(message, failure?.stopReason, failure?.rawStopReason);
-              scheduler.noteOutcome(
-                options.group,
-                modelKey,
-                cls,
-                message ? extractStatus(message.toLowerCase()) : undefined,
-              );
+                : strikeClass(classifyLlmError(message, failure?.stopReason, failure?.rawStopReason), status, options);
+              scheduler.noteOutcome(options.group, modelKey, cls, status);
             }
           } else if (event.type === "done") {
             sawTerminal = true;
@@ -1363,11 +1376,16 @@ export function withSchedulerAdmission(
         const message = err instanceof Error ? err.message : String(err);
         const aborted = (err instanceof Error && err.name === "AbortError") || signal?.aborted === true;
         if (!throttleNoted) {
+          const status = aborted ? undefined : extractStatus(message.toLowerCase());
           scheduler.noteOutcome(
             options.group,
             modelKey,
-            isStallAbort(signal) ? "environmental" : aborted ? "aborted" : classifyLlmError(message, undefined),
-            aborted ? undefined : extractStatus(message.toLowerCase()),
+            isStallAbort(signal)
+              ? "environmental"
+              : aborted
+                ? "aborted"
+                : strikeClass(classifyLlmError(message, undefined), status, options),
+            status,
           );
         }
         outer.push(synthesizeErrorEvent(model, message, aborted ? "aborted" : "error"));

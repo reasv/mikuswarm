@@ -2968,9 +2968,13 @@ export const AppConfigSchema = StrictObject({
   // model's `failure_group` gives. Optional: a group needs no entry. `statuses`:
   // HTTP statuses that, besides stalls and environmental failures, mark the group
   // failed for the request at once (e.g. a gateway that answers an upstream outage
-  // with a 4xx).
+  // with a 4xx). `strike` (default false): those statuses also count against the
+  // serving member's health like an environmental failure, so a member that keeps
+  // answering one turns unhealthy, is skipped by later requests, and comes back
+  // through its background probe.
   failure_groups: Type.Optional(Type.Record(Type.String({ minLength: 1 }), StrictObject({
     statuses: Type.Optional(Type.Array(Type.Integer({ minimum: 100, maximum: 599 }))),
+    strike: Type.Optional(Type.Boolean()),
   }))),
   rate_limits: Type.Optional(RateLimitsSchema),
   // Period cost limits (spec USAGE-COST-LIMITS §5): a centralized array of

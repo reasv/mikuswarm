@@ -567,6 +567,35 @@ test("failure group (chain): a listed status fails the group; an unlisted one ex
   unlisted.scheduler.stop();
 });
 
+test("failure group (chain): strike = true turns the listed status into a health strike on the member", async () => {
+  const mk = (strike: boolean) => {
+    const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 2 } });
+    const calls: string[] = [];
+    const fb = buildModelFallback([grouped(X, "up"), Y], {
+      consumer: "test",
+      makeBase: failingBase(calls, new Map([["wire-X", { error: NO_KEYS, delayMs: 0 }]])),
+      makeModel,
+      scheduler,
+      admission: { priority: "interactive" },
+      failureGroupStatuses: (g) => (g === "up" ? [400] : undefined),
+      failureGroupStrikes: (g) => g === "up" && strike,
+    });
+    return { calls, scheduler, streamFn: withRequestRetry(fb.streamFn, { maxWaitMs: 60_000, backoffBaseMs: 1, backoffMaxMs: 1 }) };
+  };
+  const struck = mk(true);
+  for (let i = 0; i < 3; i++) assert.equal((await run(struck.streamFn)).type, "done");
+  assert.deepEqual(
+    struck.calls,
+    ["wire-X", "wire-Y", "wire-X", "wire-Y", "wire-Y"],
+    "after two strikes X is unhealthy and the third request goes straight to Y",
+  );
+  struck.scheduler.stop();
+  const neutral = mk(false);
+  for (let i = 0; i < 3; i++) assert.equal((await run(neutral.streamFn)).type, "done");
+  assert.deepEqual(neutral.calls, ["wire-X", "wire-Y", "wire-X", "wire-Y", "wire-X", "wire-Y"], "without strike every request re-tries X");
+  neutral.scheduler.stop();
+});
+
 test("failure group (chain): the group-mate is the last resort when nothing else is left", async () => {
   const scheduler = new LlmScheduler({ health: { unhealthyThreshold: 10 } });
   const calls: string[] = [];

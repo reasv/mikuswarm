@@ -1079,6 +1079,7 @@ export class AgentSessionFactory {
         // One pass per request + out-of-band recovery (ARCHITECTURE.md §8a).
         primaryAttemptsPerRequest: recovery?.llm_primary_attempts_per_request,
         failureGroupStatuses: (group) => this.options.config.failure_groups?.[group]?.statuses,
+        failureGroupStrikes: (group) => this.options.config.failure_groups?.[group]?.strike === true,
         backgroundProbe: true,
       });
       builtFallbacks.set(cacheKey, built);
