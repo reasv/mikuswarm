@@ -25,6 +25,10 @@ Unreleased section; it is not part of any release's notes.
 
 ### Added
 
+- **Per-model image cap**: `[models.<name>] max_images` keeps only the newest N
+  images in each request that model serves and replaces older ones with a text
+  placeholder, so a session with many images no longer fails on an upstream that
+  rejects more than N per prompt. Other fallback members still get every image.
 - **Cross-encoder query choice**: `[retrieval.rerank].query = "request"` (the
   default) gives the re-ranker the request alone, the trigger text and its reply
   target with their speakers' names; `"conversation"` keeps the previous query, the

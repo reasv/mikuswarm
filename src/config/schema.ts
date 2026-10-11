@@ -952,6 +952,12 @@ const ModelSchema = StrictObject({
   // `preview` action's inline emission. Anthropic's per-image inline cap is
   // 5 MB base64 — values up to that ceiling are safe.
   image_input_bytes: Type.Optional(Type.Number({ minimum: 1 })),
+  // Most images this model accepts in one agent request (for upstreams that
+  // reject more, e.g. "At most N image(s) may be provided in one prompt"). When
+  // set, each request this model serves keeps the newest N image blocks and
+  // replaces older ones with a text placeholder; the transcript is unchanged and
+  // other fallback members still get every image. Unset = unlimited.
+  max_images: Type.Optional(Type.Integer({ minimum: 1 })),
   // NOTE: `cost` DEEP-MERGES with the inherited block (spec MODEL-FALLBACK §2.1
   // inheritance). A partial override on a virtual model keeps the parent's other
   // rate fields — so to make an inheriting model zero-cost, set ALL rate fields

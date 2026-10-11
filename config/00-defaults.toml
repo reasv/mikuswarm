@@ -340,6 +340,11 @@ context_window = 128000
 # bytes; raw inflates ~4/3 in base64). 5 MB ≈ 3.75 MB raw, under Anthropic's
 # per-image inline cap.
 image_input_bytes = 5242880
+# Most images in one agent request, for upstreams that reject more ("At most N
+# image(s) may be provided in one prompt"). When set, this model's requests keep
+# the newest N images and replace older ones with a text placeholder; other
+# fallback members still get every image. Unset = unlimited.
+# max_images = 4
 # Per-model override of the interactive-class wall-clock retry budget
 # (recovery.llm_request_max_wait_ms). The budget bounds only WAITING (admission
 # queue + inter-attempt backoff) and a STUCK attempt that emits zero tokens by

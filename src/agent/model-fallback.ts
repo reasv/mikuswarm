@@ -11,6 +11,7 @@ import {
   type SlotShare,
 } from "./scheduler.js";
 import { extractStatus, getRequestAttemptState } from "./request-retry.js";
+import { withImageCap } from "./image-cap.js";
 
 // =============================================================================
 // Transparent model fallback (spec MODEL-FALLBACK).
@@ -300,7 +301,9 @@ export function buildModelFallback(
     // that is true for the model actually serving the attempt.
     const memberWindow = memberWindowMap.get(entry.logicalId) ?? operativeContextWindow;
     const model = options.makeModel(entry.config, descriptorWindowMap.get(entry.logicalId) ?? memberWindow);
-    const base = options.makeBase(entry.config);
+    // A member's `max_images` caps the images in each of its requests (image-cap.ts).
+    const made = options.makeBase(entry.config);
+    const base = entry.config.max_images !== undefined ? withImageCap(made, entry.config.max_images) : made;
     const group = entry.config.rate_limit_group ?? "default";
     const admitted: StreamFn =
       options.scheduler && options.admission
