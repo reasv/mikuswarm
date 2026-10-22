@@ -84,7 +84,7 @@ RUN --mount=type=cache,id=mikuswarm-ubuntu-apt-cache,target=/var/cache/apt,shari
   apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
   && curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
-  && apt-get install -y --no-install-recommends nodejs \
+  && apt-get install -y --no-install-recommends nodejs=24.22.1-1nodesource1 \
   && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf "$(command -v fdfind)" /usr/local/bin/fd

@@ -22,7 +22,7 @@ ARG YT_DLP_SHA256=6bbb3d314cde4febe36e5fa1d55462e29c974f63444e707871834f6d8cc210
 # -----------------------------------------------------------------------------
 # Builder — toolchains + compile native artifacts. None of this ships to runtime.
 # -----------------------------------------------------------------------------
-FROM node:24-trixie AS builder
+FROM node:24.22.1-trixie AS builder
 
 ENV PATH=/root/.cargo/bin:$PATH
 WORKDIR /app
@@ -97,7 +97,7 @@ RUN apt-get update \
 # -----------------------------------------------------------------------------
 # Runtime — slim base + only what the agent needs at run time.
 # -----------------------------------------------------------------------------
-FROM node:24-trixie-slim AS runtime
+FROM node:24.22.1-trixie-slim AS runtime
 
 ENV NODE_ENV=production
 WORKDIR /app
