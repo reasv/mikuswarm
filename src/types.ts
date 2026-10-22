@@ -450,6 +450,11 @@ export interface ChatProviderHost {
   onNativeEvent?(event: ProviderLifecycleEvent, ctx: { accountId: string }): void;
   onDiagnostics?(diagnostics: unknown, ctx: { accountId: string }): void;
   onError(error: unknown, ctx: { accountId?: string; phase: string }): void;
+  /**
+   * A recoverable, operator-relevant condition (logged at warn). Optional;
+   * providers fall back to `onError` when the host does not implement it.
+   */
+  onWarning?(message: string, ctx: { accountId?: string; phase: string }): void;
   /** Reply-as-trigger resolver (spec RESUMABLE-SESSIONS §5); provider stays resume-unaware. */
   resolveReplyTrigger?(args: {
     provider: string;

@@ -561,6 +561,15 @@ Unreleased section; it is not part of any release's notes.
 
 ### Fixed
 
+- **IRC: an account whose nick was taken never registered.** When the configured
+  `nick` was in use at connect time (another user, or our own previous connection
+  still timing out after a restart), the server's 433 went unanswered and the
+  account sat unregistered with no error. Registration now falls back through the
+  new optional `[irc.accounts.<key>].alt_nicks` list, then `nick_`, `nick__`,
+  `nick1`…`nick3`, logging each step at warn; while on a fallback the account
+  retries `nick` every 3 minutes (at once when the holder quits or renames) and
+  every reconnect starts again from `nick`. When every candidate is refused it
+  logs an error and reconnects 3 minutes later.
 - **Discord: with `trigger_hold_ms` set, held messages were lost.** The hold was kept
   per channel and replaced the held message with any newer trigger, from any sender, so
   the earlier held messages were never stored and their senders never answered. The

@@ -115,6 +115,22 @@ const WHOIS_TIMEOUT_MS = 10_000;
 const LIBRARY_MSG_MAX_LEN = 512;
 
 /**
+ * Suffixes appended to the configured nick to derive fallback nicks once the
+ * operator's `alt_nicks` are used up (spec: nick fallback). Bounded: together
+ * with the primary and `alt_nicks` this is the whole candidate list for one
+ * registration attempt.
+ */
+const GENERATED_NICK_SUFFIXES = ["_", "__", "1", "2", "3"] as const;
+
+/**
+ * How often an account registered on a fallback nick retries the configured
+ * nick, and how long it waits before reconnecting after every candidate nick
+ * was refused. A lingering ghost of our own previous connection usually times
+ * out within a few minutes.
+ */
+const NICK_RETRY_INTERVAL_MS = 180_000;
+
+/**
  * Floor caps required for every account. The library's default want list already
  * includes server-time and message-tags. echo-message requires enable_echomessage
  * in connect options (not in the library's default want list).
@@ -167,8 +183,28 @@ interface AccountRuntime {
    * connection loop instead of giving up, implementing spec §3.1's RECONNECT path.
    */
   capDelReconnect: boolean;
-  /** Pending CAP DEL reconnect delay timer — cleared on stop(). */
+  /** Pending CAP DEL / nick-exhaustion reconnect delay timer — cleared on stop(). */
   reconnectTimer?: NodeJS.Timeout;
+  /**
+   * Nicks to try at registration, in order: the configured `nick`, then
+   * `alt_nicks`, then the generated fallbacks (see {@link buildNickCandidates}).
+   */
+  nickCandidates: string[];
+  /** Index into `nickCandidates` of the nick the pending registration requested. */
+  nickAttempt: number;
+  /**
+   * True from each connect attempt (`connecting`) until RPL_WELCOME (001).
+   * Nick rejections only advance the candidate list while this is set; after
+   * registration a rejection (a failed reclaim) is ignored.
+   */
+  registering: boolean;
+  /**
+   * Set when every candidate nick was refused: the `close` handler that
+   * follows the deliberate QUIT reconnects after NICK_RETRY_INTERVAL_MS.
+   */
+  nickExhaustedReconnect: boolean;
+  /** Interval retrying the configured nick while registered on a fallback. */
+  reclaimTimer?: NodeJS.Timeout;
   /** Casemapping from ISUPPORT token (default: rfc1459). */
   casemapping: string;
   /** NETWORK ISUPPORT token lowercased, or configured host when absent. */
@@ -221,6 +257,29 @@ interface AccountRuntime {
    * Key: casemapped channel name. Updated by TOPIC and RPL_TOPIC events.
    */
   channelData: Map<string, { topic?: string; modes?: string }>;
+}
+
+// ── Nick candidates ────────────────────────────────────────────────────────────
+
+/**
+ * The ordered nicks one registration attempt may request: `nick`, then each of
+ * `altNicks`, then `nick` + each GENERATED_NICK_SUFFIXES entry. Duplicates
+ * (casemapped) are dropped, keeping the first occurrence.
+ */
+export function buildNickCandidates(
+  nick: string,
+  altNicks: readonly string[] = [],
+  casemapping = "rfc1459",
+): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const candidate of [nick, ...altNicks, ...GENERATED_NICK_SUFFIXES.map((s) => nick + s)]) {
+    const key = casefold(candidate, casemapping);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(candidate);
+  }
+  return out;
 }
 
 // ── IrcProvider ────────────────────────────────────────────────────────────────
@@ -292,6 +351,7 @@ export class IrcProvider implements IChatProvider {
         clearTimeout(rt.reconnectTimer);
         rt.reconnectTimer = undefined;
       }
+      this.stopNickReclaim(rt);
       // Drain pending echo promises with a generic error.
       for (const queue of rt.echoQueues.values()) {
         for (const pending of queue) {
@@ -731,6 +791,10 @@ export class IrcProvider implements IChatProvider {
       capFailed: false,
       registered: false,
       capDelReconnect: false,
+      nickCandidates: buildNickCandidates(config.nick, config.alt_nicks),
+      nickAttempt: 0,
+      registering: true,
+      nickExhaustedReconnect: false,
       casemapping: "rfc1459",
       networkName: config.host,
       networkIdFrozen: false,
@@ -757,6 +821,9 @@ export class IrcProvider implements IChatProvider {
     // ── registered ──────────────────────────────────────────────────────────
     client.on("registered", (event) => {
       if (this.stopped) return;
+
+      // Registration is complete: later nick rejections are reclaim attempts.
+      rt.registering = false;
 
       // Update nick from the WELCOME message.
       rt.nick = event.nick;
@@ -789,6 +856,17 @@ export class IrcProvider implements IChatProvider {
 
       // Learn hostmask via WHO.
       this.learnHostmask(rt);
+
+      // Registered on a fallback nick: keep retrying the configured one.
+      if (!this.isPrimaryNick(rt, rt.nick)) {
+        this.warn(
+          rt,
+          `irc account "${rt.accountId}": registered as "${rt.nick}" because the configured nick ` +
+            `"${rt.config.nick}" is unavailable — retrying it every ${NICK_RETRY_INTERVAL_MS / 1000} s`,
+          "nick_fallback",
+        );
+        this.startNickReclaim(rt);
+      }
 
       // Join configured channels.
       for (const channel of rt.config.channels ?? []) {
@@ -834,6 +912,38 @@ export class IrcProvider implements IChatProvider {
       rt.networkIdFrozen = true;
     });
 
+    // ── connecting (every connect attempt) ────────────────────────────────────
+    // Fired before both client.connect() (CAP DEL path, exhaustion reconnect)
+    // and the library's own auto-reconnect. The auto-reconnect path calls
+    // connection.connect() directly, so registerToNetwork() re-sends
+    // client.user.nick — which RPL_WELCOME set to whatever nick we last
+    // registered on (possibly a fallback). Reset it so every connection starts
+    // again from the configured nick.
+    client.on("connecting", () => {
+      this.stopNickReclaim(rt);
+      rt.registering = true;
+      rt.nickAttempt = 0;
+      rt.nick = rt.config.nick;
+      if (rt.client.user) rt.client.user.nick = rt.config.nick;
+    });
+
+    // ── nick rejected (433 / 432 / 436 / 437) ─────────────────────────────────
+    client.on("nick in use", (event) => {
+      this.handleNickRejected(rt, "433", event.nick, event.reason);
+    });
+    client.on("nick invalid", (event) => {
+      this.handleNickRejected(rt, "432", event.nick, event.reason);
+    });
+    // 436 (ERR_NICKCOLLISION) and 437 (ERR_UNAVAILRESOURCE) have no library
+    // handler and surface as `unknown command`. 437 is also sent for a
+    // juped channel — only a non-channel target is a nick.
+    client.on("unknown command", (command) => {
+      if (command.command !== "436" && command.command !== "437") return;
+      const target = command.params[1] ?? "";
+      if (isChannelTarget(target)) return;
+      this.handleNickRejected(rt, command.command, target, command.params[command.params.length - 1] ?? "");
+    });
+
     // ── socket close (every disconnect, including auto-reconnect windows) ────────
     // The library emits 'socket close' on EVERY disconnect; 'close' is emitted only
     // when it gives up reconnecting (connection.js:111/141). Without this handler,
@@ -843,6 +953,7 @@ export class IrcProvider implements IChatProvider {
     client.on("socket close", () => {
       rt.registered = false;
       rt.networkIdFrozen = false; // re-freeze on next reconnect's 005
+      this.stopNickReclaim(rt);
       // Clear stale nick→account mappings: a user may have logged out of services
       // while we were disconnected, and no WHOX fires for absent nicks on reconnect.
       // WHOX-on-self-join repopulates channel members; per-message account-tag
@@ -869,6 +980,14 @@ export class IrcProvider implements IChatProvider {
           rt.reconnectTimer = undefined;
           if (!this.stopped) rt.client.connect();
         }, 1_000);
+      } else if (rt.nickExhaustedReconnect && !rt.capFailed) {
+        // Every candidate nick was refused: wait before starting over from the
+        // configured nick (a ghost of our own connection may time out by then).
+        rt.nickExhaustedReconnect = false;
+        rt.reconnectTimer = setTimeout(() => {
+          rt.reconnectTimer = undefined;
+          if (!this.stopped) rt.client.connect();
+        }, NICK_RETRY_INTERVAL_MS);
       }
     });
 
@@ -1071,6 +1190,16 @@ export class IrcProvider implements IChatProvider {
       const isOwnNick =
         casefold(event.nick, rt.casemapping) === casefold(rt.nick, rt.casemapping);
 
+      // Another user moved off the configured nick: try to reclaim it now.
+      if (
+        !isOwnNick &&
+        rt.reclaimTimer &&
+        this.isPrimaryNick(rt, event.nick) &&
+        !this.isPrimaryNick(rt, event.new_nick)
+      ) {
+        this.attemptNickReclaim(rt);
+      }
+
       // 1. Move tracked account association from old nick to new nick (Phase 2).
       rt.accountTracker.renameNick(event.nick, event.new_nick, rt.casemapping);
       // 2. Move roster entries across all channels (Phase 3).
@@ -1086,6 +1215,10 @@ export class IrcProvider implements IChatProvider {
         rt.self = { id: scopeIrcId(rt.networkName, selfBareId), username: rt.nick };
         // Re-learn hostmask (budget recomputed for new nick length).
         this.learnHostmask(rt);
+        // Reclaimed the configured nick: stop retrying.
+        if (rt.reclaimTimer && this.isPrimaryNick(rt, rt.nick)) {
+          this.stopNickReclaim(rt);
+        }
       } else {
         // Other user's rename: upsert their identity row so the new nick is
         // recorded as username (spec §5.4 / §5.3 alias history). The identity key
@@ -1227,12 +1360,122 @@ export class IrcProvider implements IChatProvider {
       rt.accountTracker.removeNick(event.nick, rt.casemapping);
       // Phase 3: remove from all channel rosters.
       rt.rosterTracker.removeNick(event.nick, rt.casemapping);
+      // The holder of the configured nick quit: try to reclaim it now.
+      if (rt.reclaimTimer && this.isPrimaryNick(rt, event.nick)) {
+        this.attemptNickReclaim(rt);
+      }
     });
 
     // ── socket error ──────────────────────────────────────────────────────────
     client.on("socket error", (err) => {
       this.host?.onError(err, { accountId: rt.accountId, phase: "socket" });
     });
+  }
+
+  // ── Nick fallback and reclaim ────────────────────────────────────────────────
+
+  private isPrimaryNick(rt: AccountRuntime, nick: string): boolean {
+    return casefold(nick, rt.casemapping) === casefold(rt.config.nick, rt.casemapping);
+  }
+
+  /** Warn-level log through the host (falls back to onError when absent). */
+  private warn(rt: AccountRuntime, message: string, phase: string): void {
+    if (this.host?.onWarning) {
+      this.host.onWarning(message, { accountId: rt.accountId, phase });
+    } else {
+      this.host?.onError(new Error(message), { accountId: rt.accountId, phase });
+    }
+  }
+
+  /**
+   * The server refused the nick we requested (433 in use, 432 erroneous, 436
+   * collision, 437 temporarily unavailable). During registration: request the
+   * next candidate, or — when every candidate was refused — log an error, QUIT
+   * and reconnect after NICK_RETRY_INTERVAL_MS from the configured nick.
+   * After registration the rejection answers a reclaim attempt: stay on the
+   * current nick silently.
+   */
+  private handleNickRejected(rt: AccountRuntime, code: string, rejected: string, reason: string): void {
+    if (this.stopped || !rt.registering) return;
+
+    const tried = rt.nickCandidates[rt.nickAttempt] ?? rejected;
+    const why = `${code}${reason ? ` ${reason}` : ""}`;
+
+    if (code === "432" && rt.nickAttempt === 0) {
+      // The configured nick itself is malformed for this server: a
+      // misconfiguration, but alt_nicks may still be valid, so keep going.
+      this.host?.onError(
+        new Error(
+          `irc account "${rt.accountId}": server ${rt.config.host} rejects the configured nick ` +
+            `"${tried}" as erroneous (${why}) — fix [irc.accounts.${rt.accountId}].nick; trying fallback nicks`,
+        ),
+        { accountId: rt.accountId, phase: "nick" },
+      );
+    }
+
+    const next = rt.nickAttempt + 1;
+    if (next >= rt.nickCandidates.length) {
+      rt.registering = false;
+      rt.nickExhaustedReconnect = true;
+      this.host?.onError(
+        new Error(
+          `irc account "${rt.accountId}": server ${rt.config.host} refused every candidate nick ` +
+            `(${rt.nickCandidates.map((n) => `"${n}"`).join(", ")}; last: ${why}) — ` +
+            `disconnecting and retrying from "${rt.config.nick}" in ${NICK_RETRY_INTERVAL_MS / 1000} s`,
+        ),
+        { accountId: rt.accountId, phase: "nick" },
+      );
+      try {
+        rt.client.quit("no nick available");
+      } catch {
+        /* best-effort */
+      }
+      return;
+    }
+
+    rt.nickAttempt = next;
+    const candidate = rt.nickCandidates[next]!;
+    this.warn(
+      rt,
+      `irc account "${rt.accountId}": nick "${tried}" unavailable (${why}) — trying "${candidate}"`,
+      "nick_fallback",
+    );
+    try {
+      rt.client.changeNick(candidate);
+    } catch {
+      /* best-effort — socket may already be gone */
+    }
+  }
+
+  private startNickReclaim(rt: AccountRuntime): void {
+    this.stopNickReclaim(rt);
+    rt.reclaimTimer = setInterval(() => this.attemptNickReclaim(rt), NICK_RETRY_INTERVAL_MS);
+  }
+
+  private stopNickReclaim(rt: AccountRuntime): void {
+    if (rt.reclaimTimer) {
+      clearInterval(rt.reclaimTimer);
+      rt.reclaimTimer = undefined;
+    }
+  }
+
+  /**
+   * Request the configured nick. Success arrives as our own NICK echo and goes
+   * through the `nick` handler's own-nick path (rt.nick, rt.self, hostmask
+   * budget), which also stops the reclaim timer. A 433 reply is ignored by
+   * handleNickRejected because registration is over.
+   */
+  private attemptNickReclaim(rt: AccountRuntime): void {
+    if (this.stopped || !rt.registered) return;
+    if (this.isPrimaryNick(rt, rt.nick)) {
+      this.stopNickReclaim(rt);
+      return;
+    }
+    try {
+      rt.client.changeNick(rt.config.nick);
+    } catch {
+      /* best-effort */
+    }
   }
 
   // ── Floor cap validation ─────────────────────────────────────────────────────

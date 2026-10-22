@@ -21,12 +21,13 @@
  *     F3: 'user updated' for self → learnHostmask; for other nick → no-op
  *     F5: trigger_hold_ms=0 → immediate; >0 → coalesce
  *     F7: floor-cap failure → capFailed + onError; echo-merge → real msgid; echo timeout → synthetic id
+ *     N1–N9: nick fallback (alt_nicks → generated → bounded exhaustion), reclaim, reconnect reset
  */
 
 import assert from "node:assert/strict";
 import test, { describe, mock } from "node:test";
 import { EventEmitter } from "node:events";
-import { IrcProvider } from "../src/irc/provider.js";
+import { IrcProvider, buildNickCandidates } from "../src/irc/provider.js";
 import { AccountTracker } from "../src/irc/account-tracker.js";
 import { RosterTracker } from "../src/irc/roster-tracker.js";
 import type { IrcConfig } from "../src/config/schema.js";
@@ -270,6 +271,9 @@ class MockClient extends EventEmitter {
     supports(_name: string) { return undefined; },
   };
 
+  user = { nick: "testbot", username: "testbot", host: "", away: false };
+  changeNickArgs: string[] = [];
+
   connected = false;
   connectCallCount = 0;
   quitCallCount = 0;
@@ -288,26 +292,32 @@ class MockClient extends EventEmitter {
   tagmsg(_target: string, _tags?: Record<string, string>): void {}
   requestCap(_cap: string | string[]): void {}
   raw(_cmd: string, ..._args: string[]): void {}
+  changeNick(nick: string): void { this.changeNickArgs.push(nick); }
 }
 
 interface MockHostResult {
   host: {
     onError(err: unknown, ctx: object): void;
+    onWarning(message: string, ctx: object): void;
     onEvent(event: unknown): void;
   };
   errors: Array<[unknown, object]>;
+  warnings: Array<[string, object]>;
   events: unknown[];
 }
 
 function makeMockHost(): MockHostResult {
   const errors: Array<[unknown, object]> = [];
+  const warnings: Array<[string, object]> = [];
   const events: unknown[] = [];
   return {
     host: {
       onError(err: unknown, ctx: object) { errors.push([err, ctx]); },
+      onWarning(message: string, ctx: object) { warnings.push([message, ctx]); },
       onEvent(event: unknown) { events.push(event); },
     },
     errors,
+    warnings,
     events,
   };
 }
@@ -320,13 +330,13 @@ function makeMockHost(): MockHostResult {
 function injectRuntime(
   accountKey: string,
   client: MockClient,
-  opts: { host?: MockHostResult; triggerHoldMs?: number } = {},
+  opts: { host?: MockHostResult; triggerHoldMs?: number; altNicks?: string[] } = {},
 ): {
   provider: IrcProvider;
   rt: Record<string, unknown>;
   host: MockHostResult;
 } {
-  const { host = makeMockHost(), triggerHoldMs } = opts;
+  const { host = makeMockHost(), triggerHoldMs, altNicks } = opts;
 
   const provider = new IrcProvider({
     enabled: true,
@@ -342,12 +352,16 @@ function injectRuntime(
 
   const rt: Record<string, unknown> = {
     accountId: accountKey,
-    config: { host: "irc.example.net", nick: "testbot", channels: [] },
+    config: { host: "irc.example.net", nick: "testbot", channels: [], alt_nicks: altNicks },
     client,
     self: { id: "irc.example.net/testbot", username: "testbot" },
     capFailed: false,
     registered: false,
     capDelReconnect: false,
+    nickCandidates: buildNickCandidates("testbot", altNicks),
+    nickAttempt: 0,
+    registering: true,
+    nickExhaustedReconnect: false,
     casemapping: "rfc1459",
     networkName: "irc.example.net",
     networkIdFrozen: true, // freeze so inbound handlers (privmsg/notice/action) pass the gate
@@ -879,4 +893,227 @@ describe("network-scoped ids: outbound round-trips", () => {
     assert.equal(provider.ownsUserId("/alice"), false, "empty network component");
     assert.equal(provider.ownsUserId("libera.chat/"), false, "empty identity component");
   });
+});
+
+// ── N: nick fallback, reclaim and reconnect reset ────────────────────────────
+
+const FLOOR = ["server-time", "message-tags", "echo-message"];
+const RETRY_MS = 180_000;
+
+function inUse(client: MockClient, nick: string): void {
+  client.emit("nick in use", { nick, reason: "Nickname is already in use", tags: {} });
+}
+
+test("N0: buildNickCandidates orders primary, alt_nicks, generated; drops casemapped duplicates", () => {
+  assert.deepEqual(buildNickCandidates("mikubot", ["mikubot2", "MikuBot_", "other"]), [
+    "mikubot",
+    "mikubot2",
+    "MikuBot_",
+    "other",
+    "mikubot__",
+    "mikubot1",
+    "mikubot3",
+  ]);
+  assert.deepEqual(buildNickCandidates("mikubot"), [
+    "mikubot",
+    "mikubot_",
+    "mikubot__",
+    "mikubot1",
+    "mikubot2",
+    "mikubot3",
+  ]);
+});
+
+test("N1: primary nick in use during registration → first alt_nick, logged at warn", () => {
+  const client = new MockClient();
+  const { host } = injectRuntime("acc", client, { altNicks: ["altbot", "altbot2"] });
+
+  inUse(client, "testbot");
+
+  assert.deepEqual(client.changeNickArgs, ["altbot"]);
+  assert.equal(host.warnings.length, 1);
+  const [msg, ctx] = host.warnings[0]!;
+  assert.match(msg, /"acc"/);
+  assert.match(msg, /"testbot".*"altbot"/);
+  assert.equal((ctx as Record<string, string>).accountId, "acc");
+  assert.equal(host.errors.length, 0);
+});
+
+test("N2: alt_nicks exhausted → generated fallbacks derived from the primary", () => {
+  const client = new MockClient();
+  injectRuntime("acc", client, { altNicks: ["altbot"] });
+
+  inUse(client, "testbot");
+  inUse(client, "altbot");
+  inUse(client, "testbot_");
+
+  assert.deepEqual(client.changeNickArgs, ["altbot", "testbot_", "testbot__"]);
+});
+
+test("N3: every candidate refused → one error, QUIT, bounded attempts, reconnect after the retry interval", () => {
+  mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  try {
+    const client = new MockClient();
+    const { rt, host } = injectRuntime("acc", client);
+    const candidates = rt.nickCandidates as string[];
+
+    // Far more rejections than candidates: must not loop.
+    for (let i = 0; i < 50; i++) inUse(client, "x");
+
+    assert.equal(client.changeNickArgs.length, candidates.length - 1, "one NICK per fallback, no more");
+    assert.equal(host.errors.length, 1, "exhaustion is logged once");
+    assert.match((host.errors[0]![0] as Error).message, /refused every candidate nick/);
+    assert.equal(client.quitCallCount, 1);
+
+    client.emit("socket close");
+    client.emit("close");
+    mock.timers.tick(RETRY_MS - 1);
+    assert.equal(client.connectCallCount, 0, "no reconnect before the retry interval");
+    mock.timers.tick(1);
+    assert.equal(client.connectCallCount, 1, "reconnects once after the retry interval");
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("N4: 432 on the primary is reported as a misconfiguration, then alt_nicks are tried", () => {
+  const client = new MockClient();
+  const { host } = injectRuntime("acc", client, { altNicks: ["altbot"] });
+
+  client.emit("nick invalid", { nick: "testbot", reason: "Erroneous Nickname", tags: {} });
+
+  assert.equal(host.errors.length, 1);
+  assert.match((host.errors[0]![0] as Error).message, /erroneous.*irc\.accounts\.acc\]\.nick/);
+  assert.deepEqual(client.changeNickArgs, ["altbot"]);
+});
+
+test("N5: 437 for a nick advances; 437 for a channel and unrelated numerics are ignored", () => {
+  const client = new MockClient();
+  injectRuntime("acc", client, { altNicks: ["altbot"] });
+
+  client.emit("unknown command", { command: "437", params: ["*", "#chan", "Channel is temporarily unavailable"], tags: {} });
+  client.emit("unknown command", { command: "999", params: ["*", "testbot", "whatever"], tags: {} });
+  assert.deepEqual(client.changeNickArgs, []);
+
+  client.emit("unknown command", { command: "437", params: ["*", "testbot", "Nick is temporarily unavailable"], tags: {} });
+  assert.deepEqual(client.changeNickArgs, ["altbot"]);
+});
+
+test("N6: registered on a fallback → periodic reclaim; 433 on reclaim is silent; success goes through the own-nick path", () => {
+  mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  try {
+    const client = new MockClient();
+    client.network.cap.enabled = [...FLOOR];
+    const { rt, host } = injectRuntime("acc", client);
+
+    inUse(client, "testbot");
+    client.emit("registered", { nick: "testbot_", tags: {} });
+    assert.equal(rt.registered, true);
+    assert.equal(rt.nick, "testbot_");
+    assert.ok(rt.reclaimTimer, "reclaim timer started");
+    const warningsAfterRegister = host.warnings.length;
+
+    mock.timers.tick(RETRY_MS);
+    assert.equal(client.changeNickArgs.at(-1), "testbot", "reclaim requests the configured nick");
+    const nickCalls = client.changeNickArgs.length;
+
+    // Holder still there: the reply is 433 — stay put, no new NICK, no logs.
+    inUse(client, "testbot");
+    assert.equal(client.changeNickArgs.length, nickCalls);
+    assert.equal(host.warnings.length, warningsAfterRegister);
+    assert.equal(host.errors.length, 0);
+    assert.equal(rt.nick, "testbot_");
+
+    // Next tick succeeds: our own NICK echo.
+    mock.timers.tick(RETRY_MS);
+    const whoBefore = client.whoCallCount;
+    client.emit("nick", { nick: "testbot_", new_nick: "testbot", ident: "u", hostname: "h", tags: {} });
+    assert.equal(rt.nick, "testbot");
+    assert.deepEqual(rt.self, { id: "irc.example.net/testbot", username: "testbot" });
+    assert.equal(client.whoCallCount, whoBefore + 1, "hostmask re-learned for the new nick length");
+    assert.equal(rt.reclaimTimer, undefined, "reclaim stops once the nick is back");
+
+    const after = client.changeNickArgs.length;
+    mock.timers.tick(RETRY_MS * 3);
+    assert.equal(client.changeNickArgs.length, after, "no further reclaim attempts");
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("N7: holder QUITs or renames away → immediate reclaim attempt", () => {
+  mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  try {
+    const client = new MockClient();
+    client.network.cap.enabled = [...FLOOR];
+    injectRuntime("acc", client);
+    client.emit("registered", { nick: "testbot_", tags: {} });
+
+    client.emit("quit", { nick: "TestBot", ident: "u", hostname: "h", message: "Ping timeout", tags: {} });
+    assert.deepEqual(client.changeNickArgs, ["testbot"]);
+
+    client.emit("nick", { nick: "testbot", new_nick: "someone", ident: "u", hostname: "h", tags: {} });
+    assert.deepEqual(client.changeNickArgs, ["testbot", "testbot"]);
+
+    // Unrelated users do not trigger an attempt.
+    client.emit("quit", { nick: "alice", ident: "u", hostname: "h", message: "bye", tags: {} });
+    assert.equal(client.changeNickArgs.length, 2);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("N8: registered on the primary → no reclaim timer, no warning", () => {
+  const client = new MockClient();
+  client.network.cap.enabled = [...FLOOR];
+  const { rt, host } = injectRuntime("acc", client);
+  client.emit("registered", { nick: "testbot", tags: {} });
+  assert.equal(rt.reclaimTimer, undefined);
+  assert.equal(host.warnings.length, 0);
+});
+
+test("N9: every reconnect starts again from the configured nick", () => {
+  mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  try {
+    const client = new MockClient();
+    client.network.cap.enabled = [...FLOOR];
+    const { rt } = injectRuntime("acc", client, { altNicks: ["altbot"] });
+
+    inUse(client, "testbot");
+    client.emit("registered", { nick: "altbot", tags: {} });
+    // The library sets user.nick from RPL_WELCOME and its auto-reconnect
+    // re-sends it, so this is what the next NICK would be without the reset.
+    client.user.nick = "altbot";
+    assert.ok(rt.reclaimTimer);
+
+    client.emit("socket close");
+    assert.equal(rt.reclaimTimer, undefined, "socket close clears the reclaim timer");
+
+    client.emit("connecting"); // library auto-reconnect
+    assert.equal(client.user.nick, "testbot", "registration NICK is the configured nick");
+    assert.equal(rt.nickAttempt, 0);
+    assert.equal(rt.registering, true);
+
+    inUse(client, "testbot");
+    assert.deepEqual(client.changeNickArgs, ["altbot", "altbot"], "fallback order restarts from the top");
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("N10: stop() clears the reclaim timer", async () => {
+  mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  try {
+    const client = new MockClient();
+    client.network.cap.enabled = [...FLOOR];
+    const { provider, rt } = injectRuntime("acc", client);
+    client.emit("registered", { nick: "testbot_", tags: {} });
+    assert.ok(rt.reclaimTimer);
+    await provider.stop();
+    assert.equal(rt.reclaimTimer, undefined);
+    mock.timers.tick(RETRY_MS * 2);
+    assert.deepEqual(client.changeNickArgs, []);
+  } finally {
+    mock.timers.reset();
+  }
 });

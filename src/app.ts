@@ -10029,6 +10029,7 @@ export async function startMikuAgent(config: AppConfig, opts?: StartMikuAgentOpt
         ...context,
         error: error instanceof Error ? error.message : String(error),
       }),
+    onWarning: (message, context) => logger.warn("provider_warning", { ...context, message }),
     // Route non-Matrix reactions through the shared generic ingest path (§9f).
     // Provider pre-resolves all fields (PK, normalizedKey, kind, display) before
     // calling onReaction; the generic ingest writes directly to the reactions table.

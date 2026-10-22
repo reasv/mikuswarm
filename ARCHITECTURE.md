@@ -638,7 +638,7 @@ The `agentName` is threaded into every read site:
 
 The agent is not hardwired to Matrix. The `IChatProvider` interface defines the cross-provider contract implemented by `MatrixProvider` (`src/matrix/provider.ts`):
 
-- `start(host: ChatProviderHost)` / `stop()` — lifecycle. `ChatProviderHost` is the callback object passed at start time: `onEvent` (inbound event delivery, replaces the old `subscribe`), `onReaction`, `onNativeEvent`, `onDiagnostics`, `onError`, `resolveReplyTrigger`.
+- `start(host: ChatProviderHost)` / `stop()` — lifecycle. `ChatProviderHost` is the callback object passed at start time: `onEvent` (inbound event delivery, replaces the old `subscribe`), `onReaction`, `onNativeEvent`, `onDiagnostics`, `onError`, the optional `onWarning` (recoverable operator-relevant conditions, logged at warn as `provider_warning` by the non-Matrix host; providers fall back to `onError` when it is absent), `resolveReplyTrigger`.
 - `send(target, message)` — outbound messages, returns `DeliveryReceipt`
 - `setTyping(target, typing)` — typing indicators
 - `accountIds()` — list of running account IDs
@@ -1256,6 +1256,17 @@ If a required cap is **withdrawn mid-connection** (`CAP DEL`), the provider logs
 
 **Opportunistic caps** (auto-detected, never config knobs): `msgid`, `labeled-response`, `batch`, `account-tag`, `account-notify`, `extended-join`, `away-notify`, `chghost`, `setname`. These are requested unconditionally; the server grants only the ones it advertises. Their presence silently improves internal fidelity (better message ids, identity resolution, echo correlation, roster freshness) but never changes the tool-visible capability surface.
 
+### Nick fallback and reclaim
+
+Each account builds an ordered nick candidate list once at startup (`buildNickCandidates`): the configured `nick`, then each `alt_nicks` entry, then generated fallbacks `nick_`, `nick__`, `nick1`, `nick2`, `nick3`, with casemapped duplicates dropped. The list is the whole budget for one connection's registration.
+
+- **During registration** (from the library's `connecting` event until RPL_WELCOME / `registered`), a nick rejection advances to the next candidate with `NICK`: 433 ERR_NICKNAMEINUSE (`nick in use`), 432 ERR_ERRONEOUSNICKNAME (`nick invalid`), and 436 ERR_NICKCOLLISION / 437 ERR_UNAVAILRESOURCE (no library handler; they arrive as `unknown command`, and a 437 naming a channel is ignored). Each step is logged at warn (`onWarning`, phase `nick_fallback`) naming the account, the refused nick and the next one. A 432 on the configured nick is additionally reported as an error (a misconfiguration) before the fallbacks are tried.
+- **Exhaustion**: when the last candidate is refused, the provider logs one error (phase `nick`) listing every candidate, `QUIT`s, and the `close` handler reconnects after `NICK_RETRY_INTERVAL_MS` (180 s), starting over from `nick`. A deliberate reconnect is needed because the library never auto-reconnects a connection that did not register.
+- **Reclaim**: when `registered` reports a nick other than the configured one, a warn is logged and a fixed `NICK_RETRY_INTERVAL_MS` interval sends `NICK <nick>`. It also tries at once when it sees the holder `QUIT` or rename away from `nick` in a shared channel. Success arrives as our own NICK echo and goes through the own-nick `nick` handler (`rt.nick`, `rt.self`, hostmask budget), which stops the interval. A 433 to a reclaim attempt is ignored silently (registration is over), so the account stays on its current nick. The interval is cleared on `socket close`, on every `connecting` and on `stop()`.
+- **Reconnects start from `nick`**: RPL_WELCOME sets the library's `client.user.nick` to the nick actually registered, and the library's auto-reconnect (`connection.connect()`) re-sends `user.nick` without resetting it from options. The `connecting` handler therefore resets `user.nick`, `rt.nick` and the candidate index to the configured nick before every attempt, for both auto-reconnect and the provider's own `client.connect()` paths (CAP DEL, exhaustion).
+
+Generated fallbacks are longer than `nick`; on a server that truncates over-long nicks to `NICKLEN` they can collapse back to `nick`, so a `nick` already at the network's limit should be given `alt_nicks`. Self identity and mention detection are unchanged: self id is the SASL account when configured, else the casemapped current nick, and mentions match the current nick.
+
 ### Key grammar
 
 | Context | Timeline key |
@@ -1312,7 +1323,7 @@ for non-embedded links.
 
 ### Inbound pipeline
 
-Events handled: `privmsg` (PRIVMSG + CTCP ACTION via the library's `action` event), `notice`, `cap del`, `nick`, `user updated` (CHGHOST/SETNAME), `join` (+ WHOX WHO on self-join), `userlist` (RPL_ENDOFNAMES), `part`, `kick`, `topic`, `away`, `back`, `account`, `quit`, `socket close`, `close`, `socket error`.
+Events handled: `privmsg` (PRIVMSG + CTCP ACTION via the library's `action` event), `notice`, `cap del`, `connecting`, `nick in use`, `nick invalid`, `unknown command` (436/437 only; see **Nick fallback and reclaim**), `nick`, `user updated` (CHGHOST/SETNAME), `join` (+ WHOX WHO on self-join), `userlist` (RPL_ENDOFNAMES), `part`, `kick`, `topic`, `away`, `back`, `account`, `quit`, `socket close`, `close`, `socket error`.
 
 **PRIVMSG / ACTION**: inbound messages from other users are normalized via `normalizeIrcMessage()` — a pure function with no live client references — and routed through `applyTriggerHoldOrEmit()`. `account` tag (if present) is used to refresh `AccountTracker` before normalization so the identity ladder reads the freshest state. DMs to a disabled (`dm_enabled = false`) account are dropped.
 
@@ -1376,6 +1387,7 @@ host            = "irc.example.org"        # required; server hostname or IP
 port            = 6697                     # optional; defaults to 6697 (TLS) or 6667 (plaintext)
 tls             = true                     # optional; defaults to true when port is 6697 or absent
 nick            = "botname"               # required; requested nick
+alt_nicks       = ["botname2"]            # optional; fallback nicks tried in order when nick is unavailable, before nick_, nick__, nick1..nick3
 username        = "botname"               # optional; IRC username (ident); defaults to nick
 realname        = "botname"               # optional; gecos / real name; defaults to nick
 sasl_user       = "..."                   # optional; SASL PLAIN username; when set with sasl_password, sasl cap is required

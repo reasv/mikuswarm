@@ -9,6 +9,7 @@
  *   - sasl_password + server_password are auto-redacted by key-name regex
  *   - unknown key in account block rejected (StrictObject)
  *   - missing required fields (host, nick) rejected
+ *   - alt_nicks optional, ordered, empty entries rejected
  */
 
 import assert from "node:assert/strict";
@@ -356,5 +357,45 @@ port = 6697
   await withConfigDir(toml, async (dir) => {
     const config = await loadConfig(dir, { env: false });
     assert.equal(config.irc?.accounts?.a?.port, 6697);
+  });
+});
+
+test("irc: alt_nicks is optional and parses as an ordered list", async () => {
+  const toml = `${BASE_CONFIG}
+[irc]
+enabled = false
+
+[irc.accounts.a]
+host = "irc.example.net"
+nick = "mikubot"
+alt_nicks = ["mikubot2", "mikubot_alt"]
+
+[irc.accounts.b]
+host = "irc.example.net"
+nick = "mikubot"
+`;
+  await withConfigDir(toml, async (dir) => {
+    const config = await loadConfig(dir, { env: false });
+    assert.deepEqual(config.irc?.accounts?.a?.alt_nicks, ["mikubot2", "mikubot_alt"]);
+    assert.equal(config.irc?.accounts?.b?.alt_nicks, undefined);
+  });
+});
+
+test("irc: alt_nicks rejects an empty string entry", async () => {
+  const toml = `${BASE_CONFIG}
+[irc]
+enabled = false
+
+[irc.accounts.a]
+host = "irc.example.net"
+nick = "mikubot"
+alt_nicks = ["mikubot2", ""]
+`;
+  await withConfigDir(toml, async (dir) => {
+    await assert.rejects(
+      loadConfig(dir, { env: false }),
+      (err: unknown) => err instanceof Error && /alt_nicks/.test(err.message),
+      "an empty alt_nicks entry must be rejected",
+    );
   });
 });

@@ -315,6 +315,28 @@ declare module "irc-framework" {
       capabilities: Record<string, string>;
     }
 
+    /**
+     * `nick in use` (ERR_NICKNAMEINUSE, 433) and `nick invalid`
+     * (ERR_ERRONEOUSNICKNAME, 432) payloads (handlers/user.js). `nick` is the
+     * rejected nick as the server reports it; `reason` is the trailing text.
+     */
+    interface NickRejectedEvent {
+      nick: string;
+      reason: string;
+      tags: Record<string, string>;
+    }
+
+    /**
+     * `unknown command` payload: a raw IrcCommand for any command or numeric the
+     * library has no handler for (handlers.js emitUnknownCommand), e.g. 436
+     * ERR_NICKCOLLISION and 437 ERR_UNAVAILRESOURCE.
+     */
+    interface UnknownCommandEvent {
+      command: string;
+      params: string[];
+      tags: Record<string, string>;
+    }
+
     // ── Connection options ────────────────────────────────────────────────
 
     interface IrcConnectOptions {
@@ -400,6 +422,12 @@ declare module "irc-framework" {
       /** Send a raw IRC line. */
       raw(command: string, ...args: string[]): void;
 
+      /**
+       * Send NICK. Does not touch `user.nick`: the library updates that from the
+       * server's NICK echo (registered) or RPL_WELCOME (during registration).
+       */
+      changeNick(nick: string): void;
+
       /** Send JOIN. */
       join(channel: string, key?: string): void;
 
@@ -421,6 +449,15 @@ declare module "irc-framework" {
       /** "connected" is an alias for "registered" emitted by addCommandHandlerListeners. */
       on(event: "connected", listener: (event: RegisteredEvent) => void): this;
       on(event: "close", listener: () => void): this;
+      /**
+       * Emitted by the connection before every connect attempt, both
+       * `client.connect()` and the library's own auto-reconnect (which calls
+       * `connection.connect()` and does NOT reset `user.nick` from options).
+       */
+      on(event: "connecting", listener: () => void): this;
+      on(event: "nick in use", listener: (event: NickRejectedEvent) => void): this;
+      on(event: "nick invalid", listener: (event: NickRejectedEvent) => void): this;
+      on(event: "unknown command", listener: (event: UnknownCommandEvent) => void): this;
       on(event: "socket close", listener: () => void): this;
       on(event: "socket error", listener: (error: Error) => void): this;
       on(event: "reconnecting", listener: (opts: { delay: number; attempt: number }) => void): this;

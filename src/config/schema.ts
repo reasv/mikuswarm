@@ -1815,6 +1815,14 @@ const IrcAccountSchema = StrictObject({
   tls: Type.Optional(Type.Boolean()),
   /** Requested nick. */
   nick: Type.String({ minLength: 1 }),
+  /**
+   * Fallback nicks, tried in order when `nick` is unavailable at registration
+   * (in use, colliding, temporarily held or rejected). After these the provider
+   * tries a few nicks derived from `nick` (`nick_`, `nick__`, `nick1`…`nick3`).
+   * Once registered on a fallback it keeps retrying `nick` and switches back
+   * when it frees up.
+   */
+  alt_nicks: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
   /** IRC username (ident). Defaults to nick when absent. */
   username: Type.Optional(Type.String({ minLength: 1 })),
   /** IRC real name / gecos. Defaults to nick when absent. */
