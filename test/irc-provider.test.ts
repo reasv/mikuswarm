@@ -362,6 +362,7 @@ function injectRuntime(
     nickAttempt: 0,
     registering: true,
     nickExhaustedReconnect: false,
+    giveUpReconnects: 0,
     casemapping: "rfc1459",
     networkName: "irc.example.net",
     networkIdFrozen: true, // freeze so inbound handlers (privmsg/notice/action) pass the gate
@@ -537,6 +538,73 @@ test("F2: capFailed path after reconnect prevents further connect() calls", () =
 
     // No further connect() — capFailed terminates the reconnect loop permanently.
     assert.equal(client.connectCallCount, 1, "no second connect after capFailed");
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+// ── F2b: library gave up (failed first connect / retries exhausted) ──────────
+
+test("F2b: 'close' with no reconnect flag reconnects with doubling backoff", () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const client = new MockClient();
+    const { rt } = injectRuntime("acc", client);
+
+    client.emit("socket close");
+    client.emit("close"); // the library gave up
+    mock.timers.tick(14_999);
+    assert.equal(client.connectCallCount, 0, "no connect before the 15 s base delay");
+    mock.timers.tick(1);
+    assert.equal(client.connectCallCount, 1, "connect after 15 s");
+
+    client.emit("socket close");
+    client.emit("close"); // that attempt failed too
+    mock.timers.tick(29_999);
+    assert.equal(client.connectCallCount, 1, "second delay doubles to 30 s");
+    mock.timers.tick(1);
+    assert.equal(client.connectCallCount, 2);
+    assert.equal(rt.giveUpReconnects, 2);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("F2b: backoff is capped at 300 s and resets on registration", () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const client = new MockClient();
+    client.network.cap.enabled = ["server-time", "message-tags", "echo-message"];
+    const { rt } = injectRuntime("acc", client);
+    rt.giveUpReconnects = 10; // 15 s × 2^10 would be far past the cap
+
+    client.emit("close");
+    mock.timers.tick(300_000);
+    assert.equal(client.connectCallCount, 1, "delay capped at 300 s");
+
+    client.emit("registered", { nick: "testbot" });
+    assert.equal(rt.giveUpReconnects, 0, "a registered connection resets the backoff");
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("F2b: 'close' after stop() or a cap failure never reconnects", async () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const capClient = new MockClient();
+    const { rt: capRt } = injectRuntime("cap", capClient);
+    capRt.capFailed = true;
+    capClient.emit("close");
+    mock.timers.tick(600_000);
+    assert.equal(capClient.connectCallCount, 0, "capFailed stops the loop");
+
+    const client = new MockClient();
+    const { provider } = injectRuntime("acc", client);
+    await provider.stop();
+    client.emit("close");
+    mock.timers.tick(600_000);
+    assert.equal(client.connectCallCount, 0, "a stopped provider never reconnects");
   } finally {
     mock.timers.reset();
   }

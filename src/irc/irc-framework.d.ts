@@ -366,7 +366,7 @@ declare module "irc-framework" {
       auto_reconnect?: boolean;
       /** Max reconnect wait in ms. Default 300000. */
       auto_reconnect_max_wait?: number;
-      /** Max reconnect retries before giving up (0 = unlimited). Default 3. */
+      /** Max reconnect retries before giving up. Default 3; 0 also means 3 (`|| 3`). */
       auto_reconnect_max_retries?: number;
       /**
        * Byte budget for the message body (content only; excludes `:source PRIVMSG target :`).

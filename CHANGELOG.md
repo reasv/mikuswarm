@@ -570,6 +570,12 @@ Unreleased section; it is not part of any release's notes.
   retries `nick` every 3 minutes (at once when the holder quits or renames) and
   every reconnect starts again from `nick`. When every candidate is refused it
   logs an error and reconnects 3 minutes later.
+- **IRC: an account could stay disconnected until restart.** The library only
+  auto-reconnects a connection that had registered, and gave up after 3 attempts
+  (the configured "0 = unlimited" was read as its default of 3). A failed first
+  connect at startup, or a longer outage, left the account dead. The provider now
+  reconnects on its own when the library gives up, with backoff from 15 s doubling
+  to at most 5 minutes, logged at warn.
 - **Discord: with `trigger_hold_ms` set, held messages were lost.** The hold was kept
   per channel and replaced the held message with any newer trigger, from any sender, so
   the earlier held messages were never stored and their senders never answered. The

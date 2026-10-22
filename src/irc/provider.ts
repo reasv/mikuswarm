@@ -131,6 +131,17 @@ const GENERATED_NICK_SUFFIXES = ["_", "__", "1", "2", "3"] as const;
 const NICK_RETRY_INTERVAL_MS = 180_000;
 
 /**
+ * Backoff for the provider's own reconnect after the library gives up: a
+ * failed first connect (the library only auto-reconnects a connection that was
+ * registered for over 5 s) or exhausted library retries. Doubles per attempt
+ * from the base, capped at the max; reset once an attempt registers.
+ */
+const GIVE_UP_RECONNECT_BASE_MS = 15_000;
+const GIVE_UP_RECONNECT_MAX_MS = 300_000;
+/** Library-level retries per outage before the provider's reconnect takes over. */
+const LIBRARY_RECONNECT_RETRIES = 10;
+
+/**
  * Floor caps required for every account. The library's default want list already
  * includes server-time and message-tags. echo-message requires enable_echomessage
  * in connect options (not in the library's default want list).
@@ -203,6 +214,11 @@ interface AccountRuntime {
    * follows the deliberate QUIT reconnects after NICK_RETRY_INTERVAL_MS.
    */
   nickExhaustedReconnect: boolean;
+  /**
+   * Consecutive provider reconnects after the library gave up (a failed first
+   * connect or exhausted library retries); drives the backoff, reset on 001.
+   */
+  giveUpReconnects: number;
   /** Interval retrying the configured nick while registered on a fallback. */
   reclaimTimer?: NodeJS.Timeout;
   /** Casemapping from ISUPPORT token (default: rfc1459). */
@@ -761,11 +777,12 @@ export class IrcProvider implements IChatProvider {
       enable_chghost: true,
       message_max_length: LIBRARY_MSG_MAX_LEN,
       auto_reconnect: true,
-      // Unlimited retries — the library's default is 3 which is too low for
-      // a production bot. On cap failure we handle "give up" by not processing
-      // further (capFailed flag). For transient network issues we want indefinite
-      // retry.
-      auto_reconnect_max_retries: 0,
+      // The library has no "unlimited": 0 means its default of 3
+      // (`options.auto_reconnect_max_retries || 3`). When its retries run out,
+      // or the first connect fails, it emits `close` and the `close` handler
+      // below reconnects with backoff, so retry is indefinite either way. On cap
+      // failure the capFailed flag stops it.
+      auto_reconnect_max_retries: LIBRARY_RECONNECT_RETRIES,
     };
 
     if (config.server_password) {
@@ -795,6 +812,7 @@ export class IrcProvider implements IChatProvider {
       nickAttempt: 0,
       registering: true,
       nickExhaustedReconnect: false,
+      giveUpReconnects: 0,
       casemapping: "rfc1459",
       networkName: config.host,
       networkIdFrozen: false,
@@ -824,6 +842,7 @@ export class IrcProvider implements IChatProvider {
 
       // Registration is complete: later nick rejections are reclaim attempts.
       rt.registering = false;
+      rt.giveUpReconnects = 0;
 
       // Update nick from the WELCOME message.
       rt.nick = event.nick;
@@ -988,6 +1007,25 @@ export class IrcProvider implements IChatProvider {
           rt.reconnectTimer = undefined;
           if (!this.stopped) rt.client.connect();
         }, NICK_RETRY_INTERVAL_MS);
+      } else if (!rt.capFailed && !this.stopped) {
+        // The library gave up: the first connect failed (it only auto-reconnects
+        // a connection that registered) or its retries ran out. Keep trying with
+        // backoff, or the account would stay dead until the process restarts.
+        const delay = Math.min(
+          GIVE_UP_RECONNECT_BASE_MS * 2 ** rt.giveUpReconnects,
+          GIVE_UP_RECONNECT_MAX_MS,
+        );
+        rt.giveUpReconnects++;
+        this.warn(
+          rt,
+          `irc account "${rt.accountId}": connection to ${rt.config.host} closed and the ` +
+            `library stopped retrying — reconnecting in ${Math.round(delay / 1000)} s`,
+          "reconnect",
+        );
+        rt.reconnectTimer = setTimeout(() => {
+          rt.reconnectTimer = undefined;
+          if (!this.stopped) rt.client.connect();
+        }, delay);
       }
     });
 
