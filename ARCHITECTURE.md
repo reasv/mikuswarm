@@ -1327,7 +1327,7 @@ for non-embedded links.
 
 Events handled: `privmsg` (PRIVMSG + CTCP ACTION via the library's `action` event), `notice`, `cap del`, `connecting`, `nick in use`, `nick invalid`, `unknown command` (436/437 only; see **Nick fallback and reclaim**), `nick`, `user updated` (CHGHOST/SETNAME), `join` (+ WHOX WHO on self-join), `userlist` (RPL_ENDOFNAMES), `part`, `kick`, `topic`, `away`, `back`, `account`, `quit`, `socket close`, `close`, `socket error`.
 
-**PRIVMSG / ACTION**: inbound messages from other users are normalized via `normalizeIrcMessage()` — a pure function with no live client references — and routed through `applyTriggerHoldOrEmit()`. `account` tag (if present) is used to refresh `AccountTracker` before normalization so the identity ladder reads the freshest state. DMs to a disabled (`dm_enabled = false`) account are dropped.
+**PRIVMSG / ACTION**: inbound messages from other users are normalized via `normalizeIrcMessage()` — a pure function with no live client references — and routed through `applyTriggerHoldOrEmit()`. Every normalized event carries an `outboundTarget` (`provider`, `timelineKey`, `accountId`, `roomId` = the key's channel id, `replyToId` = the external id), which a session it triggers replies to; `send()` and `setTyping()` resolve the wire target from its `timelineKey`. `account` tag (if present) is used to refresh `AccountTracker` before normalization so the identity ladder reads the freshest state. DMs to a disabled (`dm_enabled = false`) account are dropped.
 
 **NOTICE**: channel NOTICEs are ingested (trigger forced to `undefined`). Query NOTICEs (DMs) are dropped entirely. This is the only inbound suppression that is not a config option.
 

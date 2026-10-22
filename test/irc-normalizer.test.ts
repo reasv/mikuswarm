@@ -515,6 +515,54 @@ test("normalizeIrcMessage: basic privmsg from another user in a channel", () => 
   assert.ok(inbound.event.trigger === undefined, "No mention → no trigger");
 });
 
+test("normalizeIrcMessage: channel message carries an outbound target for the reply", () => {
+  _resetCounters();
+  const ctx = { accountId: "myacc", selfNick: "miku", casemapping: "ascii", networkId: "test.net" };
+  const msg = {
+    nick: "alice",
+    ident: "alice",
+    hostname: "example.com",
+    target: "#General",
+    message: "miku: hi",
+    tags: { "msgid": "server-id-9" },
+    time: 1704067200000,
+    account: undefined,
+    isAction: false,
+    isNotice: false,
+  };
+  const inbound = normalizeIrcMessage(msg, ctx);
+  assert.deepEqual(inbound.outboundTarget, {
+    provider: "irc",
+    timelineKey: "irc:myacc:room:#general",
+    accountId: "myacc",
+    roomId: "#general",
+    replyToId: "server-id-9",
+  });
+  assert.equal(inbound.outboundTarget?.timelineKey, inbound.timelineKey);
+});
+
+test("normalizeIrcMessage: DM carries an outbound target keyed by the scoped sender", () => {
+  _resetCounters();
+  const ctx = { accountId: "myacc", selfNick: "miku", casemapping: "ascii", networkId: "test.net" };
+  const msg = {
+    nick: "Alice",
+    ident: "alice",
+    hostname: "example.com",
+    target: "miku",
+    message: "hello",
+    tags: { "msgid": "server-id-10" },
+    time: 1704067200000,
+    account: undefined,
+    isAction: false,
+    isNotice: false,
+  };
+  const inbound = normalizeIrcMessage(msg, ctx);
+  assert.equal(inbound.outboundTarget?.provider, "irc");
+  assert.equal(inbound.outboundTarget?.timelineKey, inbound.timelineKey);
+  assert.equal(inbound.outboundTarget?.accountId, "myacc");
+  assert.equal(inbound.outboundTarget?.roomId, "test.net/alice");
+});
+
 test("normalizeIrcMessage: channel privmsg with mention triggers", () => {
   _resetCounters();
   const ctx = { accountId: "myacc", selfNick: "miku", casemapping: "ascii", networkId: "test.net" };

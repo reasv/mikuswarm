@@ -570,6 +570,9 @@ Unreleased section; it is not part of any release's notes.
   retries `nick` every 3 minutes (at once when the holder quits or renames) and
   every reconnect starts again from `nick`. When every candidate is refused it
   logs an error and reconnects 3 minutes later.
+- **IRC: the bot never replied.** Inbound IRC events had no outbound target, so
+  every session an IRC message triggered ended at launch with
+  `session_missing_outbound_target` and no model call. Events now carry one.
 - **IRC: an account could stay disconnected until restart.** The library only
   auto-reconnects a connection that had registered, and gave up after 3 attempts
   (the configured "0 = unlimited" was read as its default of 3). A failed first

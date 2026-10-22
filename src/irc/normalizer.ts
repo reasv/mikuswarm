@@ -596,6 +596,17 @@ export function normalizeIrcMessage(
     event,
     trigger,
     channelType,
+    // Where a session started by this message replies. Without it the session
+    // ends at launch (`session_missing_outbound_target`). roomId is the key's
+    // channel id (casemapped channel, or the scoped identity for a DM), as on
+    // the recovery and proactive paths; the provider sends by timelineKey.
+    outboundTarget: {
+      provider: "irc",
+      timelineKey,
+      accountId: ctx.accountId,
+      roomId: channelIsChannel ? casefold(msg.target, ctx.casemapping) : senderId,
+      replyToId: externalId,
+    },
   };
 
   return inbound;
